@@ -52,6 +52,14 @@ enum Commands {
         /// Max concurrent extraction workers
         #[arg(long, default_value_t = 4)]
         parallel: usize,
+
+        /// Refine output with a second LLM pass to fix garbled text and remaining duplicates
+        #[arg(long)]
+        refine: bool,
+
+        /// Text model for refinement (must be available in Ollama)
+        #[arg(long, default_value = "qwen2.5:32b")]
+        refine_model: String,
     },
 }
 
@@ -71,6 +79,8 @@ async fn main() -> Result<()> {
             model_dir,
             work_dir,
             parallel,
+            refine,
+            refine_model,
         } => {
             if !video.exists() {
                 bail!("{} not found", video.display());
@@ -92,6 +102,8 @@ async fn main() -> Result<()> {
                 model_dir,
                 work_dir,
                 parallel: parallel.max(1),
+                refine,
+                refine_model,
             };
             frametap::pipeline::run_pipeline(&args).await
         }

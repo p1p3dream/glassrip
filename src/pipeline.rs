@@ -23,6 +23,8 @@ pub struct ScrapeArgs {
     pub model_dir: PathBuf,
     pub work_dir: Option<PathBuf>,
     pub parallel: usize,
+    pub refine: bool,
+    pub refine_model: String,
 }
 
 pub async fn run_pipeline(args: &ScrapeArgs) -> Result<()> {
@@ -196,7 +198,13 @@ pub async fn run_pipeline(args: &ScrapeArgs) -> Result<()> {
     let cleaned = stitch::clean::clean_hallucinations(&stitched);
     let deduped = stitch::dedup::dedup_blocks(&cleaned);
     let section_deduped = stitch::dedup::dedup_sections(&deduped);
-    let final_content = stitch::dedup::dedup_passages(&section_deduped);
+    let passage_deduped = stitch::dedup::dedup_passages(&section_deduped);
+
+    let final_content = if args.refine {
+        stitch::refine::refine_text(&passage_deduped, &args.ollama_host, &args.refine_model).await?
+    } else {
+        passage_deduped
+    };
     let stitch_lines = final_content.lines().count();
     println!(
         "  Stitched {stitch_lines} lines from {} revisions",

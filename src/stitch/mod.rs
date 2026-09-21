@@ -1,5 +1,6 @@
 pub mod clean;
 pub mod dedup;
+pub mod refine;
 pub mod scroll;
 
 pub use clean::{clean_hallucinations, is_hallucinated};
