@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 
-const MODEL_DIR_ENV: &str = "FRAMETAP_MODEL_DIR";
-const DEFAULT_MODEL_DIR: &str = ".frametap/models";
+const MODEL_DIR_ENV: &str = "GLASSRIP_MODEL_DIR";
+const DEFAULT_MODEL_DIR: &str = ".glassrip/models";
 
 const DET_MODEL: &str = "det.onnx";
 const REC_MODEL: &str = "rec.onnx";
@@ -40,7 +40,7 @@ pub fn check_models(model_dir: &Path) -> Result<()> {
              # Download: languages/english/rec.onnx -> {dir}/rec.onnx\n\
              # Download: languages/english/dict.txt -> {dir}/dict.txt\n\
              \n\
-             Or set FRAMETAP_MODEL_DIR to your model directory.",
+             Or set GLASSRIP_MODEL_DIR to your model directory.",
             model_dir.display(),
             dir = model_dir.display(),
         );

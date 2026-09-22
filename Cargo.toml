@@ -1,5 +1,5 @@
 [package]
-name = "frametap"
+name = "glassrip"
 version = "0.1.0"
 edition = "2021"
 description = "Extract source code from screencasts and tutorial videos"

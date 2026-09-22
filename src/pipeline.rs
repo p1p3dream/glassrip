@@ -25,6 +25,7 @@ pub struct ScrapeArgs {
     pub parallel: usize,
     pub refine: bool,
     pub refine_model: String,
+    pub refine_agents: usize,
 }
 
 pub async fn run_pipeline(args: &ScrapeArgs) -> Result<()> {
@@ -33,7 +34,7 @@ pub async fn run_pipeline(args: &ScrapeArgs) -> Result<()> {
         Some(dir) => dir.as_path(),
         None => {
             temp_dir = tempfile::Builder::new()
-                .prefix("frametap_")
+                .prefix("glassrip_")
                 .tempdir()?;
             temp_dir.path()
         }
@@ -201,7 +202,7 @@ pub async fn run_pipeline(args: &ScrapeArgs) -> Result<()> {
     let passage_deduped = stitch::dedup::dedup_passages(&section_deduped);
 
     let final_content = if args.refine {
-        stitch::refine::refine_text(&passage_deduped, &args.ollama_host, &args.refine_model).await?
+        stitch::refine::refine_text(&passage_deduped, &args.refine_model, args.refine_agents).await?
     } else {
         passage_deduped
     };

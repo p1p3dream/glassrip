@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "frametap", about = "Extract code from video")]
+#[command(name = "glassrip", about = "Extract code from video")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -53,13 +53,17 @@ enum Commands {
         #[arg(long, default_value_t = 4)]
         parallel: usize,
 
-        /// Refine output with a second LLM pass to fix garbled text and remaining duplicates
+        /// Refine output via parallel Claude agents (requires ANTHROPIC_API_KEY)
         #[arg(long)]
         refine: bool,
 
-        /// Text model for refinement (must be available in Ollama)
-        #[arg(long, default_value = "qwen2.5:32b")]
+        /// Claude model for refinement
+        #[arg(long, default_value = "claude-opus-4-20250514")]
         refine_model: String,
+
+        /// Number of parallel refine agents
+        #[arg(long, default_value_t = 4)]
+        refine_agents: usize,
     },
 }
 
@@ -81,6 +85,7 @@ async fn main() -> Result<()> {
             parallel,
             refine,
             refine_model,
+            refine_agents,
         } => {
             if !video.exists() {
                 bail!("{} not found", video.display());
@@ -89,9 +94,9 @@ async fn main() -> Result<()> {
             std::fs::create_dir_all(&output)
                 .with_context(|| format!("failed to create output dir {}", output.display()))?;
 
-            let model_dir = model_dir.unwrap_or_else(frametap::extract::gpu_ocr::default_model_dir);
+            let model_dir = model_dir.unwrap_or_else(glassrip::extract::gpu_ocr::default_model_dir);
 
-            let args = frametap::pipeline::ScrapeArgs {
+            let args = glassrip::pipeline::ScrapeArgs {
                 video,
                 output,
                 model,
@@ -104,8 +109,9 @@ async fn main() -> Result<()> {
                 parallel: parallel.max(1),
                 refine,
                 refine_model,
+                refine_agents: refine_agents.max(1),
             };
-            frametap::pipeline::run_pipeline(&args).await
+            glassrip::pipeline::run_pipeline(&args).await
         }
     }
 }

@@ -604,26 +604,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "frametap"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "clap",
- "image",
- "imageproc",
- "md-5",
- "ndarray",
- "ort",
- "reqwest",
- "serde",
- "serde_json",
- "similar",
- "tempfile",
- "tokio",
-]
-
-[[package]]
 name = "futures-channel"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -716,6 +696,26 @@ checksum = "ee8cfcc411d9adbbaba82fb72661cc1bcca13e8bba98b364e62b2dba8f960159"
 dependencies = [
  "color_quant",
  "weezl",
+]
+
+[[package]]
+name = "glassrip"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "clap",
+ "image",
+ "imageproc",
+ "md-5",
+ "ndarray",
+ "ort",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "similar",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

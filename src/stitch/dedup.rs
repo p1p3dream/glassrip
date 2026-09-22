@@ -190,14 +190,35 @@ fn is_heading(line: &str) -> bool {
     stripped.starts_with("v") && stripped.len() > 1 && stripped.as_bytes()[1].is_ascii_digit()
 }
 
+fn heading_level(line: &str) -> usize {
+    let trimmed = line.trim();
+    if trimmed.starts_with('#') {
+        trimmed.chars().take_while(|&c| c == '#').count()
+    } else {
+        1
+    }
+}
+
 fn split_into_sections<'a>(lines: &[&'a str]) -> Vec<Section> {
     use super::normalize_line;
 
     let mut sections = Vec::new();
+    let mut ancestors: Vec<(usize, String)> = Vec::new();
     let mut i = 0;
     while i < lines.len() {
         if is_heading(lines[i]) {
             let norm = normalize_line(lines[i]);
+            let level = heading_level(lines[i]);
+
+            ancestors.retain(|(l, _)| *l < level);
+            ancestors.push((level, norm));
+
+            let scoped_key = ancestors
+                .iter()
+                .map(|(_, h)| h.as_str())
+                .collect::<Vec<_>>()
+                .join("|");
+
             let start = i;
             i += 1;
             while i < lines.len() && !is_heading(lines[i]) {
@@ -207,7 +228,7 @@ fn split_into_sections<'a>(lines: &[&'a str]) -> Vec<Section> {
             sections.push(Section {
                 start,
                 end: i,
-                norm_heading: Some(norm),
+                norm_heading: Some(scoped_key),
                 body_len,
             });
         } else {
@@ -366,6 +387,38 @@ mod tests {
         assert_eq!(result.matches("v1.2.3").count(), 1);
         assert!(result.contains("change C"));
         assert!(result.contains("v2.0.0"));
+    }
+
+    #[test]
+    fn section_dedup_scoped_to_parent() {
+        let input = "## v0.38.0\n### Features\n- feature X\n### Bug Fixes\n- fix Y\n## v0.37.0\n### Features\n- feature Z\n### Bug Fixes\n- fix W";
+        let result = dedup_sections(input);
+        assert_eq!(
+            result.matches("### Features").count(),
+            2,
+            "### Features under different versions must not dedup"
+        );
+        assert!(result.contains("feature X"));
+        assert!(result.contains("feature Z"));
+        assert_eq!(
+            result.matches("### Bug Fixes").count(),
+            2,
+            "### Bug Fixes under different versions must not dedup"
+        );
+        assert!(result.contains("fix Y"));
+        assert!(result.contains("fix W"));
+    }
+
+    #[test]
+    fn section_dedup_same_parent_still_deduped() {
+        let input = "## v0.38.0\n### Features\n- feature X\n### Features\n- feature X\n- feature Y";
+        let result = dedup_sections(input);
+        assert_eq!(
+            result.matches("### Features").count(),
+            1,
+            "duplicate ### Features under same parent should dedup"
+        );
+        assert!(result.contains("feature Y"), "longer section should be kept");
     }
 
     #[test]
