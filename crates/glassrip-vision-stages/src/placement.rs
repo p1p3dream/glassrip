@@ -170,6 +170,7 @@ fn truncated_info(raw_text: &str) -> ErrorInfo {
         "generation stopped at the output limit (done_reason length)",
     )
     .with_raw_text(raw_text.to_string())
+    .terminal()
 }
 
 /// Why [`PlacementMonitor::infer_typed_detailed`] failed.
@@ -178,6 +179,9 @@ pub enum InferFailure {
     /// The reply stopped at the output limit (`done_reason: length`). The caller
     /// may retry with a smaller output (see `board_read`'s compact retry).
     Truncated(ErrorInfo),
+    /// The reply fell into a repetition loop and was stopped. The caller may retry
+    /// with a repeat penalty (see `board_read`).
+    Repetition(ErrorInfo, glassrip_vision::repetition::RepetitionFinding),
     /// Any other failure.
     Other(ErrorInfo),
 }
@@ -186,7 +190,7 @@ impl InferFailure {
     /// The item error.
     pub fn into_info(self) -> ErrorInfo {
         match self {
-            Self::Truncated(e) | Self::Other(e) => e,
+            Self::Truncated(e) | Self::Repetition(e, _) | Self::Other(e) => e,
         }
     }
 }
@@ -479,10 +483,10 @@ impl PlacementMonitor {
         }
         let (value, raw) = result.map_err(|e| {
             let info = vision_error_info(&e);
-            if e.is_truncated() {
-                InferFailure::Truncated(info)
-            } else {
-                InferFailure::Other(info)
+            match e {
+                VisionError::Repetition { finding, .. } => InferFailure::Repetition(info, finding),
+                e if e.is_truncated() => InferFailure::Truncated(info),
+                _ => InferFailure::Other(info),
             }
         })?;
         if raw.done_reason.as_deref() == Some("length") {
@@ -571,19 +575,33 @@ impl CloneDigest for VisionError {
 }
 
 /// Map a vision error to an item error.
+///
+/// Failures that are a deterministic answer to the request (requests run at
+/// temperature 0 with a fixed seed, and the cache key holds the model digest) are
+/// marked terminal ([`ErrorInfo::terminal`]): an invalid reply after the repair
+/// retry, a reply cut off at the output limit or stopped for repetition, and inputs
+/// that cannot be sent. Transport, server, and placement failures stay retryable.
 pub fn vision_error_info(e: &VisionError) -> ErrorInfo {
     match e {
         VisionError::Cancelled => ErrorInfo::new(ErrorCode::Cancelled, e.to_string()),
         VisionError::Timeout { .. } => ErrorInfo::new(ErrorCode::Timeout, e.to_string()),
         VisionError::SchemaInvalid { raw_text, .. } => {
-            ErrorInfo::new(ErrorCode::SchemaParse, e.to_string()).with_raw_text(raw_text.clone())
+            ErrorInfo::new(ErrorCode::SchemaParse, e.to_string())
+                .with_raw_text(raw_text.clone())
+                .terminal()
         }
-        VisionError::Decode { .. } => ErrorInfo::new(ErrorCode::SchemaParse, e.to_string()),
-        VisionError::Truncated { raw_text, .. } => {
-            ErrorInfo::new(ErrorCode::ModelRequest, e.to_string()).with_raw_text(raw_text.clone())
+        VisionError::Decode { .. } => {
+            ErrorInfo::new(ErrorCode::SchemaParse, e.to_string()).terminal()
         }
-        VisionError::Image(_) | VisionError::ImageTooManyTokens { .. } => {
-            ErrorInfo::new(ErrorCode::InvalidInput, e.to_string())
+        VisionError::Truncated { raw_text, .. } | VisionError::Repetition { raw_text, .. } => {
+            ErrorInfo::new(ErrorCode::ModelRequest, e.to_string())
+                .with_raw_text(raw_text.clone())
+                .terminal()
+        }
+        VisionError::Image(_)
+        | VisionError::ImageTooManyTokens { .. }
+        | VisionError::ContextOverflow { .. } => {
+            ErrorInfo::new(ErrorCode::InvalidInput, e.to_string()).terminal()
         }
         _ => ErrorInfo::new(ErrorCode::ModelRequest, e.to_string()),
     }

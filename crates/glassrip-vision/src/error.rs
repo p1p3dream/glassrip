@@ -85,6 +85,19 @@ pub enum VisionError {
         raw_text: String,
     },
 
+    /// The reply fell into a repetition loop ([`crate::repetition`]) and was
+    /// stopped (streaming) or rejected (returned). `raw_text` is the output up to
+    /// that point. The caller decides whether to retry (see `board_read`).
+    #[error(
+        "generation stopped: repetition loop ({finding}); {} bytes of output",
+        .raw_text.len()
+    )]
+    Repetition {
+        num_predict: u32,
+        finding: crate::repetition::RepetitionFinding,
+        raw_text: String,
+    },
+
     /// Decoding an already-validated value into the caller's type failed.
     #[error("could not decode model output:\n{}", format_field_errors(.errors))]
     Decode { errors: Vec<FieldError> },
@@ -154,6 +167,11 @@ impl VisionError {
     /// True when the reply was cut off at the output limit.
     pub fn is_truncated(&self) -> bool {
         matches!(self, VisionError::Truncated { .. })
+    }
+
+    /// True when the reply was stopped for a repetition loop.
+    pub fn is_repetition(&self) -> bool {
+        matches!(self, VisionError::Repetition { .. })
     }
 }
 

@@ -32,7 +32,8 @@ use glassrip_vision::image_prep::{
     prepare_board_image_with, prepare_long_edge, BoardSizing, BOARD_LONG_EDGE, LOW_RES_THRESHOLD,
     LOW_RES_UPSCALE,
 };
-use glassrip_vision::{BBox, GenerationOptions, PreparedImage};
+use glassrip_vision::repetition::{detect, RepetitionFinding, RepetitionParams};
+use glassrip_vision::{BBox, GenerationOptions, PreparedImage, SamplingOverrides, VisionRequest};
 use image::{DynamicImage, RgbImage};
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -69,6 +70,17 @@ pub struct BoardReadParams {
     /// A reply cut off at the output limit is retried once with every list
     /// budget (`maxItems`) scaled by this and a compact single-line instruction.
     pub compact_retry_scale: f64,
+    /// Repetition-loop detector applied to every reply (streamed and returned).
+    pub repetition: RepetitionParams,
+    /// A reply that loops is retried once with this `repeat_penalty`: stronger
+    /// than the server default (1.1)...
+    pub repetition_retry_penalty: f32,
+    /// ...over this many recent tokens (`repeat_last_n`; the server default of 64
+    /// is shorter than one board list item, which runs 40 to 60 tokens)...
+    pub repetition_retry_last_n: u32,
+    /// ...and with the output budget scaled by this, so a retry that loops again
+    /// costs less.
+    pub repetition_retry_predict_share: f64,
 }
 
 impl Default for BoardReadParams {
@@ -90,8 +102,27 @@ impl Default for BoardReadParams {
             merge_iou: 0.5,
             merge_text_ratio: 0.85,
             compact_retry_scale: COMPACT_RETRY_SCALE,
+            repetition: RepetitionParams::default(),
+            repetition_retry_penalty: 1.2,
+            repetition_retry_last_n: 512,
+            repetition_retry_predict_share: 0.75,
         }
     }
+}
+
+/// The retry of a looping board read: the same request with a repeat penalty over
+/// a long window and a smaller output budget (never under `min_num_predict`).
+pub fn repetition_retry(p: &BoardReadParams, request: &VisionRequest) -> VisionRequest {
+    let mut retry = request.clone();
+    retry.sampling = SamplingOverrides {
+        repeat_penalty: Some(p.repetition_retry_penalty),
+        repeat_last_n: Some(p.repetition_retry_last_n),
+    };
+    let scaled =
+        (f64::from(request.options.num_predict) * p.repetition_retry_predict_share).floor() as u32;
+    retry.options.num_predict = scaled.max(p.min_num_predict.min(request.options.num_predict));
+    retry.repetition_guard = Some(p.repetition);
+    retry
 }
 
 /// Output tokens left by `num_ctx` after the image, the prompt (estimated at
@@ -341,16 +372,57 @@ impl BoardReadStage {
         )
         .map_err(|e| vision_error_info(&e))?;
         request.options.num_predict = output_budget(&self.params, &request);
+        request.repetition_guard = Some(self.params.repetition);
         let mut key = request_key(&self.model, &request);
         let started = Instant::now();
         let mut compact_retry = false;
+        let mut repetition: Option<RepetitionFinding> = None;
+        let mut sent = request.clone();
         let first = self
             .monitor
             .infer_typed_detailed::<BoardReadOutput>(request.clone(), cancel.clone())
             .await;
+        // A reply cut off at the output limit may be a loop that ran into it (a
+        // returned, not streamed, reply): the loop decides the retry.
+        let first = match first {
+            Err(InferFailure::Truncated(e)) => {
+                match e
+                    .raw_text
+                    .as_deref()
+                    .and_then(|t| detect(t, &self.params.repetition))
+                {
+                    Some(f) => Err(InferFailure::Repetition(e, f)),
+                    None => Err(InferFailure::Truncated(e)),
+                }
+            }
+            r => r,
+        };
         let (out, raw) = match first {
             Ok(v) => v,
             Err(InferFailure::Other(e)) => return Err(e),
+            Err(InferFailure::Repetition(e, finding)) => {
+                let retry = repetition_retry(&self.params, &request);
+                tracing::warn!(
+                    role = ?role,
+                    finding = %finding,
+                    repeat_penalty = self.params.repetition_retry_penalty,
+                    num_predict = retry.options.num_predict,
+                    error = %e.message,
+                    "board reading fell into a repetition loop; retrying once with a repeat penalty"
+                );
+                key = request_key(&self.model, &retry);
+                sent = retry.clone();
+                let message = format!("after the repetition retry ({finding})");
+                repetition = Some(finding);
+                self.monitor
+                    .infer_typed_detailed::<BoardReadOutput>(retry, cancel)
+                    .await
+                    .map_err(|f| {
+                        let mut info = f.into_info();
+                        info.message = format!("{message}: {}", info.message);
+                        info
+                    })?
+            }
             Err(InferFailure::Truncated(e)) => {
                 tracing::warn!(
                     role = ?role,
@@ -358,13 +430,15 @@ impl BoardReadStage {
                     error = %e.message,
                     "board reading hit the output limit; retrying once with a compact budget"
                 );
-                let retry = board_read_request_compact(
+                let mut retry = board_read_request_compact(
                     &prepared,
                     request.options,
                     self.params.compact_retry_scale,
                 )
                 .map_err(|e| vision_error_info(&e))?;
+                retry.repetition_guard = Some(self.params.repetition);
                 key = request_key(&self.model, &retry);
+                sent = retry.clone();
                 compact_retry = true;
                 self.monitor
                     .infer_typed_detailed::<BoardReadOutput>(retry, cancel)
@@ -392,6 +466,9 @@ impl BoardReadStage {
                 prompt_eval_count: raw.prompt_eval_count,
                 done_reason: raw.done_reason,
                 compact_retry,
+                repetition,
+                sampling: sent.sampling,
+                num_predict: Some(sent.options.num_predict),
             },
         ))
     }

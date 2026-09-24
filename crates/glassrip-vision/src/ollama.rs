@@ -510,6 +510,93 @@ impl OllamaBackend {
         Err(self.classify_status(path, status, text, retry_after))
     }
 
+    /// `post_once` with `stream: true`: reads the NDJSON reply line by line, feeds
+    /// the growing text to `guard`, and drops the connection (the server then stops
+    /// generating) as soon as the guard finds a repetition loop. A completed stream
+    /// is returned as the single JSON object a non-streaming reply would be.
+    async fn post_stream_once(
+        &self,
+        path: &str,
+        body: &Value,
+        timeout: Duration,
+        params: crate::repetition::RepetitionParams,
+        num_predict: u32,
+    ) -> Result<Value, AttemptError> {
+        let mut body = body.clone();
+        if let Value::Object(map) = &mut body {
+            map.insert("stream".into(), Value::Bool(true));
+        }
+        let mut resp = self
+            .http
+            .post(self.url(path))
+            .timeout(timeout)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| self.classify_reqwest(e))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let retry_after = parse_retry_after(resp.headers(), SystemTime::now())
+                .map(|d| d.min(self.config.max_retry_after));
+            let text = resp.text().await.unwrap_or_default();
+            return Err(self.classify_status(path, status, text, retry_after));
+        }
+        let mut guard = crate::repetition::StreamGuard::new(params);
+        let mut pending: Vec<u8> = Vec::new();
+        let mut content = String::new();
+        loop {
+            let chunk = resp.chunk().await.map_err(|e| self.classify_reqwest(e))?;
+            let Some(chunk) = chunk else {
+                return Err(AttemptError::Retryable {
+                    message: format!("{path} stream ended before the final message"),
+                    retry_after: None,
+                    timed_out: false,
+                });
+            };
+            pending.extend_from_slice(&chunk);
+            while let Some(nl) = pending.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = pending.drain(..=nl).collect();
+                let line = String::from_utf8_lossy(&line);
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let mut v: Value = serde_json::from_str(line).map_err(|e| {
+                    AttemptError::Fatal(VisionError::Protocol(format!(
+                        "{path} stream line is not JSON: {e}"
+                    )))
+                })?;
+                if let Some(err) = v.get("error").and_then(Value::as_str) {
+                    return Err(AttemptError::Retryable {
+                        message: format!("{path} stream error: {err}"),
+                        retry_after: None,
+                        timed_out: false,
+                    });
+                }
+                if let Some(piece) = v.pointer("/message/content").and_then(Value::as_str) {
+                    content.push_str(piece);
+                }
+                if v.get("done").and_then(Value::as_bool) == Some(true) {
+                    if let Some(m) = v.get_mut("message").and_then(Value::as_object_mut) {
+                        m.insert("content".into(), Value::String(content));
+                    } else if let Value::Object(map) = &mut v {
+                        map.insert("message".into(), json!({ "content": content }));
+                    }
+                    return Ok(v);
+                }
+                if let Some(finding) = guard.feed(&content) {
+                    // Dropping `resp` closes the connection; Ollama cancels the
+                    // generation when its client goes away.
+                    return Err(AttemptError::Fatal(VisionError::Repetition {
+                        num_predict,
+                        finding,
+                        raw_text: content,
+                    }));
+                }
+            }
+        }
+    }
+
     async fn get_once(&self, path: &str) -> Result<Value, AttemptError> {
         let resp = self
             .http
@@ -655,6 +742,14 @@ impl OllamaBackend {
         if let (Some(think), Value::Object(map)) = (self.config.think, &mut body) {
             map.insert("think".into(), Value::Bool(think));
         }
+        if let Some(opts) = body.get_mut("options").and_then(Value::as_object_mut) {
+            if let Some(p) = request.sampling.repeat_penalty {
+                opts.insert("repeat_penalty".into(), json!(p));
+            }
+            if let Some(n) = request.sampling.repeat_last_n {
+                opts.insert("repeat_last_n".into(), json!(n));
+            }
+        }
         body
     }
 
@@ -679,13 +774,29 @@ impl OllamaBackend {
         &self,
         body: &Value,
         cancel: &CancellationToken,
+        request: &VisionRequest,
     ) -> Result<(ChatResponse, u32, Duration)> {
         let start = Instant::now();
-        let (value, attempts) = self
-            .with_retries(cancel, || {
-                self.post_once("/api/chat", body, self.config.request_timeout)
-            })
-            .await?;
+        let (value, attempts) = match request.repetition_guard {
+            Some(params) => {
+                self.with_retries(cancel, || {
+                    self.post_stream_once(
+                        "/api/chat",
+                        body,
+                        self.config.request_timeout,
+                        params,
+                        request.options.num_predict,
+                    )
+                })
+                .await?
+            }
+            None => {
+                self.with_retries(cancel, || {
+                    self.post_once("/api/chat", body, self.config.request_timeout)
+                })
+                .await?
+            }
+        };
         let wall = start.elapsed();
         let resp: ChatResponse = serde_json::from_value(value)
             .map_err(|e| VisionError::Protocol(format!("/api/chat response: {e}")))?;
@@ -726,12 +837,13 @@ impl OllamaBackend {
     ) -> Result<RawResponse> {
         self.check_context(request)?;
         let body = self.chat_body(request, None);
-        let (resp, attempts, wall) = self.generate(&body, cancel).await?;
+        let (resp, attempts, wall) = self.generate(&body, cancel, request).await?;
         let text = resp
             .message
             .as_ref()
             .map(|m| m.content.clone())
             .unwrap_or_default();
+        repetition(request, &text)?;
         truncation(request, &resp, &text)?;
         let first_errors = match validate_text(request, &text) {
             Ok(json) => return Ok(Self::to_raw(resp, json, text, attempts, wall, false)),
@@ -766,12 +878,13 @@ impl OllamaBackend {
             );
         }
         let body = self.chat_body(request, Some(&plan));
-        let (resp, attempts, wall) = self.generate(&body, cancel).await?;
+        let (resp, attempts, wall) = self.generate(&body, cancel, request).await?;
         let text = resp
             .message
             .as_ref()
             .map(|m| m.content.clone())
             .unwrap_or_default();
+        repetition(request, &text)?;
         truncation(request, &resp, &text)?;
         match validate_text(request, &text) {
             Ok(json) => Ok(Self::to_raw(resp, json, text, attempts, wall, true)),
@@ -964,6 +1077,22 @@ impl OllamaBackend {
             latency: start.elapsed(),
         })
     }
+}
+
+/// A guarded request's returned text is checked once more (a non-streaming path, or
+/// a loop completed inside one chunk): a loop is reported as
+/// [`VisionError::Repetition`] before truncation or validation.
+pub fn repetition(request: &VisionRequest, text: &str) -> Result<()> {
+    if let Some(p) = &request.repetition_guard {
+        if let Some(finding) = crate::repetition::detect(text, p) {
+            return Err(VisionError::Repetition {
+                num_predict: request.options.num_predict,
+                finding,
+                raw_text: text.to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// A reply that stopped at the output limit is incomplete whatever it parses to:

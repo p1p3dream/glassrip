@@ -61,6 +61,28 @@ impl Default for GenerationOptions {
     }
 }
 
+/// Sampling settings a retry may change. Unset fields leave the server's
+/// defaults, and are left out of request keys, so requests without overrides keep
+/// the keys (and recorded responses) they always had.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SamplingOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Ollama `repeat_penalty` (the server default is 1.1).
+    pub repeat_penalty: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Ollama `repeat_last_n`: how many recent tokens the penalty looks back over
+    /// (the server default is 64, shorter than one board list item).
+    pub repeat_last_n: Option<u32>,
+}
+
+impl SamplingOverrides {
+    /// No override set.
+    pub fn is_empty(&self) -> bool {
+        self.repeat_penalty.is_none() && self.repeat_last_n.is_none()
+    }
+}
+
 /// One schema-constrained request carrying exactly one image.
 #[derive(Debug, Clone)]
 pub struct VisionRequest {
@@ -71,6 +93,13 @@ pub struct VisionRequest {
     /// Output schema; also sent as the server-side `format` constraint.
     pub schema: OutputSchema,
     pub options: GenerationOptions,
+    /// Sampling overrides (retries only).
+    pub sampling: SamplingOverrides,
+    /// Stop the reply as soon as it falls into a repetition loop
+    /// ([`crate::repetition`]); a streaming backend checks while it generates, and
+    /// every backend checks the returned text. The server sees the same request
+    /// either way, so the guard is not part of the request key.
+    pub repetition_guard: Option<crate::repetition::RepetitionParams>,
 }
 
 impl VisionRequest {
@@ -89,6 +118,8 @@ impl VisionRequest {
             image,
             schema,
             options,
+            sampling: SamplingOverrides::default(),
+            repetition_guard: None,
         })
     }
 }

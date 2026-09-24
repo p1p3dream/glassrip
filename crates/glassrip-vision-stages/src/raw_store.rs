@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use glassrip_vision::repetition::RepetitionFinding;
 use glassrip_vision::{
     BackendId, Placement, RawResponse, VisionBackend, VisionError, VisionRequest,
 };
@@ -17,9 +18,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-/// Replay key for a request.
+/// Replay key for a request. Sampling overrides are part of the key only when set,
+/// so requests without them keep their original keys. The repetition guard is not:
+/// the server sees the same request with or without it.
 pub fn request_key(model: &str, request: &VisionRequest) -> String {
-    let body = json!({
+    let mut body = json!({
         "domain": "glassrip.vision_request.v1",
         "model": model,
         "prompt": request.prompt,
@@ -29,6 +32,11 @@ pub fn request_key(model: &str, request: &VisionRequest) -> String {
         "seed": request.options.seed,
         "num_predict": request.options.num_predict,
     });
+    if !request.sampling.is_empty() {
+        if let serde_json::Value::Object(map) = &mut body {
+            map.insert("sampling".into(), json!(request.sampling));
+        }
+    }
     let text = glassrip_core::canonical::canonical_value_string(&body);
     blake3::hash(text.as_bytes()).to_hex().to_string()
 }
@@ -45,10 +53,16 @@ pub struct RecordedResponse {
     /// (`json` is null) and replay answers with [`VisionError::Truncated`].
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
+    /// The reply was stopped for a repetition loop: `response` holds the text up to
+    /// that point (`json` is null) and replay answers with
+    /// [`VisionError::Repetition`] and this finding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repetition: Option<RepetitionFinding>,
 }
 
-/// The stored form of a reply cut off at the output limit.
-fn truncated_response(raw_text: &str, eval_count: Option<u32>) -> RawResponse {
+/// The stored form of a reply cut off at the output limit (`done_reason`
+/// `length`) or stopped for repetition (`repetition`).
+fn stopped_response(raw_text: &str, eval_count: Option<u32>, done_reason: &str) -> RawResponse {
     RawResponse {
         raw_text: raw_text.to_string(),
         json: serde_json::Value::Null,
@@ -57,7 +71,7 @@ fn truncated_response(raw_text: &str, eval_count: Option<u32>) -> RawResponse {
         durations: glassrip_vision::Durations::default(),
         attempts: 1,
         repaired: false,
-        done_reason: Some("length".into()),
+        done_reason: Some(done_reason.into()),
     }
 }
 
@@ -156,23 +170,33 @@ impl VisionBackend for RecordingBackend {
         let response = match self.inner.infer(request, cancel).await {
             Ok(r) => r,
             Err(e) => {
-                // A truncation is a deterministic answer to this request; record
-                // it so replay takes the same (retry) path.
-                if let VisionError::Truncated {
-                    raw_text,
-                    eval_count,
-                    ..
-                } = &e
-                {
+                // A truncation or a repetition stop is a deterministic answer to
+                // this request; record it so replay takes the same (retry) path.
+                let stopped = match &e {
+                    VisionError::Truncated {
+                        raw_text,
+                        eval_count,
+                        ..
+                    } => Some((stopped_response(raw_text, *eval_count, "length"), None)),
+                    VisionError::Repetition {
+                        raw_text, finding, ..
+                    } => Some((
+                        stopped_response(raw_text, None, "repetition"),
+                        Some(finding.clone()),
+                    )),
+                    _ => None,
+                };
+                if let Some((response, repetition)) = stopped {
                     let entry = RecordedResponse {
                         key,
                         model: id.model,
                         digest: id.digest,
-                        response: truncated_response(raw_text, *eval_count),
-                        truncated: true,
+                        truncated: repetition.is_none(),
+                        response,
+                        repetition,
                     };
                     if let Err(w) = self.store.put(&entry) {
-                        tracing::warn!(error = %w, "could not record truncated response");
+                        tracing::warn!(error = %w, "could not record stopped response");
                     }
                 }
                 return Err(e);
@@ -184,6 +208,7 @@ impl VisionBackend for RecordingBackend {
             digest: id.digest,
             response: response.clone(),
             truncated: false,
+            repetition: None,
         };
         // A response that cannot be recorded is still a valid answer; replay
         // will report the missing key.
@@ -241,12 +266,27 @@ impl VisionBackend for ReplayBackend {
         }
         let key = request_key(&self.model, &request);
         match self.store.get(&key) {
-            Ok(Some(entry)) if entry.truncated => Err(VisionError::Truncated {
+            Ok(Some(RecordedResponse {
+                repetition: Some(finding),
+                response,
+                ..
+            })) => Err(VisionError::Repetition {
                 num_predict: request.options.num_predict,
-                eval_count: entry.response.eval_count,
-                raw_text: entry.response.raw_text,
+                finding,
+                raw_text: response.raw_text,
             }),
+            Ok(Some(entry)) if entry.truncated => {
+                // The live client checks a guarded reply for loops before calling
+                // it truncated; replay does the same.
+                glassrip_vision::ollama::repetition(&request, &entry.response.raw_text)?;
+                Err(VisionError::Truncated {
+                    num_predict: request.options.num_predict,
+                    eval_count: entry.response.eval_count,
+                    raw_text: entry.response.raw_text,
+                })
+            }
             Ok(Some(entry)) => {
+                glassrip_vision::ollama::repetition(&request, &entry.response.raw_text)?;
                 // Validate against the request schema, as a live reply would be.
                 request
                     .schema
@@ -336,6 +376,85 @@ mod tests {
         assert_eq!(a, request_key("m", &request(1)));
         assert_ne!(a, request_key("m", &request(2)));
         assert_ne!(a, request_key("other", &request(1)));
+    }
+
+    #[test]
+    fn sampling_overrides_change_the_key_and_the_guard_does_not() {
+        let plain = request(1);
+        let base = request_key("m", &plain);
+        let mut guarded = plain.clone();
+        guarded.repetition_guard = Some(Default::default());
+        assert_eq!(
+            base,
+            request_key("m", &guarded),
+            "the server sees the same request"
+        );
+        let mut penalized = guarded.clone();
+        penalized.sampling.repeat_penalty = Some(1.3);
+        assert_ne!(base, request_key("m", &penalized));
+        let mut windowed = plain;
+        windowed.sampling.repeat_last_n = Some(512);
+        assert_ne!(base, request_key("m", &windowed));
+        assert_ne!(request_key("m", &penalized), request_key("m", &windowed));
+    }
+
+    /// Answers every request with a repetition stop.
+    struct Looping;
+
+    fn finding() -> RepetitionFinding {
+        RepetitionFinding {
+            kind: glassrip_vision::repetition::RepetitionKind::Templated,
+            repeats: 6,
+            pattern: "{\"src\":\"n#\"}".into(),
+            at_bytes: 900,
+        }
+    }
+
+    #[async_trait]
+    impl VisionBackend for Looping {
+        fn id(&self) -> BackendId {
+            Fixed.id()
+        }
+        async fn preflight(&self) -> glassrip_vision::Result<Placement> {
+            Err(VisionError::Config("unused".into()))
+        }
+        async fn infer(
+            &self,
+            r: VisionRequest,
+            _c: CancellationToken,
+        ) -> glassrip_vision::Result<RawResponse> {
+            Err(VisionError::Repetition {
+                num_predict: r.options.num_predict,
+                finding: finding(),
+                raw_text: "{\"edges\": [".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn repetition_stops_are_recorded_and_replayed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RawStore::new(dir.path());
+        let mut req = request(7);
+        req.repetition_guard = Some(Default::default());
+        let rec = RecordingBackend::new(Arc::new(Looping), store.clone());
+        let live = rec.infer(req.clone(), CancellationToken::new()).await;
+        assert!(matches!(live, Err(VisionError::Repetition { .. })));
+        let entry = store.get(&request_key("m", &req)).unwrap().unwrap();
+        assert_eq!(entry.repetition, Some(finding()));
+        assert!(!entry.truncated);
+        let replay = ReplayBackend::new("m", store);
+        match replay.infer(req, CancellationToken::new()).await {
+            Err(VisionError::Repetition {
+                finding: f,
+                raw_text,
+                ..
+            }) => {
+                assert_eq!(f, finding());
+                assert_eq!(raw_text, "{\"edges\": [");
+            }
+            other => panic!("expected a replayed repetition stop, got {other:?}"),
+        }
     }
 
     #[tokio::test]

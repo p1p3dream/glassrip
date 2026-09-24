@@ -322,6 +322,8 @@ pub fn board_read_request_compact(
         image: prepared.image.clone(),
         schema,
         options,
+        sampling: crate::backend::SamplingOverrides::default(),
+        repetition_guard: None,
     })
 }
 
