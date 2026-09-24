@@ -11,6 +11,9 @@ description = "Extract source code from screencasts and tutorial videos"
 [features]
 default = []
 gpu = ["dep:ort", "dep:ndarray"]
+# GPU OCR on NVIDIA GPUs: registers the CUDA execution provider and fails
+# loudly if it cannot be initialized. Plain `gpu` runs ONNX Runtime on CPU.
+gpu-cuda = ["gpu", "ort/cuda"]
 
 [dependencies]
 anyhow = "1"

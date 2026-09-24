@@ -67,6 +67,33 @@ mod engine {
         anyhow::anyhow!("{e}")
     }
 
+    /// Name of the ONNX Runtime execution provider this build uses.
+    pub fn execution_provider() -> &'static str {
+        if cfg!(feature = "gpu-cuda") {
+            "CUDA"
+        } else {
+            "CPU"
+        }
+    }
+
+    fn session_builder() -> Result<ort::session::builder::SessionBuilder> {
+        let builder = Session::builder()
+            .map_err(ort_err)?
+            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
+            .map_err(ort_err)?;
+
+        // Without an explicit provider ONNX Runtime silently runs on CPU.
+        // error_on_failure turns a missing or broken CUDA install into an
+        // error instead of a quiet CPU fallback.
+        #[cfg(feature = "gpu-cuda")]
+        let builder = builder
+            .with_execution_providers([ort::ep::CUDA::default().build().error_on_failure()])
+            .map_err(ort_err)
+            .context("failed to register the CUDA execution provider")?;
+
+        Ok(builder)
+    }
+
     pub struct GpuOcrEngine {
         det_session: Session,
         rec_session: Session,
@@ -77,18 +104,12 @@ mod engine {
         pub fn new(model_dir: &Path) -> Result<Self> {
             super::check_models(model_dir)?;
 
-            let det_session = Session::builder()
-                .map_err(ort_err)?
-                .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
-                .map_err(ort_err)?
+            let det_session = session_builder()?
                 .commit_from_file(model_dir.join(super::DET_MODEL))
                 .map_err(ort_err)
                 .context("failed to load detection model")?;
 
-            let rec_session = Session::builder()
-                .map_err(ort_err)?
-                .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
-                .map_err(ort_err)?
+            let rec_session = session_builder()?
                 .commit_from_file(model_dir.join(super::REC_MODEL))
                 .map_err(ort_err)
                 .context("failed to load recognition model")?;
@@ -98,8 +119,9 @@ mod engine {
             let dictionary: Vec<String> = dict_text.lines().map(String::from).collect();
 
             eprintln!(
-                "  Loaded detection model and recognition model ({} chars in dictionary)",
-                dictionary.len()
+                "  Loaded detection model and recognition model ({} chars in dictionary) on {} execution provider",
+                dictionary.len(),
+                execution_provider()
             );
 
             Ok(Self {
@@ -387,7 +409,23 @@ mod engine {
 }
 
 #[cfg(feature = "gpu")]
-pub use engine::GpuOcrEngine;
+pub use engine::{execution_provider, GpuOcrEngine};
+
+#[cfg(all(test, feature = "gpu"))]
+mod tests {
+    #[test]
+    fn execution_provider_matches_features() {
+        let expected = if cfg!(feature = "gpu-cuda") { "CUDA" } else { "CPU" };
+        assert_eq!(super::execution_provider(), expected);
+    }
+
+    #[test]
+    fn missing_models_error_before_session_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = super::GpuOcrEngine::new(dir.path()).err().unwrap();
+        assert!(err.to_string().contains("GPU OCR models not found"), "{err}");
+    }
+}
 
 #[cfg(not(feature = "gpu"))]
 pub struct GpuOcrEngine;
