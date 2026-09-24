@@ -4,10 +4,12 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use tokio::sync::Semaphore;
 use tokio::time::{sleep, Duration};
+
+use crate::retry::{is_retryable_status, parse_retry_after, RetryPolicy};
 
 const EXTRACT_PROMPT: &str = "\
 Extract the exact source code visible in this image. \
@@ -26,12 +28,30 @@ const DIFF_TEMPLATE: &str = "\
 Previous frame's code ended with:\n```\n{previous_tail}\n```\n\n\
 Extract the code in this new frame exactly as shown. Output ONLY the code.";
 
-const MAX_RETRIES: u32 = 3;
+/// Default per-request timeout for VLM calls, in seconds.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 
 #[derive(Deserialize)]
 struct OllamaResponse {
     #[serde(default)]
     response: String,
+}
+
+/// Settings shared by every request in a VLM batch.
+#[derive(Debug, Clone)]
+pub struct VlmOptions {
+    /// Per-request timeout applied to the shared HTTP client.
+    pub timeout: Duration,
+    pub retry: RetryPolicy,
+}
+
+impl Default for VlmOptions {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            retry: RetryPolicy::default(),
+        }
+    }
 }
 
 pub async fn extract_code_from_frame(
@@ -43,7 +63,31 @@ pub async fn extract_code_from_frame(
     previous_code: Option<&str>,
     timeout_secs: u64,
 ) -> Result<String> {
-    let image_b64 = encode_image(frame_path)?;
+    extract_with_policy(
+        frame_path,
+        ollama_host,
+        model,
+        client,
+        narration,
+        previous_code,
+        Duration::from_secs(timeout_secs),
+        &RetryPolicy::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn extract_with_policy(
+    frame_path: &Path,
+    ollama_host: &str,
+    model: &str,
+    client: Option<&Client>,
+    narration: Option<&str>,
+    previous_code: Option<&str>,
+    timeout: Duration,
+    policy: &RetryPolicy,
+) -> Result<String> {
+    let image_b64 = encode_image(frame_path).await?;
 
     let prompt = if let Some(prev) = previous_code {
         let lines: Vec<&str> = prev.lines().collect();
@@ -78,68 +122,73 @@ pub async fn extract_code_from_frame(
     let client = match client {
         Some(c) => c,
         None => {
-            owned_client = Client::builder()
-                .timeout(Duration::from_secs(timeout_secs))
-                .build()?;
+            owned_client = Client::builder().timeout(timeout).build()?;
             &owned_client
         }
     };
 
     let url = format!("{ollama_host}/api/generate");
+    let max_attempts = policy.max_attempts.max(1);
+    let mut attempt: u32 = 0;
 
-    for attempt in 0..MAX_RETRIES {
-        let result = client.post(&url).json(&payload).send().await;
-        let should_retry = |e: &dyn std::fmt::Display, attempt: u32| -> bool {
-            if attempt >= MAX_RETRIES - 1 {
-                return false;
+    loop {
+        attempt += 1;
+        let (err, retry_after) = match client.post(&url).json(&payload).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    let data: OllamaResponse = resp
+                        .json()
+                        .await
+                        .context("failed to parse Ollama response")?;
+                    let cleaned = clean_response(&data.response);
+                    if cleaned.trim().is_empty() {
+                        eprintln!("  Warning: empty VLM response for {}", frame_path.display());
+                    }
+                    return Ok(cleaned);
+                }
+                if !is_retryable_status(status) {
+                    let body = resp.text().await.unwrap_or_default();
+                    anyhow::bail!("Ollama API returned {status}: {body}");
+                }
+                let retry_after = if status == StatusCode::TOO_MANY_REQUESTS {
+                    parse_retry_after(resp.headers())
+                } else {
+                    None
+                };
+                (anyhow::anyhow!("Ollama API returned {status}"), retry_after)
             }
-            let wait = 2u64.pow(attempt);
-            eprintln!("  Retry {}/{MAX_RETRIES} after {e}, waiting {wait}s", attempt + 1);
-            true
+            Err(e) => (anyhow::Error::new(e).context("Ollama request failed"), None),
         };
 
-        match result {
-            Ok(resp) => {
-                if resp.status().is_server_error() {
-                    let status = resp.status();
-                    if should_retry(&status, attempt) {
-                        sleep(Duration::from_secs(2u64.pow(attempt))).await;
-                        continue;
-                    }
-                    anyhow::bail!("Ollama API returned {status} after {MAX_RETRIES} retries");
-                }
-                let resp = resp
-                    .error_for_status()
-                    .context("Ollama API returned error status")?;
-                let data: OllamaResponse = resp.json().await?;
-                let cleaned = clean_response(&data.response);
-                if cleaned.trim().is_empty() {
-                    eprintln!("  Warning: empty VLM response for {}", frame_path.display());
-                }
-                return Ok(cleaned);
-            }
-            Err(e) => {
-                if !should_retry(&e, attempt) {
-                    return Err(e).context("Ollama request failed after all retries");
-                }
-                sleep(Duration::from_secs(2u64.pow(attempt))).await;
-            }
+        if attempt >= max_attempts {
+            return Err(err.context(format!(
+                "giving up on {} after {attempt} attempt(s)",
+                frame_path.display()
+            )));
         }
+        let wait = policy.delay_for(attempt - 1, retry_after);
+        eprintln!(
+            "  Retry {attempt}/{} for {} after {err:#}, waiting {wait:.2?}",
+            max_attempts - 1,
+            frame_path.display()
+        );
+        sleep(wait).await;
     }
-
-    unreachable!("retry loop exhausted without returning")
 }
 
+/// Extract every frame concurrently. The outer `Result` covers setup only
+/// (building the HTTP client); each frame gets its own `Result` so one bad
+/// frame never aborts the batch. Output order matches `frame_paths`.
 pub async fn extract_batch(
     frame_paths: &[&Path],
     ollama_host: &str,
     model: &str,
     max_concurrent: usize,
-) -> Result<Vec<String>> {
-    let sem = Arc::new(Semaphore::new(max_concurrent));
-    let client = Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()?;
+    options: &VlmOptions,
+) -> Result<Vec<Result<String>>> {
+    let sem = Arc::new(Semaphore::new(max_concurrent.max(1)));
+    let client = Client::builder().timeout(options.timeout).build()?;
 
     let mut handles = Vec::with_capacity(frame_paths.len());
 
@@ -149,26 +198,33 @@ pub async fn extract_batch(
         let host = ollama_host.to_string();
         let model = model.to_string();
         let path = path.to_path_buf();
+        let timeout = options.timeout;
+        let policy = options.retry.clone();
 
         handles.push(tokio::spawn(async move {
             let _permit = permit
                 .acquire()
                 .await
                 .context("semaphore closed unexpectedly")?;
-            extract_code_from_frame(&path, &host, &model, Some(&client), None, None, 60).await
+            extract_with_policy(&path, &host, &model, Some(&client), None, None, timeout, &policy)
+                .await
         }));
     }
 
     let mut results = Vec::with_capacity(handles.len());
-    for handle in handles {
-        results.push(handle.await??);
+    for (i, handle) in handles.into_iter().enumerate() {
+        results.push(match handle.await {
+            Ok(r) => r,
+            Err(e) => Err(anyhow::anyhow!("VLM worker for frame {i} failed to complete: {e}")),
+        });
     }
 
     Ok(results)
 }
 
-fn encode_image(path: &Path) -> Result<String> {
-    let bytes = std::fs::read(path)
+async fn encode_image(path: &Path) -> Result<String> {
+    let bytes = tokio::fs::read(path)
+        .await
         .with_context(|| format!("failed to read image: {}", path.display()))?;
     Ok(STANDARD.encode(bytes))
 }
@@ -188,5 +244,175 @@ fn clean_response(text: &str) -> String {
         lines.join("\n")
     } else {
         text.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{serve, Reply};
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    fn fast_policy(max_attempts: u32) -> RetryPolicy {
+        RetryPolicy {
+            max_attempts,
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(50),
+            max_retry_after: Duration::from_secs(5),
+        }
+    }
+
+    fn opts(timeout: Duration, max_attempts: u32) -> VlmOptions {
+        VlmOptions {
+            timeout,
+            retry: fast_policy(max_attempts),
+        }
+    }
+
+    fn fake_frame(dir: &tempfile::TempDir, name: &str) -> PathBuf {
+        let path = dir.path().join(name);
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"not really a png").unwrap();
+        path
+    }
+
+    fn ok_reply(text: &str) -> Reply {
+        Reply::json(200, serde_json::json!({ "response": text }))
+    }
+
+    #[tokio::test]
+    async fn batch_isolates_failed_frames() {
+        let server = serve(vec![ok_reply("let x = 1;")]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let good_a = fake_frame(&dir, "a.png");
+        let missing = dir.path().join("missing.png");
+        let good_b = fake_frame(&dir, "b.png");
+        let paths = [good_a.as_path(), missing.as_path(), good_b.as_path()];
+
+        let results = extract_batch(&paths, &server.url, "m", 2, &opts(Duration::from_secs(5), 1))
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].as_ref().unwrap(), "let x = 1;");
+        let err = results[1].as_ref().unwrap_err();
+        assert!(format!("{err:#}").contains("failed to read image"), "{err:#}");
+        assert_eq!(results[2].as_ref().unwrap(), "let x = 1;");
+    }
+
+    #[tokio::test]
+    async fn batch_uses_configured_timeout() {
+        let server = serve(vec![ok_reply("slow").delay(Duration::from_secs(3))]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let frame = fake_frame(&dir, "a.png");
+
+        let started = Instant::now();
+        let results = extract_batch(
+            &[frame.as_path()],
+            &server.url,
+            "m",
+            1,
+            &opts(Duration::from_millis(300), 1),
+        )
+        .await
+        .unwrap();
+
+        let err = results[0].as_ref().unwrap_err();
+        assert!(format!("{err:?}").to_lowercase().contains("timed out"), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(2), "timeout not applied");
+    }
+
+    #[tokio::test]
+    async fn retries_429_and_honors_retry_after() {
+        let server = serve(vec![
+            Reply::json(429, serde_json::json!({})).header("Retry-After", "1"),
+            ok_reply("done"),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let frame = fake_frame(&dir, "a.png");
+
+        let started = Instant::now();
+        let out = extract_with_policy(
+            &frame, &server.url, "m", None, None, None,
+            Duration::from_secs(5), &fast_policy(3),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, "done");
+        assert_eq!(server.hits(), 2);
+        assert!(started.elapsed() >= Duration::from_millis(950), "Retry-After ignored");
+    }
+
+    #[tokio::test]
+    async fn retries_429_without_retry_after_using_backoff() {
+        let server = serve(vec![Reply::json(429, serde_json::json!({})), ok_reply("done")]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let frame = fake_frame(&dir, "a.png");
+
+        let out = extract_with_policy(
+            &frame, &server.url, "m", None, None, None,
+            Duration::from_secs(5), &fast_policy(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "done");
+        assert_eq!(server.hits(), 2);
+    }
+
+    #[tokio::test]
+    async fn retries_server_errors_then_gives_up() {
+        let server = serve(vec![Reply::json(503, serde_json::json!({}))]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let frame = fake_frame(&dir, "a.png");
+
+        let err = extract_with_policy(
+            &frame, &server.url, "m", None, None, None,
+            Duration::from_secs(5), &fast_policy(3),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(server.hits(), 3);
+        assert!(format!("{err:#}").contains("after 3 attempt"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn retries_dropped_connections() {
+        let server = serve(vec![Reply::Drop, ok_reply("recovered")]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let frame = fake_frame(&dir, "a.png");
+
+        let out = extract_with_policy(
+            &frame, &server.url, "m", None, None, None,
+            Duration::from_secs(5), &fast_policy(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "recovered");
+        assert_eq!(server.hits(), 2);
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_client_errors() {
+        let server = serve(vec![Reply::json(400, serde_json::json!({"error": "bad model"}))]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let frame = fake_frame(&dir, "a.png");
+
+        let err = extract_with_policy(
+            &frame, &server.url, "m", None, None, None,
+            Duration::from_secs(5), &fast_policy(3),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(server.hits(), 1);
+        assert!(err.to_string().contains("400"), "{err}");
+    }
+
+    #[test]
+    fn default_timeout_is_120s() {
+        assert_eq!(VlmOptions::default().timeout, Duration::from_secs(120));
     }
 }

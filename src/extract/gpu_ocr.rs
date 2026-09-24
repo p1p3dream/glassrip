@@ -136,7 +136,8 @@ mod engine {
             Ok(lines.join("\n"))
         }
 
-        pub fn extract_batch(&mut self, frame_paths: &[PathBuf]) -> Result<Vec<String>> {
+        /// One result per frame, in order; a failed frame does not stop the batch.
+        pub fn extract_batch(&mut self, frame_paths: &[PathBuf]) -> Vec<Result<String>> {
             frame_paths
                 .iter()
                 .map(|p| self.extract_code_from_frame(p))
@@ -401,7 +402,10 @@ impl GpuOcrEngine {
         bail!("GPU OCR not available");
     }
 
-    pub fn extract_batch(&mut self, _frame_paths: &[PathBuf]) -> Result<Vec<String>> {
-        bail!("GPU OCR not available");
+    pub fn extract_batch(&mut self, frame_paths: &[PathBuf]) -> Vec<Result<String>> {
+        frame_paths
+            .iter()
+            .map(|_| Err(anyhow::anyhow!("GPU OCR not available")))
+            .collect()
     }
 }
