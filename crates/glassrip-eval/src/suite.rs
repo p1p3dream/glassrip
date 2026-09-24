@@ -47,8 +47,8 @@ use crate::replay::{RequestId, Responder};
 use crate::text::{median, SENTENCE_MATCH_DICE};
 use crate::timejoin::{join_time, KeyframeSpan};
 use crate::views::{
-    self, BoardReadingItem, BoardStateItem, KeyframeItem, NotesItem, RunArtifacts, ScreenClassItem,
-    StateTarget, TranscriptItem,
+    self, BoardReadingItem, BoardStateItem, EdgeOrientation, Keyframe, MeetingNotes, NotesStatus,
+    OwnerTarget, RunArtifacts, ScreenClassItem, SpeakersRecord, TranscriptSegment,
 };
 
 /// Flat metric map.
@@ -512,7 +512,7 @@ pub fn run_docs_suite(cases: &[DocsCase], predictions: Option<&Path>) -> SuiteRu
     run
 }
 
-fn spans(items: &[KeyframeItem]) -> Vec<KeyframeSpan> {
+fn spans(items: &[Keyframe]) -> Vec<KeyframeSpan> {
     items
         .iter()
         .map(|k| KeyframeSpan {
@@ -540,17 +540,33 @@ fn gold_board_with_groups(g: &GoldBoard) -> GoldBoard {
     out
 }
 
+fn direction_of(d: EdgeOrientation) -> Direction {
+    match d {
+        EdgeOrientation::Forward => Direction::Forward,
+        EdgeOrientation::Uncertain => Direction::Uncertain,
+        EdgeOrientation::Bidirectional => Direction::Bidirectional,
+    }
+}
+
+/// Snake-case name of a serialized enum value (`NodeAdded` stays as serialized).
+fn enum_name<T: Serialize>(v: &T) -> String {
+    serde_json::to_value(v)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
 fn state_to_pred(b: &BoardStateItem) -> PredBoard {
     let text_of: BTreeMap<&str, &str> = b
         .nodes
         .iter()
-        .map(|n| (n.node_id.as_str(), n.text.as_str()))
+        .map(|n| (n.id.as_str(), n.text.as_str()))
         .collect();
     PredBoard {
         nodes: b
             .nodes
             .iter()
-            .filter(|n| n.in_final_state)
+            .filter(|n| n.in_final)
             .map(|n| PredNode {
                 text: n.text.clone(),
                 bbox: None,
@@ -559,6 +575,7 @@ fn state_to_pred(b: &BoardStateItem) -> PredBoard {
         edges: b
             .edges
             .iter()
+            .filter(|e| e.in_final)
             .map(|e| PredEdge {
                 src: text_of
                     .get(e.src.as_str())
@@ -571,14 +588,14 @@ fn state_to_pred(b: &BoardStateItem) -> PredBoard {
                     .unwrap_or(e.dst.as_str())
                     .to_string(),
                 label: e.label.clone(),
-                style: e.style,
-                direction: e.direction,
+                style: e.style.into(),
+                direction: direction_of(e.direction),
             })
             .collect(),
         stickies: b
             .stickies
             .iter()
-            .filter(|s| s.in_final_state)
+            .filter(|s| s.in_final)
             .map(|s| PredSticky {
                 text: s.text.clone(),
                 bbox: None,
@@ -592,7 +609,7 @@ fn state_to_pred(b: &BoardStateItem) -> PredBoard {
 fn reading_chrome(items: &[BoardReadingItem], chrome: &[String]) -> usize {
     items
         .iter()
-        .filter_map(|r| r.result.as_ref())
+        .map(|r| &r.result)
         .map(|r| {
             r.nodes
                 .iter()
@@ -623,13 +640,25 @@ pub fn run_meeting(
 ) -> Result<SuiteRun> {
     let mut run = SuiteRun::default();
     let mut details = serde_json::Map::new();
-    let keyframes: Option<Vec<KeyframeItem>> = run_art.items(views::schema::KEYFRAMES)?;
+    let keyframes: Option<Vec<Keyframe>> = run_art.items(views::schema::KEYFRAMES)?;
     let kspans = keyframes.as_deref().map(spans);
     let screen_items: Option<Vec<ScreenClassItem>> = run_art.items(views::schema::SCREEN_CLASS)?;
     let state_items: Option<Vec<BoardStateItem>> = run_art.items(views::schema::BOARD_STATE)?;
     let readings: Option<Vec<BoardReadingItem>> = run_art.items(views::schema::BOARD_READING)?;
-    let transcript: Option<Vec<TranscriptItem>> = run_art.items(views::schema::TRANSCRIPT)?;
-    let notes: Option<Vec<NotesItem>> = run_art.items(views::schema::MEETING_NOTES)?;
+    let transcript: Option<Vec<TranscriptSegment>> = run_art.items(views::schema::TRANSCRIPT)?;
+    let speakers: Option<Vec<SpeakersRecord>> = run_art.items(views::schema::SPEAKERS)?;
+    let notes: Option<Vec<MeetingNotes>> = run_art.items(views::schema::MEETING_NOTES)?;
+    for schema in [
+        views::schema::SCREEN_CLASS,
+        views::schema::BOARD_READING,
+        views::schema::BOARD_STATE,
+        views::schema::MEETING_NOTES,
+    ] {
+        let failed = run_art.failed_ids(schema)?;
+        if !failed.is_empty() {
+            details.insert(format!("failed_items.{schema}"), json!(failed));
+        }
+    }
     let m = &mut run.metrics;
 
     // Screen types and trap coverage.
@@ -637,7 +666,7 @@ pub fn run_meeting(
         (Some(ks), Some(sc)) => {
             let by_kf: BTreeMap<&str, Option<ScreenType>> = sc
                 .iter()
-                .map(|s| (s.keyframe_id.as_str(), ScreenType::parse(&s.screen_type)))
+                .map(|s| (s.keyframe_id.as_str(), Some(s.screen_type.into())))
                 .collect();
             let mut score = ScreenScore::default();
             let mut unconfirmed = 0;
@@ -700,12 +729,12 @@ pub fn run_meeting(
             let text_of: BTreeMap<&str, &str> = state
                 .nodes
                 .iter()
-                .map(|n| (n.node_id.as_str(), n.text.as_str()))
+                .map(|n| (n.id.as_str(), n.text.as_str()))
                 .collect();
             let gold_id =
                 |node_id: &str| resolver.resolve(text_of.get(node_id).copied().unwrap_or(node_id));
             for o in &state.owner_assignments {
-                let raw = o.person_id.clone().unwrap_or_else(|| o.name_raw.clone());
+                let raw = o.person_id.clone();
                 if golden.owners.negatives.iter().any(|n| {
                     crate::text::labels_match(n, &o.name_raw) || crate::text::labels_match(n, &raw)
                 }) {
@@ -714,10 +743,10 @@ pub fn run_meeting(
                 let person =
                     resolve_person(golden, &raw).or_else(|| resolve_person(golden, &o.name_raw));
                 let target = match &o.target {
-                    StateTarget::Node { node_id } => gold_id(node_id).map(|n| Target::Node {
+                    OwnerTarget::Node { node_id, .. } => gold_id(node_id).map(|n| Target::Node {
                         node: n.to_string(),
                     }),
-                    StateTarget::Edge { src, dst } => match (gold_id(src), gold_id(dst)) {
+                    OwnerTarget::Edge { src, dst, .. } => match (gold_id(src), gold_id(dst)) {
                         (Some(a), Some(b)) => Some(Target::Edge {
                             src: a.to_string(),
                             dst: b.to_string(),
@@ -730,13 +759,13 @@ pub fn run_meeting(
                         person_id,
                         target,
                         valid_from_s: o.valid_from_s,
-                        valid_to_s: o.valid_to_s,
+                        valid_to_s: Some(o.valid_to_s).filter(|t| t.is_finite()),
                     }),
                     _ => unresolved += 1,
                 }
             }
             events.extend(state.events.iter().map(|e| PredEvent {
-                kind: e.kind.clone(),
+                kind: enum_name(&e.kind),
                 t_s: e.t_s,
             }));
         }
@@ -798,18 +827,20 @@ pub fn run_meeting(
     // Notes.
     match notes.as_ref().and_then(|n| n.first()) {
         Some(n) => {
-            if n.status.eq_ignore_ascii_case("degraded") {
+            if n.report.status == NotesStatus::Degraded {
                 run.gate_failures
                     .push("meeting_notes status is degraded (6.14 minimum-output alarm)".into());
             }
-            let texts = |v: &[views::NotesText]| -> Vec<PredItem> {
-                v.iter()
+            let texts = |v: Vec<&str>| -> Vec<PredItem> {
+                v.into_iter()
                     .map(|t| PredItem {
-                        text: t.text.clone(),
+                        text: t.to_string(),
                         person_id: None,
                     })
                     .collect()
             };
+            let decisions = texts(n.decisions.iter().map(|d| d.text.as_str()).collect());
+            let questions = texts(n.open_questions.iter().map(|q| q.text.as_str()).collect());
             let actions: Vec<PredItem> = n
                 .action_items
                 .iter()
@@ -825,7 +856,7 @@ pub fn run_meeting(
             put_prf(
                 m,
                 "notes.decision",
-                score_items(&t.decisions, &texts(&n.decisions), SENTENCE_MATCH_DICE).0,
+                score_items(&t.decisions, &decisions, SENTENCE_MATCH_DICE).0,
             );
             put_prf(
                 m,
@@ -835,12 +866,7 @@ pub fn run_meeting(
             put_prf(
                 m,
                 "notes.question",
-                score_items(
-                    &t.open_questions,
-                    &texts(&n.open_questions),
-                    SENTENCE_MATCH_DICE,
-                )
-                .0,
+                score_items(&t.open_questions, &questions, SENTENCE_MATCH_DICE).0,
             );
             let neg = negative_hits(&t.negative_action_items, &actions, SENTENCE_MATCH_DICE);
             m.insert("notes.negative_action_hits".into(), neg.len() as f64);
@@ -849,6 +875,35 @@ pub fn run_meeting(
         None => run
             .not_run
             .push("notes metrics: glassrip.meeting_notes missing".into()),
+    }
+
+    // Speaker naming.
+    if let Some(records) = &speakers {
+        let labels: Vec<_> = records
+            .iter()
+            .filter_map(|r| match r {
+                SpeakersRecord::Label(l) => Some(l),
+                _ => None,
+            })
+            .collect();
+        let mapped: std::collections::BTreeSet<&str> = labels
+            .iter()
+            .filter_map(|l| l.person_id.as_deref())
+            .collect();
+        m.insert("speakers.labels".into(), labels.len() as f64);
+        m.insert("speakers.distinct_people".into(), mapped.len() as f64);
+        m.insert(
+            "speakers.distinct_people_error".into(),
+            (mapped.len() as f64 - golden.transcript.speaker_count as f64).abs(),
+        );
+        let resolved = mapped
+            .iter()
+            .filter(|p| resolve_person(golden, p).is_some())
+            .count();
+        m.insert("speakers.people_in_golden".into(), resolved as f64);
+    } else {
+        run.not_run
+            .push("speaker metrics: glassrip.speakers missing".into());
     }
 
     // Transcript.
@@ -907,19 +962,39 @@ mod tests {
 
     #[test]
     fn state_conversion_uses_node_text_and_final_flag() {
-        let v = json!({
-            "board_id": "b",
-            "nodes": [
-                {"node_id": "n1", "text": "Ledger API"},
-                {"node_id": "n2", "text": "Orbit Queue"},
-                {"node_id": "n3", "text": "Gone", "in_final_state": false}
+        use crate::synth::run_artifacts as ra;
+        let mut gone_edge = ra::edge(("n1", "Ledger API"), ("n3", "Gone"), "", "forward");
+        gone_edge["in_final"] = json!(false);
+        let v = ra::board(
+            "b",
+            true,
+            Some(60.0),
+            vec![
+                ra::node("n1", "Ledger API", true),
+                ra::node("n2", "Orbit Queue", true),
+                ra::node("n3", "Gone", false),
             ],
-            "edges": [{"src": "n1", "dst": "n2", "label": "REST"}],
-            "stickies": [{"text": "Who owns retries?"}]
-        });
+            vec![
+                ra::edge(
+                    ("n1", "Ledger API"),
+                    ("n2", "Orbit Queue"),
+                    "REST",
+                    "forward",
+                ),
+                gone_edge,
+            ],
+            vec![ra::sticky("s1", "Who owns retries?", true)],
+            vec![],
+            vec![],
+        );
         let b: BoardStateItem = serde_json::from_value(v).unwrap();
         let p = state_to_pred(&b);
         assert_eq!(p.nodes.len(), 2);
+        assert_eq!(
+            p.edges.len(),
+            1,
+            "edges outside the final board are not scored"
+        );
         assert_eq!(p.edges[0].src, "Ledger API");
         let gold = GoldBoard {
             nodes: vec![

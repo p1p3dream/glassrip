@@ -1,5 +1,6 @@
 //! End-to-end meeting-suite scoring on a fictional golden set and fictional run
-//! artifacts written as glassrip-core envelopes, with hand-computed expectations.
+//! artifacts in the real stage formats (core JSONL records of the stage crates'
+//! item types), with hand-computed expectations.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -7,23 +8,20 @@ use std::path::Path;
 
 use glassrip_eval::golden::MeetingGolden;
 use glassrip_eval::suite::run_meeting;
-use glassrip_eval::views::RunArtifacts;
+use glassrip_eval::synth::run_artifacts as ra;
+use glassrip_eval::views::{schema, RunArtifacts};
 use serde_json::{json, Value};
 
-fn envelope(schema: &str, items: Value) -> Value {
-    json!({
-        "schema": schema,
-        "schema_version": "1.0.0",
-        "run_id": "run-1",
-        "producer": {"tool": "glassrip", "version": "0.1.0", "git_sha": null},
-        "inputs": [],
-        "params": {},
-        "items": items
-    })
-}
-
-fn write(dir: &Path, name: &str, v: Value) {
-    fs_err::write(dir.join(name), serde_json::to_string_pretty(&v).unwrap()).unwrap();
+fn write(run: &Path, schema: &str, items: Vec<(&str, Value)>) {
+    ra::write_artifact(
+        run,
+        schema,
+        items
+            .into_iter()
+            .map(|(id, v)| (id.to_string(), v))
+            .collect(),
+    )
+    .unwrap();
 }
 
 fn golden() -> MeetingGolden {
@@ -77,80 +75,110 @@ fn meeting_suite_hand_computed() {
     let d = dir.path();
     write(
         d,
-        "keyframes.json",
-        envelope(
-            "glassrip.keyframes",
-            json!([
-                {"keyframe_id": "k1", "t_start_s": 0.0, "t_end_s": 10.0, "t_rep_s": 2.1},
-                {"keyframe_id": "k2", "t_start_s": 10.0, "t_end_s": 20.0, "t_rep_s": 12.3},
-                {"keyframe_id": "k3", "t_start_s": 20.0, "t_end_s": 45.0, "t_rep_s": 22.2}
-            ]),
-        ),
+        schema::KEYFRAMES,
+        vec![
+            ("k1", ra::keyframe("k1", 0.0, 10.0, 2.1)),
+            ("k2", ra::keyframe("k2", 10.0, 20.0, 12.3)),
+            ("k3", ra::keyframe("k3", 20.0, 45.0, 22.2)),
+        ],
     );
     write(
         d,
-        "screen_class.json",
-        envelope(
-            "glassrip.screen_class",
-            json!([
-                {"keyframe_id": "k1", "screen_type": "whiteboard"},
-                {"keyframe_id": "k2", "screen_type": "whiteboard"},
-                {"keyframe_id": "k3", "screen_type": "whiteboard"}
-            ]),
-        ),
+        schema::SCREEN_CLASS,
+        vec![
+            ("k1", ra::screen_class("k1", "whiteboard")),
+            ("k2", ra::screen_class("k2", "whiteboard")),
+            ("k3", ra::screen_class("k3", "whiteboard")),
+        ],
     );
+    let (api, queue, share) = (("n1", "Ledger API"), ("n2", "Orbit Queue"), ("n3", "Share"));
     write(
         d,
-        "board_state.json",
-        envelope(
-            "glassrip.board_state",
-            json!([{
-                "board_id": "b1",
-                "nodes": [
-                    {"node_id": "n1", "text": "Ledger API"},
-                    {"node_id": "n2", "text": "Orbit Queue"},
-                    {"node_id": "n3", "text": "Share"}
+        schema::BOARD_STATE,
+        vec![(
+            "board-1",
+            ra::board(
+                "b1",
+                false,
+                None,
+                vec![
+                    ra::node(api.0, api.1, true),
+                    ra::node(queue.0, queue.1, true),
+                    ra::node(share.0, share.1, true),
                 ],
-                "edges": [{"src": "n2", "dst": "n1", "label": "REST", "direction": "forward"}],
-                "stickies": [{"text": "Who owns retries?"}],
-                "owner_assignments": [
-                    {"name_raw": "Avery", "target": {"kind": "node", "node_id": "n1"}, "valid_from_s": 21.0, "valid_to_s": 40.0},
-                    {"name_raw": "Avery", "target": {"kind": "node", "node_id": "n2"}, "valid_from_s": 40.0},
-                    {"name_raw": "Riley Park", "target": {"kind": "node", "node_id": "n2"}, "valid_from_s": 21.0}
+                // Read in the reverse direction of gold.
+                vec![ra::edge(queue, api, "REST", "forward")],
+                vec![ra::sticky("s1", "Who owns retries?", true)],
+                vec![
+                    ra::owner("Avery", "Avery", ra::on_node(api.0, api.1), 21.0, 40.0),
+                    ra::owner(
+                        "Avery",
+                        "Avery",
+                        ra::on_node(queue.0, queue.1),
+                        40.0,
+                        3600.0,
+                    ),
+                    ra::owner(
+                        "riley-park",
+                        "Riley Park",
+                        ra::on_node(queue.0, queue.1),
+                        21.0,
+                        3600.0,
+                    ),
                 ],
-                "events": [
-                    {"kind": "NodeAdded", "t_s": 24.0},
-                    {"kind": "OwnerMoved", "t_s": 40.0}
-                ]
-            }]),
-        ),
+                vec![
+                    ra::event("E1", "NodeAdded", 24.0),
+                    ra::event("E2", "OwnerMoved", 40.0),
+                ],
+            ),
+        )],
     );
     write(
         d,
-        "transcript.json",
-        envelope(
-            "glassrip.transcript",
-            json!([
-                {"segment_id": "s1", "start_s": 0.0, "end_s": 9.0, "speaker_label": "S0", "text": "hi",
-                 "words": [{"w": "Quorra,", "start_s": 1.0}, {"w": "Cora", "start_s": 5.0}]},
-                {"segment_id": "s2", "start_s": 9.0, "end_s": 20.0, "speaker_label": "S1", "text": "Quorra again",
-                 "words": []},
-                {"segment_id": "s3", "start_s": 20.0, "end_s": 30.0, "speaker_label": "S2", "text": "ok", "words": []}
-            ]),
-        ),
+        schema::TRANSCRIPT,
+        vec![
+            (
+                "s1",
+                ra::segment(
+                    "s1",
+                    "S0",
+                    0.0,
+                    9.0,
+                    "hi",
+                    &[("Quorra,", 1.0), ("Cora", 5.0)],
+                ),
+            ),
+            (
+                "s2",
+                ra::segment("s2", "S1", 9.0, 20.0, "Quorra again", &[]),
+            ),
+            ("s3", ra::segment("s3", "S2", 20.0, 30.0, "ok", &[])),
+        ],
     );
     write(
         d,
-        "notes.json",
-        envelope(
-            "glassrip.meeting_notes",
-            json!([{
-                "status": "ok",
-                "decisions": [{"text": "defer importer now"}, {"text": "lunch at noon"}],
-                "action_items": [{"person_id": "Jordan", "task": "write the parser"}, {"person_id": "Avery", "task": "I'll see you guys later"}],
-                "open_questions": [{"text": "who owns the retries"}]
-            }]),
-        ),
+        schema::SPEAKERS,
+        vec![
+            ("label:S0", ra::speaker_label("S0", Some("avery"))),
+            ("label:S1", ra::speaker_label("S1", Some("jordan"))),
+            ("label:S2", ra::speaker_label("S2", None)),
+        ],
+    );
+    write(
+        d,
+        schema::MEETING_NOTES,
+        vec![(
+            "meeting_notes",
+            ra::notes(
+                "ok",
+                &["defer importer now", "lunch at noon"],
+                &[
+                    (Some("Jordan"), "write the parser"),
+                    (Some("Avery"), "I'll see you guys later"),
+                ],
+                &["who owns the retries"],
+            ),
+        )],
     );
 
     let run = run_meeting(&golden(), &RunArtifacts::scan(d).unwrap(), 2.0).unwrap();
@@ -196,6 +224,11 @@ fn meeting_suite_hand_computed() {
     assert_eq!(get("audio.hotword_wer"), 0.0);
     assert_eq!(get("audio.speaker_labels"), 3.0);
     assert_eq!(get("audio.speaker_label_error"), 1.0);
+    // Speakers: 3 labels, 2 mapped people, both in the golden set.
+    assert_eq!(get("speakers.labels"), 3.0);
+    assert_eq!(get("speakers.distinct_people"), 2.0);
+    assert_eq!(get("speakers.distinct_people_error"), 0.0);
+    assert_eq!(get("speakers.people_in_golden"), 2.0);
     assert!(run.not_run.is_empty(), "{:?}", run.not_run);
     assert!(run.gate_failures.is_empty());
 }
@@ -205,47 +238,59 @@ fn degraded_notes_fail_the_gate_and_missing_artifacts_are_reported() {
     let dir = tempfile::tempdir().unwrap();
     write(
         dir.path(),
-        "notes.json",
-        envelope("glassrip.meeting_notes", json!([{"status": "degraded"}])),
+        schema::MEETING_NOTES,
+        vec![("meeting_notes", ra::notes("degraded", &[], &[], &[]))],
     );
     let run = run_meeting(&golden(), &RunArtifacts::scan(dir.path()).unwrap(), 2.0).unwrap();
     assert_eq!(run.gate_failures.len(), 1);
-    assert_eq!(run.not_run.len(), 3);
+    // Screens, board, speakers, and audio.
+    assert_eq!(run.not_run.len(), 4, "{:?}", run.not_run);
 }
 
-fn board_state(items: Value) -> tempfile::TempDir {
+fn board_metrics(states: Vec<Value>) -> glassrip_eval::suite::Metrics {
     let dir = tempfile::tempdir().unwrap();
-    write(
-        dir.path(),
-        "board_state.json",
-        envelope("glassrip.board_state", items),
-    );
-    dir
-}
-
-fn board_metrics(items: Value) -> glassrip_eval::suite::Metrics {
-    let dir = board_state(items);
+    let items: Vec<(String, Value)> = states
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| (format!("board-{i}"), v))
+        .collect();
+    ra::write_artifact(dir.path(), schema::BOARD_STATE, items).unwrap();
     run_meeting(&golden(), &RunArtifacts::scan(dir.path()).unwrap(), 2.0)
         .unwrap()
         .metrics
 }
 
+fn nodes(list: &[(&str, &str)]) -> Vec<Value> {
+    list.iter().map(|(id, t)| ra::node(id, t, true)).collect()
+}
+
 #[test]
 fn noisy_extra_state_cannot_improve_the_score() {
+    let (api, queue) = (("n1", "Ledger API"), ("n2", "Orbit Queue"));
     // The pipeline's final state reads only one of the two gold nodes.
-    let final_state = json!({
-        "board_id": "b1", "final": true, "t_end_s": 50.0,
-        "nodes": [{"node_id": "n1", "text": "Ledger API"}, {"node_id": "n9", "text": "Noise"}]
-    });
+    let final_state = ra::board(
+        "b1",
+        true,
+        Some(50.0),
+        nodes(&[api, ("n9", "Noise")]),
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+    );
     // A non-final state that happens to match gold perfectly.
-    let perfect = json!({
-        "board_id": "b2", "final": false, "t_end_s": 60.0,
-        "nodes": [{"node_id": "n1", "text": "Ledger API"}, {"node_id": "n2", "text": "Orbit Queue"}],
-        "edges": [{"src": "n1", "dst": "n2", "label": "REST"}],
-        "stickies": [{"text": "Who owns retries?"}]
-    });
-    let alone = board_metrics(json!([final_state.clone()]));
-    let with_noise = board_metrics(json!([perfect.clone(), final_state.clone()]));
+    let perfect = ra::board(
+        "b2",
+        false,
+        Some(60.0),
+        nodes(&[api, queue]),
+        vec![ra::edge(api, queue, "REST", "forward")],
+        vec![ra::sticky("s1", "Who owns retries?", true)],
+        vec![],
+        vec![],
+    );
+    let alone = board_metrics(vec![final_state.clone()]);
+    let with_noise = board_metrics(vec![perfect, final_state]);
     for k in [
         "board.node.f1",
         "board.node.recall",
@@ -258,34 +303,66 @@ fn noisy_extra_state_cannot_improve_the_score() {
     assert_eq!(with_noise["board.node.recall"], 0.5);
 
     // Without flags, the latest state by time is final: the earlier perfect state is ignored.
-    let early_perfect = json!({
-        "board_id": "b2", "t_end_s": 10.0,
-        "nodes": [{"node_id": "n1", "text": "Ledger API"}, {"node_id": "n2", "text": "Orbit Queue"}]
-    });
-    let late_partial = json!({
-        "board_id": "b1", "t_end_s": 50.0,
-        "nodes": [{"node_id": "n1", "text": "Ledger API"}]
-    });
-    let m = board_metrics(json!([late_partial, early_perfect]));
+    let early_perfect = ra::board(
+        "b2",
+        false,
+        Some(10.0),
+        nodes(&[api, queue]),
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+    );
+    let late_partial = ra::board(
+        "b1",
+        false,
+        Some(50.0),
+        nodes(&[api]),
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+    );
+    let m = board_metrics(vec![late_partial, early_perfect]);
     assert_eq!(m["board.node.recall"], 0.5);
 }
 
 #[test]
 fn owners_and_events_use_every_state_once() {
     // Owner timing lives in a non-final state; the same event appears in both.
-    let early = json!({
-        "board_id": "w1", "t_end_s": 30.0,
-        "nodes": [{"node_id": "a", "text": "Ledger API"}],
-        "owner_assignments": [{"name_raw": "Avery", "target": {"kind": "node", "node_id": "a"}, "valid_from_s": 20.0, "valid_to_s": 30.0}],
-        "events": [{"kind": "NodeAdded", "t_s": 24.0}]
-    });
-    let last = json!({
-        "board_id": "w2", "final": true, "t_end_s": 60.0,
-        "nodes": [{"node_id": "q", "text": "Orbit Queue"}],
-        "owner_assignments": [{"name_raw": "Avery", "target": {"kind": "node", "node_id": "q"}, "valid_from_s": 30.0}],
-        "events": [{"kind": "node_added", "t_s": 24.0}]
-    });
-    let m = board_metrics(json!([early, last]));
+    let early = ra::board(
+        "w1",
+        false,
+        Some(30.0),
+        nodes(&[("a", "Ledger API")]),
+        vec![],
+        vec![],
+        vec![ra::owner(
+            "Avery",
+            "Avery",
+            ra::on_node("a", "Ledger API"),
+            20.0,
+            30.0,
+        )],
+        vec![ra::event("E1", "NodeAdded", 24.0)],
+    );
+    let last = ra::board(
+        "w2",
+        true,
+        Some(60.0),
+        nodes(&[("q", "Orbit Queue")]),
+        vec![],
+        vec![],
+        vec![ra::owner(
+            "Avery",
+            "Avery",
+            ra::on_node("q", "Orbit Queue"),
+            30.0,
+            3600.0,
+        )],
+        vec![ra::event("E1", "NodeAdded", 24.0)],
+    );
+    let m = board_metrics(vec![early, last]);
     assert_eq!(m["owners.attribution"], 1.0);
     assert_eq!(m["owners.move_error_max_s"], 0.0);
     assert_eq!(m["events.false_change"], 1.0);
