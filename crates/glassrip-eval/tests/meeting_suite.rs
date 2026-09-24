@@ -223,6 +223,8 @@ fn meeting_suite_hand_computed() {
     // tolerance and fills the second slot. 3 speaker labels vs 2 people.
     assert_eq!(get("audio.hotword_wer"), 0.0);
     assert_eq!(get("audio.speaker_labels"), 3.0);
+    // After name mapping: avery, jordan, and the unresolved S2 voice.
+    assert_eq!(get("audio.speaker_identities"), 3.0);
     assert_eq!(get("audio.speaker_label_error"), 1.0);
     // Speakers: 3 labels, 2 mapped people, both in the golden set.
     assert_eq!(get("speakers.labels"), 3.0);

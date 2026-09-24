@@ -633,6 +633,43 @@ fn resolve_person(g: &MeetingGolden, name: &str) -> Option<String> {
 }
 
 /// Scores a meeting run against the private golden set.
+/// Distinct speakers of the transcript after the `name_speakers` mapping: each
+/// segment counts as its mapped person (the per-segment record, else its label's
+/// mapping); a segment whose speaker stayed unresolved counts as its raw diarizer
+/// label, since it is a voice the pipeline could not attribute to anyone.
+pub fn speaker_identities(records: &[SpeakersRecord], segs: &[TranscriptSegment]) -> usize {
+    let mut by_segment: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut by_label: BTreeMap<&str, &str> = BTreeMap::new();
+    for r in records {
+        match r {
+            SpeakersRecord::Segment(s) => {
+                if let Some(p) = s.person_id.as_deref() {
+                    by_segment.insert(s.segment_id.as_str(), p);
+                }
+            }
+            SpeakersRecord::Label(l) => {
+                if let Some(p) = l.person_id.as_deref() {
+                    by_label.insert(l.label.as_str(), p);
+                }
+            }
+            _ => {}
+        }
+    }
+    segs.iter()
+        .filter(|s| {
+            !s.speaker_label.trim().is_empty() || by_segment.contains_key(s.segment_id.as_str())
+        })
+        .map(|s| {
+            by_segment
+                .get(s.segment_id.as_str())
+                .or_else(|| by_label.get(s.speaker_label.trim()))
+                .map(|p| format!("person:{p}"))
+                .unwrap_or_else(|| format!("label:{}", s.speaker_label.trim()))
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
 pub fn run_meeting(
     golden: &MeetingGolden,
     run_art: &RunArtifacts,
@@ -929,9 +966,20 @@ pub fn run_meeting(
             }
             let n = speaker_label_count(segs.iter().map(|s| s.speaker_label.as_str()));
             m.insert("audio.speaker_labels".into(), n as f64);
+            // The target compares speakers after `name_speakers`: two diarizer
+            // labels mapped to one person are one speaker. Without the mapping the
+            // raw labels are all there is.
+            let identities = match &speakers {
+                Some(records) => {
+                    let ids = speaker_identities(records, segs);
+                    m.insert("audio.speaker_identities".into(), ids as f64);
+                    ids
+                }
+                None => n,
+            };
             m.insert(
                 "audio.speaker_label_error".into(),
-                (n as f64 - golden.transcript.speaker_count as f64).abs(),
+                (identities as f64 - golden.transcript.speaker_count as f64).abs(),
             );
             details.insert("hotwords".into(), json!(hw.per_word));
         }
@@ -947,6 +995,53 @@ pub fn run_meeting(
 mod tests {
     use super::*;
     use crate::metrics::board::{GoldEdge, GoldNode, LineStyle};
+
+    #[test]
+    fn speakers_are_counted_after_the_name_mapping() {
+        use crate::synth::run_artifacts as ra;
+        let seg = |id: &str, label: &str| -> TranscriptSegment {
+            serde_json::from_value(ra::segment(id, label, 0.0, 1.0, "x", &[])).unwrap()
+        };
+        let rec = |v: serde_json::Value| -> SpeakersRecord { serde_json::from_value(v).unwrap() };
+        let seg_rec = |id: &str, label: &str, person: Option<&str>| {
+            rec(json!({
+                "kind": "segment", "segment_id": id, "start_s": 0.0, "end_s": 1.0,
+                "label": label, "person_id": person, "confidence": 0.9,
+                "source": if person.is_some() { "label_map" } else { "unresolved" },
+                "scores": {}, "observations": []
+            }))
+        };
+        // Five diarizer labels for three people: S0 and S2 are the same person, S4
+        // was split off one person's voice, S3 stayed unresolved.
+        let segs: Vec<TranscriptSegment> = ["S0", "S1", "S2", "S3", "S4", "S0"]
+            .iter()
+            .enumerate()
+            .map(|(i, l)| seg(&format!("s{i}"), l))
+            .collect();
+        let records = vec![
+            rec(ra::speaker_label("S0", Some("avery"))),
+            rec(ra::speaker_label("S1", Some("jordan"))),
+            rec(ra::speaker_label("S2", Some("avery"))),
+            rec(ra::speaker_label("S3", None)),
+            rec(ra::speaker_label("S4", Some("riley"))),
+            // The last S0 segment was relabeled per segment to jordan.
+            seg_rec("s5", "S0", Some("jordan")),
+        ];
+        // avery, jordan, riley, and the unresolved S3 voice.
+        assert_eq!(speaker_identities(&records, &segs), 4);
+        let resolved: Vec<SpeakersRecord> = records
+            .into_iter()
+            .map(|r| match r {
+                SpeakersRecord::Label(mut l) if l.label == "S3" => {
+                    l.person_id = Some("riley".into());
+                    SpeakersRecord::Label(l)
+                }
+                r => r,
+            })
+            .collect();
+        assert_eq!(speaker_identities(&resolved, &segs), 3);
+        assert_eq!(speaker_identities(&[], &segs), 5, "no mapping: raw labels");
+    }
 
     #[test]
     fn crop_rect_clamps() {
