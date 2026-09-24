@@ -676,6 +676,8 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
             .iter()
             .filter_map(|z| z.badge.as_ref().map(|b| b.r.inflate(2.0))),
     );
+    // Zone titles too: an edge label placed on one hides it.
+    taken.extend(zones.iter().map(|z| zone_title_r(z).inflate(2.0)));
     let mut edges = Vec::new();
     let mut edge_anchor: BTreeMap<String, (f64, f64, bool)> = BTreeMap::new();
     let mut channel = 0usize;
@@ -770,22 +772,40 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
                 } else {
                     (18.0, text_width(&text, 11.0, true) + 16.0)
                 };
-                let candidates: Vec<(f64, f64)> = if via_channel || (relation && horizontal) {
-                    vec![
-                        (mid.0 - tw / 2.0, mid.1 - h / 2.0),
-                        (mid.0 - tw / 2.0, mid.1 + 8.0),
-                    ]
-                } else if horizontal {
-                    vec![
-                        (mid.0 - tw / 2.0, mid.1 - h - 6.0),
-                        (mid.0 - tw / 2.0, mid.1 + 6.0),
-                    ]
-                } else {
-                    vec![
-                        (mid.0 + 8.0, mid.1 - h / 2.0),
-                        (mid.0 - tw - 8.0, mid.1 - h / 2.0),
-                    ]
+                let around = |mid: (f64, f64), horizontal: bool| -> Vec<(f64, f64)> {
+                    if via_channel || (relation && horizontal) {
+                        vec![
+                            (mid.0 - tw / 2.0, mid.1 - h / 2.0),
+                            (mid.0 - tw / 2.0, mid.1 + 8.0),
+                        ]
+                    } else if horizontal {
+                        vec![
+                            (mid.0 - tw / 2.0, mid.1 - h - 6.0),
+                            (mid.0 - tw / 2.0, mid.1 + 6.0),
+                        ]
+                    } else {
+                        vec![
+                            (mid.0 + 8.0, mid.1 - h / 2.0),
+                            (mid.0 - tw - 8.0, mid.1 - h / 2.0),
+                        ]
+                    }
                 };
+                // The middle of the longest segment first, then points sliding
+                // along every segment (longest first) when that spot is taken
+                // (a card, another label, a zone title or badge).
+                let mut candidates = around(mid, horizontal);
+                let mut order: Vec<usize> = (0..pts.len() - 1).collect();
+                let seg_len =
+                    |i: usize| (pts[i + 1].0 - pts[i].0).abs() + (pts[i + 1].1 - pts[i].1).abs();
+                order.sort_by(|a, b| seg_len(*b).total_cmp(&seg_len(*a)));
+                for i in order {
+                    let (a, b) = (pts[i], pts[i + 1]);
+                    let hz = (a.1 - b.1).abs() < 0.5;
+                    for t in [0.5, 0.3, 0.7, 0.15, 0.85] {
+                        let m = (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+                        candidates.extend(around(m, hz));
+                    }
+                }
                 let r = candidates
                     .iter()
                     .map(|(x, y)| R::new(*x, *y, tw, h))
@@ -1201,6 +1221,7 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
         blocking.push((format!("card {}", c.id), c.r));
     }
     for z in &zones {
+        blocking.push((format!("zone title {}", z.label.text), zone_title_r(z)));
         if let Some(b) = &z.badge {
             blocking.push((format!("zone badge {}", z.label.text), b.r));
         }
@@ -1246,6 +1267,17 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
         blocking,
         unplaced,
     }
+}
+
+/// Box of a zone's title text (`section-label`: 18 px bold, baseline 28 px below
+/// the zone's top, starting 20 px in).
+fn zone_title_r(z: &Zone) -> R {
+    R::new(
+        z.r.x + 20.0,
+        z.r.y + 12.0,
+        text_width(&z.label.text, 18.0, true),
+        20.0,
+    )
 }
 
 /// Pairs of blocking boxes that overlap.

@@ -126,6 +126,43 @@ fn coincident_boxes_are_separated() {
     assert!(overlaps(&scene).is_empty(), "{:?}", overlaps(&scene));
 }
 
+#[test]
+fn edge_labels_never_cover_zone_titles() {
+    // Move each box over a grid of offsets: wherever an edge enters a zone, its
+    // label must not land on the zone's title.
+    let (notes, board) = inputs();
+    let mut titled = 0;
+    for i in 0..board.nodes.len() {
+        for dx in [-300.0, -150.0, 0.0, 150.0, 300.0] {
+            for dy in [-200.0, -100.0, 0.0, 100.0, 200.0] {
+                let mut b = board.clone();
+                if let Some(bb) = &mut b.nodes[i].bbox {
+                    *bb = glassrip_notes::board::BBox::new(
+                        bb.x1 + dx,
+                        bb.y1 + dy,
+                        bb.x2 + dx,
+                        bb.y2 + dy,
+                    );
+                }
+                let scene = build_scene(&b, &notes);
+                titled += scene
+                    .blocking
+                    .iter()
+                    .filter(|(n, _)| n.starts_with("zone title"))
+                    .count();
+                // Crowded positions may leave a note unplaced (reported, not
+                // drawn); what this checks is that no zone title is covered.
+                let o: Vec<String> = overlaps(&scene)
+                    .into_iter()
+                    .filter(|m| m.contains("zone title"))
+                    .collect();
+                assert!(o.is_empty(), "node {i} moved by ({dx}, {dy}): {o:?}");
+            }
+        }
+    }
+    assert!(titled > 0, "the sweep produced zones with titles");
+}
+
 /// Runs the render stage; returns the stage outcome and the records written.
 async fn run_render_stage(
     params: RenderParams,
