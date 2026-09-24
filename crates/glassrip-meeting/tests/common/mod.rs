@@ -164,4 +164,31 @@ impl Canvas {
             }
         }
     }
+
+    /// Cubic Bezier connector from `p0` to `p3` with a filled head of `(len, half)` at
+    /// `p3`, pointing along the final tangent.
+    pub fn bezier(&mut self, p: [(f64, f64); 4], head: (f64, f64)) {
+        let at = |t: f64| {
+            let u = 1.0 - t;
+            let (a, b, c, d) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
+            (
+                a * p[0].0 + b * p[1].0 + c * p[2].0 + d * p[3].0,
+                a * p[0].1 + b * p[1].1 + c * p[2].1 + d * p[3].1,
+            )
+        };
+        let pts: Vec<(f64, f64)> = (0..=200).map(|i| at(f64::from(i) / 200.0)).collect();
+        // Stop the line where the head's base begins.
+        let mut cut = pts.len() - 1;
+        while cut > 0 {
+            let q = pts[cut];
+            if ((q.0 - p[3].0).powi(2) + (q.1 - p[3].1).powi(2)).sqrt() >= head.0 - 2.0 {
+                break;
+            }
+            cut -= 1;
+        }
+        for w in pts[..=cut].windows(2) {
+            self.line(w[0], w[1], 2);
+        }
+        self.arrowhead(pts[cut.saturating_sub(3)], p[3], head.0, head.1);
+    }
 }

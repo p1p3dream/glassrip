@@ -20,6 +20,8 @@
 //! 5. **Arrowhead.** On the unthinned component within `arrow_radius_px` of the
 //!    terminus: the spread perpendicular to the local skeleton axis, and off-axis
 //!    pixels on both sides of it (a head is symmetric; noise touching a line is not).
+//!    A head is compact: a line crossing or branching near the terminus reaches the
+//!    edge of the test disk sideways and is rejected.
 //!
 //! Node boxes are first snapped to their drawn outlines (the strongest straight
 //! stroke within a few pixels of each side), and only the outline plus a thin band is
@@ -491,7 +493,8 @@ impl PreparedCanvas {
                 p.arrow_radius_px,
                 stroke_px,
             );
-            let arrow = m.min_side >= p.min_arrow_side_px
+            let arrow = !m.crossing
+                && m.min_side >= p.min_arrow_side_px
                 && m.spread
                     >= p.min_arrow_spread_px
                         .max(m.stroke / 2.0 + p.min_arrow_overhang_px);
@@ -758,6 +761,9 @@ struct ArrowMetrics {
     min_side: u32,
     /// Local stroke width of the line near the terminus.
     stroke: f64,
+    /// Some pixel leaves the test disk sideways (a crossing or branching line, not
+    /// a compact head).
+    crossing: bool,
 }
 
 /// Unit direction from the nearest point of `b` to `p` (the normal of the side a
@@ -787,6 +793,7 @@ fn arrow_metrics(
         spread: 0.0,
         min_side: 0,
         stroke,
+        crossing: false,
     };
     let ri = r.ceil() as isize;
     let mut comp_pts = Vec::new();
@@ -875,11 +882,40 @@ fn arrow_metrics(
             right += 1;
         }
     }
+    // Arms leaving the disk: skeleton pixels near the rim, grouped by adjacency. A
+    // line end or a head has one (the connector); a crossing or branch has more.
+    let rim: Vec<(f64, f64)> = skel_pts
+        .iter()
+        .copied()
+        .filter(|p| dist_t(p) >= 0.8 * r)
+        .collect();
+    let mut arm = vec![usize::MAX; rim.len()];
+    let mut arms = 0usize;
+    for i in 0..rim.len() {
+        if arm[i] != usize::MAX {
+            continue;
+        }
+        arm[i] = arms;
+        let mut stack = vec![i];
+        while let Some(k) = stack.pop() {
+            for j in 0..rim.len() {
+                if arm[j] == usize::MAX
+                    && (rim[j].0 - rim[k].0).abs() <= 1.5
+                    && (rim[j].1 - rim[k].1).abs() <= 1.5
+                {
+                    arm[j] = arms;
+                    stack.push(j);
+                }
+            }
+        }
+        arms += 1;
+    }
     ArrowMetrics {
         area_ratio,
         spread,
         min_side: left.min(right),
         stroke,
+        crossing: arms >= 2 || spread >= 0.8 * r,
     }
 }
 

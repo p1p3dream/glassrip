@@ -244,3 +244,95 @@ fn small_head_on_a_slanted_outline_with_an_imprecise_box() {
     assert_eq!(ev.status, PixelStatus::Traced, "{ev:?}");
     assert_eq!(ev.verdict, EndVerdict::Forward, "{ev:?}");
 }
+
+#[test]
+fn heads_of_several_sizes() {
+    for (len, half) in [(7.0, 3.5), (10.0, 5.0), (13.0, 6.0), (16.0, 8.0)] {
+        let mut c = Canvas::new(720, 420);
+        let (a, b) = (a_box(), b_box());
+        c.node(a);
+        c.node(b);
+        c.arrowhead((a.x2, 155.0), (b.x1, 155.0), len, half);
+        c.line((a.x2, 155.0), (b.x1 - len + 2.0, 155.0), 2);
+        let case = Case {
+            canvas: c,
+            nodes: vec![a, b],
+            texts: vec![],
+        };
+        let ev = run(
+            &case,
+            &EdgeQuery {
+                src: a,
+                dst: b,
+                label: None,
+                style: EdgeStyle::Solid,
+            },
+        );
+        assert_eq!(ev.verdict, EndVerdict::Forward, "head {len}x{half}: {ev:?}");
+    }
+}
+
+#[test]
+fn a_line_crossing_near_a_terminus_is_not_a_head() {
+    let mut c = Canvas::new(720, 420);
+    let (a, b) = (a_box(), b_box());
+    c.node(a);
+    c.node(b);
+    // Plain connector, no heads, crossed by another line 8 px before B.
+    c.line((a.x2, 155.0), (b.x1, 155.0), 2);
+    c.line((b.x1 - 8.0, 60.0), (b.x1 - 8.0, 260.0), 2);
+    let case = Case {
+        canvas: c,
+        nodes: vec![a, b],
+        texts: vec![],
+    };
+    let ev = run(
+        &case,
+        &EdgeQuery {
+            src: a,
+            dst: b,
+            label: None,
+            style: EdgeStyle::Solid,
+        },
+    );
+    assert!(
+        !ev.dst_end.is_some_and(|e| e.arrow),
+        "crossing counted as a head: {ev:?}"
+    );
+    assert_ne!(ev.verdict, EndVerdict::Forward, "{ev:?}");
+}
+
+#[test]
+fn curved_connector_is_followed() {
+    let mut c = Canvas::new(720, 420);
+    let (a, b) = (a_box(), b_box());
+    c.node(a);
+    c.node(b);
+    c.bezier(
+        [(a.x2, 155.0), (320.0, 40.0), (400.0, 300.0), (b.x1, 155.0)],
+        (12.0, 6.0),
+    );
+    let case = Case {
+        canvas: c,
+        nodes: vec![a, b],
+        texts: vec![],
+    };
+    let q = EdgeQuery {
+        src: a,
+        dst: b,
+        label: None,
+        style: EdgeStyle::Solid,
+    };
+    let ev = run(&case, &q);
+    assert_eq!(ev.status, PixelStatus::Traced, "{ev:?}");
+    assert_eq!(ev.verdict, EndVerdict::Forward, "{ev:?}");
+    let back = run(
+        &case,
+        &EdgeQuery {
+            src: b,
+            dst: a,
+            ..q
+        },
+    );
+    assert_eq!(back.verdict, EndVerdict::Reverse, "{back:?}");
+}
