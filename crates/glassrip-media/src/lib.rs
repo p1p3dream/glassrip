@@ -11,6 +11,7 @@ pub mod gaussian;
 pub mod jpeg;
 pub mod plane;
 pub mod resize;
+pub mod segment;
 pub mod sharpness;
 pub mod ssim;
 pub mod util;
