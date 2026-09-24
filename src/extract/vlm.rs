@@ -96,7 +96,12 @@ async fn extract_with_policy(
         DIFF_TEMPLATE.replace("{previous_tail}", &tail)
     } else if let Some(narr) = narration {
         let truncated = if narr.len() > 500 {
-            let end = narr.char_indices().take_while(|(i, _)| *i < 500).last().map(|(i, c)| i + c.len_utf8()).unwrap_or(0);
+            let end = narr
+                .char_indices()
+                .take_while(|(i, _)| *i < 500)
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(0);
             &narr[..end]
         } else {
             narr
@@ -206,8 +211,17 @@ pub async fn extract_batch(
                 .acquire()
                 .await
                 .context("semaphore closed unexpectedly")?;
-            extract_with_policy(&path, &host, &model, Some(&client), None, None, timeout, &policy)
-                .await
+            extract_with_policy(
+                &path,
+                &host,
+                &model,
+                Some(&client),
+                None,
+                None,
+                timeout,
+                &policy,
+            )
+            .await
         }));
     }
 
@@ -215,7 +229,9 @@ pub async fn extract_batch(
     for (i, handle) in handles.into_iter().enumerate() {
         results.push(match handle.await {
             Ok(r) => r,
-            Err(e) => Err(anyhow::anyhow!("VLM worker for frame {i} failed to complete: {e}")),
+            Err(e) => Err(anyhow::anyhow!(
+                "VLM worker for frame {i} failed to complete: {e}"
+            )),
         });
     }
 
@@ -291,14 +307,23 @@ mod tests {
         let good_b = fake_frame(&dir, "b.png");
         let paths = [good_a.as_path(), missing.as_path(), good_b.as_path()];
 
-        let results = extract_batch(&paths, &server.url, "m", 2, &opts(Duration::from_secs(5), 1))
-            .await
-            .unwrap();
+        let results = extract_batch(
+            &paths,
+            &server.url,
+            "m",
+            2,
+            &opts(Duration::from_secs(5), 1),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].as_ref().unwrap(), "let x = 1;");
         let err = results[1].as_ref().unwrap_err();
-        assert!(format!("{err:#}").contains("failed to read image"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("failed to read image"),
+            "{err:#}"
+        );
         assert_eq!(results[2].as_ref().unwrap(), "let x = 1;");
     }
 
@@ -320,8 +345,14 @@ mod tests {
         .unwrap();
 
         let err = results[0].as_ref().unwrap_err();
-        assert!(format!("{err:?}").to_lowercase().contains("timed out"), "{err:?}");
-        assert!(started.elapsed() < Duration::from_secs(2), "timeout not applied");
+        assert!(
+            format!("{err:?}").to_lowercase().contains("timed out"),
+            "{err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timeout not applied"
+        );
     }
 
     #[tokio::test]
@@ -336,26 +367,45 @@ mod tests {
 
         let started = Instant::now();
         let out = extract_with_policy(
-            &frame, &server.url, "m", None, None, None,
-            Duration::from_secs(5), &fast_policy(3),
+            &frame,
+            &server.url,
+            "m",
+            None,
+            None,
+            None,
+            Duration::from_secs(5),
+            &fast_policy(3),
         )
         .await
         .unwrap();
 
         assert_eq!(out, "done");
         assert_eq!(server.hits(), 2);
-        assert!(started.elapsed() >= Duration::from_millis(950), "Retry-After ignored");
+        assert!(
+            started.elapsed() >= Duration::from_millis(950),
+            "Retry-After ignored"
+        );
     }
 
     #[tokio::test]
     async fn retries_429_without_retry_after_using_backoff() {
-        let server = serve(vec![Reply::json(429, serde_json::json!({})), ok_reply("done")]).await;
+        let server = serve(vec![
+            Reply::json(429, serde_json::json!({})),
+            ok_reply("done"),
+        ])
+        .await;
         let dir = tempfile::tempdir().unwrap();
         let frame = fake_frame(&dir, "a.png");
 
         let out = extract_with_policy(
-            &frame, &server.url, "m", None, None, None,
-            Duration::from_secs(5), &fast_policy(3),
+            &frame,
+            &server.url,
+            "m",
+            None,
+            None,
+            None,
+            Duration::from_secs(5),
+            &fast_policy(3),
         )
         .await
         .unwrap();
@@ -370,8 +420,14 @@ mod tests {
         let frame = fake_frame(&dir, "a.png");
 
         let err = extract_with_policy(
-            &frame, &server.url, "m", None, None, None,
-            Duration::from_secs(5), &fast_policy(3),
+            &frame,
+            &server.url,
+            "m",
+            None,
+            None,
+            None,
+            Duration::from_secs(5),
+            &fast_policy(3),
         )
         .await
         .unwrap_err();
@@ -386,8 +442,14 @@ mod tests {
         let frame = fake_frame(&dir, "a.png");
 
         let out = extract_with_policy(
-            &frame, &server.url, "m", None, None, None,
-            Duration::from_secs(5), &fast_policy(3),
+            &frame,
+            &server.url,
+            "m",
+            None,
+            None,
+            None,
+            Duration::from_secs(5),
+            &fast_policy(3),
         )
         .await
         .unwrap();
@@ -397,13 +459,23 @@ mod tests {
 
     #[tokio::test]
     async fn does_not_retry_client_errors() {
-        let server = serve(vec![Reply::json(400, serde_json::json!({"error": "bad model"}))]).await;
+        let server = serve(vec![Reply::json(
+            400,
+            serde_json::json!({"error": "bad model"}),
+        )])
+        .await;
         let dir = tempfile::tempdir().unwrap();
         let frame = fake_frame(&dir, "a.png");
 
         let err = extract_with_policy(
-            &frame, &server.url, "m", None, None, None,
-            Duration::from_secs(5), &fast_policy(3),
+            &frame,
+            &server.url,
+            "m",
+            None,
+            None,
+            None,
+            Duration::from_secs(5),
+            &fast_policy(3),
         )
         .await
         .unwrap_err();

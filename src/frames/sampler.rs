@@ -110,10 +110,7 @@ pub fn detect_scroll_sequences(frames: Vec<SampledFrame>) -> Vec<Vec<SampledFram
     groups
 }
 
-fn extract_via_select_filter(
-    video_path: &Path,
-    frames_dir: &Path,
-) -> Result<Vec<SampledFrame>> {
+fn extract_via_select_filter(video_path: &Path, frames_dir: &Path) -> Result<Vec<SampledFrame>> {
     let pattern = frames_dir.join("kf_%06d.png");
 
     let ffmpeg_out = Command::new("ffmpeg")
@@ -154,10 +151,7 @@ fn extract_via_select_filter(
     pair_frames_with_times(frame_files, keyframe_times, true, "keyframe")
 }
 
-fn extract_via_scene_change(
-    video_path: &Path,
-    frames_dir: &Path,
-) -> Result<Vec<SampledFrame>> {
+fn extract_via_scene_change(video_path: &Path, frames_dir: &Path) -> Result<Vec<SampledFrame>> {
     let pattern = frames_dir.join("sc_%06d.png");
 
     let sc_out = Command::new("ffmpeg")
@@ -341,10 +335,8 @@ fn is_vertical_scroll(prev_path: &Path, curr_path: &Path) -> bool {
     let sw = 320u32;
     let sh = (h as f64 * scale).round().max(1.0) as u32;
 
-    let prev_small =
-        image::imageops::resize(&prev, sw, sh, image::imageops::FilterType::Triangle);
-    let curr_small =
-        image::imageops::resize(&curr, sw, sh, image::imageops::FilterType::Triangle);
+    let prev_small = image::imageops::resize(&prev, sw, sh, image::imageops::FilterType::Triangle);
+    let curr_small = image::imageops::resize(&curr, sw, sh, image::imageops::FilterType::Triangle);
 
     for pct in &[0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9] {
         let scroll_px = (sh as f64 * pct) as u32;
@@ -384,8 +376,7 @@ mod tests {
     #[test]
     fn pair_frames_uses_real_times() {
         let files = vec![PathBuf::from("kf_1.png"), PathBuf::from("kf_2.png")];
-        let frames = pair_frames_with_times(files, vec![0.5, 3.25], true, "keyframe")
-            .unwrap();
+        let frames = pair_frames_with_times(files, vec![0.5, 3.25], true, "keyframe").unwrap();
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].timestamp, 0.5);
         assert_eq!(frames[1].timestamp, 3.25);
@@ -396,7 +387,10 @@ mod tests {
     fn pair_frames_errors_on_missing_times() {
         let files = vec![PathBuf::from("kf_1.png"), PathBuf::from("kf_2.png")];
         let err = pair_frames_with_times(files, vec![0.5], true, "keyframe").unwrap_err();
-        assert!(err.to_string().contains("2 frame files but reported 1"), "{err}");
+        assert!(
+            err.to_string().contains("2 frame files but reported 1"),
+            "{err}"
+        );
     }
 
     #[test]

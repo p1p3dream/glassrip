@@ -102,7 +102,10 @@ fn pattern_bonus(line: &str) -> f64 {
     }
 
     let punctuation_chars = ['=', '{', '}', '(', ')', '[', ']', ';', ':', ',', '.'];
-    let punct_count = line.chars().filter(|c| punctuation_chars.contains(c)).count();
+    let punct_count = line
+        .chars()
+        .filter(|c| punctuation_chars.contains(c))
+        .count();
     if punct_count > 0 {
         bonus += (punct_count as f64 * 0.05).min(0.2);
     }
@@ -229,14 +232,21 @@ mod tests {
 
     #[test]
     fn collapse_repetitions_preserves_non_consecutive() {
-        let input = "# comment\nfirst\n# comment\nsecond\n# comment\nthird\n# comment\nfourth\n# comment";
-        assert_eq!(collapse_repetitions(input), input.lines().collect::<Vec<_>>());
+        let input =
+            "# comment\nfirst\n# comment\nsecond\n# comment\nthird\n# comment\nfourth\n# comment";
+        assert_eq!(
+            collapse_repetitions(input),
+            input.lines().collect::<Vec<_>>()
+        );
     }
 
     #[test]
     fn collapse_repetitions_threshold() {
         let input = "a\na\na\na\nb\nb\nb\nb\nb\nc";
-        assert_eq!(collapse_repetitions(input), vec!["a", "a", "a", "a", "b", "c"]);
+        assert_eq!(
+            collapse_repetitions(input),
+            vec!["a", "a", "a", "a", "b", "c"]
+        );
         assert!(collapse_repetitions("").is_empty());
     }
 
@@ -247,7 +257,8 @@ mod tests {
 
     #[test]
     fn clean_collapses_repetitions_before_filtering_garbage() {
-        let input = "# comment\n# comment\n# comment\nasdkjhaslkdjhqweoiruqwlekrj\n# comment\n# comment";
+        let input =
+            "# comment\n# comment\n# comment\nasdkjhaslkdjhqweoiruqwlekrj\n# comment\n# comment";
         assert_eq!(clean_hallucinations(input), ["# comment"; 5].join("\n"));
     }
 

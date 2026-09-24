@@ -10,7 +10,12 @@ pub fn dedup_blocks(text: &str) -> String {
 
     let hashed: Vec<Vec<String>> = blocks
         .iter()
-        .map(|block| block.iter().map(|line| normalized_line_hash(line)).collect())
+        .map(|block| {
+            block
+                .iter()
+                .map(|line| normalized_line_hash(line))
+                .collect()
+        })
         .collect();
 
     let mut removed: HashSet<usize> = HashSet::new();
@@ -56,11 +61,7 @@ pub(crate) fn block_similarity_from_hashes(a: &[String], b: &[String]) -> f64 {
         return 0.0;
     }
 
-    let (shorter, longer) = if a.len() <= b.len() {
-        (a, b)
-    } else {
-        (b, a)
-    };
+    let (shorter, longer) = if a.len() <= b.len() { (a, b) } else { (b, a) };
 
     let mut longer_counts: HashMap<&String, usize> = HashMap::new();
     for h in longer {
@@ -150,7 +151,10 @@ pub fn dedup_sections(text: &str) -> String {
     let mut kept: Vec<&Section> = Vec::new();
     for section in &sections {
         if let Some(ref key) = section.norm_heading {
-            if let Some(existing) = kept.iter_mut().find(|s| s.norm_heading.as_ref() == Some(key)) {
+            if let Some(existing) = kept
+                .iter_mut()
+                .find(|s| s.norm_heading.as_ref() == Some(key))
+            {
                 if section.body_len > existing.body_len {
                     *existing = section;
                 }
@@ -186,7 +190,8 @@ fn is_heading(line: &str) -> bool {
     if trimmed.starts_with('#') || trimmed.starts_with("@@") {
         return true;
     }
-    let stripped = trimmed.trim_start_matches(|c: char| c == '*' || c == '-' || c == '>' || c.is_whitespace());
+    let stripped =
+        trimmed.trim_start_matches(|c: char| c == '*' || c == '-' || c == '>' || c.is_whitespace());
     stripped.starts_with("v") && stripped.len() > 1 && stripped.as_bytes()[1].is_ascii_digit()
 }
 
@@ -301,10 +306,7 @@ mod tests {
         let block_b = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nextra line";
         let input = format!("{}\n\n{}", block_a, block_b);
         let result = dedup_blocks(&input);
-        assert!(
-            result.contains("extra line"),
-            "longer block should be kept"
-        );
+        assert!(result.contains("extra line"), "longer block should be kept");
         let line1_count = result.matches("line 1").count();
         assert_eq!(line1_count, 1, "shorter duplicate should be removed");
     }
@@ -354,7 +356,10 @@ mod tests {
     fn passage_dedup_ignores_short_matches() {
         let input = "a\nb\nx\ny\nz\na\nb\nw";
         let result = dedup_passages(input);
-        assert_eq!(result.matches("\na\n").count() + result.starts_with("a\n") as usize, 2);
+        assert_eq!(
+            result.matches("\na\n").count() + result.starts_with("a\n") as usize,
+            2
+        );
     }
 
     #[test]
@@ -362,7 +367,10 @@ mod tests {
         let input = "## v0.35.0\n- feature A\n\n## v0.34.0\n- fix B\n- fix C\n\n## v0.35.0\n- feature A\n- feature D\n- feature E";
         let result = dedup_sections(input);
         assert_eq!(result.matches("v0.35.0").count(), 1);
-        assert!(result.contains("feature E"), "longer section should be kept");
+        assert!(
+            result.contains("feature E"),
+            "longer section should be kept"
+        );
         assert!(result.contains("v0.34.0"), "different section untouched");
     }
 
@@ -382,7 +390,8 @@ mod tests {
 
     #[test]
     fn section_dedup_version_pattern_heading() {
-        let input = "v1.2.3\n- change A\nv2.0.0\n- other stuff\nv1.2.3\n- change A\n- change B\n- change C";
+        let input =
+            "v1.2.3\n- change A\nv2.0.0\n- other stuff\nv1.2.3\n- change A\n- change B\n- change C";
         let result = dedup_sections(input);
         assert_eq!(result.matches("v1.2.3").count(), 1);
         assert!(result.contains("change C"));
@@ -418,7 +427,10 @@ mod tests {
             1,
             "duplicate ### Features under same parent should dedup"
         );
-        assert!(result.contains("feature Y"), "longer section should be kept");
+        assert!(
+            result.contains("feature Y"),
+            "longer section should be kept"
+        );
     }
 
     #[test]

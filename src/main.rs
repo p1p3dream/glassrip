@@ -152,7 +152,11 @@ mod tests {
 
     #[test]
     fn robustness_flag_defaults() {
-        let Commands::Scrape { vlm_timeout, max_frame_failure_rate, .. } = scrape(&[]).unwrap();
+        let Commands::Scrape {
+            vlm_timeout,
+            max_frame_failure_rate,
+            ..
+        } = scrape(&[]).unwrap();
         assert_eq!(vlm_timeout, 120);
         assert_eq!(max_frame_failure_rate, 0.10);
     }
@@ -165,8 +169,11 @@ mod tests {
 
     #[test]
     fn robustness_flags_parse() {
-        let Commands::Scrape { vlm_timeout, max_frame_failure_rate, .. } =
-            scrape(&["--vlm-timeout", "300", "--max-frame-failure-rate", "0.25"]).unwrap();
+        let Commands::Scrape {
+            vlm_timeout,
+            max_frame_failure_rate,
+            ..
+        } = scrape(&["--vlm-timeout", "300", "--max-frame-failure-rate", "0.25"]).unwrap();
         assert_eq!(vlm_timeout, 300);
         assert_eq!(max_frame_failure_rate, 0.25);
     }

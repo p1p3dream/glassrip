@@ -27,4 +27,3 @@ pub fn extract_code_from_frame(frame_path: &Path) -> Result<String> {
 
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
-

@@ -44,7 +44,10 @@ pub fn stitch_all_revisions(revisions: &[String]) -> String {
             continue;
         }
 
-        let hashes: Vec<String> = lines.iter().map(|line| normalized_line_hash(line)).collect();
+        let hashes: Vec<String> = lines
+            .iter()
+            .map(|line| normalized_line_hash(line))
+            .collect();
         if accepted_hashes
             .iter()
             .any(|prior| block_similarity_from_hashes(prior, &hashes) > 0.75)
@@ -55,7 +58,10 @@ pub fn stitch_all_revisions(revisions: &[String]) -> String {
 
         if accumulated.is_empty() {
             accumulated = lines.iter().map(|l| l.to_string()).collect();
-            accumulated_norm = accumulated.iter().map(|l| normalized_line_hash(l)).collect();
+            accumulated_norm = accumulated
+                .iter()
+                .map(|l| normalized_line_hash(l))
+                .collect();
             continue;
         }
 
@@ -202,7 +208,11 @@ fn find_reverse_overlap<S1: AsRef<str>, S2: AsRef<str>>(
     -1
 }
 
-fn find_overlap_from_hashes(prev_hashes: &[String], curr_hashes: &[String], min_overlap: usize) -> usize {
+fn find_overlap_from_hashes(
+    prev_hashes: &[String],
+    curr_hashes: &[String],
+    min_overlap: usize,
+) -> usize {
     if prev_hashes.is_empty() || curr_hashes.is_empty() {
         return 0;
     }
@@ -221,7 +231,11 @@ fn find_overlap_from_hashes(prev_hashes: &[String], curr_hashes: &[String], min_
     for n in (min_overlap..=fuzzy_max).rev() {
         let prev_tail = &prev_hashes[prev_hashes.len() - n..];
         let curr_head = &curr_hashes[..n];
-        let match_count = prev_tail.iter().zip(curr_head.iter()).filter(|(a, b)| a == b).count();
+        let match_count = prev_tail
+            .iter()
+            .zip(curr_head.iter())
+            .filter(|(a, b)| a == b)
+            .count();
         let non_blank = prev_tail.iter().filter(|h| **h != blank_hash).count();
         if match_count as f64 >= n as f64 * 0.85 && non_blank >= min_overlap {
             return n;
@@ -275,10 +289,7 @@ mod tests {
 
     #[test]
     fn overlapping_blocks() {
-        let blocks = vec![
-            "a\nb\nc\nd\ne".to_string(),
-            "c\nd\ne\nf\ng".to_string(),
-        ];
+        let blocks = vec!["a\nb\nc\nd\ne".to_string(), "c\nd\ne\nf\ng".to_string()];
         assert_eq!(stitch_scroll_sequence(&blocks), "a\nb\nc\nd\ne\nf\ng");
     }
 
@@ -309,8 +320,14 @@ mod tests {
     fn compute_diff_keeps_change_on_first_line() {
         let result = compute_diff(Some("a\nb\nc\nd"), "A\nb\nc\nd");
         assert!(result.starts_with("@@ -1,2 +1,2 @@"), "got: {result}");
-        assert!(result.contains("\n-a\n"), "first removed line dropped: {result}");
-        assert!(result.contains("\n+A"), "first added line dropped: {result}");
+        assert!(
+            result.contains("\n-a\n"),
+            "first removed line dropped: {result}"
+        );
+        assert!(
+            result.contains("\n+A"),
+            "first added line dropped: {result}"
+        );
     }
 
     #[test]
@@ -372,9 +389,7 @@ mod tests {
         let result_lines: Vec<&str> = result.lines().collect();
         assert_eq!(
             result_lines,
-            vec![
-                "line1", "line2", "line3", "line4", "line5", "line6", "line7", "line8", "line9"
-            ]
+            vec!["line1", "line2", "line3", "line4", "line5", "line6", "line7", "line8", "line9"]
         );
     }
 

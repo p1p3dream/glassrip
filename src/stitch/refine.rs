@@ -65,8 +65,17 @@ pub async fn refine_text(text: &str, model: &str, num_agents: usize) -> Result<S
         let model = model.to_string();
         let policy = policy.clone();
         handles.push(tokio::spawn(async move {
-            refine_chunk(&client, API_BASE_URL, &api_key, &model, &chunk, i + 1, total, &policy)
-                .await
+            refine_chunk(
+                &client,
+                API_BASE_URL,
+                &api_key,
+                &model,
+                &chunk,
+                i + 1,
+                total,
+                &policy,
+            )
+            .await
         }));
     }
 
@@ -274,7 +283,10 @@ mod tests {
         .await;
         let started = std::time::Instant::now();
         assert_eq!(run_chunk(&server.url).await.unwrap(), "clean");
-        assert!(started.elapsed() >= Duration::from_millis(950), "Retry-After ignored");
+        assert!(
+            started.elapsed() >= Duration::from_millis(950),
+            "Retry-After ignored"
+        );
     }
 
     #[tokio::test]

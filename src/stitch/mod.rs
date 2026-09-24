@@ -17,7 +17,9 @@ pub(crate) fn line_hash(line: &str) -> String {
 }
 
 pub(crate) fn normalize_line(line: &str) -> String {
-    let s = line.trim_start_matches(|c: char| c == '#' || c == '*' || c == '-' || c == '>' || c == '@' || c == '+' || c.is_whitespace());
+    let s = line.trim_start_matches(|c: char| {
+        c == '#' || c == '*' || c == '-' || c == '>' || c == '@' || c == '+' || c.is_whitespace()
+    });
     s.replace("**", "").trim().to_lowercase()
 }
 

@@ -49,9 +49,7 @@ pub async fn run_pipeline(args: &ScrapeArgs) -> Result<()> {
     let work_dir = match &args.work_dir {
         Some(dir) => dir.as_path(),
         None => {
-            temp_dir = tempfile::Builder::new()
-                .prefix("glassrip_")
-                .tempdir()?;
+            temp_dir = tempfile::Builder::new().prefix("glassrip_").tempdir()?;
             temp_dir.path()
         }
     };
@@ -102,9 +100,11 @@ pub async fn run_pipeline(args: &ScrapeArgs) -> Result<()> {
 
     let (all_paths, group_boundaries) = {
         let frame_groups = frame_groups.clone();
-        tokio::task::spawn_blocking(move || crop_frames(&frame_groups, layout.as_ref(), &cropped_dir))
-            .await
-            .context("cropping task failed")??
+        tokio::task::spawn_blocking(move || {
+            crop_frames(&frame_groups, layout.as_ref(), &cropped_dir)
+        })
+        .await
+        .context("cropping task failed")??
     };
 
     let method = if args.gpu_ocr {
@@ -166,7 +166,9 @@ pub async fn run_pipeline(args: &ScrapeArgs) -> Result<()> {
         for (i, handle) in handles.into_iter().enumerate() {
             codes.push(match handle.await {
                 Ok(r) => r,
-                Err(e) => Err(anyhow::anyhow!("OCR worker for frame {i} failed to complete: {e}")),
+                Err(e) => Err(anyhow::anyhow!(
+                    "OCR worker for frame {i} failed to complete: {e}"
+                )),
             });
         }
         codes
@@ -182,7 +184,8 @@ pub async fn run_pipeline(args: &ScrapeArgs) -> Result<()> {
         .await?
     };
 
-    let all_codes = apply_frame_failure_policy(frame_results, &all_paths, args.max_frame_failure_rate)?;
+    let all_codes =
+        apply_frame_failure_policy(frame_results, &all_paths, args.max_frame_failure_rate)?;
 
     println!("Building revisions...");
     let revisions = build_revisions(&frame_groups, &group_boundaries, &all_codes);
@@ -196,7 +199,8 @@ pub async fn run_pipeline(args: &ScrapeArgs) -> Result<()> {
     let passage_deduped = stitch::dedup::dedup_passages(&section_deduped);
 
     let final_content = if args.refine {
-        stitch::refine::refine_text(&passage_deduped, &args.refine_model, args.refine_agents).await?
+        stitch::refine::refine_text(&passage_deduped, &args.refine_model, args.refine_agents)
+            .await?
     } else {
         passage_deduped
     };
@@ -252,7 +256,10 @@ fn apply_frame_failure_policy(
             Ok(code) => Some(code),
             Err(e) => {
                 failed += 1;
-                let name = paths.get(i).map(|p| p.display().to_string()).unwrap_or_default();
+                let name = paths
+                    .get(i)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
                 eprintln!("  Warning: frame {i} ({name}) failed, skipping: {e:#}");
                 None
             }
@@ -366,11 +373,7 @@ fn crop_frames(
             let path = if let Some(region) = layout {
                 let out_path = cropped_dir.join(format!(
                     "crop_{}.png",
-                    frame
-                        .path
-                        .file_stem()
-                        .unwrap_or_default()
-                        .to_string_lossy()
+                    frame.path.file_stem().unwrap_or_default().to_string_lossy()
                 ));
                 regions::crop_to_region(&frame.path, region, &out_path)?;
                 out_path
@@ -433,7 +436,13 @@ fn detect_language(code: &str) -> String {
         (
             "python",
             &[
-                "import ", "class ", "self.", "print(", "elif ", "except ", "async def ",
+                "import ",
+                "class ",
+                "self.",
+                "print(",
+                "elif ",
+                "except ",
+                "async def ",
             ],
         ),
         (
@@ -457,12 +466,7 @@ fn detect_language(code: &str) -> String {
         ),
         (
             "java",
-            &[
-                "public class",
-                "public static",
-                "System.out",
-                "import java",
-            ],
+            &["public class", "public static", "System.out", "import java"],
         ),
         ("ruby", &["end\n", "puts ", "require '", "attr_"]),
         (
@@ -524,7 +528,8 @@ mod tests {
 
     #[test]
     fn detect_javascript_not_typescript() {
-        let code = "const x = 1;\nlet y = 2;\nconsole.log(x + y);\nfunction add(a, b) { return a + b; }\n";
+        let code =
+            "const x = 1;\nlet y = 2;\nconsole.log(x + y);\nfunction add(a, b) { return a + b; }\n";
         assert_eq!(detect_language(code), "javascript");
     }
 
@@ -580,9 +585,15 @@ mod tests {
             Err(anyhow::anyhow!("boom")),
             Ok("c".to_string()),
         ];
-        let paths: Vec<PathBuf> = ["1.png", "2.png", "3.png"].iter().map(PathBuf::from).collect();
+        let paths: Vec<PathBuf> = ["1.png", "2.png", "3.png"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
         let codes = apply_frame_failure_policy(results, &paths, 0.5).unwrap();
-        assert_eq!(codes, vec![Some("a".to_string()), None, Some("c".to_string())]);
+        assert_eq!(
+            codes,
+            vec![Some("a".to_string()), None, Some("c".to_string())]
+        );
     }
 
     #[test]
@@ -594,9 +605,18 @@ mod tests {
 
     #[test]
     fn revisions_skip_failed_frames_and_groups() {
-        let groups = vec![vec![frame(1.0), frame(2.0)], vec![frame(5.0)], vec![frame(9.0)]];
+        let groups = vec![
+            vec![frame(1.0), frame(2.0)],
+            vec![frame(5.0)],
+            vec![frame(9.0)],
+        ];
         let bounds = vec![(0, 2), (2, 1), (3, 1)];
-        let codes = vec![None, Some("x = 1".to_string()), None, Some("y = 2".to_string())];
+        let codes = vec![
+            None,
+            Some("x = 1".to_string()),
+            None,
+            Some("y = 2".to_string()),
+        ];
         let revs = build_revisions(&groups, &bounds, &codes);
         assert_eq!(revs.len(), 2);
         assert_eq!(revs[0].timestamp, 2.0);
@@ -638,7 +658,10 @@ mod tests {
             vlm_timeout_secs: 45,
             max_frame_failure_rate: DEFAULT_MAX_FRAME_FAILURE_RATE,
         };
-        assert_eq!(args.vlm_options().timeout, std::time::Duration::from_secs(45));
+        assert_eq!(
+            args.vlm_options().timeout,
+            std::time::Duration::from_secs(45)
+        );
     }
 
     #[test]

@@ -145,8 +145,7 @@ mod engine {
                 if y2 <= y1 || y2 - y1 < 3 {
                     continue;
                 }
-                let crop =
-                    image::imageops::crop_imm(&rgb, 0, y1, rgb.width(), y2 - y1).to_image();
+                let crop = image::imageops::crop_imm(&rgb, 0, y1, rgb.width(), y2 - y1).to_image();
                 if let Ok(text) = self.recognize_line(&crop) {
                     let trimmed = text.trim();
                     if !trimmed.is_empty() {
@@ -166,10 +165,7 @@ mod engine {
                 .collect()
         }
 
-        fn detect_text_lines(
-            &mut self,
-            img: &image::RgbImage,
-        ) -> Result<Vec<(u32, u32)>> {
+        fn detect_text_lines(&mut self, img: &image::RgbImage) -> Result<Vec<(u32, u32)>> {
             let (orig_w, orig_h) = (img.width(), img.height());
 
             let scale = DET_MAX_SIDE as f32 / orig_w.max(orig_h) as f32;
@@ -179,18 +175,18 @@ mod engine {
             let new_w = new_w.div_ceil(32) * 32;
             let new_h = new_h.div_ceil(32) * 32;
 
-            let resized = image::imageops::resize(
-                img, new_w, new_h, image::imageops::FilterType::Triangle,
-            );
+            let resized =
+                image::imageops::resize(img, new_w, new_h, image::imageops::FilterType::Triangle);
             let tensor = image_to_tensor(&resized, new_w, new_h);
             let input = Tensor::from_array(tensor).map_err(ort_err)?;
-            let outputs = self.det_session
-                .run(ort::inputs![input])
-                .map_err(ort_err)?;
+            let outputs = self.det_session.run(ort::inputs![input]).map_err(ort_err)?;
 
             let (shape, data) = outputs[0].try_extract_tensor::<f32>().map_err(ort_err)?;
             if shape.len() != 4 {
-                anyhow::bail!("unexpected detection model output rank: {}, expected 4", shape.len());
+                anyhow::bail!(
+                    "unexpected detection model output rank: {}, expected 4",
+                    shape.len()
+                );
             }
             let out_h = shape[2] as usize;
             let out_w = shape[3] as usize;
@@ -249,7 +245,6 @@ mod engine {
 
             Ok(lines)
         }
-
     }
 
     fn split_merged_lines(y1: u32, y2: u32, img_h: u32, out: &mut Vec<(u32, u32)>) {
@@ -271,7 +266,6 @@ mod engine {
     }
 
     impl GpuOcrEngine {
-
         fn recognize_line(&mut self, crop: &image::RgbImage) -> Result<String> {
             let (w, h) = (crop.width(), crop.height());
             if w == 0 || h == 0 {
@@ -282,20 +276,19 @@ mod engine {
             let new_w = ((w as f32 / h as f32) * new_h as f32).max(1.0) as u32;
             let padded_w = new_w.max(320);
 
-            let resized = image::imageops::resize(
-                crop, new_w, new_h, image::imageops::FilterType::Triangle,
-            );
+            let resized =
+                image::imageops::resize(crop, new_w, new_h, image::imageops::FilterType::Triangle);
 
             let tensor = rec_image_to_tensor(&resized, new_w, new_h, padded_w);
             let input = Tensor::from_array(tensor).map_err(ort_err)?;
-            let outputs = self
-                .rec_session
-                .run(ort::inputs![input])
-                .map_err(ort_err)?;
+            let outputs = self.rec_session.run(ort::inputs![input]).map_err(ort_err)?;
 
             let (shape, data) = outputs[0].try_extract_tensor::<f32>().map_err(ort_err)?;
             if shape.len() != 3 {
-                anyhow::bail!("unexpected recognition model output rank: {}, expected 3", shape.len());
+                anyhow::bail!(
+                    "unexpected recognition model output rank: {}, expected 3",
+                    shape.len()
+                );
             }
 
             // CTC decode: [1, seq_len, num_classes]
@@ -429,7 +422,10 @@ mod tests {
     fn missing_models_error_before_session_build() {
         let dir = tempfile::tempdir().unwrap();
         let err = super::GpuOcrEngine::new(dir.path()).err().unwrap();
-        assert!(err.to_string().contains("GPU OCR models not found"), "{err}");
+        assert!(
+            err.to_string().contains("GPU OCR models not found"),
+            "{err}"
+        );
     }
 }
 

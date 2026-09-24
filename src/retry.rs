@@ -109,7 +109,11 @@ mod tests {
             let exp = Duration::from_millis(100 * 2u64.pow(retry));
             for _ in 0..50 {
                 let d = p.backoff(retry);
-                assert!(d >= exp / 2 && d <= exp, "retry {retry}: {d:?} not in [{:?}, {exp:?}]", exp / 2);
+                assert!(
+                    d >= exp / 2 && d <= exp,
+                    "retry {retry}: {d:?} not in [{:?}, {exp:?}]",
+                    exp / 2
+                );
             }
         }
     }
@@ -126,7 +130,10 @@ mod tests {
     fn backoff_has_jitter() {
         let p = policy();
         let samples: std::collections::HashSet<Duration> = (0..20).map(|_| p.backoff(3)).collect();
-        assert!(samples.len() > 1, "backoff produced identical delays: {samples:?}");
+        assert!(
+            samples.len() > 1,
+            "backoff produced identical delays: {samples:?}"
+        );
     }
 
     #[test]
@@ -147,11 +154,17 @@ mod tests {
         assert_eq!(parse_retry_after(&h), Some(Duration::from_secs(7)));
         h.insert(RETRY_AFTER, HeaderValue::from_static("0.5"));
         assert_eq!(parse_retry_after(&h), Some(Duration::from_millis(500)));
-        h.insert(RETRY_AFTER, HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"));
+        h.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
         assert_eq!(parse_retry_after(&h), None);
         h.insert(RETRY_AFTER, HeaderValue::from_static("-3"));
         assert_eq!(parse_retry_after(&h), None);
-        h.insert(RETRY_AFTER, HeaderValue::from_static("99999999999999999999"));
+        h.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("99999999999999999999"),
+        );
         assert_eq!(parse_retry_after(&h), None);
         h.insert(RETRY_AFTER, HeaderValue::from_static("1e300"));
         assert_eq!(parse_retry_after(&h), None);
@@ -168,8 +181,14 @@ mod tests {
     #[test]
     fn delay_prefers_retry_after_and_caps_it() {
         let p = policy();
-        assert_eq!(p.delay_for(0, Some(Duration::from_secs(3))), Duration::from_secs(3));
-        assert_eq!(p.delay_for(0, Some(Duration::from_secs(999))), Duration::from_secs(10));
+        assert_eq!(
+            p.delay_for(0, Some(Duration::from_secs(3))),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            p.delay_for(0, Some(Duration::from_secs(999))),
+            Duration::from_secs(10)
+        );
         assert!(p.delay_for(0, None) <= Duration::from_millis(100));
     }
 }
