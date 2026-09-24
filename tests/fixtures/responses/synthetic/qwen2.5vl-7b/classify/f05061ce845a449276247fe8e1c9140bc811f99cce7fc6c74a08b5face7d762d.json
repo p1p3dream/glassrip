@@ -1,0 +1,10 @@
+{
+  "record_version": 1,
+  "key": "f05061ce845a449276247fe8e1c9140bc811f99cce7fc6c74a08b5face7d762d",
+  "kind": "classify",
+  "case": "board_owners",
+  "model": "qwen2.5vl:7b",
+  "model_digest": "5ced39dfa4bac325dc183dd1e4febaa1c46b3ea28bce48896c8e69c1e79611cc",
+  "raw_text": "{\n  \"screen_type\": \"whiteboard\",\n  \"app_hint\": \"Boardly\",\n  \"bbox_2d\": [1, 1, 1203, 728],\n  \"confidence\": 0.95\n}",
+  "wall_s": 3.699
+}

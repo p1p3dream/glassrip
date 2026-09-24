@@ -1,0 +1,10 @@
+{
+  "record_version": 1,
+  "key": "8faff51b1da93be45384ee07bc7a301b345d9465f4fb2cc5095ec7ad1a9f9c4a",
+  "kind": "board_read",
+  "case": "board_basic",
+  "model": "qwen2.5vl:7b",
+  "model_digest": "5ced39dfa4bac325dc183dd1e4febaa1c46b3ea28bce48896c8e69c1e79611cc",
+  "raw_text": "{\n  \"nodes\": [\n    {\"local_id\": \"n1\", \"text\": \"Ledger API\", \"bbox_2d\": [322, 225, 622, 292], \"conf\": 0.9},\n    {\"local_id\": \"n2\", \"text\": \"Orbit Queue\", \"bbox_2d\": [822, 188, 1022, 264], \"conf\": 0.9},\n    {\"local_id\": \"n3\", \"text\": \"Parcel Store\", \"bbox_2d\": [1242, 210, 1442, 292], \"conf\": 0.9}\n  ],\n  \"edges\": [\n    {\"src\": \"n1\", \"dst\": \"n2\", \"label\": \"REST\", \"label_bbox_2d\": [686, 210, 730, 230], \"style\": \"solid\", \"conf\": 0.9},\n    {\"src\": \"n2\", \"dst\": \"n3\", \"label\": \"gRPC\", \"label_bbox_2d\": [1094, 250, 1138, 270], \"style\": \"solid\", \"conf\": 0.9}\n  ],\n  \"stickies\": [\n    {\"text\": \"Who owns retries?\", \"color\": \"yellow\", \"bbox_2d\": [250, 672, 458, 818]}\n  ],\n  \"owner_tags\": [\n    {\"name_raw\": \"Riley Park\", \"near\": \"\", \"bbox_2d\": [1666, 118, 1828, 246]},\n    {\"name_raw\": \"Casey Moreno\", \"near\": \"\", \"bbox_2d\": [1666, 318, 1828, 448]},\n    {\"name_raw\": \"Quinn Adler\", \"near\": \"\", \"bbox_2d\": [1666, 519, 1828, 649]}\n  ],\n  \"other_visible_text\": [\n    {\"text\": \"boardly.example/app/board/q3-roadmap\", \"bbox_2d\": [119, 28, 1012, 44]},\n    {\"text\": \"Riley Park (Presenting)\", \"bbox_2d\": [200, 60, 898, 84]},\n    {\"text\": \"100% Fit Undo\", \"bbox_2d\": [1376, 1026, 1600, 1046]}\n  ],\n  \"confidence\": 0.9\n}",
+  "wall_s": 21.169
+}

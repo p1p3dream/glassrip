@@ -1,0 +1,10 @@
+{
+  "record_version": 1,
+  "key": "d32f2f5384c90344c8fe44ab464b5dc485558a3cba9ff15f305ea89e1f252604",
+  "kind": "classify",
+  "case": "meet_gallery",
+  "model": "qwen2.5vl:7b",
+  "model_digest": "5ced39dfa4bac325dc183dd1e4febaa1c46b3ea28bce48896c8e69c1e79611cc",
+  "raw_text": "{\n  \"screen_type\": \"meet_gallery\",\n  \"app_hint\": \"\",\n  \"bbox_2d\": [78, 67, 1125, 625],\n  \"confidence\": 0.95\n}",
+  "wall_s": 1.823
+}

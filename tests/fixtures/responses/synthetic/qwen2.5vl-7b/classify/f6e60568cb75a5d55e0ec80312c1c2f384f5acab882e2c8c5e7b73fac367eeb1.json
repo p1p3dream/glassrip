@@ -1,0 +1,10 @@
+{
+  "record_version": 1,
+  "key": "f6e60568cb75a5d55e0ec80312c1c2f384f5acab882e2c8c5e7b73fac367eeb1",
+  "kind": "classify",
+  "case": "terminal_build",
+  "model": "qwen2.5vl:7b",
+  "model_digest": "5ced39dfa4bac325dc183dd1e4febaa1c46b3ea28bce48896c8e69c1e79611cc",
+  "raw_text": "{\n  \"screen_type\": \"code\",\n  \"app_hint\": \"\",\n  \"bbox_2d\": [0, 0, 1204, 700],\n  \"confidence\": 0.95\n}",
+  "wall_s": 6.349
+}
