@@ -24,8 +24,9 @@ use glassrip_core::runner::{
     ArtifactSpec, InputDecl, ItemContext, KeyExtras, Stage, StageError, StageInputs, WorkItem,
 };
 use glassrip_vision::board::{
-    board_read_request, normalize, BoardNode, BoardReadOutput, BoardReading, OwnerTag, Sticky,
-    TextItem, BOARD_READ_PROMPT,
+    board_read_request, board_read_request_compact, normalize, BoardNode, BoardReadOutput,
+    BoardReading, OwnerTag, Sticky, TextItem, BOARD_READ_PROMPT, COMPACT_RETRY_NOTE,
+    COMPACT_RETRY_SCALE,
 };
 use glassrip_vision::image_prep::{
     prepare_board_image_with, prepare_long_edge, BoardSizing, BOARD_LONG_EDGE, LOW_RES_THRESHOLD,
@@ -38,7 +39,7 @@ use serde::Serialize;
 
 use crate::artifacts::{self, BoardReadingItem, CanvasCropItem, ModelRef, RequestLog, RequestRole};
 use crate::pixels;
-use crate::placement::{vision_error_info, PlacementMonitor};
+use crate::placement::{vision_error_info, InferFailure, PlacementMonitor};
 use crate::raw_store::request_key;
 use crate::stages::{input, internal, load_rgb, text_hash};
 
@@ -65,6 +66,9 @@ pub struct BoardReadParams {
     pub merge_iou: f64,
     /// ...or their normalized texts are at least this similar and their centers are close.
     pub merge_text_ratio: f64,
+    /// A reply cut off at the output limit is retried once with every list
+    /// budget (`maxItems`) scaled by this and a compact single-line instruction.
+    pub compact_retry_scale: f64,
 }
 
 impl Default for BoardReadParams {
@@ -85,6 +89,7 @@ impl Default for BoardReadParams {
             tile_overlap: 0.12,
             merge_iou: 0.5,
             merge_text_ratio: 0.85,
+            compact_retry_scale: COMPACT_RETRY_SCALE,
         }
     }
 }
@@ -336,12 +341,41 @@ impl BoardReadStage {
         )
         .map_err(|e| vision_error_info(&e))?;
         request.options.num_predict = output_budget(&self.params, &request);
-        let key = request_key(&self.model, &request);
+        let mut key = request_key(&self.model, &request);
         let started = Instant::now();
-        let (out, raw) = self
+        let mut compact_retry = false;
+        let first = self
             .monitor
-            .infer_typed::<BoardReadOutput>(request, cancel)
-            .await?;
+            .infer_typed_detailed::<BoardReadOutput>(request.clone(), cancel.clone())
+            .await;
+        let (out, raw) = match first {
+            Ok(v) => v,
+            Err(InferFailure::Other(e)) => return Err(e),
+            Err(InferFailure::Truncated(e)) => {
+                tracing::warn!(
+                    role = ?role,
+                    num_predict = request.options.num_predict,
+                    error = %e.message,
+                    "board reading hit the output limit; retrying once with a compact budget"
+                );
+                let retry = board_read_request_compact(
+                    &prepared,
+                    request.options,
+                    self.params.compact_retry_scale,
+                )
+                .map_err(|e| vision_error_info(&e))?;
+                key = request_key(&self.model, &retry);
+                compact_retry = true;
+                self.monitor
+                    .infer_typed_detailed::<BoardReadOutput>(retry, cancel)
+                    .await
+                    .map_err(|f| {
+                        let mut info = f.into_info();
+                        info.message = format!("after the compact retry: {}", info.message);
+                        info
+                    })?
+            }
+        };
         let out = shift_output(out.to_canvas_coords(&prepared), region.x1, region.y1);
         Ok((
             out,
@@ -357,6 +391,7 @@ impl BoardReadStage {
                 eval_count: raw.eval_count,
                 prompt_eval_count: raw.prompt_eval_count,
                 done_reason: raw.done_reason,
+                compact_retry,
             },
         ))
     }
@@ -392,7 +427,9 @@ impl Stage for BoardReadStage {
                 self.model,
                 self.digest.clone().unwrap_or_default()
             )),
-            prompt_hash: Some(text_hash(BOARD_READ_PROMPT)),
+            prompt_hash: Some(text_hash(&format!(
+                "{BOARD_READ_PROMPT}\n{COMPACT_RETRY_NOTE}"
+            ))),
             tool_versions: self
                 .server_version
                 .iter()

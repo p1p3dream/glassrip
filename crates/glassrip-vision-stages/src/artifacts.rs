@@ -320,6 +320,10 @@ pub struct RequestLog {
     /// far below the prompt's size.
     pub prompt_eval_count: Option<u32>,
     pub done_reason: Option<String>,
+    /// The first reply stopped at the output limit and this is the compact
+    /// retry (smaller list budgets); `request_key` is the retry's key.
+    #[serde(default)]
+    pub compact_retry: bool,
 }
 
 /// Model identity.

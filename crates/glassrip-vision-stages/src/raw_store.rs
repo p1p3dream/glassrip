@@ -41,6 +41,24 @@ pub struct RecordedResponse {
     pub model: String,
     pub digest: Option<String>,
     pub response: RawResponse,
+    /// The reply stopped at the output limit: `response` holds the cut-off text
+    /// (`json` is null) and replay answers with [`VisionError::Truncated`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+}
+
+/// The stored form of a reply cut off at the output limit.
+fn truncated_response(raw_text: &str, eval_count: Option<u32>) -> RawResponse {
+    RawResponse {
+        raw_text: raw_text.to_string(),
+        json: serde_json::Value::Null,
+        prompt_eval_count: None,
+        eval_count,
+        durations: glassrip_vision::Durations::default(),
+        attempts: 1,
+        repaired: false,
+        done_reason: Some("length".into()),
+    }
 }
 
 /// Directory of recorded responses: `<dir>/<key[0..2]>/<key>.json`.
@@ -135,12 +153,37 @@ impl VisionBackend for RecordingBackend {
     ) -> glassrip_vision::Result<RawResponse> {
         let id = self.inner.id();
         let key = request_key(&id.model, &request);
-        let response = self.inner.infer(request, cancel).await?;
+        let response = match self.inner.infer(request, cancel).await {
+            Ok(r) => r,
+            Err(e) => {
+                // A truncation is a deterministic answer to this request; record
+                // it so replay takes the same (retry) path.
+                if let VisionError::Truncated {
+                    raw_text,
+                    eval_count,
+                    ..
+                } = &e
+                {
+                    let entry = RecordedResponse {
+                        key,
+                        model: id.model,
+                        digest: id.digest,
+                        response: truncated_response(raw_text, *eval_count),
+                        truncated: true,
+                    };
+                    if let Err(w) = self.store.put(&entry) {
+                        tracing::warn!(error = %w, "could not record truncated response");
+                    }
+                }
+                return Err(e);
+            }
+        };
         let entry = RecordedResponse {
             key,
             model: id.model,
             digest: id.digest,
             response: response.clone(),
+            truncated: false,
         };
         // A response that cannot be recorded is still a valid answer; replay
         // will report the missing key.
@@ -198,6 +241,11 @@ impl VisionBackend for ReplayBackend {
         }
         let key = request_key(&self.model, &request);
         match self.store.get(&key) {
+            Ok(Some(entry)) if entry.truncated => Err(VisionError::Truncated {
+                num_predict: request.options.num_predict,
+                eval_count: entry.response.eval_count,
+                raw_text: entry.response.raw_text,
+            }),
             Ok(Some(entry)) => {
                 // Validate against the request schema, as a live reply would be.
                 request

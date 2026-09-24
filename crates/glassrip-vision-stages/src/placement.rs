@@ -149,11 +149,7 @@ impl Default for MonitorConfig {
 /// small `prompt_eval_count` is not an error.
 pub fn check_usage(raw: &RawResponse, num_ctx: u32) -> Result<(), ErrorInfo> {
     if raw.done_reason.as_deref() == Some("length") {
-        return Err(ErrorInfo::new(
-            ErrorCode::ModelRequest,
-            "generation stopped at the output limit (done_reason length)",
-        )
-        .with_raw_text(raw.raw_text.clone()));
+        return Err(truncated_info(&raw.raw_text));
     }
     let prompt = raw.prompt_eval_count.unwrap_or(0);
     let output = raw.eval_count.unwrap_or(0);
@@ -164,6 +160,39 @@ pub fn check_usage(raw: &RawResponse, num_ctx: u32) -> Result<(), ErrorInfo> {
         ));
     }
     Ok(())
+}
+
+fn truncated_info(raw_text: &str) -> ErrorInfo {
+    ErrorInfo::new(
+        ErrorCode::ModelRequest,
+        "generation stopped at the output limit (done_reason length)",
+    )
+    .with_raw_text(raw_text.to_string())
+}
+
+/// Why [`PlacementMonitor::infer_typed_detailed`] failed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InferFailure {
+    /// The reply stopped at the output limit (`done_reason: length`). The caller
+    /// may retry with a smaller output (see `board_read`'s compact retry).
+    Truncated(ErrorInfo),
+    /// Any other failure.
+    Other(ErrorInfo),
+}
+
+impl InferFailure {
+    /// The item error.
+    pub fn into_info(self) -> ErrorInfo {
+        match self {
+            Self::Truncated(e) | Self::Other(e) => e,
+        }
+    }
+}
+
+impl From<ErrorInfo> for InferFailure {
+    fn from(e: ErrorInfo) -> Self {
+        Self::Other(e)
+    }
 }
 
 /// Preflight, periodic checks, recovery, and abort state shared by every model
@@ -373,6 +402,18 @@ impl PlacementMonitor {
         request: VisionRequest,
         cancel: CancellationToken,
     ) -> Result<(T, RawResponse), ErrorInfo> {
+        self.infer_typed_detailed(request, cancel)
+            .await
+            .map_err(InferFailure::into_info)
+    }
+
+    /// [`Self::infer_typed`], reporting a reply cut off at the output limit as
+    /// [`InferFailure::Truncated`] (the request is not retried here).
+    pub async fn infer_typed_detailed<T: DeserializeOwned>(
+        &self,
+        request: VisionRequest,
+        cancel: CancellationToken,
+    ) -> Result<(T, RawResponse), InferFailure> {
         self.ensure_preflight().await?;
         let mut retried = false;
         let result = loop {
@@ -391,9 +432,19 @@ impl PlacementMonitor {
         };
         self.after_request().await;
         if let Some(e) = self.abort_error() {
-            return Err(e);
+            return Err(e.into());
         }
-        let (value, raw) = result.map_err(|e| crate::placement::vision_error_info(&e))?;
+        let (value, raw) = result.map_err(|e| {
+            let info = vision_error_info(&e);
+            if e.is_truncated() {
+                InferFailure::Truncated(info)
+            } else {
+                InferFailure::Other(info)
+            }
+        })?;
+        if raw.done_reason.as_deref() == Some("length") {
+            return Err(InferFailure::Truncated(truncated_info(&raw.raw_text)));
+        }
         check_usage(&raw, self.cfg.num_ctx)?;
         Ok((value, raw))
     }
@@ -482,6 +533,9 @@ pub fn vision_error_info(e: &VisionError) -> ErrorInfo {
             ErrorInfo::new(ErrorCode::SchemaParse, e.to_string()).with_raw_text(raw_text.clone())
         }
         VisionError::Decode { .. } => ErrorInfo::new(ErrorCode::SchemaParse, e.to_string()),
+        VisionError::Truncated { raw_text, .. } => {
+            ErrorInfo::new(ErrorCode::ModelRequest, e.to_string()).with_raw_text(raw_text.clone())
+        }
         VisionError::Image(_) | VisionError::ImageTooManyTokens { .. } => {
             ErrorInfo::new(ErrorCode::InvalidInput, e.to_string())
         }

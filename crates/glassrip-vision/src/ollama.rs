@@ -619,7 +619,9 @@ impl OllamaBackend {
             "messages": messages,
             "stream": false,
             "keep_alive": self.config.keep_alive,
-            "format": request.schema.format_value(),
+            // Structural schema only (see OutputSchema::grammar_value); the prompt
+            // carries the documented schema.
+            "format": request.schema.grammar_value(),
             "options": {
                 "temperature": 0,
                 "seed": seed,
@@ -707,6 +709,7 @@ impl OllamaBackend {
             .as_ref()
             .map(|m| m.content.clone())
             .unwrap_or_default();
+        truncation(request, &resp, &text)?;
         let first_errors = match validate_text(request, &text) {
             Ok(json) => return Ok(Self::to_raw(resp, json, text, attempts, wall, false)),
             Err(errors) => errors,
@@ -746,6 +749,7 @@ impl OllamaBackend {
             .as_ref()
             .map(|m| m.content.clone())
             .unwrap_or_default();
+        truncation(request, &resp, &text)?;
         match validate_text(request, &text) {
             Ok(json) => Ok(Self::to_raw(resp, json, text, attempts, wall, true)),
             Err(errors) => Err(VisionError::SchemaInvalid {
@@ -904,6 +908,19 @@ impl OllamaBackend {
             latency: start.elapsed(),
         })
     }
+}
+
+/// A reply that stopped at the output limit is incomplete whatever it parses to:
+/// report it as [`VisionError::Truncated`] instead of validating or repairing it.
+fn truncation(request: &VisionRequest, resp: &ChatResponse, text: &str) -> Result<()> {
+    if resp.done_reason.as_deref() == Some("length") {
+        return Err(VisionError::Truncated {
+            num_predict: request.options.num_predict,
+            eval_count: resp.eval_count,
+            raw_text: text.to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_text(
