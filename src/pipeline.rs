@@ -266,6 +266,9 @@ fn apply_frame_failure_policy(
 }
 
 fn check_failure_rate(failed: usize, total: usize, max_rate: f64) -> Result<()> {
+    if !max_rate.is_finite() || !(0.0..=1.0).contains(&max_rate) {
+        anyhow::bail!("max frame failure rate must be between 0.0 and 1.0, got {max_rate}");
+    }
     if total == 0 || failed == 0 {
         return Ok(());
     }
@@ -543,6 +546,13 @@ mod tests {
             path: PathBuf::from(format!("f{t}.png")),
             is_keyframe: true,
         }
+    }
+
+    #[test]
+    fn failure_rate_rejects_non_finite_or_out_of_range_threshold() {
+        assert!(check_failure_rate(1, 10, f64::NAN).is_err());
+        assert!(check_failure_rate(0, 10, f64::INFINITY).is_err());
+        assert!(check_failure_rate(1, 10, 1.5).is_err());
     }
 
     #[test]

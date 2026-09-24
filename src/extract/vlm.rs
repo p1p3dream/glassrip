@@ -4,12 +4,12 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use reqwest::{Client, StatusCode};
+use reqwest::Client;
 use serde::Deserialize;
 use tokio::sync::Semaphore;
 use tokio::time::{sleep, Duration};
 
-use crate::retry::{is_retryable_status, parse_retry_after, RetryPolicy};
+use crate::retry::{honors_retry_after, is_retryable_status, parse_retry_after, RetryPolicy};
 
 const EXTRACT_PROMPT: &str = "\
 Extract the exact source code visible in this image. \
@@ -151,7 +151,7 @@ async fn extract_with_policy(
                     let body = resp.text().await.unwrap_or_default();
                     anyhow::bail!("Ollama API returned {status}: {body}");
                 }
-                let retry_after = if status == StatusCode::TOO_MANY_REQUESTS {
+                let retry_after = if honors_retry_after(status) {
                     parse_retry_after(resp.headers())
                 } else {
                     None

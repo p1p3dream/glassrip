@@ -57,7 +57,7 @@ enum Commands {
         parallel: usize,
 
         /// Per-request VLM timeout in seconds
-        #[arg(long = "vlm-timeout", default_value_t = glassrip::extract::vlm::DEFAULT_TIMEOUT_SECS)]
+        #[arg(long = "vlm-timeout", default_value_t = glassrip::extract::vlm::DEFAULT_TIMEOUT_SECS, value_parser = clap::value_parser!(u64).range(1..))]
         vlm_timeout: u64,
 
         /// Fraction of frames (0.0 to 1.0) allowed to fail extraction before the run fails
@@ -123,7 +123,7 @@ async fn main() -> Result<()> {
                 refine,
                 refine_model,
                 refine_agents: refine_agents.max(1),
-                vlm_timeout_secs: vlm_timeout.max(1),
+                vlm_timeout_secs: vlm_timeout,
                 max_frame_failure_rate,
             };
             glassrip::pipeline::run_pipeline(&args).await
@@ -175,5 +175,13 @@ mod tests {
     fn failure_rate_out_of_range_rejected() {
         assert!(scrape(&["--max-frame-failure-rate", "1.5"]).is_err());
         assert!(scrape(&["--max-frame-failure-rate", "-0.1"]).is_err());
+        assert!(scrape(&["--max-frame-failure-rate", "NaN"]).is_err());
+    }
+
+    #[test]
+    fn zero_vlm_timeout_rejected() {
+        assert!(scrape(&["--vlm-timeout", "0"]).is_err());
+        let Commands::Scrape { vlm_timeout, .. } = scrape(&["--vlm-timeout", "1"]).unwrap();
+        assert_eq!(vlm_timeout, 1);
     }
 }

@@ -413,10 +413,16 @@ pub use engine::{execution_provider, GpuOcrEngine};
 
 #[cfg(all(test, feature = "gpu"))]
 mod tests {
+    #[cfg(not(feature = "gpu-cuda"))]
     #[test]
-    fn execution_provider_matches_features() {
-        let expected = if cfg!(feature = "gpu-cuda") { "CUDA" } else { "CPU" };
-        assert_eq!(super::execution_provider(), expected);
+    fn plain_gpu_feature_uses_cpu_provider() {
+        assert_eq!(super::execution_provider(), "CPU");
+    }
+
+    #[cfg(feature = "gpu-cuda")]
+    #[test]
+    fn gpu_cuda_feature_uses_cuda_provider() {
+        assert_eq!(super::execution_provider(), "CUDA");
     }
 
     #[test]

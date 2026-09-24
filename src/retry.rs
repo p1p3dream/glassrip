@@ -1,5 +1,5 @@
 //! Shared HTTP retry policy: exponential backoff with jitter, and
-//! `Retry-After` support for 429 responses.
+//! `Retry-After` support for 429 and 503 responses.
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
@@ -52,6 +52,12 @@ impl RetryPolicy {
     }
 }
 
+/// Statuses whose `Retry-After` header is honored (RFC 9110 allows it on
+/// 429 and 503).
+pub fn honors_retry_after(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::SERVICE_UNAVAILABLE
+}
+
 /// 429 and 5xx are worth retrying; other statuses are not.
 pub fn is_retryable_status(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
@@ -63,7 +69,9 @@ pub fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
     let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
     let secs: f64 = value.parse().ok()?;
     if secs.is_finite() && secs >= 0.0 {
-        Some(Duration::from_secs_f64(secs))
+        // try_from avoids the panic from_secs_f64 raises when the value
+        // overflows Duration; such headers fall back to computed backoff.
+        Duration::try_from_secs_f64(secs).ok()
     } else {
         None
     }
@@ -143,6 +151,18 @@ mod tests {
         assert_eq!(parse_retry_after(&h), None);
         h.insert(RETRY_AFTER, HeaderValue::from_static("-3"));
         assert_eq!(parse_retry_after(&h), None);
+        h.insert(RETRY_AFTER, HeaderValue::from_static("99999999999999999999"));
+        assert_eq!(parse_retry_after(&h), None);
+        h.insert(RETRY_AFTER, HeaderValue::from_static("1e300"));
+        assert_eq!(parse_retry_after(&h), None);
+    }
+
+    #[test]
+    fn retry_after_status_covers_429_and_503() {
+        assert!(honors_retry_after(StatusCode::TOO_MANY_REQUESTS));
+        assert!(honors_retry_after(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(!honors_retry_after(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(!honors_retry_after(StatusCode::BAD_REQUEST));
     }
 
     #[test]

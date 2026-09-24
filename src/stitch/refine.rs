@@ -3,7 +3,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use tokio::time::Duration;
 
-use crate::retry::{is_retryable_status, parse_retry_after, RetryPolicy};
+use crate::retry::{honors_retry_after, is_retryable_status, parse_retry_after, RetryPolicy};
 
 /// Default model for `--refine`.
 pub const DEFAULT_REFINE_MODEL: &str = "claude-opus-5-5";
@@ -145,7 +145,7 @@ async fn refine_chunk(
 
         let status = resp.status();
         if is_retryable_status(status) {
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            if honors_retry_after(status) {
                 retry_after = parse_retry_after(resp.headers());
             }
             let body = resp.text().await.unwrap_or_default();
