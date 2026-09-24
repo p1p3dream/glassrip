@@ -147,6 +147,8 @@ impl TileReader for FixedTiles {
 struct Replay {
     log: Mutex<Vec<String>>,
     resident: Mutex<Vec<String>>,
+    /// Report the text model as only half on the GPU.
+    spill: bool,
     ids: std::collections::BTreeMap<&'static str, String>,
 }
 
@@ -184,7 +186,11 @@ impl TextBackend for Replay {
             .map(|m| LoadedModel {
                 name: m.clone(),
                 size: 100,
-                size_vram: 100,
+                size_vram: if self.spill && m.starts_with("text") {
+                    60
+                } else {
+                    100
+                },
                 context_length: Some(16384),
             })
             .collect())
@@ -448,4 +454,84 @@ async fn board_only_notes_when_there_is_no_audio() {
         .open_questions
         .iter()
         .all(|q| q.source == QuestionSource::Board && !q.evidence.event_ids.is_empty()));
+}
+
+#[tokio::test]
+async fn a_spilled_text_model_is_refused_and_unloaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = RunDir::open(
+        &dir.path().join("run"),
+        "synthetic",
+        Producer::glassrip("0.1.0", None),
+    )
+    .unwrap();
+    let (board, keyframes) = synthetic_board::synthetic_board();
+    import::write_artifact(
+        &run,
+        schemas::KEYFRAMES,
+        semver::Version::new(1, 0, 0),
+        serde_json::json!({}),
+        keyframes
+            .into_iter()
+            .map(|k| (k["keyframe_id"].as_str().unwrap().to_string(), k))
+            .collect(),
+    )
+    .unwrap();
+    let t = TranscriptArtifact {
+        schema: "glassrip.transcript".into(),
+        schema_version: "1.0.0".into(),
+        run_id: "synthetic".into(),
+        producer: glassrip_audio::types::Producer::current(),
+        inputs: vec![],
+        params: serde_json::from_value(serde_json::json!({
+            "asr_model": "synthetic", "vocabulary": [], "language": "en", "beam_size": 5,
+            "vad_model": null, "diarization": null, "num_speakers": 3, "timeline_offset_s": 0.0,
+            "correction_max_p": 0.6, "correction_max_p_proper_noun": 0.85, "asr_backend": "cpu", "gap_fill": null
+        }))
+        .unwrap(),
+        items: transcript(),
+    };
+    import::import_transcript(&run, &t).unwrap();
+    import::write_empty(&run, schemas::SPEAKERS).unwrap();
+    import::import_boards(&run, &[board]).unwrap();
+    let graph = StageGraph::new(meeting_mode_stage_decls()).unwrap();
+    let sel = Selection {
+        from: Some("notes".into()),
+        until: Some("notes".into()),
+        ..Default::default()
+    };
+    let mut runner = Runner::new(
+        run,
+        graph,
+        &sel,
+        Cache::in_workspace(dir.path()),
+        RunnerOptions::default(),
+        CancellationToken::new(),
+    )
+    .unwrap();
+    let backend = Arc::new(Replay {
+        spill: true,
+        ..Replay::default()
+    });
+    let stage = NotesStage::new(
+        NotesParams {
+            text_model: "text:27b".into(),
+            vision_model: None,
+            ..Default::default()
+        },
+        backend.clone(),
+    );
+    assert!(runner.run_stage(&stage).await.is_err());
+    let log = backend.log.lock().unwrap().clone();
+    assert_eq!(log.first().map(String::as_str), Some("load text:27b"));
+    assert_eq!(
+        log.last().map(String::as_str),
+        Some("unload text:27b"),
+        "{log:?}"
+    );
+    assert!(
+        !log.iter().any(|l| l.starts_with("chat")),
+        "no calls on a spilled model"
+    );
+    assert!(backend.resident.lock().unwrap().is_empty());
 }
