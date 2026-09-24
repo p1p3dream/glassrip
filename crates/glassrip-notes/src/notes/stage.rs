@@ -88,10 +88,14 @@ pub struct NotesParams {
     /// Decisions need a speaker commitment or an owner-tag change.
     #[serde(default)]
     pub precision_guard: bool,
-    /// Owner tags valid at the end become "Own <target>" action items unless
-    /// the owner already has an action naming the target.
+    /// Owner tags valid at the end become "Own <target>" action items when the
+    /// transcript corroborates them and they pass validation, unless the owner
+    /// already has an action naming the target.
     #[serde(default)]
     pub owner_actions: bool,
+    /// Transcript lines this close to an owner tag's appearance can corroborate it, seconds.
+    #[serde(default = "default_owner_corroboration_s")]
+    pub owner_corroboration_s: f64,
     /// Time windows of this length instead of token windows, seconds.
     #[serde(default)]
     pub window_s: Option<f64>,
@@ -102,6 +106,10 @@ pub struct NotesParams {
 
 fn default_max_cues() -> usize {
     60
+}
+
+fn default_owner_corroboration_s() -> f64 {
+    120.0
 }
 
 fn default_window_overlap_s() -> f64 {
@@ -134,6 +142,7 @@ impl Default for NotesParams {
             board_questions_in_reduce: true,
             precision_guard: true,
             owner_actions: true,
+            owner_corroboration_s: default_owner_corroboration_s(),
             window_s: None,
             window_overlap_s: default_window_overlap_s(),
         }
@@ -421,9 +430,17 @@ impl NotesStage {
         }
         let mut sections = assemble(checked);
         let board_added = merge_board_questions(&mut sections.open_questions, &input.boards);
+        // the 6.14 empty-section alarm judges the model's own output, before any
+        // action is added from owner tags
+        let model_actions_empty = sections.action_items.is_empty();
         let owner_added = if p.owner_actions {
-            let add =
-                super::candidates::owner_actions(&input.boards, &sections.action_items, &people);
+            let ctx = super::candidates::OwnerActionContext {
+                lines: &lines,
+                corpus: &corpus,
+                opts,
+                near_s: p.owner_corroboration_s,
+            };
+            let add = super::candidates::owner_actions(&input.boards, &sections.action_items, &ctx);
             let n = add.len();
             sections.action_items.extend(add);
             for (i, a) in sections.action_items.iter_mut().enumerate() {
@@ -452,7 +469,7 @@ impl NotesStage {
         if duration_s > p.alarm_min_transcript_s {
             for (name, empty) in [
                 ("decisions", sections.decisions.is_empty()),
-                ("action items", sections.action_items.is_empty()),
+                ("action items", model_actions_empty),
                 ("summary", sections.summary.is_empty()),
             ] {
                 if empty {

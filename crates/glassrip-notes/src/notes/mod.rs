@@ -234,7 +234,8 @@ pub struct NotesReport {
     pub windows: usize,
     /// Model calls.
     pub calls: Vec<CallRecord>,
-    /// Items drafted by the model (after reduce) plus board questions.
+    /// Items drafted by the model (after reduce), plus questions added from the
+    /// board and actions added from corroborated owner tags.
     pub items_drafted: usize,
     /// Items kept.
     pub items_kept: usize,

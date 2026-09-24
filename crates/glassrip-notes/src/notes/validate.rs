@@ -204,8 +204,9 @@ pub struct Corpus {
     times: BTreeMap<String, f64>,
     table: AliasTable,
     /// Ids that show an owner tag appearing or moving (owner events, and the
-    /// keyframes that opened owner assignments).
-    owner_keys: BTreeSet<String>,
+    /// keyframes that opened owner assignments), with the words of the person
+    /// and the target they concern.
+    owner_keys: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// Validation switches (see [`super::candidates`]).
@@ -268,16 +269,27 @@ impl Corpus {
                 }
             }
         }
-        let mut owner_keys = BTreeSet::new();
+        let mut owner_keys: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for b in boards {
-            for e in &b.events {
-                if matches!(e.kind, EventKind::OwnerAssigned | EventKind::OwnerMoved) {
-                    owner_keys.insert(e.event_id.clone());
-                }
-            }
             for o in &b.owner_assignments {
+                let mut words: BTreeSet<String> =
+                    content_tokens(&o.display_name).into_iter().collect();
+                words.extend(content_tokens(&crate::board::target_text(&o.target)));
+                for e in b.events.iter().filter(|e| {
+                    matches!(e.kind, EventKind::OwnerAssigned | EventKind::OwnerMoved)
+                        && e.subject == o.person_id
+                        && (e.t_s - o.valid_from_s).abs() <= 30.0
+                }) {
+                    owner_keys
+                        .entry(e.event_id.clone())
+                        .or_default()
+                        .extend(words.iter().cloned());
+                }
                 if !o.opened_at_keyframe.is_empty() {
-                    owner_keys.insert(o.opened_at_keyframe.clone());
+                    owner_keys
+                        .entry(o.opened_at_keyframe.clone())
+                        .or_default()
+                        .extend(words.iter().cloned());
                     times.entry(o.opened_at_keyframe.clone()).or_insert(
                         keyframes
                             .get(&o.opened_at_keyframe)
@@ -621,6 +633,49 @@ pub fn is_greeting_or_farewell(text: &str) -> bool {
         && content_tokens(text).len() <= 6
 }
 
+/// True for a verb that starts a task.
+pub fn is_task_verb(word: &str) -> bool {
+    TASK_VERBS.contains(&word)
+}
+
+/// Words of personal activities that are not work tasks ("grab a coffee").
+const PERSONAL: &[&str] = &[
+    "coffee",
+    "lunch",
+    "breakfast",
+    "dinner",
+    "snack",
+    "break",
+    "bathroom",
+    "restroom",
+    "water",
+    "drink",
+    "nap",
+    "doctor",
+    "appointment",
+    "errand",
+    "errands",
+    "gym",
+];
+/// Phrases of leaving or pausing ("head out", "step away").
+const PERSONAL_PHRASES: &[&str] = &[
+    "head out",
+    "step away",
+    "step out",
+    "grab a",
+    "be right back",
+];
+
+/// True when a task is a personal activity rather than work.
+pub fn is_personal_activity(text: &str) -> bool {
+    let toks = tokens(text);
+    let n = format!(" {} ", toks.join(" "));
+    toks.iter().any(|t| PERSONAL.contains(&t.as_str()))
+        || PERSONAL_PHRASES
+            .iter()
+            .any(|p| n.contains(&format!(" {p} ")))
+}
+
 /// Checks the task has a leading verb and an object. Returns the reason if not.
 pub fn check_task(task: &str) -> Option<String> {
     let toks = tokens(task);
@@ -728,6 +783,12 @@ pub fn check_with(
         });
     }
     let mut owners = Vec::new();
+    if section == Section::ActionItems && is_personal_activity(&text) {
+        return Err(Failure {
+            reasons: vec!["personal activity, not a work task".into()],
+            fatal: true,
+        });
+    }
     if section == Section::ActionItems {
         if let Some(r) = check_task(&text) {
             reasons.push(r);
@@ -749,11 +810,17 @@ pub fn check_with(
         section,
         Section::Decisions | Section::ActionItems | Section::OpenQuestions
     );
+    // board support counts only when the item names the person or the target
+    // of the owner-tag change it cites
+    let item_words: BTreeSet<String> = content_tokens(&format!("{text} {}", item.owner))
+        .into_iter()
+        .collect();
     let board_backed = evidence
         .event_ids
         .iter()
         .chain(&evidence.keyframe_ids)
-        .any(|id| corpus.owner_keys.contains(id));
+        .filter_map(|id| corpus.owner_keys.get(id))
+        .any(|words| words.iter().any(|w| item_words.contains(w)));
     let board_ok = opts.board_support
         && board_backed
         && matches!(section, Section::Decisions | Section::ActionItems);
@@ -1237,6 +1304,27 @@ mod tests {
         let d = item("The team decided to skip the importer", &["s1"], "");
         let e = check_with(Section::Decisions, &d, &c, &all).unwrap_err();
         assert!(e.reasons.iter().any(|r| r.contains("commits")), "{e:?}");
+        // citing an unrelated owner-tag change does not bypass the guard
+        let mut d = item("The team decided to skip the importer", &["s1"], "");
+        d.keyframe_ids = vec!["kf_000040".into()];
+        let e = check_with(Section::Decisions, &d, &c, &all).unwrap_err();
+        assert!(e.reasons.iter().any(|r| r.contains("commits")), "{e:?}");
+        // a decision about that owner tag's target is board-backed
+        let mut d = item("Avery owns the Kiosk App work", &["s1"], "");
+        d.keyframe_ids = vec!["kf_000040".into()];
+        assert!(check_with(Section::Decisions, &d, &c, &all).is_ok());
+        // personal activities are not tasks
+        let coffee = DraftItem {
+            owner: "Avery".into(),
+            task: "Get coffee before the next session".into(),
+            segment_ids: vec!["s2".into()],
+            ..Default::default()
+        };
+        let e = check_with(Section::ActionItems, &coffee, &c, &all).unwrap_err();
+        assert!(
+            e.fatal && e.reasons[0].contains("personal activity"),
+            "{e:?}"
+        );
         // citing the committing line passes, with the prefix removed
         let d = item("The team decided to skip the importer", &["s2"], "");
         let ok = check_with(Section::Decisions, &d, &c, &all).unwrap();
