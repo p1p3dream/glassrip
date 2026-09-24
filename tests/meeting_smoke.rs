@@ -1,0 +1,686 @@
+//! End-to-end smoke test of `glassrip meeting` on a synthetic video.
+//!
+//! ffmpeg's lavfi sources draw a tiny fictional meeting: two whiteboard slides
+//! (outlined boxes, a connector, a sticky, an owner tag) and a chat screen, with a
+//! sine tone as audio. Every model is scripted (OCR, vision, ASR, diarization,
+//! text), so the run is offline and deterministic; everything else is the real
+//! pipeline on the core runner: media stages, GPU phases A/B/C, board state,
+//! speaker naming, notes, and render. Names and texts are fictional.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use base64::Engine;
+use glassrip::meeting::{self, run_meeting, Backends, MeetingOptions, VisionBackends};
+use glassrip_audio::asr::{AsrOutput, AsrSegment};
+use glassrip_audio::diarize::Diarization;
+use glassrip_audio::recluster::Turn;
+use glassrip_audio::stages::{AsrEngine, DiarizeEngine};
+use glassrip_audio::words::AsrWord;
+use glassrip_core::config::Config;
+use glassrip_core::envelope::{Record, SchemaReq};
+use glassrip_core::graph::meeting_mode_stage_decls;
+use glassrip_core::manifest::{RunManifest, StageStatus};
+use glassrip_notes::notes::llm::{ChatRequest, ChatResponse, LlmError, LoadedModel, TextBackend};
+use glassrip_notes::notes::MeetingNotes;
+use glassrip_ocr::{OcrError, PixelBox, RecognizedSpan, TextRecognizer};
+use glassrip_vision::{
+    BackendId, Durations, Placement, RawResponse, VisionBackend, VisionError, VisionRequest,
+};
+use glassrip_vision_stages::placement::StaticProbe;
+use glassrip_vision_stages::raw_store::{RawStore, RecordingBackend};
+use image::RgbImage;
+use serde_json::{json, Value};
+use tokio_util::sync::CancellationToken;
+
+const W: u32 = 1280;
+const H: u32 = 720;
+const VISION_MODEL: &str = "scripted-vl";
+const TEXT_MODEL: &str = "scripted-text";
+
+/// Boxes drawn on the slides, frame pixels `(x1, y1, x2, y2)`.
+const LEDGER: [u32; 4] = [160, 200, 460, 320];
+const ORBIT: [u32; 4] = [760, 200, 1060, 320];
+const PARCEL: [u32; 4] = [560, 450, 860, 570];
+const STICKY: [u32; 4] = [180, 450, 380, 600];
+const TAG: [u32; 4] = [470, 330, 560, 370];
+
+fn ffmpeg_ok() -> bool {
+    Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+fn font() -> Option<&'static str> {
+    [
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    .into_iter()
+    .find(|p| Path::new(p).is_file())
+}
+
+fn outline(b: [u32; 4]) -> String {
+    format!(
+        "drawbox=x={}:y={}:w={}:h={}:color=0x222222:t=5",
+        b[0],
+        b[1],
+        b[2] - b[0],
+        b[3] - b[1]
+    )
+}
+
+fn filled(b: [u32; 4], color: &str) -> String {
+    format!(
+        "drawbox=x={}:y={}:w={}:h={}:color={color}:t=fill",
+        b[0],
+        b[1],
+        b[2] - b[0],
+        b[3] - b[1]
+    )
+}
+
+fn text(t: &str, x: u32, y: u32) -> Option<String> {
+    font().map(|f| {
+        format!("drawtext=fontfile={f}:text='{t}':x={x}:y={y}:fontsize=30:fontcolor=0x111111")
+    })
+}
+
+/// A three-slide synthetic meeting (6 s each) with or without a tone.
+fn make_video(path: &Path, audio: bool) {
+    let board_a: Vec<String> = [
+        Some(outline(LEDGER)),
+        Some(outline(ORBIT)),
+        // Connector from the right edge of one box to the left edge of the other.
+        Some(filled([460, 258, 760, 263], "0x222222")),
+        Some(filled(STICKY, "0xF5D547")),
+        Some(filled(TAG, "0x5DBB63")),
+        text("Ledger API", 200, 245),
+        text("Orbit Queue", 800, 245),
+        text("REST", 585, 225),
+        text("Retries?", 200, 510),
+        text("Ada", 485, 335),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let mut board_b = board_a.clone();
+    board_b.push(outline(PARCEL));
+    board_b.extend(text("Parcel Store", 600, 495));
+    let chat: Vec<String> = [
+        Some(filled([80, 120, 1200, 180], "0x3A3F4B")),
+        Some(filled([80, 220, 900, 280], "0x3A3F4B")),
+        text("general", 100, 135),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let graph = format!(
+        "color=c=0xFAFAFA:s={W}x{H}:r=10:d=6,{}[a];\
+         color=c=0xFAFAFA:s={W}x{H}:r=10:d=6,{}[b];\
+         color=c=0x1E2129:s={W}x{H}:r=10:d=6,{}[c];\
+         [a][b][c]concat=n=3:v=1:a=0,format=yuv420p[v]",
+        board_a.join(","),
+        board_b.join(","),
+        chat.join(",")
+    );
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-filter_complex",
+        &graph,
+    ]);
+    if audio {
+        cmd.args([
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=16000:duration=18",
+        ]);
+        cmd.args(["-map", "[v]", "-map", "0:a", "-c:a", "aac", "-shortest"]);
+    } else {
+        cmd.args(["-map", "[v]"]);
+    }
+    cmd.args(["-c:v", "libx264", "-pix_fmt", "yuv420p"]);
+    cmd.arg(path);
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "ffmpeg failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn mean_luma(img: &RgbImage) -> f64 {
+    let n = f64::from(img.width()) * f64::from(img.height());
+    img.pixels()
+        .map(|p| 0.299 * f64::from(p[0]) + 0.587 * f64::from(p[1]) + 0.114 * f64::from(p[2]))
+        .sum::<f64>()
+        / n.max(1.0)
+}
+
+/// True when the pixel at a frame-relative position is dark (a drawn outline).
+fn dark_at(img: &RgbImage, fx: f64, fy: f64) -> bool {
+    let x = ((fx * f64::from(img.width())) as u32).min(img.width().saturating_sub(1));
+    let y = ((fy * f64::from(img.height())) as u32).min(img.height().saturating_sub(1));
+    let p = img.get_pixel(x, y);
+    u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2]) < 200
+}
+
+fn has_parcel(img: &RgbImage) -> bool {
+    // Left edge of the third box, halfway down.
+    let fx = (f64::from(PARCEL[0]) + 2.0) / f64::from(W);
+    let fy = (f64::from(PARCEL[1] + PARCEL[3]) / 2.0) / f64::from(H);
+    dark_at(img, fx, fy)
+}
+
+fn span(t: &str, b: [u32; 4]) -> RecognizedSpan {
+    RecognizedSpan {
+        text: t.into(),
+        bbox: PixelBox {
+            x1: f64::from(b[0]),
+            y1: f64::from(b[1]),
+            x2: f64::from(b[2]),
+            y2: f64::from(b[3]),
+        },
+        confidence: 0.95,
+        det_score: 0.9,
+    }
+}
+
+/// OCR that recognizes the drawn slides by their pixels.
+struct ScriptedOcr;
+
+impl TextRecognizer for ScriptedOcr {
+    fn recognize(&self, img: &RgbImage) -> Result<Vec<RecognizedSpan>, OcrError> {
+        if mean_luma(img) < 100.0 {
+            return Ok(vec![span("general", [100, 135, 220, 165])]);
+        }
+        let mut v = vec![
+            span("Ledger API", [200, 245, 380, 275]),
+            span("Orbit Queue", [800, 245, 990, 275]),
+            span("REST", [585, 225, 660, 252]),
+            span("Retries?", [200, 510, 330, 540]),
+            span("Ada", [485, 335, 545, 362]),
+        ];
+        if has_parcel(img) {
+            v.push(span("Parcel Store", [600, 495, 800, 525]));
+        }
+        Ok(v)
+    }
+    fn execution_provider(&self) -> String {
+        "scripted".into()
+    }
+    fn model_fingerprint(&self) -> String {
+        "scripted-ocr-v1".into()
+    }
+}
+
+fn decode(request: &VisionRequest) -> RgbImage {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(request.image.base64())
+        .unwrap();
+    image::load_from_memory(&bytes).unwrap().to_rgb8()
+}
+
+fn frac(b: [u32; 4], w: f64, h: f64) -> Value {
+    json!([
+        f64::from(b[0]) / f64::from(W) * w,
+        f64::from(b[1]) / f64::from(H) * h,
+        f64::from(b[2]) / f64::from(W) * w,
+        f64::from(b[3]) / f64::from(H) * h
+    ])
+}
+
+/// Vision model that reads the drawn slides from their pixels. Boxes are given
+/// as shares of the sent image, which is the whole frame (the classifier
+/// reports the full frame as the canvas).
+struct ScriptedVision;
+
+#[async_trait]
+impl VisionBackend for ScriptedVision {
+    fn id(&self) -> BackendId {
+        BackendId {
+            backend: "scripted".into(),
+            model: VISION_MODEL.into(),
+            digest: Some("sha256:scripted-vision".into()),
+            server_version: None,
+        }
+    }
+    async fn preflight(&self) -> glassrip_vision::Result<Placement> {
+        Err(VisionError::Config("unused".into()))
+    }
+    async fn infer(
+        &self,
+        request: VisionRequest,
+        _cancel: CancellationToken,
+    ) -> glassrip_vision::Result<RawResponse> {
+        let img = decode(&request);
+        let (w, h) = (f64::from(img.width()), f64::from(img.height()));
+        let board = mean_luma(&img) >= 100.0;
+        let value = if request.schema.name().contains("ScreenClass") {
+            json!({
+                "screen_type": if board { "whiteboard" } else { "chat" },
+                "app_hint": if board { "Miro" } else { "" },
+                "bbox_2d": [0.0, 0.0, w, h],
+                "confidence": 0.93
+            })
+        } else {
+            let mut nodes = vec![
+                json!({"local_id": "n1", "text": "Ledger API", "bbox_2d": frac(LEDGER, w, h), "conf": 0.95}),
+                json!({"local_id": "n2", "text": "Orbit Queue", "bbox_2d": frac(ORBIT, w, h), "conf": 0.95}),
+            ];
+            if has_parcel(&img) {
+                nodes.push(json!({"local_id": "n3", "text": "Parcel Store", "bbox_2d": frac(PARCEL, w, h), "conf": 0.9}));
+            }
+            json!({
+                "nodes": nodes,
+                "edges": [{"src": "n1", "dst": "n2", "label": "REST",
+                           "label_bbox_2d": frac([585, 225, 660, 252], w, h),
+                           "style": "solid", "conf": 0.9}],
+                "stickies": [{"text": "Retries?", "color": "yellow", "bbox_2d": frac(STICKY, w, h)}],
+                "owner_tags": [{"name_raw": "Ada", "near": "n1", "bbox_2d": frac(TAG, w, h)}],
+                "other_visible_text": [],
+                "confidence": 0.9
+            })
+        };
+        request
+            .schema
+            .validate(&value)
+            .map_err(|errors| VisionError::SchemaInvalid {
+                attempts: 1,
+                errors,
+                raw_text: value.to_string(),
+            })?;
+        Ok(RawResponse {
+            raw_text: value.to_string(),
+            json: value,
+            prompt_eval_count: Some(900),
+            eval_count: Some(120),
+            durations: Durations::default(),
+            attempts: 1,
+            repaired: false,
+            done_reason: Some("stop".into()),
+        })
+    }
+}
+
+/// Two short utterances on the audio timeline.
+struct ScriptedAsr;
+
+fn words(start: f64, text: &str) -> Vec<AsrWord> {
+    text.split_whitespace()
+        .enumerate()
+        .map(|(i, w)| AsrWord {
+            w: w.into(),
+            start_s: start + 0.4 * i as f64,
+            end_s: start + 0.4 * (i + 1) as f64,
+            p: 0.92,
+        })
+        .collect()
+}
+
+impl AsrEngine for ScriptedAsr {
+    fn describe(&self) -> Value {
+        json!({"engine": "scripted-asr"})
+    }
+    fn transcribe(
+        &self,
+        samples: &[f32],
+        vocabulary: &[String],
+    ) -> glassrip_audio::Result<AsrOutput> {
+        assert!(!samples.is_empty(), "audio samples reach ASR");
+        assert!(
+            vocabulary.iter().any(|v| v == "Ledger"),
+            "on-screen vocabulary reaches ASR: {vocabulary:?}"
+        );
+        let a = words(1.0, "We keep the Ledger API on REST for the pilot.");
+        let b = words(9.0, "Ada will build the Orbit Queue this week.");
+        Ok(AsrOutput {
+            segments: vec![
+                AsrSegment {
+                    start_s: 1.0,
+                    end_s: a.last().map_or(1.0, |w| w.end_s),
+                    words: a,
+                },
+                AsrSegment {
+                    start_s: 9.0,
+                    end_s: b.last().map_or(9.0, |w| w.end_s),
+                    words: b,
+                },
+            ],
+            chunk_spans: vec![(0.0, 18.0)],
+            speech_regions: 2,
+            prompt_tokens: 4,
+            prompt_terms: vocabulary.to_vec(),
+            backend: "scripted".into(),
+        })
+    }
+}
+
+struct ScriptedDiarizer;
+
+impl DiarizeEngine for ScriptedDiarizer {
+    fn describe(&self) -> Value {
+        json!({"engine": "scripted-diarizer"})
+    }
+    fn diarize(&self, _samples: &[f32]) -> glassrip_audio::Result<Diarization> {
+        Ok(Diarization {
+            turns: vec![Turn::new(0.0, 8.0, 0), Turn::new(8.0, 18.0, 1)],
+            labels: vec!["SPEAKER_00".into(), "SPEAKER_01".into()],
+            talk_time_s: vec![8.0, 10.0],
+            num_clusters_raw: 2,
+            active_s: 18.0,
+            centroids: vec![None, None],
+        })
+    }
+}
+
+/// Text model answering every notes call with the same cited draft; logs the
+/// phase C model sequence.
+struct ScriptedText {
+    log: Mutex<Vec<String>>,
+    resident: Mutex<Vec<String>>,
+}
+
+impl ScriptedText {
+    fn new() -> Self {
+        Self {
+            log: Mutex::new(Vec::new()),
+            // The vision model is still loaded when phase C starts.
+            resident: Mutex::new(vec![VISION_MODEL.into()]),
+        }
+    }
+}
+
+#[async_trait]
+impl TextBackend for ScriptedText {
+    async fn chat(&self, model: &str, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("chat {model} {}", req.purpose));
+        let draft = json!({
+            "decisions": [{"text": "Keep the Ledger API on REST for the pilot",
+                           "segment_ids": ["seg_00000"], "event_ids": [], "keyframe_ids": [],
+                           "quote": "keep the Ledger API on REST"}],
+            "action_items": [{"owner": "Ada", "task": "Build the Orbit Queue this week",
+                              "segment_ids": ["seg_00001"], "event_ids": [], "keyframe_ids": [],
+                              "quote": "build the Orbit Queue this week"}],
+            "open_questions": [],
+            "timeline": [],
+            "summary": [{"text": "The team reviewed the ledger design",
+                         "segment_ids": ["seg_00000"], "event_ids": [], "keyframe_ids": []}]
+        });
+        Ok(ChatResponse {
+            content: draft.to_string(),
+            eval_count: Some(80),
+            done_reason: Some("stop".into()),
+            ..ChatResponse::default()
+        })
+    }
+    async fn load(&self, model: &str) -> Result<(), LlmError> {
+        self.log.lock().unwrap().push(format!("load {model}"));
+        self.resident.lock().unwrap().push(model.into());
+        Ok(())
+    }
+    async fn unload(&self, model: &str) -> Result<(), LlmError> {
+        self.log.lock().unwrap().push(format!("unload {model}"));
+        self.resident.lock().unwrap().retain(|m| m != model);
+        Ok(())
+    }
+    async fn loaded(&self) -> Result<Vec<LoadedModel>, LlmError> {
+        Ok(self
+            .resident
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|m| LoadedModel {
+                name: m.clone(),
+                size: 100,
+                size_vram: 100,
+                context_length: Some(16384),
+            })
+            .collect())
+    }
+    async fn digest(&self, _model: &str) -> Result<Option<String>, LlmError> {
+        Ok(Some("sha256:scripted-text".into()))
+    }
+}
+
+fn backends(raw: &Path, text: Arc<ScriptedText>) -> Backends {
+    let mut b = Backends::none("unused");
+    b.ocr = Ok(Arc::new(ScriptedOcr));
+    b.vision = Ok(VisionBackends {
+        backend: Arc::new(RecordingBackend::new(
+            Arc::new(ScriptedVision),
+            RawStore::new(raw),
+        )),
+        probe: Arc::new(StaticProbe),
+        model: VISION_MODEL.into(),
+        digest: Some("sha256:scripted-vision".into()),
+        server_version: None,
+        concurrency: 2,
+    });
+    b.text = Ok(text);
+    b.asr = Ok(Arc::new(ScriptedAsr));
+    b.diarize = Ok(Arc::new(ScriptedDiarizer));
+    b
+}
+
+fn options(video: PathBuf, out: PathBuf, workspace: &Path) -> MeetingOptions {
+    let mut config = Config::default();
+    config.frames.scale_width = W;
+    config.orient.override_rotation_deg = Some(0);
+    config.models.vision = VISION_MODEL.into();
+    config.models.text = TEXT_MODEL.into();
+    config.audio.speakers = Some(2);
+    let mut o = MeetingOptions::new(video, out, workspace, config);
+    o.participants = vec!["Ada Quill".into(), "Bo Tran".into()];
+    o.allow_model_download = false;
+    o
+}
+
+fn manifest(out: &Path) -> RunManifest {
+    serde_json::from_slice(&std::fs::read(out.join("run.lock.json")).unwrap()).unwrap()
+}
+
+fn items<T: serde::de::DeserializeOwned>(out: &Path, schema: &str) -> Vec<T> {
+    glassrip_core::jsonl::read::<Record<T>>(
+        &out.join("artifacts").join(format!("{schema}.jsonl")),
+        &SchemaReq::new(schema, 1),
+    )
+    .unwrap()
+    .items
+    .into_iter()
+    .filter_map(|r| r.outcome.result)
+    .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn meeting_mode_end_to_end_on_a_synthetic_video() {
+    if !ffmpeg_ok() {
+        eprintln!("SKIPPED: ffmpeg is not installed");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let video = root.join("weekly-sync.mp4");
+    make_video(&video, true);
+    let out = root.join("weekly-sync.glassrip");
+    let log = meeting::logging::init(&out).unwrap();
+
+    // ---- full run
+    let text = Arc::new(ScriptedText::new());
+    let opts = options(video.clone(), out.clone(), root);
+    let outcome = run_meeting(
+        &opts,
+        backends(&out.join(meeting::RAW_RESPONSES_DIR), Arc::clone(&text)),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(outcome.phase_b_concurrent);
+    for phase in ["media", "phase_a", "phase_b", "join", "phase_c", "render"] {
+        assert!(outcome.phase_wall_s.contains_key(phase), "{phase}");
+    }
+
+    // Every stage of the graph ran and wrote its artifact.
+    let m = manifest(&out);
+    for d in meeting_mode_stage_decls() {
+        let rec = m
+            .stages
+            .get(&d.name)
+            .unwrap_or_else(|| panic!("{} not in manifest", d.name));
+        assert_eq!(rec.status, StageStatus::Ok, "{}: {rec:?}", d.name);
+        assert!(
+            out.join("artifacts")
+                .join(format!("{}.jsonl", d.output))
+                .is_file(),
+            "{}",
+            d.output
+        );
+    }
+    assert!(m.inputs.iter().any(|i| i.path.ends_with("weekly-sync.mp4")));
+    assert!(m.tool_versions.contains_key("ffmpeg"));
+    assert!(m.commands.iter().any(|c| c.stage == "audio_extract"));
+
+    // run.log.jsonl holds structured events with stage spans.
+    let log_text = std::fs::read_to_string(&log).unwrap();
+    let events: Vec<Value> = log_text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert!(events
+        .iter()
+        .any(|e| e["fields"]["message"] == "stage finished"));
+
+    // Keyframes, screen types, board, transcript, speakers, notes.
+    let keyframes = std::fs::read_dir(out.join("frames/keyframes"))
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .is_ok_and(|e| e.path().extension().is_some_and(|x| x == "jpg"))
+        })
+        .count();
+    assert!(keyframes >= 2, "{keyframes} keyframe images");
+    let classes: Vec<Value> = items(&out, "glassrip.screen_class");
+    let types: Vec<&str> = classes
+        .iter()
+        .filter_map(|c| c["screen_type"].as_str())
+        .collect();
+    assert!(
+        types.contains(&"whiteboard") && types.contains(&"chat"),
+        "{types:?}"
+    );
+    let readings: Vec<Value> = items(&out, "glassrip.board_reading");
+    assert!(!readings.is_empty());
+    let boards: Vec<Value> = items(&out, "glassrip.board_state");
+    assert_eq!(boards.len(), 1, "one board");
+    let node_texts: Vec<&str> = boards[0]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n["text"].as_str())
+        .collect();
+    assert!(node_texts.contains(&"Ledger API"), "{node_texts:?}");
+    let transcript: Vec<glassrip_audio::types::TranscriptSegment> =
+        items(&out, "glassrip.transcript");
+    assert_eq!(transcript.len(), 2, "{transcript:?}");
+    assert_eq!(transcript[0].speaker_label, "SPEAKER_00");
+    assert_eq!(transcript[1].speaker_label, "SPEAKER_01");
+    assert!(transcript[0].text.contains("Ledger API"));
+    let notes: Vec<MeetingNotes> = items(&out, "glassrip.meeting_notes");
+    assert_eq!(notes.len(), 1);
+    assert!(
+        notes[0]
+            .decisions
+            .iter()
+            .any(|d| d.text.contains("Ledger API")),
+        "{:?}",
+        notes[0].decisions
+    );
+    // Phase C: the vision model is unloaded before the text model loads.
+    let calls = text.log.lock().unwrap().clone();
+    let unload = calls
+        .iter()
+        .position(|c| c == &format!("unload {VISION_MODEL}"));
+    let load = calls
+        .iter()
+        .position(|c| c == &format!("load {TEXT_MODEL}"));
+    assert!(
+        matches!((unload, load), (Some(u), Some(l)) if u < l),
+        "{calls:?}"
+    );
+
+    // Rendered outputs.
+    let md = out.join("weekly-sync-meeting-notes.md");
+    let svg = out.join("weekly-sync-architecture.svg");
+    let png = out.join("weekly-sync-architecture.png");
+    for p in [&md, &svg, &png] {
+        assert!(outcome.outputs.contains(p), "{} not reported", p.display());
+    }
+    let md_text = std::fs::read_to_string(&md).unwrap();
+    assert!(md_text.contains("Keep the Ledger API on REST"), "{md_text}");
+    let svg_text = std::fs::read_to_string(&svg).unwrap();
+    assert!(svg_text.trim_start().starts_with("<svg") || svg_text.starts_with("<?xml"));
+    assert!(svg_text.contains("Ledger API"));
+    let png_bytes = std::fs::read(&png).unwrap();
+    assert!(png_bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+    // Vision replies were recorded for offline replay.
+    assert!(out.join(meeting::RAW_RESPONSES_DIR).is_dir());
+
+    // ---- rerun: everything restores from cache except the forced render.
+    let rerun = run_meeting(
+        &opts,
+        backends(
+            &out.join(meeting::RAW_RESPONSES_DIR),
+            Arc::new(ScriptedText::new()),
+        ),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    for r in &rerun.reports {
+        let expected = if r.stage == "render" {
+            StageStatus::Ok
+        } else {
+            StageStatus::Cached
+        };
+        assert_eq!(r.status, expected, "{}", r.stage);
+    }
+
+    // ---- a video without an audio stream: empty transcript, board-only notes.
+    let silent = root.join("silent-board.mp4");
+    make_video(&silent, false);
+    let out2 = root.join("silent-board.glassrip");
+    let outcome2 = run_meeting(
+        &options(silent, out2.clone(), root),
+        backends(
+            &out2.join(meeting::RAW_RESPONSES_DIR),
+            Arc::new(ScriptedText::new()),
+        ),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let audio: Vec<Value> = items(&out2, "glassrip.audio");
+    assert_eq!(audio[0]["has_audio"], json!(false));
+    let empty: Vec<Value> = items(&out2, "glassrip.transcript");
+    assert!(
+        empty.is_empty(),
+        "no audio stream yields an empty transcript"
+    );
+    assert!(out2.join("artifacts/glassrip.transcript.jsonl").is_file());
+    assert!(outcome2
+        .outputs
+        .iter()
+        .any(|p| p.ends_with("silent-board-meeting-notes.md")));
+}
