@@ -125,12 +125,28 @@ pub fn order_quad(p: [[f64; 2]; 4]) -> Quad {
     ]
 }
 
-fn edge_support(edges: &GrayImage, q: &[[f64; 2]; 4], tol: u32) -> f64 {
+/// True when segment `a-b` lies along one frame border (within `slack` pixels).
+fn on_border(a: [f64; 2], b: [f64; 2], w: f64, h: f64, slack: f64) -> bool {
+    let near = |v: f64, edge: f64| (v - edge).abs() <= slack;
+    (near(a[0], 0.0) && near(b[0], 0.0))
+        || (near(a[1], 0.0) && near(b[1], 0.0))
+        || (near(a[0], w - 1.0) && near(b[0], w - 1.0))
+        || (near(a[1], h - 1.0) && near(b[1], h - 1.0))
+}
+
+/// Share of points along the quad's sides with a Canny edge nearby. Sides lying on the
+/// frame border (monitor running out of view) are not scored; `None` when every side is on
+/// the border (the frame itself).
+fn edge_support(edges: &GrayImage, q: &[[f64; 2]; 4], tol: u32) -> Option<f64> {
     let (w, h) = (edges.width() as i64, edges.height() as i64);
     let t = i64::from(tol);
+    let slack = f64::from(tol) + 2.0;
     let (mut hit, mut total) = (0usize, 0usize);
     for i in 0..4 {
         let (a, b) = (q[i], q[(i + 1) % 4]);
+        if on_border(a, b, w as f64, h as f64, slack) {
+            continue;
+        }
         let len = ((b[0] - a[0]).hypot(b[1] - a[1])).max(1.0);
         let steps = (len / 2.0).ceil() as usize;
         for s in 0..=steps {
@@ -156,11 +172,7 @@ fn edge_support(edges: &GrayImage, q: &[[f64; 2]; 4], tol: u32) -> f64 {
             }
         }
     }
-    if total == 0 {
-        0.0
-    } else {
-        hit as f64 / total as f64
-    }
+    (total > 0).then(|| hit as f64 / total as f64)
 }
 
 /// Detects the monitor quad in a full-resolution gray frame.
@@ -183,11 +195,21 @@ pub fn detect_quad(gray: &GrayImage, p: &QuadParams) -> Detection {
         small
     };
     let edges = imageproc::edges::canny(&blurred, p.canny_low, p.canny_high);
-    let closed = if p.close_radius > 0 {
+    let mut closed = if p.close_radius > 0 {
         imageproc::morphology::close(&edges, Norm::LInf, p.close_radius)
     } else {
         edges.clone()
     };
+    // Close regions against the frame border, so a monitor that runs out of view still
+    // yields a contour (its visible part).
+    for x in 0..ww {
+        closed.put_pixel(x, 0, image::Luma([255]));
+        closed.put_pixel(x, wh - 1, image::Luma([255]));
+    }
+    for y in 0..wh {
+        closed.put_pixel(0, y, image::Luma([255]));
+        closed.put_pixel(ww - 1, y, image::Luma([255]));
+    }
     let frame_area = f64::from(ww) * f64::from(wh);
     let mut best: Option<(f64, [[f64; 2]; 4], f64)> = None; // (area, quad, conf)
     let mut best_rejected = 0.0f64;
@@ -222,7 +244,9 @@ pub fn detect_quad(gray: &GrayImage, p: &QuadParams) -> Detection {
             continue;
         }
         let quad = order_quad([poly[0], poly[1], poly[2], poly[3]]);
-        let conf = edge_support(&edges, &quad, p.edge_tolerance_px);
+        let Some(conf) = edge_support(&edges, &quad, p.edge_tolerance_px) else {
+            continue;
+        };
         if conf < p.min_confidence {
             best_rejected = best_rejected.max(conf);
             continue;
@@ -271,7 +295,7 @@ impl Stage for ScreenQuadStage {
         "screen_quad"
     }
     fn version(&self) -> u32 {
-        1
+        2
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
@@ -362,6 +386,29 @@ pub(crate) mod tests {
                 "{got:?}"
             );
         }
+        assert!(d.confidence > 0.8, "{d:?}");
+    }
+
+    #[test]
+    fn finds_monitor_running_out_of_view() {
+        // Screen covers the top-right; only its left and bottom edges are visible.
+        let q = [
+            [400.0, -300.0],
+            [2400.0, -300.0],
+            [2400.0, 820.0],
+            [380.0, 780.0],
+        ];
+        let img = synthetic_screen(1920, 1080, q);
+        let d = detect_quad(&img, &QuadParams::default());
+        let got = d.quad.unwrap();
+        assert!(
+            (got[3][0] - 380.0).abs() < 15.0 && (got[3][1] - 780.0).abs() < 15.0,
+            "{got:?}"
+        );
+        assert!(
+            (got[2][1] - 820.0).abs() < 15.0 && got[2][0] > 1900.0,
+            "{got:?}"
+        );
         assert!(d.confidence > 0.8, "{d:?}");
     }
 
