@@ -9,10 +9,19 @@ use super::{
     ActionItem, Decision, DroppedItem, Evidence, OpenQuestion, QuestionSource, Quote, QuoteMatch,
     SummaryPoint, TimelineEntry,
 };
-use crate::board::{BoardState, StickyKind};
+use crate::board::{first_seen, BoardExt, BoardStateItem, KeyframeTimes, StickyKind};
 use crate::named::NamedLine;
 use crate::people::AliasTable;
-use crate::text::{content_tokens, jaccard, normalize, sanitize_dashes, tokens};
+use crate::text::{content_tokens, is_stopword, jaccard, normalize, sanitize_dashes, tokens};
+
+/// Most `...` elisions in one quote.
+pub const MAX_ELISIONS: usize = 2;
+/// Fewest words in a quote.
+pub const MIN_QUOTE_TOKENS: usize = 5;
+/// Fewest words in each part of an elided quote.
+pub const MIN_PART_TOKENS: usize = 3;
+/// Share of the matched transcript span the quote's words must cover.
+pub const MIN_QUOTE_COVERAGE: f64 = 0.6;
 
 /// One drafted item (fields depend on the section).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -198,7 +207,12 @@ pub struct Corpus {
 
 impl Corpus {
     /// Builds the corpus from named transcript lines and board states.
-    pub fn new(lines: &[NamedLine], boards: &[BoardState], table: AliasTable) -> Self {
+    pub fn new(
+        lines: &[NamedLine],
+        boards: &[BoardStateItem],
+        keyframes: &KeyframeTimes,
+        table: AliasTable,
+    ) -> Self {
         let mut segs: BTreeMap<String, SegText> = BTreeMap::new();
         for l in lines {
             let e = segs.entry(l.segment_id.clone()).or_insert_with(|| SegText {
@@ -222,13 +236,20 @@ impl Corpus {
             s.norm = normalize(&s.text);
             s.norm_raw = normalize(&s.text_raw);
         }
+        // citable board ids: events, and keyframes (times from glassrip.keyframes;
+        // an event's keyframe falls back to the event time)
         let mut times = BTreeMap::new();
         for b in boards {
             for e in &b.events {
                 times.insert(e.event_id.clone(), e.t_s);
+                times
+                    .entry(e.keyframe_id.clone())
+                    .or_insert(keyframes.get(&e.keyframe_id).unwrap_or(e.t_s));
             }
-            for k in &b.keyframes {
-                times.insert(k.keyframe_id.clone(), k.t_rep_s);
+            for k in &b.board_keyframes {
+                if let Some(t) = keyframes.get(k) {
+                    times.insert(k.clone(), t);
+                }
             }
         }
         Self { segs, times, table }
@@ -256,65 +277,94 @@ impl Corpus {
     }
 
     /// Finds a quote (with optional `...` elisions) in the cited segments.
-    fn find_quote(&self, quote: &str, cited: &[&str]) -> Option<(QuoteMatch, String)> {
-        let parts: Vec<String> = quote
+    /// Checks a quote (with optional `...` elisions) against the cited segments.
+    ///
+    /// A quote passes when it has at most [`MAX_ELISIONS`] elisions and at least
+    /// [`MIN_QUOTE_TOKENS`] tokens, every part has at least [`MIN_PART_TOKENS`]
+    /// tokens with one that is not a stopword, the parts appear in order in the
+    /// cited segments' verbatim text (else their corrected text), and the quote's
+    /// tokens cover at least [`MIN_QUOTE_COVERAGE`] of the transcript span they
+    /// match (elisions cannot skip most of what was said).
+    fn find_quote(&self, quote: &str, cited: &[&str]) -> Result<(QuoteMatch, String), String> {
+        let parts: Vec<Vec<String>> = quote
             .split("...")
             .flat_map(|p| p.split('\u{2026}'))
-            .map(normalize)
+            .map(tokens)
             .filter(|p| !p.is_empty())
             .collect();
-        if parts.is_empty() {
-            return None;
+        if parts.len() > MAX_ELISIONS + 1 {
+            return Err(format!("quote has more than {MAX_ELISIONS} elisions"));
+        }
+        let total: usize = parts.iter().map(Vec::len).sum();
+        if total < MIN_QUOTE_TOKENS {
+            return Err(format!("quote is shorter than {MIN_QUOTE_TOKENS} words"));
+        }
+        if parts
+            .iter()
+            .any(|p| p.len() < MIN_PART_TOKENS || p.iter().all(|t| is_stopword(t)))
+        {
+            return Err(format!(
+                "each quoted part needs {MIN_PART_TOKENS} or more words, not only common words"
+            ));
         }
         let mut segs: Vec<(&str, &SegText)> = cited
             .iter()
             .filter_map(|id| self.segs.get(*id).map(|s| (*id, s)))
             .collect();
         segs.sort_by(|a, b| a.1.start_s.total_cmp(&b.1.start_s));
-        let contains_in_order = |hay: &str| {
-            let hay = format!(" {hay} ");
-            let mut pos = 0;
-            for p in &parts {
-                let needle = format!(" {p} ");
-                match hay.get(pos..).and_then(|h| h.find(&needle)) {
-                    Some(i) => pos += i + needle.len() - 1,
-                    None => return false,
-                }
-            }
-            true
-        };
-        let first_part = parts.first().cloned().unwrap_or_default();
-        let owner = |raw: bool| -> String {
-            segs.iter()
-                .find(|(_, s)| {
-                    format!(" {} ", if raw { &s.norm_raw } else { &s.norm })
-                        .contains(&format!(" {first_part} "))
-                })
-                .or(segs.first())
-                .map(|(id, _)| (*id).to_string())
-                .unwrap_or_default()
-        };
+        let mut best_coverage = 0.0f64;
         for (raw, kind) in [(true, QuoteMatch::Raw), (false, QuoteMatch::Corrected)] {
-            let pick = |s: &SegText| {
-                if raw {
-                    s.norm_raw.clone()
-                } else {
-                    s.norm.clone()
-                }
-            };
-            if segs.iter().any(|(_, s)| contains_in_order(&pick(s))) {
-                return Some((kind, owner(raw)));
-            }
-            let joined = segs
+            // tokens of the cited segments in time order, with their segment
+            let hay: Vec<(&str, &str)> = segs
                 .iter()
-                .map(|(_, s)| pick(s))
-                .collect::<Vec<_>>()
-                .join(" ");
-            if contains_in_order(&joined) {
-                return Some((kind, owner(raw)));
+                .flat_map(|(id, s)| {
+                    let t = if raw { &s.norm_raw } else { &s.norm };
+                    t.split(' ')
+                        .filter(|w| !w.is_empty())
+                        .map(move |w| (*id, w))
+                })
+                .collect();
+            let at = |i: usize, part: &[String]| {
+                part.iter()
+                    .enumerate()
+                    .all(|(k, t)| hay.get(i + k).is_some_and(|h| h.1 == t))
+            };
+            let mut best: Option<(usize, usize)> = None;
+            for start in 0..hay.len() {
+                if !at(start, &parts[0]) {
+                    continue;
+                }
+                let mut pos = start + parts[0].len();
+                let mut ok = true;
+                for part in &parts[1..] {
+                    match (pos..hay.len()).find(|i| at(*i, part)) {
+                        Some(i) => pos = i + part.len(),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok && best.is_none_or(|(a, b)| pos - start < b - a) {
+                    best = Some((start, pos));
+                }
+            }
+            if let Some((a, b)) = best {
+                let coverage = total as f64 / (b - a) as f64;
+                if coverage >= MIN_QUOTE_COVERAGE {
+                    return Ok((kind, hay[a].0.to_string()));
+                }
+                best_coverage = best_coverage.max(coverage);
             }
         }
-        None
+        if best_coverage > 0.0 {
+            Err(format!(
+                "quote elides too much: it covers {:.0}% of the words it spans",
+                best_coverage * 100.0
+            ))
+        } else {
+            Err(format!("quote \"{quote}\" is not in the cited segments"))
+        }
     }
 }
 
@@ -662,14 +712,14 @@ pub fn check(section: Section, item: &DraftItem, corpus: &Corpus) -> Result<Chec
     if !q.is_empty() && reasons.is_empty() {
         let cited: Vec<&str> = evidence.segment_ids.iter().map(String::as_str).collect();
         match corpus.find_quote(&q, &cited) {
-            Some((matched, segment_id)) => {
+            Ok((matched, segment_id)) => {
                 quote = Some(Quote {
                     text: q,
                     segment_id,
                     matched,
                 })
             }
-            None => reasons.push(format!("quote \"{q}\" is not in the cited segments")),
+            Err(why) => reasons.push(why),
         }
     }
     if !reasons.is_empty() {
@@ -818,24 +868,18 @@ pub fn assemble(checked: Vec<Checked>) -> Sections {
 const BOARD_MERGE_JACCARD: f64 = 0.3;
 
 /// Merges question stickies into the open questions. Returns how many were added.
-pub fn merge_board_questions(qs: &mut Vec<OpenQuestion>, boards: &[BoardState]) -> usize {
+pub fn merge_board_questions(qs: &mut Vec<OpenQuestion>, boards: &[BoardStateItem]) -> usize {
     let mut added = 0;
     for b in boards {
-        for s in b
-            .stickies
-            .iter()
-            .filter(|s| s.effective_kind() == StickyKind::Question)
-        {
-            let events: Vec<String> = b
-                .events
-                .iter()
-                .filter(|e| e.refs.iter().any(|r| r == &s.sticky_id))
-                .map(|e| e.event_id.clone())
-                .collect();
+        for s in b.stickies.iter().filter(|s| s.kind == StickyKind::Question) {
+            let events = b.events_of(&s.id);
+            let mut keyframe_ids: Vec<String> =
+                events.iter().map(|e| e.keyframe_id.clone()).collect();
+            keyframe_ids.dedup();
             let ev = Evidence {
                 segment_ids: vec![],
-                event_ids: events,
-                keyframe_ids: s.keyframe_ids.clone(),
+                event_ids: events.iter().map(|e| e.event_id.clone()).collect(),
+                keyframe_ids,
             };
             let toks = content_tokens(&s.text);
             let cites_sticky = |q: &OpenQuestion| {
@@ -863,7 +907,7 @@ pub fn merge_board_questions(qs: &mut Vec<OpenQuestion>, boards: &[BoardState]) 
                         id: String::new(),
                         text: sanitize_dashes(s.text.trim()),
                         source: QuestionSource::Board,
-                        t_s: Some(s.first_seen_s),
+                        t_s: Some(first_seen(&s.lifetimes)),
                         evidence: ev,
                         quote: None,
                     });
@@ -935,6 +979,7 @@ mod tests {
         Corpus::new(
             &lines,
             &[],
+            &KeyframeTimes::default(),
             AliasTable::from_names(&["Avery Quinn", "Rohan Dasgupta"]),
         )
     }
@@ -956,7 +1001,7 @@ mod tests {
             &item(
                 "Skip the ledger step for now",
                 &["s1"],
-                "skip the Ledger Lee step",
+                "skip the Ledger Lee step for",
             ),
             &c,
         )
@@ -967,7 +1012,7 @@ mod tests {
             &item(
                 "Skip the ledger step for now",
                 &["s1"],
-                "skip the Ledgerly step",
+                "skip the Ledgerly step for now",
             ),
             &c,
         )
@@ -986,11 +1031,74 @@ mod tests {
         assert_eq!((ok.t_start_s, ok.t_end_s), (10.0, 17.0));
         let err = check(
             Section::Decisions,
-            &item("Skip the ledger step", &["s2"], "skip the Ledgerly step"),
+            &item(
+                "Skip the ledger step",
+                &["s2"],
+                "skip the Ledgerly step for now",
+            ),
             &c,
         )
         .unwrap_err();
         assert!(err.reasons[0].contains("not in the cited segments"));
+    }
+
+    #[test]
+    fn elided_quotes_cannot_launder_common_words() {
+        let mut lines = vec![line(
+            "s9",
+            100.0,
+            "We should move the relay config into the ledger service so that the kiosk team can ship the badge printer changes next month without waiting on us to review it.",
+            "We should move the relay config into the ledger service so that the kiosk team can ship the badge printer changes next month without waiting on us to review it.",
+        )];
+        lines.push(line(
+            "s1",
+            10.0,
+            "Let's skip the Ledgerly step for now.",
+            "Let's skip the Ledger Lee step for now.",
+        ));
+        let c = Corpus::new(
+            &lines,
+            &[],
+            &KeyframeTimes::default(),
+            AliasTable::from_names(&["Avery Quinn"]),
+        );
+        let fails = |quote: &str, why: &str| {
+            let e = check(
+                Section::Decisions,
+                &item("Move the relay config into the ledger", &["s9"], quote),
+                &c,
+            )
+            .unwrap_err();
+            assert!(
+                e.reasons.iter().any(|r| r.contains(why)),
+                "{quote}: {:?}",
+                e.reasons
+            );
+        };
+        // stopword-only parts
+        fails("we ... the ... to", "words");
+        fails("we should ... the ... to us", "words");
+        // too many elisions
+        fails(
+            "we should move ... relay config into ... ledger service so ... kiosk team can",
+            "elisions",
+        );
+        // too short overall
+        fails("relay config into", "shorter than");
+        // elision skips most of the segment
+        fails("we should move ... on us to review it", "elides too much");
+        // a real quote with one short elision passes
+        let ok = check(
+            Section::Decisions,
+            &item(
+                "Move the relay config into the ledger",
+                &["s9"],
+                "move the relay config ... the ledger service",
+            ),
+            &c,
+        )
+        .unwrap();
+        assert_eq!(ok.quote.unwrap().segment_id, "s9");
     }
 
     #[test]
@@ -1061,18 +1169,25 @@ mod tests {
         let mut s = assemble(vec![a, b]);
         assert_eq!(s.open_questions.len(), 1);
         assert_eq!(s.open_questions[0].evidence.segment_ids, vec!["s1", "s2"]);
-        let board: BoardState = serde_json::from_value(serde_json::json!({
-            "board_id": "b", "final_t_s": 90.0, "nodes": [], "edges": [],
-            "stickies": [
-                {"sticky_id": "st1", "text": "What widgets do we need for the kiosk?", "first_seen_s": 5.0, "keyframe_ids": ["kf_1"]},
-                {"sticky_id": "st2", "text": "Do we change the badge flow?", "first_seen_s": 40.0, "keyframe_ids": ["kf_2"]},
-                {"sticky_id": "st3", "text": "Clone the lobby page", "first_seen_s": 41.0}
-            ],
-            "keyframes": [{"keyframe_id": "kf_1", "t_rep_s": 5.0}, {"keyframe_id": "kf_2", "t_rep_s": 40.0}]
-        }))
-        .unwrap();
+        use crate::board::build;
+        let mut board = build::board("b", 90.0);
+        board.stickies = vec![
+            build::sticky("st1", "What widgets do we need for the kiosk?", 5.0, 90.0),
+            build::sticky("st2", "Do we change the badge flow?", 40.0, 90.0),
+            build::sticky("st3", "Clone the lobby page", 41.0, 90.0),
+        ];
+        board.events = vec![build::event(
+            "ev_1",
+            crate::board::EventKind::StickyAdded,
+            40.0,
+            "kf_2",
+            "st2",
+            "Do we change the badge flow?",
+        )];
         let added = merge_board_questions(&mut s.open_questions, &[board]);
         assert_eq!(added, 1);
+        assert_eq!(s.open_questions[1].evidence.event_ids, vec!["ev_1"]);
+        assert_eq!(s.open_questions[1].evidence.keyframe_ids, vec!["kf_2"]);
         assert_eq!(
             s.open_questions[0].source,
             QuestionSource::BoardAndTranscript

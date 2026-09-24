@@ -33,26 +33,10 @@ use std::collections::BTreeMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-pub use crate::people::Person;
+pub use glassrip_audio::types::{
+    Evidence, EvidenceKind, Person, SpeakerItem, SpeakerStatus, SpeakersArtifact, SpeakersParams,
+};
 pub use stage::{NameSpeakersParams, NameSpeakersStage};
-
-/// Kind of evidence behind a vote.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum CueKind {
-    /// The participant's tile carried the speaking ring.
-    ActiveSpeakerHighlight,
-    /// No visible tile was lit and this participant had no visible tile.
-    AbsentTile,
-    /// The segment answers a direct address to this participant.
-    AddressResponse,
-    /// The segment addresses this participant by name, so it is not theirs (negative).
-    AddressedNotSpeaker,
-    /// Presenter banner plus the largest talk time.
-    RoleCue,
-}
 
 /// One on-screen participant tile in a frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -105,59 +89,6 @@ impl FrameObservation {
         v.dedup();
         v
     }
-}
-
-/// One piece of evidence recorded on a label.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct LabelEvidence {
-    /// Time, seconds.
-    pub t_s: f64,
-    /// Kind.
-    pub kind: CueKind,
-    /// Participant the evidence is about.
-    pub person_id: String,
-    /// Signed vote weight.
-    pub weight: f64,
-    /// Segment the evidence came from.
-    #[serde(default)]
-    pub segment_id: Option<String>,
-    /// Supporting text (transcript words or tile text).
-    pub text: String,
-}
-
-/// Resolution status of a label.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum LabelStatus {
-    /// Mapped to a participant.
-    Mapped,
-    /// Not a participant (noise, system audio, a stray cluster of a few words).
-    Noise,
-    /// Not resolved.
-    Unresolved,
-}
-
-/// One diarization label.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct LabelItem {
-    /// Diarization label.
-    pub label: String,
-    /// Resolution status.
-    pub status: LabelStatus,
-    /// Mapped participant.
-    pub person_id: Option<String>,
-    /// Confidence of the mapping in [0, 1].
-    pub confidence: f32,
-    /// Summed vote per participant.
-    pub votes: BTreeMap<String, f64>,
-    /// Strongest evidence items (at most 40, by absolute weight).
-    pub evidence: Vec<LabelEvidence>,
-    /// Evidence items in total.
-    pub evidence_total: usize,
-    /// Speaking time of the label, seconds.
-    pub talk_time_s: f64,
-    /// Part of the talk time from gap-filled words, seconds.
-    pub talk_time_gap_fill_s: f64,
 }
 
 /// Where a segment's speaker came from.
@@ -275,7 +206,7 @@ pub enum SpeakersRecord {
     /// A participant (`person:<id>`).
     Person(Person),
     /// A diarization label (`label:<label>`).
-    Label(LabelItem),
+    Label(SpeakerItem),
     /// A transcript segment (`segment:<segment_id>`).
     Segment(SegmentSpeaker),
     /// Run summary (`summary`).
@@ -288,7 +219,7 @@ pub struct SpeakersDoc {
     /// Participants.
     pub people: Vec<Person>,
     /// Labels.
-    pub labels: Vec<LabelItem>,
+    pub labels: Vec<SpeakerItem>,
     /// Segments by id.
     pub segments: BTreeMap<String, SegmentSpeaker>,
     /// Summary.
@@ -319,5 +250,110 @@ impl SpeakersDoc {
             .iter()
             .find(|p| p.person_id == person_id)
             .map(|p| p.display_name.as_str())
+    }
+
+    /// Reads the audio crate's whole-file `glassrip.speakers` envelope (labels and
+    /// people; it carries no per-segment decisions).
+    pub fn from_artifact(a: &SpeakersArtifact) -> Self {
+        let mut d = Self {
+            people: a.people.clone(),
+            labels: a.envelope.items.clone(),
+            ..Self::default()
+        };
+        d.labels.sort_by(|x, y| x.label.cmp(&y.label));
+        if let Some(n) = &a.notes {
+            d.summary = Some(SpeakersSummary {
+                method: a.envelope.params.method.clone(),
+                frames_decoded: 0,
+                frames_failed: 0,
+                frames_with_tiles: 0,
+                frames_with_highlight: 0,
+                relabeled_segments: 0,
+                presenter: None,
+                gap_fill: GapFillCheck::default(),
+                notes: Some(n.clone()),
+            });
+        }
+        d
+    }
+
+    /// Writes the labels and people as the audio crate's whole-file envelope.
+    pub fn to_artifact(&self, run_id: &str) -> SpeakersArtifact {
+        use glassrip_audio::types::{Envelope, Producer, SCHEMA_VERSION, SPEAKERS_SCHEMA};
+        let summary = self.summary.as_ref();
+        SpeakersArtifact {
+            envelope: Envelope {
+                schema: SPEAKERS_SCHEMA.into(),
+                schema_version: SCHEMA_VERSION.into(),
+                run_id: run_id.into(),
+                producer: Producer::current(),
+                inputs: vec![],
+                params: SpeakersParams {
+                    method: summary.map(|s| s.method.clone()).unwrap_or_default(),
+                    num_speakers_requested: None,
+                    num_clusters_raw: self.labels.len(),
+                    num_speakers_found: self
+                        .labels
+                        .iter()
+                        .filter(|l| l.status == SpeakerStatus::Mapped)
+                        .count(),
+                },
+                items: self.labels.clone(),
+            },
+            people: self.people.clone(),
+            notes: summary.and_then(|s| s.notes.clone()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trips_through_the_audio_envelope() {
+        let doc = SpeakersDoc {
+            people: vec![Person {
+                person_id: "avery-quinn".into(),
+                display_name: "Avery Quinn".into(),
+                aliases: vec!["Avery".into()],
+            }],
+            labels: vec![SpeakerItem {
+                label: "SPEAKER_00".into(),
+                status: SpeakerStatus::Mapped,
+                person_id: Some("avery-quinn".into()),
+                confidence: 0.8,
+                evidence: vec![Evidence {
+                    t_s: 3.0,
+                    kind: EvidenceKind::AbsentTile,
+                    text: "no tile lit".into(),
+                    person_id: Some("avery-quinn".into()),
+                    weight: Some(0.4),
+                    segment_id: Some("seg_00001".into()),
+                }],
+                talk_time_s: 12.0,
+                talk_time_gap_fill_s: 1.0,
+                words_diarizer: 30,
+                words_gap_fill: 3,
+                words_unassigned: 0,
+                votes: [("avery-quinn".to_string(), 0.4)].into_iter().collect(),
+                evidence_total: 1,
+            }],
+            ..SpeakersDoc::default()
+        };
+        let art = doc.to_artifact("r1");
+        let v = serde_json::to_value(&art).unwrap();
+        assert_eq!(v["schema"], "glassrip.speakers");
+        assert_eq!(v["people"][0]["display_name"], "Avery Quinn");
+        assert_eq!(v["items"][0]["evidence"][0]["kind"], "absent_tile");
+        let back: SpeakersArtifact = serde_json::from_value(v).unwrap();
+        let again = SpeakersDoc::from_artifact(&back);
+        assert_eq!(again.labels, doc.labels);
+        assert_eq!(again.people, doc.people);
+        // a label record in the JSONL artifact is the audio SpeakerItem plus a kind tag
+        let rec = serde_json::to_value(SpeakersRecord::Label(doc.labels[0].clone())).unwrap();
+        assert_eq!(rec["kind"], "label");
+        let item: SpeakerItem = serde_json::from_value(rec).unwrap();
+        assert_eq!(item, doc.labels[0]);
     }
 }

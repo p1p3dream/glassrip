@@ -109,6 +109,8 @@ pub struct OllamaTextConfig {
     pub request_timeout_s: u64,
     /// Attempts per request, including the first.
     pub max_attempts: u32,
+    /// Longest `Retry-After` wait honored, seconds.
+    pub max_retry_after_s: u64,
 }
 
 impl Default for OllamaTextConfig {
@@ -121,6 +123,7 @@ impl Default for OllamaTextConfig {
             seed: 42,
             request_timeout_s: 900,
             max_attempts: 4,
+            max_retry_after_s: 120,
         }
     }
 }
@@ -133,7 +136,8 @@ pub struct OllamaText {
 }
 
 enum Attempt {
-    Retry(LlmError),
+    /// Retryable, with the server's `Retry-After` when it sent one.
+    Retry(LlmError, Option<Duration>),
     Fatal(LlmError),
 }
 
@@ -163,12 +167,17 @@ impl OllamaText {
             let resp = rb
                 .send()
                 .await
-                .map_err(|e| Attempt::Retry(LlmError::Transport(e.to_string())))?;
+                .map_err(|e| Attempt::Retry(LlmError::Transport(e.to_string()), None))?;
             let status = resp.status();
+            let retry_after = glassrip_vision::ollama::parse_retry_after(
+                resp.headers(),
+                std::time::SystemTime::now(),
+            )
+            .map(|d| d.min(Duration::from_secs(self.cfg.max_retry_after_s)));
             let text = resp
                 .text()
                 .await
-                .map_err(|e| Attempt::Retry(LlmError::Transport(e.to_string())))?;
+                .map_err(|e| Attempt::Retry(LlmError::Transport(e.to_string()), None))?;
             if status.is_success() {
                 return serde_json::from_str::<Value>(&text)
                     .map_err(|e| Attempt::Fatal(LlmError::Protocol(format!("{path}: {e}"))));
@@ -178,7 +187,7 @@ impl OllamaText {
                 body: text.chars().take(500).collect(),
             };
             if status.is_server_error() || status.as_u16() == 429 {
-                Err(Attempt::Retry(err))
+                Err(Attempt::Retry(err, retry_after))
             } else {
                 Err(Attempt::Fatal(err))
             }
@@ -188,11 +197,17 @@ impl OllamaText {
             .with_max_delay(Duration::from_secs(20))
             .with_max_times(self.cfg.max_attempts.saturating_sub(1) as usize)
             .with_jitter();
+        // same rule as glassrip-vision: wait at least what the server asks for
         once.retry(backoff)
-            .when(|e| matches!(e, Attempt::Retry(_)))
+            .sleep(tokio::time::sleep)
+            .when(|e| matches!(e, Attempt::Retry(..)))
+            .adjust(|e: &Attempt, next: Option<Duration>| match (next, e) {
+                (Some(d), Attempt::Retry(_, Some(ra))) => Some(d.max(*ra)),
+                (next, _) => next,
+            })
             .await
             .map_err(|e| match e {
-                Attempt::Retry(e) | Attempt::Fatal(e) => e,
+                Attempt::Retry(e, _) | Attempt::Fatal(e) => e,
             })
     }
 }
@@ -323,4 +338,46 @@ pub fn same_model(a: &str, b: &str) -> bool {
         }
     };
     norm(a) == norm(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serves `responses` in order, one per connection.
+    async fn stub(responses: Vec<&'static str>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for r in responses {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                sock.write_all(r.as_bytes()).await.unwrap();
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn too_many_requests_waits_for_retry_after() {
+        let busy = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbusy";
+        let ok = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"models\":[]}";
+        let base_url = stub(vec![busy, ok]).await;
+        let c = OllamaText::new(OllamaTextConfig {
+            base_url,
+            ..OllamaTextConfig::default()
+        })
+        .unwrap();
+        let t0 = std::time::Instant::now();
+        let loaded = c.loaded().await.unwrap();
+        assert!(loaded.is_empty());
+        assert!(
+            t0.elapsed() >= Duration::from_millis(990),
+            "waited only {:?}",
+            t0.elapsed()
+        );
+    }
 }

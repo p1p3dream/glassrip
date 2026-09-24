@@ -19,6 +19,8 @@ async-trait = "0.1"
 backon = "1.6"
 glassrip-audio = { path = "../glassrip-audio" }
 glassrip-core = { path = "../glassrip-core" }
+glassrip-meeting = { path = "../glassrip-meeting" }
+glassrip-vision = { path = "../glassrip-vision" }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 ndarray = { version = "0.17", optional = true }
 ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = ["std", "ndarray", "load-dynamic", "api-27"] }
@@ -35,7 +37,7 @@ tracing = "0.1"
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }
 tempfile = "3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 tokio-util = "0.7"
 
 [lints.clippy]

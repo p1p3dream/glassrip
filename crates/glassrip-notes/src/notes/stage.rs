@@ -20,12 +20,17 @@ use super::prompt::{
 use super::validate::{
     assemble, check, dropped, merge_board_questions, Checked, Corpus, Draft, Section,
 };
-use super::{CallRecord, Caveat, MeetingNotes, NotesReport, NotesStatus, SpeakerLine};
-use crate::board::BoardState;
+use super::{
+    CallRecord, Caveat, Evidence, MeetingNotes, NotesReport, NotesStatus, SpeakerLine,
+    SummaryPoint, TimelineEntry,
+};
+use crate::board::{
+    event_text, BoardExt, BoardStateItem, KeyframeTimes, KeyframeView, KEYFRAMES_MAJOR,
+};
 use crate::named::{named_lines, paragraphs, NamedLine};
 use crate::people::AliasTable;
 use crate::schemas;
-use crate::speakers::{LabelStatus, SpeakersDoc, SpeakersRecord};
+use crate::speakers::{SpeakerStatus, SpeakersDoc, SpeakersRecord};
 use crate::text::{mmss, sanitize_dashes};
 
 /// Parameters of `notes`.
@@ -86,7 +91,8 @@ impl Default for NotesParams {
 #[derive(Debug)]
 pub struct NotesInput {
     segments: Vec<TranscriptSegment>,
-    boards: Vec<BoardState>,
+    boards: Vec<BoardStateItem>,
+    keyframes: KeyframeTimes,
     speakers: SpeakersDoc,
 }
 
@@ -204,7 +210,8 @@ impl NotesStage {
         let doc = &input.speakers;
         let lines = named_lines(&input.segments, doc);
         if lines.is_empty() {
-            return Err(ErrorInfo::new(ErrorCode::InvalidInput, "empty transcript"));
+            // no audio stream (or no speech): notes from the board alone
+            return Ok(self.board_only(input, started));
         }
         let mut table = AliasTable::default();
         for person in &doc.people {
@@ -214,8 +221,8 @@ impl NotesStage {
             }
         }
         let people = table.people().to_vec();
-        let corpus = Corpus::new(&lines, &input.boards, table);
-        let digest = board_digest(&input.boards, &people);
+        let corpus = Corpus::new(&lines, &input.boards, &input.keyframes, table);
+        let digest = board_digest(&input.boards, &input.keyframes);
 
         let placement = self.enter_phase_c().await?;
         let model_digest = self.backend.digest(&p.text_model).await.ok().flatten();
@@ -317,7 +324,12 @@ impl NotesStage {
         let mut sections = assemble(checked);
         let board_added = merge_board_questions(&mut sections.open_questions, &input.boards);
 
-        let duration_s = input.segments.iter().map(|s| s.end_s).fold(0.0, f64::max);
+        let duration_s = input
+            .segments
+            .iter()
+            .map(|s| s.end_s)
+            .chain(input.boards.iter().map(|b| b.end_s()))
+            .fold(0.0, f64::max);
         let drafted = draft.len();
         let drop_rate = dropped_items.len() as f64 / drafted.max(1) as f64;
         let mut alarm = Vec::new();
@@ -364,13 +376,13 @@ impl NotesStage {
                     .and_then(|pid| doc.display_name(pid))
                     .map(str::to_string)
                     .unwrap_or_else(|| match l.status {
-                        LabelStatus::Noise => "noise".into(),
+                        SpeakerStatus::Noise => "noise".into(),
                         _ => "unresolved".into(),
                     }),
                 status: match l.status {
-                    LabelStatus::Mapped => "mapped",
-                    LabelStatus::Noise => "noise",
-                    LabelStatus::Unresolved => "unresolved",
+                    SpeakerStatus::Mapped => "mapped",
+                    SpeakerStatus::Noise => "noise",
+                    SpeakerStatus::Unresolved => "unresolved",
                 }
                 .into(),
                 confidence: l.confidence,
@@ -393,10 +405,7 @@ impl NotesStage {
             + sections.timeline.len()
             + sections.summary.len();
         Ok(MeetingNotes {
-            title: p
-                .title
-                .clone()
-                .or_else(|| input.boards.iter().find_map(|b| b.title.clone())),
+            title: p.title.clone(),
             duration_s,
             people,
             presenter,
@@ -428,12 +437,172 @@ impl NotesStage {
     }
 }
 
+impl NotesStage {
+    /// Notes from the board alone (no audio stream, or a transcript with no
+    /// words). No model is called: the timeline, summary and open questions come
+    /// from the board state, and a visible caveat says why the transcript-based
+    /// sections are empty.
+    fn board_only(&self, input: &NotesInput, started: Instant) -> MeetingNotes {
+        let p = &self.params;
+        let mut timeline: Vec<TimelineEntry> = Vec::new();
+        let mut summary: Vec<SummaryPoint> = Vec::new();
+        for b in &input.boards {
+            // one timeline entry per keyframe with changes
+            let mut by_kf: Vec<(String, Vec<&crate::board::BoardEvent>)> = Vec::new();
+            let mut events: Vec<&crate::board::BoardEvent> =
+                b.events.iter().filter(|e| !e.baseline).collect();
+            events.sort_by(|x, y| x.t_s.total_cmp(&y.t_s));
+            for e in events {
+                match by_kf.last_mut() {
+                    Some((k, v)) if *k == e.keyframe_id => v.push(e),
+                    _ => by_kf.push((e.keyframe_id.clone(), vec![e])),
+                }
+            }
+            for (kf, evs) in by_kf {
+                let mut texts: Vec<String> = evs.iter().take(4).map(|e| event_text(e)).collect();
+                if evs.len() > 4 {
+                    texts.push(format!("and {} more changes", evs.len() - 4));
+                }
+                let t = evs.first().map_or(0.0, |e| e.t_s);
+                timeline.push(TimelineEntry {
+                    id: String::new(),
+                    t_start_s: t,
+                    t_end_s: t,
+                    text: sanitize_dashes(&texts.join("; ")),
+                    evidence: Evidence {
+                        segment_ids: vec![],
+                        event_ids: evs.iter().map(|e| e.event_id.clone()).collect(),
+                        keyframe_ids: vec![kf],
+                    },
+                });
+            }
+            let final_kfs: Vec<String> = b
+                .final_window
+                .as_ref()
+                .map(|w| w.keyframe_ids.clone())
+                .filter(|v| !v.is_empty())
+                .or_else(|| b.board_keyframes.last().map(|k| vec![k.clone()]))
+                .unwrap_or_default();
+            let end = b.end_s();
+            let nodes = b.final_nodes();
+            if !nodes.is_empty() {
+                let names: Vec<&str> = nodes.iter().map(|n| n.text.as_str()).collect();
+                summary.push(SummaryPoint {
+                    id: String::new(),
+                    text: sanitize_dashes(&format!(
+                        "The final board shows {} components: {}",
+                        names.len(),
+                        names.join(", ")
+                    )),
+                    t_start_s: end,
+                    t_end_s: end,
+                    evidence: Evidence {
+                        segment_ids: vec![],
+                        event_ids: vec![],
+                        keyframe_ids: final_kfs.clone(),
+                    },
+                });
+            }
+            let owners = b.current_owners();
+            if !owners.is_empty() {
+                let list: Vec<String> = owners
+                    .iter()
+                    .map(|o| {
+                        format!(
+                            "{} on {}",
+                            o.display_name,
+                            crate::board::target_text(&o.target)
+                        )
+                    })
+                    .collect();
+                let event_ids: Vec<String> = b
+                    .events
+                    .iter()
+                    .filter(|e| {
+                        matches!(
+                            e.kind,
+                            crate::board::EventKind::OwnerAssigned
+                                | crate::board::EventKind::OwnerMoved
+                        )
+                    })
+                    .map(|e| e.event_id.clone())
+                    .collect();
+                summary.push(SummaryPoint {
+                    id: String::new(),
+                    text: sanitize_dashes(&format!(
+                        "Owners on the board at the end: {}",
+                        list.join("; ")
+                    )),
+                    t_start_s: end,
+                    t_end_s: end,
+                    evidence: Evidence {
+                        segment_ids: vec![],
+                        event_ids,
+                        keyframe_ids: final_kfs.clone(),
+                    },
+                });
+            }
+        }
+        timeline.sort_by(|a, b| a.t_start_s.total_cmp(&b.t_start_s));
+        for (i, t) in timeline.iter_mut().enumerate() {
+            t.id = format!("t{}", i + 1);
+        }
+        for (i, s) in summary.iter_mut().enumerate() {
+            s.id = format!("s{}", i + 1);
+        }
+        let mut open_questions = Vec::new();
+        let added = merge_board_questions(&mut open_questions, &input.boards);
+        let duration_s = input.boards.iter().map(|b| b.end_s()).fold(0.0, f64::max);
+        let mut caveats = vec![Caveat {
+            kind: "no_audio".into(),
+            text: "No speech was transcribed (the recording has no audio stream or no words were recognized). These notes come from the whiteboard only: decisions, action items and the transcript are not available.".into(),
+        }];
+        if input.boards.is_empty() {
+            caveats.push(Caveat {
+                kind: "no_board".into(),
+                text: "No whiteboard was read either, so these notes are empty.".into(),
+            });
+        }
+        let items_kept = timeline.len() + summary.len() + open_questions.len();
+        MeetingNotes {
+            title: p.title.clone(),
+            duration_s,
+            people: input.speakers.people.clone(),
+            presenter: None,
+            summary,
+            decisions: vec![],
+            action_items: vec![],
+            open_questions,
+            timeline,
+            caveats,
+            speakers: vec![],
+            transcript: vec![],
+            report: NotesReport {
+                status: NotesStatus::Ok,
+                model: p.text_model.clone(),
+                model_digest: None,
+                windows: 0,
+                calls: vec![],
+                items_drafted: added,
+                items_kept,
+                items_failed_first_pass: 0,
+                items_repaired: 0,
+                dropped: vec![],
+                drop_rate: 0.0,
+                placement: None,
+                unloaded_vision_model: None,
+                wall_s: started.elapsed().as_secs_f64(),
+            },
+        }
+    }
+}
+
 /// Caveats computed from the inputs (never from model text).
 fn caveats(
     segments: &[TranscriptSegment],
     lines: &[NamedLine],
     doc: &SpeakersDoc,
-    boards: &[BoardState],
+    boards: &[BoardStateItem],
     p: &NotesParams,
     alarm: &[String],
     dropped: usize,
@@ -451,7 +620,7 @@ fn caveats(
     let unresolved: Vec<String> = doc
         .labels
         .iter()
-        .filter(|l| l.status != LabelStatus::Mapped)
+        .filter(|l| l.status != SpeakerStatus::Mapped)
         .map(|l| format!("{} ({:.0} s)", l.label, l.talk_time_s))
         .collect();
     if !unresolved.is_empty() {
@@ -607,6 +776,10 @@ impl Stage for NotesStage {
                 schema: schemas::TRANSCRIPT,
                 major: 1,
             },
+            InputDecl {
+                schema: schemas::KEYFRAMES,
+                major: KEYFRAMES_MAJOR,
+            },
         ]
     }
     fn params(&self) -> &NotesParams {
@@ -617,11 +790,17 @@ impl Stage for NotesStage {
     }
 
     fn plan(&self, inputs: &StageInputs) -> Result<Vec<WorkItem<Self::Work>>, StageError> {
-        let boards: Vec<BoardState> = inputs
-            .read_ok::<BoardState>(schemas::BOARD_STATE)?
+        let boards: Vec<BoardStateItem> = inputs
+            .read_ok::<BoardStateItem>(schemas::BOARD_STATE)?
             .into_iter()
             .map(|(_, b)| b)
             .collect();
+        let views: Vec<KeyframeView> = inputs
+            .read_ok::<KeyframeView>(schemas::KEYFRAMES)?
+            .into_iter()
+            .map(|(_, k)| k)
+            .collect();
+        let keyframes = KeyframeTimes::from_views(&views);
         let speakers = SpeakersDoc::from_records(
             inputs
                 .read_ok::<SpeakersRecord>(schemas::SPEAKERS)?
@@ -643,6 +822,7 @@ impl Stage for NotesStage {
             work: Arc::new(NotesInput {
                 segments,
                 boards,
+                keyframes,
                 speakers,
             }),
         }])

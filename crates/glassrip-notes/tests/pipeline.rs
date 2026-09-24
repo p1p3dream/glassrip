@@ -15,7 +15,6 @@ use glassrip_core::graph::{meeting_mode_stage_decls, Selection, StageGraph};
 use glassrip_core::jsonl;
 use glassrip_core::manifest::RunDir;
 use glassrip_core::runner::{Runner, RunnerOptions};
-use glassrip_notes::board::BoardState;
 use glassrip_notes::import;
 use glassrip_notes::notes::llm::{ChatRequest, ChatResponse, LlmError, LoadedModel, TextBackend};
 use glassrip_notes::notes::{MeetingNotes, NotesParams, NotesStage, NotesStatus, QuestionSource};
@@ -28,7 +27,8 @@ use glassrip_notes::speakers::{
 use image::RgbImage;
 use tokio_util::sync::CancellationToken;
 
-pub const BOARD: &str = include_str!("fixtures/synthetic_board.json");
+#[path = "common/synthetic_board.rs"]
+mod synthetic_board;
 const RESPONSES: &str = include_str!("fixtures/synthetic_llm_responses.json");
 
 fn segment(id: &str, label: &str, start: f64, text: &str, src: Source) -> TranscriptSegment {
@@ -147,6 +147,7 @@ impl TileReader for FixedTiles {
 struct Replay {
     log: Mutex<Vec<String>>,
     resident: Mutex<Vec<String>>,
+    ids: std::collections::BTreeMap<&'static str, String>,
 }
 
 #[async_trait]
@@ -159,7 +160,7 @@ impl TextBackend for Replay {
         let all: serde_json::Value = serde_json::from_str(RESPONSES).unwrap();
         let key = req.purpose.split_whitespace().next().unwrap_or("");
         Ok(ChatResponse {
-            content: all[key].to_string(),
+            content: synthetic_board::resolve(&all[key].to_string(), &self.ids),
             eval_count: Some(100),
             ..Default::default()
         })
@@ -221,9 +222,20 @@ pub async fn run_pipeline(root: &std::path::Path) -> Outputs {
         items: transcript(),
     };
     import::import_transcript(&run, &t).unwrap();
-    import::write_empty(&run, schemas::KEYFRAMES).unwrap();
+    let (board, keyframes) = synthetic_board::synthetic_board();
+    let ids = synthetic_board::symbolic_ids(&board);
+    import::write_artifact(
+        &run,
+        schemas::KEYFRAMES,
+        semver::Version::new(1, 0, 0),
+        serde_json::json!({}),
+        keyframes
+            .into_iter()
+            .map(|k| (k["keyframe_id"].as_str().unwrap().to_string(), k))
+            .collect(),
+    )
+    .unwrap();
     import::write_empty(&run, schemas::OCR).unwrap();
-    let board: BoardState = serde_json::from_str(BOARD).unwrap();
     import::import_boards(&run, &[board]).unwrap();
 
     let graph = StageGraph::new(meeting_mode_stage_decls()).unwrap();
@@ -255,7 +267,10 @@ pub async fn run_pipeline(root: &std::path::Path) -> Outputs {
     let rep = runner.run_stage(&speakers_stage).await.unwrap();
     assert_eq!(rep.items_error, 0);
 
-    let backend = Arc::new(Replay::default());
+    let backend = Arc::new(Replay {
+        ids,
+        ..Replay::default()
+    });
     backend.resident.lock().unwrap().push("vision:7b".into());
     let notes_params = NotesParams {
         text_model: "text:27b".into(),
@@ -361,4 +376,76 @@ async fn speakers_and_notes_end_to_end() {
         .iter()
         .any(|p| p.speaker == "Mira Okafor" && p.text == "Hey."));
     assert!(n.caveats.iter().any(|c| c.kind == "gap_fill"));
+}
+
+#[tokio::test]
+async fn board_only_notes_when_there_is_no_audio() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = RunDir::open(
+        &dir.path().join("run"),
+        "synthetic",
+        Producer::glassrip("0.1.0", None),
+    )
+    .unwrap();
+    let (board, keyframes) = synthetic_board::synthetic_board();
+    import::write_artifact(
+        &run,
+        schemas::KEYFRAMES,
+        semver::Version::new(1, 0, 0),
+        serde_json::json!({}),
+        keyframes
+            .into_iter()
+            .map(|k| (k["keyframe_id"].as_str().unwrap().to_string(), k))
+            .collect(),
+    )
+    .unwrap();
+    // the audio branch was skipped: empty transcript and speakers
+    import::write_empty(&run, schemas::TRANSCRIPT).unwrap();
+    import::write_empty(&run, schemas::SPEAKERS).unwrap();
+    import::import_boards(&run, &[board]).unwrap();
+    let graph = StageGraph::new(meeting_mode_stage_decls()).unwrap();
+    let sel = Selection {
+        from: Some("notes".into()),
+        until: Some("notes".into()),
+        ..Default::default()
+    };
+    let mut runner = Runner::new(
+        run,
+        graph,
+        &sel,
+        Cache::in_workspace(dir.path()),
+        RunnerOptions::default(),
+        CancellationToken::new(),
+    )
+    .unwrap();
+    let backend = Arc::new(Replay::default());
+    let stage = NotesStage::new(NotesParams::default(), backend.clone());
+    let rep = runner.run_stage(&stage).await.unwrap();
+    assert_eq!(rep.items_error, 0, "{rep:?}");
+    let n = jsonl::read::<Record<MeetingNotes>>(
+        &runner.run_dir().artifact_path(schemas::MEETING_NOTES),
+        &SchemaReq::new(schemas::MEETING_NOTES, 1),
+    )
+    .unwrap()
+    .items
+    .into_iter()
+    .find_map(|r| r.outcome.result)
+    .unwrap();
+    assert!(backend.log.lock().unwrap().is_empty(), "no model calls");
+    assert_eq!(n.caveats[0].kind, "no_audio");
+    assert!(n.decisions.is_empty() && n.action_items.is_empty() && n.transcript.is_empty());
+    assert!(!n.timeline.is_empty());
+    assert!(n.summary[0].text.contains("Kiosk App"), "{:?}", n.summary);
+    assert!(
+        n.summary
+            .iter()
+            .any(|s| s.text.contains("Mira Okafor on Design Kit")),
+        "{:?}",
+        n.summary
+    );
+    assert_eq!(n.open_questions.len(), 2);
+    assert!(n
+        .open_questions
+        .iter()
+        .all(|q| q.source == QuestionSource::Board && !q.evidence.event_ids.is_empty()));
 }

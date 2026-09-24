@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use super::address::AddressEvent;
 use super::{
-    CueKind, FrameObservation, GapFillCheck, LabelEvidence, LabelItem, LabelStatus, SegmentSpeaker,
-    SpeakerSource, WordSpan,
+    Evidence, EvidenceKind, FrameObservation, GapFillCheck, SegmentSpeaker, SpeakerItem,
+    SpeakerSource, SpeakerStatus, WordSpan,
 };
 use crate::people::{AliasTable, Person};
 
@@ -54,7 +54,8 @@ pub struct VoteParams {
     pub short_turn_s: f64,
     /// How long before a short turn the hold sample is taken, seconds.
     pub pre_offset_s: f64,
-    /// Weight of a short greeting answering a greeting by name.
+    /// Weight of a short greeting answering a greeting by name. Below
+    /// `relabel_min` on purpose: it relabels only with another cue.
     pub w_response_echo: f64,
 }
 
@@ -78,7 +79,7 @@ impl Default for VoteParams {
             min_mapped_confidence: 0.2,
             short_turn_s: 1.5,
             pre_offset_s: 0.4,
-            w_response_echo: 1.2,
+            w_response_echo: 0.65,
         }
     }
 }
@@ -105,6 +106,8 @@ pub struct GapRun {
     pub times: Vec<f64>,
     /// True when the run is the whole segment.
     pub whole_segment: bool,
+    /// Hold-check sample just before the run starts.
+    pub pre_time: Option<f64>,
 }
 
 /// Frame times to decode.
@@ -128,6 +131,7 @@ impl SamplePlan {
             .flatten()
             .chain(self.runs.iter().flat_map(|r| r.times.iter()))
             .chain(self.pre_times.iter().flatten())
+            .chain(self.runs.iter().filter_map(|r| r.pre_time.as_ref()))
         {
             m.entry(time_key(*t)).or_insert(*t);
         }
@@ -180,6 +184,9 @@ pub fn plan_samples(segments: &[TranscriptSegment], p: &VoteParams) -> SamplePla
                 end_s: b,
                 times,
                 whole_segment: whole,
+                // gap runs usually follow someone else's words, so a ring lit
+                // just before the run may be held from that turn
+                pre_time: Some((a - p.pre_offset_s).max(0.0)),
             });
         }
     }
@@ -194,7 +201,7 @@ pub struct Verdict {
     /// Fraction of usable samples supporting it.
     pub strength: f64,
     /// Highlight or absent tile.
-    pub kind: CueKind,
+    pub kind: EvidenceKind,
 }
 
 /// Combines samples into one verdict (None when there is no usable or a tied cue).
@@ -223,7 +230,7 @@ pub fn visual_verdict(obs: &[&FrameObservation], people: &[Person]) -> Option<Ve
             [one] => Some(Verdict {
                 person_id: (*one).to_string(),
                 strength: max as f64 / usable.len() as f64,
-                kind: CueKind::ActiveSpeakerHighlight,
+                kind: EvidenceKind::ActiveSpeakerHighlight,
             }),
             _ => None,
         };
@@ -240,17 +247,48 @@ pub fn visual_verdict(obs: &[&FrameObservation], people: &[Person]) -> Option<Ve
         [one] if !visible.is_empty() => Some(Verdict {
             person_id: one.person_id.clone(),
             strength: 1.0,
-            kind: CueKind::AbsentTile,
+            kind: EvidenceKind::AbsentTile,
         }),
         _ => None,
     }
+}
+
+/// Copies of `obs` with the rings of `held` people switched off: a ring already
+/// lit in the hold-check sample belongs to the previous turn, not this one.
+pub fn without_held(obs: &[&FrameObservation], held: &[&str]) -> Vec<FrameObservation> {
+    obs.iter()
+        .map(|o| {
+            let mut o = (*o).clone();
+            for t in &mut o.tiles {
+                if held.contains(&t.person_id.as_str()) {
+                    t.highlighted = false;
+                }
+            }
+            o
+        })
+        .collect()
+}
+
+/// Visual verdict after discarding rings held from before `pre`.
+pub fn verdict_after_hold(
+    obs: &[&FrameObservation],
+    pre: &[&FrameObservation],
+    people: &[Person],
+) -> Option<Verdict> {
+    let held: Vec<&str> = pre.iter().flat_map(|o| o.highlighted()).collect();
+    if held.is_empty() {
+        return visual_verdict(obs, people);
+    }
+    let cleaned = without_held(obs, &held);
+    let refs: Vec<&FrameObservation> = cleaned.iter().collect();
+    visual_verdict(&refs, people)
 }
 
 /// Everything the vote produces.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VoteOutput {
     /// Labels.
-    pub labels: Vec<LabelItem>,
+    pub labels: Vec<SpeakerItem>,
     /// Segments.
     pub segments: Vec<SegmentSpeaker>,
     /// Gap-fill re-check.
@@ -267,13 +305,14 @@ fn word_secs(s: &TranscriptSegment, src: Source) -> f64 {
         .sum()
 }
 
-fn kind_weight(k: CueKind, p: &VoteParams) -> f64 {
+fn kind_weight(k: EvidenceKind, p: &VoteParams) -> f64 {
     match k {
-        CueKind::ActiveSpeakerHighlight => p.w_highlight,
-        CueKind::AbsentTile => p.w_absent,
-        CueKind::AddressResponse => p.w_response,
-        CueKind::AddressedNotSpeaker => -p.w_addressed_not_speaker,
-        CueKind::RoleCue => p.w_role,
+        EvidenceKind::ActiveSpeakerHighlight => p.w_highlight,
+        EvidenceKind::AbsentTile => p.w_absent,
+        EvidenceKind::AddressResponse => p.w_response,
+        EvidenceKind::AddressedNotSpeaker => -p.w_addressed_not_speaker,
+        EvidenceKind::RoleCue => p.w_role,
+        EvidenceKind::DirectAddress => p.w_response,
     }
 }
 
@@ -318,15 +357,15 @@ pub fn vote(
                 .and_then(|t| frames.get(&time_key(t)))
         })
         .collect();
+    // a ring already lit before a short turn belongs to the previous turn; with it
+    // switched off, a frame with no lit tile can still point at the one
+    // participant without a visible tile
     let seg_verdict: Vec<Option<Verdict>> = seg_obs
         .iter()
         .zip(&pre_obs)
         .map(|(o, pre)| {
-            let v = visual_verdict(o, people)?;
-            let held = v.kind == CueKind::ActiveSpeakerHighlight
-                && pre.is_some_and(|pre| pre.highlighted().contains(&v.person_id.as_str()));
-            // a ring already lit before a short turn belongs to the previous turn
-            (!held).then_some(v)
+            let pre: Vec<&FrameObservation> = pre.iter().copied().collect();
+            verdict_after_hold(o, &pre, people)
         })
         .collect();
     let response_weight = |a: &AddressEvent| {
@@ -352,17 +391,20 @@ pub fn vote(
         e.2 += d;
     }
     let mut votes: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
-    let mut evidence: BTreeMap<String, Vec<LabelEvidence>> = BTreeMap::new();
+    let mut evidence: BTreeMap<String, Vec<Evidence>> = BTreeMap::new();
     let mut add =
-        |label: &str, ev: LabelEvidence, votes: &mut BTreeMap<String, BTreeMap<String, f64>>| {
+        |label: &str, ev: Evidence, votes: &mut BTreeMap<String, BTreeMap<String, f64>>| {
+            let (Some(person), Some(weight)) = (ev.person_id.clone(), ev.weight) else {
+                return;
+            };
             if !labels.contains(label) {
                 return;
             }
             *votes
                 .entry(label.to_string())
                 .or_default()
-                .entry(ev.person_id.clone())
-                .or_default() += ev.weight;
+                .entry(person)
+                .or_default() += weight;
             evidence.entry(label.to_string()).or_default().push(ev);
         };
     for (si, s) in segments.iter().enumerate() {
@@ -376,11 +418,11 @@ pub fn vote(
         let seg_w = 0.3 + 0.7 * dur.min(8.0) / 8.0;
         add(
             &s.speaker_label,
-            LabelEvidence {
+            Evidence {
                 t_s: (s.start_s + s.end_s) / 2.0,
                 kind: v.kind,
-                person_id: v.person_id.clone(),
-                weight: kind_weight(v.kind, p) * v.strength * seg_w,
+                person_id: Some(v.person_id.clone()),
+                weight: Some(kind_weight(v.kind, p) * v.strength * seg_w),
                 segment_id: Some(s.segment_id.clone()),
                 text: describe(&seg_obs[si]),
             },
@@ -393,11 +435,11 @@ pub fn vote(
         };
         add(
             &seg.speaker_label,
-            LabelEvidence {
+            Evidence {
                 t_s: a.t_s,
-                kind: CueKind::AddressedNotSpeaker,
-                person_id: person.person_id.clone(),
-                weight: kind_weight(CueKind::AddressedNotSpeaker, p),
+                kind: EvidenceKind::AddressedNotSpeaker,
+                person_id: Some(person.person_id.clone()),
+                weight: Some(kind_weight(EvidenceKind::AddressedNotSpeaker, p)),
                 segment_id: Some(seg.segment_id.clone()),
                 text: a.sentence.clone(),
             },
@@ -407,11 +449,11 @@ pub fn vote(
             if r.speaker_label != seg.speaker_label {
                 add(
                     &r.speaker_label,
-                    LabelEvidence {
+                    Evidence {
                         t_s: r.start_s,
-                        kind: CueKind::AddressResponse,
-                        person_id: person.person_id.clone(),
-                        weight: response_weight(a),
+                        kind: EvidenceKind::AddressResponse,
+                        person_id: Some(person.person_id.clone()),
+                        weight: Some(response_weight(a)),
                         segment_id: Some(r.segment_id.clone()),
                         text: format!("answers \"{}\" with \"{}\"", a.sentence, r.text),
                     },
@@ -439,11 +481,11 @@ pub fn vote(
         if let Some((label, secs)) = top {
             add(
                 label,
-                LabelEvidence {
+                Evidence {
                     t_s: 0.0,
-                    kind: CueKind::RoleCue,
-                    person_id: pr.clone(),
-                    weight: p.w_role,
+                    kind: EvidenceKind::RoleCue,
+                    person_id: Some(pr.clone()),
+                    weight: Some(p.w_role),
                     segment_id: None,
                     text: format!(
                         "presenter banner in {} frames; label has the most diarized talk time ({secs:.0} s)",
@@ -506,10 +548,10 @@ pub fn vote(
         let (total, gap, _) = talk.get(l).copied().unwrap_or_default();
         let (status, person, conf) = match mapped.get(l) {
             Some(pid) if confidence(l, pid) >= p.min_mapped_confidence => {
-                (LabelStatus::Mapped, Some(pid.clone()), confidence(l, pid))
+                (SpeakerStatus::Mapped, Some(pid.clone()), confidence(l, pid))
             }
-            _ if total <= p.noise_max_talk_s => (LabelStatus::Noise, None, 0.0),
-            _ => (LabelStatus::Unresolved, None, 0.0),
+            _ if total <= p.noise_max_talk_s => (SpeakerStatus::Noise, None, 0.0),
+            _ => (SpeakerStatus::Unresolved, None, 0.0),
         };
         if let Some(pid) = &person {
             label_person.insert(l, (pid.clone(), conf));
@@ -517,23 +559,31 @@ pub fn vote(
         let mut ev = evidence.remove(*l).unwrap_or_default();
         let evidence_total = ev.len();
         ev.sort_by(|a, b| {
-            b.weight
-                .abs()
-                .total_cmp(&a.weight.abs())
-                .then(a.t_s.total_cmp(&b.t_s))
+            let w = |e: &Evidence| e.weight.unwrap_or(0.0).abs();
+            w(b).total_cmp(&w(a)).then(a.t_s.total_cmp(&b.t_s))
         });
         ev.truncate(40);
         ev.sort_by(|a, b| a.t_s.total_cmp(&b.t_s));
-        label_items.push(LabelItem {
+        let words_by = |src: Source| {
+            segments
+                .iter()
+                .flat_map(|s| s.words.iter())
+                .filter(|w| w.speaker_label == *l && w.source == src)
+                .count()
+        };
+        label_items.push(SpeakerItem {
             label: (*l).to_string(),
             status,
             person_id: person,
             confidence: conf.clamp(0.0, 1.0) as f32,
-            votes: votes.get(*l).cloned().unwrap_or_default(),
             evidence: ev,
-            evidence_total,
             talk_time_s: total,
             talk_time_gap_fill_s: gap,
+            words_diarizer: words_by(Source::Diarizer),
+            words_gap_fill: words_by(Source::GapFill),
+            words_unassigned: words_by(Source::Unassigned),
+            votes: votes.get(*l).cloned().unwrap_or_default(),
+            evidence_total,
         });
     }
 
@@ -583,13 +633,13 @@ pub fn vote(
         };
         let (person, source, reason) = if relabel {
             let (pid, _) = best.clone().unwrap_or_default();
-            let visual = verdict
-                .as_ref()
-                .is_some_and(|v| v.person_id == pid && v.kind == CueKind::ActiveSpeakerHighlight);
+            let visual = verdict.as_ref().is_some_and(|v| {
+                v.person_id == pid && v.kind == EvidenceKind::ActiveSpeakerHighlight
+            });
             let mut why = Vec::new();
             if let Some(v) = verdict.as_ref().filter(|v| v.person_id == pid) {
                 why.push(match v.kind {
-                    CueKind::ActiveSpeakerHighlight => {
+                    EvidenceKind::ActiveSpeakerHighlight => {
                         format!("tile lit in {:.0}% of samples", v.strength * 100.0)
                     }
                     _ => "no visible tile lit; only participant without a visible tile".to_string(),
@@ -677,7 +727,15 @@ pub fn vote(
                 .filter(|o| o.t_s >= run.start_s - 0.5 && o.t_s <= run.end_s + 0.5)
                 .collect()
         };
-        let Some(v) = visual_verdict(&obs, people) else {
+        let mut pre: Vec<&FrameObservation> = run
+            .pre_time
+            .and_then(|t| frames.get(&time_key(t)))
+            .into_iter()
+            .collect();
+        if run.whole_segment {
+            pre.extend(pre_obs[run.segment]);
+        }
+        let Some(v) = verdict_after_hold(&obs, &pre, people) else {
             gf.words_no_cue += n;
             continue;
         };
@@ -711,7 +769,7 @@ pub fn vote(
             words.iter().map(|w| f64::from(w.assign_conf)).sum::<f64>() / n.max(1) as f64;
         let base = p.w_diarizer * mean_conf;
         let score = kind_weight(v.kind, p) * v.strength;
-        if v.kind == CueKind::ActiveSpeakerHighlight
+        if v.kind == EvidenceKind::ActiveSpeakerHighlight
             && score >= p.relabel_min
             && score >= base + p.relabel_margin
         {
@@ -901,7 +959,7 @@ mod tests {
         });
         let addresses = find_addresses(&segs, &table, p.response_window_s, p.min_name_score);
         let out = vote(&segs, &table, &addresses, &plan, &frames, &p);
-        let map: Vec<(&str, Option<&str>, LabelStatus)> = out
+        let map: Vec<(&str, Option<&str>, SpeakerStatus)> = out
             .labels
             .iter()
             .map(|l| (l.label.as_str(), l.person_id.as_deref(), l.status))
@@ -909,9 +967,9 @@ mod tests {
         assert_eq!(
             map,
             vec![
-                ("L0", Some("avery-quinn"), LabelStatus::Mapped),
-                ("L1", Some("rohan-dasgupta"), LabelStatus::Mapped),
-                ("L2", Some("mira-okafor"), LabelStatus::Mapped),
+                ("L0", Some("avery-quinn"), SpeakerStatus::Mapped),
+                ("L1", Some("rohan-dasgupta"), SpeakerStatus::Mapped),
+                ("L2", Some("mira-okafor"), SpeakerStatus::Mapped),
             ]
         );
         let who: Vec<(&str, Option<&str>, SpeakerSource)> = out
@@ -1038,6 +1096,66 @@ mod tests {
     }
 
     #[test]
+    fn a_held_ring_does_not_relabel_gap_filled_words() {
+        let table = AliasTable::from_names(&["Avery Quinn", "Rohan Dasgupta", "Mira Okafor"]);
+        let s0 = seg(
+            "s0",
+            "L1",
+            0.0,
+            &["The", "relay", "config", "is", "ready", "now"],
+        );
+        // gap-filled words open the next segment right after Rohan stops
+        let mut s1 = seg_src(
+            "s1",
+            "L0",
+            2.6,
+            &["so", "I", "think", "we"],
+            Source::GapFill,
+        );
+        let rest = seg(
+            "y",
+            "L0",
+            4.2,
+            &["should", "ship", "the", "relay", "first", "today"],
+        );
+        s1.words.extend(rest.words);
+        s1.end_s = 6.6;
+        let segs = vec![s0, s1];
+        let p = VoteParams::default();
+        let plan = plan_samples(&segs, &p);
+        assert_eq!(plan.runs.len(), 1);
+        assert!(plan.runs[0].pre_time.is_some());
+        // Rohan's ring stays lit 1.4 s after he stops; Avery lights up later
+        let lit = |t: f64| {
+            if t < 3.8 {
+                Some("rohan-dasgupta")
+            } else if t >= 4.2 {
+                Some("avery-quinn")
+            } else {
+                None
+            }
+        };
+        let frames = frames_for(&plan, lit);
+        let out = vote(&segs, &table, &[], &plan, &frames, &p);
+        assert!(
+            out.segments[1].spans.is_empty(),
+            "{:?}",
+            out.segments[1].spans
+        );
+        assert_eq!(out.gap_fill.words_relabeled, 0);
+        assert_eq!(out.gap_fill.runs_agree, 0);
+        // without the hold sample the held ring relabels the words to Rohan
+        let mut no_hold = plan.clone();
+        no_hold.runs[0].pre_time = None;
+        let out2 = vote(&segs, &table, &[], &no_hold, &frames, &p);
+        assert_eq!(out2.gap_fill.words_relabeled, 4);
+        assert_eq!(
+            out2.segments[1].spans[0].person_id.as_deref(),
+            Some("rohan-dasgupta")
+        );
+    }
+
+    #[test]
     fn no_video_leaves_labels_to_address_and_role_cues() {
         let table = AliasTable::from_names(&["Avery Quinn", "Rohan Dasgupta"]);
         let segs = vec![
@@ -1055,8 +1173,8 @@ mod tests {
         let addresses = find_addresses(&segs, &table, p.response_window_s, p.min_name_score);
         let out = vote(&segs, &table, &addresses, &plan, &BTreeMap::new(), &p);
         assert_eq!(out.labels[1].person_id.as_deref(), Some("rohan-dasgupta"));
-        assert_eq!(out.labels[0].status, LabelStatus::Unresolved);
-        assert_eq!(out.labels[2].status, LabelStatus::Noise);
+        assert_eq!(out.labels[0].status, SpeakerStatus::Unresolved);
+        assert_eq!(out.labels[2].status, SpeakerStatus::Noise);
         assert!(out.labels[0].votes["rohan-dasgupta"] < 0.0);
     }
 }

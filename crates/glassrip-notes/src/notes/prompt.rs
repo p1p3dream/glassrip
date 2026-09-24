@@ -4,7 +4,10 @@ use std::fmt::Write as _;
 
 use super::llm::{ChatRequest, Message};
 use super::validate::{draft_schema, Draft, DraftItem, Section};
-use crate::board::BoardState;
+use crate::board::{
+    event_text, first_seen, last_seen, target_text, BoardEvent, BoardExt, BoardStateItem,
+    EdgeOrientation, EdgeStyle, KeyframeTimes, NodeState, StickyKind,
+};
 use crate::named::NamedLine;
 use crate::people::Person;
 use crate::text::{content_tokens, estimate_tokens, jaccard, mmss};
@@ -32,124 +35,125 @@ pub fn format_line(l: &NamedLine) -> String {
     )
 }
 
-/// Board summary listing every id the model may cite.
-pub fn board_digest(boards: &[BoardState], people: &[Person]) -> String {
+/// Board summary listing every id the model may cite (event ids and keyframe
+/// ids; board elements themselves have no citable id).
+pub fn board_digest(boards: &[BoardStateItem], keyframes: &KeyframeTimes) -> String {
     let mut s = String::new();
     if boards.is_empty() {
         return "No whiteboard was read.".into();
     }
-    let name = |pid: &Option<String>, raw: &str| -> String {
-        pid.as_ref()
-            .and_then(|p| people.iter().find(|x| &x.person_id == p))
-            .map(|p| p.display_name.clone())
-            .unwrap_or_else(|| raw.to_string())
-    };
     for b in boards {
         let _ = writeln!(
             s,
-            "Board {}{} (final state at {})",
+            "Board {} (final state at {})",
             b.board_id,
-            b.title
-                .as_ref()
-                .map(|t| format!(" \"{t}\""))
-                .unwrap_or_default(),
-            mmss(b.final_t_s)
+            mmss(b.end_s())
         );
+        s.push_str("Boxes in the final state:\n");
+        for n in b.final_nodes() {
+            let _ = writeln!(
+                s,
+                "- \"{}\" (from {})",
+                n.text,
+                mmss(first_seen(&n.lifetimes))
+            );
+        }
+        let removed: Vec<&NodeState> = b.nodes.iter().filter(|n| !n.in_final).collect();
+        if !removed.is_empty() {
+            s.push_str("Boxes removed during the meeting:\n");
+            for n in removed {
+                let until = last_seen(&n.lifetimes).map(mmss).unwrap_or_default();
+                let _ = writeln!(s, "- \"{}\" (seen until {until})", n.text);
+            }
+        }
+        s.push_str("Arrows (from caller to callee):\n");
         let label = |id: &str| {
             b.node(id)
                 .map(|n| n.text.clone())
                 .unwrap_or_else(|| id.to_string())
         };
-        s.push_str("Boxes:\n");
-        for n in &b.nodes {
-            let until = n
-                .last_seen_s
-                .map(|t| format!(" until {}", mmss(t)))
-                .unwrap_or_default();
-            let _ = writeln!(s, "- \"{}\" (from {}{until})", n.text, mmss(n.first_seen_s));
-        }
-        s.push_str("Arrows (from caller to callee):\n");
-        for e in &b.edges {
+        for e in b.final_edges() {
+            let arrow = match e.direction {
+                EdgeOrientation::Forward => "->",
+                EdgeOrientation::Bidirectional => "<->",
+                EdgeOrientation::Uncertain => "--",
+            };
             let _ = writeln!(
                 s,
-                "- {} -> {}{}{}",
+                "- {} {arrow} {}{}{}",
                 label(&e.src),
                 label(&e.dst),
-                e.label
-                    .as_ref()
-                    .map(|l| format!(" labeled \"{l}\""))
-                    .unwrap_or_default(),
-                if e.style == crate::board::EdgeStyle::Dashed {
+                if e.label.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" labeled \"{}\"", e.label.trim())
+                },
+                if e.style == EdgeStyle::Dashed {
                     " (dashed)"
                 } else {
                     ""
                 }
             );
         }
-        if !b.stickies.is_empty() {
+        let stickies = b.final_stickies();
+        if !stickies.is_empty() {
             s.push_str("Sticky notes:\n");
-            for st in &b.stickies {
+            for st in stickies {
+                let kind = match st.kind {
+                    StickyKind::Question => "question",
+                    StickyKind::Milestone => "milestone",
+                    StickyKind::Idea => "idea",
+                    StickyKind::Note => "note",
+                };
                 let _ = writeln!(
                     s,
-                    "- \"{}\" (first seen {}; keyframes {})",
+                    "- {kind}: \"{}\" (from {})",
                     st.text,
-                    mmss(st.first_seen_s),
-                    st.keyframe_ids.join(", ")
+                    mmss(first_seen(&st.lifetimes))
                 );
             }
-        }
-        for g in &b.groups {
-            let members: Vec<String> = g
-                .members
-                .iter()
-                .map(|m| match &m.detail {
-                    Some(d) => format!("{} ({d})", m.text),
-                    None => m.text.clone(),
-                })
-                .collect();
-            let _ = writeln!(
-                s,
-                "Group \"{}\" (from {}): {}",
-                g.label,
-                mmss(g.first_seen_s),
-                members.join("; ")
-            );
         }
         if !b.owner_assignments.is_empty() {
             s.push_str("Owner tags:\n");
             for o in &b.owner_assignments {
-                let target = match o.target_kind {
-                    crate::board::TargetKind::Node => label(&o.target_id),
-                    crate::board::TargetKind::Edge => b
-                        .edge(&o.target_id)
-                        .map(|e| format!("the arrow {} -> {}", label(&e.src), label(&e.dst)))
-                        .unwrap_or_else(|| o.target_id.clone()),
+                let until = if o.valid_to_s >= b.end_s() - 0.5 {
+                    String::new()
+                } else {
+                    format!(" until {}", mmss(o.valid_to_s))
                 };
-                let until = o
-                    .valid_to_s
-                    .map(|t| format!(" until {}", mmss(t)))
-                    .unwrap_or_default();
                 let _ = writeln!(
                     s,
-                    "- {} on {target} from {}{until}",
-                    name(&o.person_id, &o.name_raw),
+                    "- {} on {} from {}{until}",
+                    o.display_name,
+                    target_text(&o.target),
                     mmss(o.valid_from_s)
                 );
             }
         }
-        if !b.events.is_empty() {
-            s.push_str("Board events (id, time, what changed):\n");
-            for e in &b.events {
-                let _ = writeln!(s, "- {} [{}] {}", e.event_id, mmss(e.t_s), e.summary);
+        let events: Vec<&BoardEvent> = b.events.iter().filter(|e| !e.baseline).collect();
+        if !events.is_empty() {
+            s.push_str("Board events (id, time, keyframe, what changed):\n");
+            for e in events {
+                let _ = writeln!(
+                    s,
+                    "- {} [{}] {} {}",
+                    e.event_id,
+                    mmss(e.t_s),
+                    e.keyframe_id,
+                    event_text(e)
+                );
             }
         }
-        if !b.keyframes.is_empty() {
-            let ks: Vec<String> = b
-                .keyframes
-                .iter()
-                .map(|k| format!("{} ({})", k.keyframe_id, mmss(k.t_rep_s)))
-                .collect();
-            let _ = writeln!(s, "Keyframes: {}", ks.join(", "));
+        let ks: Vec<String> = b
+            .board_keyframes
+            .iter()
+            .map(|k| match keyframes.get(k) {
+                Some(t) => format!("{k} ({})", mmss(t)),
+                None => k.clone(),
+            })
+            .collect();
+        if !ks.is_empty() {
+            let _ = writeln!(s, "Board keyframes: {}", ks.join(", "));
         }
     }
     s

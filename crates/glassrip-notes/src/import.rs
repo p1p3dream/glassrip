@@ -14,7 +14,7 @@ use semver::Version;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::board::BoardState;
+use crate::board::BoardStateItem;
 use crate::schemas;
 
 /// Writes `items` (id, value) as an artifact of `schema` in the run directory.
@@ -77,7 +77,7 @@ pub fn import_transcript(run: &RunDir, t: &TranscriptArtifact) -> Result<PathBuf
 }
 
 /// Imports board states (one item per board).
-pub fn import_boards(run: &RunDir, boards: &[BoardState]) -> Result<PathBuf, JsonlError> {
+pub fn import_boards(run: &RunDir, boards: &[BoardStateItem]) -> Result<PathBuf, JsonlError> {
     let items = boards
         .iter()
         .map(|b| (b.board_id.clone(), b.clone()))

@@ -47,9 +47,20 @@ pub struct AddressEvent {
     pub echo: bool,
 }
 
-const ECHO_WORDS: &[&str] = &[
-    "hey", "hi", "hello", "yes", "yeah", "yep", "yo", "morning", "thanks",
+/// Greetings that echo a greeting. Generic acknowledgments ("yes", "yeah",
+/// "thanks") answer anyone and are not echo evidence.
+const ECHO_WORDS: &[&str] = &["hey", "hi", "hello", "yo", "morning", "hiya", "howdy"];
+
+/// Words that introduce reported speech: a name after them is quoted, not said
+/// to someone in the room ("it says, hey Avery, your build is red").
+const REPORTING: &[&str] = &[
+    "said", "says", "say", "saying", "told", "tells", "asked", "asks", "wrote", "writes", "reads",
+    "read", "quote", "quoting", "goes",
 ];
+
+fn quote_mark(w: &str) -> bool {
+    w.contains(['"', '\u{201c}', '\u{201d}'])
+}
 
 const GREETINGS: &[&str] = &[
     "hey", "hi", "hello", "thanks", "welcome", "bye", "morning", "sorry",
@@ -87,6 +98,15 @@ pub fn find_addresses(
                     continue;
                 };
                 if m.score < min_name_score {
+                    continue;
+                }
+                // reported speech: a reporting word or an opening quote mark earlier
+                // in the sentence
+                let reported = sentence[..k]
+                    .iter()
+                    .any(|p| quote_mark(p) || REPORTING.contains(&letters(p).as_str()))
+                    || quote_mark(&w.w);
+                if reported {
                     continue;
                 }
                 let prev = k.checked_sub(1).map(|p| letters(sentence[p]));
@@ -190,5 +210,34 @@ mod tests {
                 (3, 1, AddressKind::Closing, None),
             ]
         );
+    }
+
+    #[test]
+    fn reported_speech_and_generic_acks_are_not_address_evidence() {
+        let table = AliasTable::from_names(&["Avery Quinn", "Rohan Dasgupta"]);
+        let segs = vec![
+            // read aloud: the name is quoted, not said to Avery
+            seg(
+                "s0",
+                "L0",
+                0.0,
+                &[
+                    "The", "bot", "says,", "hey", "Avery,", "your", "build", "is", "red.",
+                ],
+            ),
+            seg(
+                "s1",
+                "L0",
+                5.0,
+                &["He", "said", "\"hi", "Rohan\"", "earlier."],
+            ),
+            // a greeting answered by a generic acknowledgment
+            seg("s2", "L0", 10.0, &["Bye,", "Rohan."]),
+            seg("s3", "L1", 11.2, &["Yeah,", "thanks."]),
+        ];
+        let ev = find_addresses(&segs, &table, 4.0, 0.6);
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!((ev[0].segment, ev[0].kind), (2, AddressKind::Greeting));
+        assert!(!ev[0].echo, "\"Yeah, thanks.\" answers anyone");
     }
 }

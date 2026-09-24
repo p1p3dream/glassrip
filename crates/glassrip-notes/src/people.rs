@@ -10,25 +10,15 @@ use glassrip_audio::vocab::{is_common_word, letters, normalized_edit, phonetic_k
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// A known participant.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct Person {
-    /// Stable person id (slug of the display name).
-    pub person_id: String,
-    /// Display name.
-    pub display_name: String,
-    /// Other spellings (first name, ASR variants, tile names).
-    pub aliases: Vec<String>,
-}
+/// A known participant (the audio crate's `glassrip.speakers` person).
+pub use glassrip_audio::types::Person;
 
-impl Person {
-    /// First word of the display name.
-    pub fn first_name(&self) -> &str {
-        self.display_name
-            .split_whitespace()
-            .next()
-            .unwrap_or(&self.display_name)
-    }
+/// First word of a participant's display name.
+pub fn first_name(p: &Person) -> &str {
+    p.display_name
+        .split_whitespace()
+        .next()
+        .unwrap_or(&p.display_name)
 }
 
 /// Slug used as a person id: lowercase letters and digits joined by `-`.
@@ -281,7 +271,7 @@ mod tests {
     fn slugs_and_first_names() {
         let t = table();
         assert_eq!(t.people()[1].person_id, "rohan-dasgupta");
-        assert_eq!(t.people()[1].first_name(), "Rohan");
+        assert_eq!(first_name(&t.people()[1]), "Rohan");
         assert_eq!(t.people()[1].aliases, vec!["Rohan", "Dasgupta"]);
     }
 
