@@ -7,7 +7,9 @@
 pub mod decode;
 pub mod ecc;
 pub mod error;
+pub mod features;
 pub mod gaussian;
+pub mod ink;
 pub mod jpeg;
 pub mod plane;
 pub mod resize;
