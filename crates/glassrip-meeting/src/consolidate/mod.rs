@@ -1048,6 +1048,30 @@ pub fn consolidate(
     let mut sticky_id: HashMap<usize, String> = HashMap::new();
     let mut nodes: Vec<NodeState> = Vec::new();
     let mut stickies: Vec<StickyState> = Vec::new();
+    // A node read in a single keyframe with the text of an established node (seen
+    // in at least `min_support_keyframes` keyframes, and not read in that keyframe)
+    // is that node read at an imprecise place: it never becomes a second final
+    // element.
+    let mut established: HashMap<String, Vec<(usize, Vec<usize>)>> = HashMap::new();
+    for (ti, t) in tracks.iter().enumerate() {
+        if !track_intervals[ti].is_empty() && t.votes().kind() == ObsList::Node {
+            established
+                .entry(normalize(&t.text()))
+                .or_default()
+                .push((ti, t.frames()));
+        }
+    }
+    let echo_of_established = |ti: usize, t: &Track| -> bool {
+        let seen = t.frames();
+        seen.len() == 1
+            && established.get(&normalize(&t.text())).is_some_and(|v| {
+                v.iter().any(|(u, frames)| {
+                    *u != ti
+                        && frames.len() >= params.min_support_keyframes
+                        && !frames.contains(&seen[0])
+                })
+            })
+    };
     for &ti in &order {
         let t = &tracks[ti];
         let ivs = &track_intervals[ti];
@@ -1073,7 +1097,8 @@ pub fn consolidate(
                     variant_counts,
                     last_seen_s: lifetimes.iter().map(|l| l.last_seen_s).reduce(f64::max),
                     lifetimes,
-                    in_final: alive_in_final(ivs, t.obs.iter().any(|o| o.bbox.is_some())),
+                    in_final: alive_in_final(ivs, t.obs.iter().any(|o| o.bbox.is_some()))
+                        && !echo_of_established(ti, t),
                     registration: if t.obs.iter().any(|o| o.bbox.is_some()) {
                         ElementRegistration::Position
                     } else {

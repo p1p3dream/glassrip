@@ -1719,3 +1719,32 @@ fn an_edge_left_out_of_readings_stays_until_the_ink_changes() {
     assert!(!e.in_final, "{e:?}");
     assert_eq!(e.lifetimes.last().unwrap().removed_at_s, Some(100.0));
 }
+
+#[test]
+fn one_odd_reading_of_a_known_box_is_not_a_second_final_box() {
+    // The last keyframe reads "Queue" far from its place (a confident, traced
+    // single sighting) and not at its place: one Queue on the final board.
+    let mut specs: Vec<Spec> = (0..5).map(|_| base()).collect();
+    specs[4].nodes.retain(|n| n.0 != "n2");
+    specs[4].edges.retain(|e| e.0 != "n2" && e.1 != "n2");
+    specs[4].nodes.push(("n9", "Queue".into(), (1400.0, 450.0)));
+    specs[4].edges.push(("n3", "n9", ""));
+    let mut fr = frames(&specs);
+    fr[4].directions = Some(dir_item(
+        "kf04",
+        vec![evidence("n3", "n9", EndVerdict::Forward, None)],
+    ));
+    let s = run(fr, &params());
+    let queues: Vec<_> = s
+        .nodes
+        .iter()
+        .filter(|n| n.text == "Queue" && n.in_final)
+        .collect();
+    assert_eq!(queues.len(), 1, "{:#?}", s.nodes);
+    assert!(queues[0].lifetimes[0].keyframes >= 2);
+    // The odd single sighting itself is not final.
+    assert!(!s
+        .nodes
+        .iter()
+        .any(|n| n.text == "Queue" && n.lifetimes[0].keyframes == 1 && n.in_final));
+}
