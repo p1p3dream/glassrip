@@ -20,6 +20,8 @@
 
 pub mod atomic;
 pub mod canonical;
+pub mod envelope;
+pub mod versioning;
 
 
 /// Returns the blake3 hash of `bytes` as lowercase hex.
