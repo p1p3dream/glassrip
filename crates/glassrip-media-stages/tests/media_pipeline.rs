@@ -295,3 +295,45 @@ async fn rotated_video_is_turned_upright_by_override() {
         "{frames:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_accepts_non_16_9_frames() {
+    if !have_ffmpeg() {
+        return;
+    }
+    let ws = tempfile::tempdir().unwrap();
+    let dir = ws.path();
+    let video = dir.join("four_three.mp4");
+    let st = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=1440x1080:rate=10",
+            "-t",
+            "6",
+            "-c:v",
+            "mpeg4",
+            "-g",
+            "5",
+        ])
+        .arg(&video)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let mut o = options(&video, dir, "run-43");
+    o.selection.until = Some("keyframes".into());
+    let rep = run(&o).await;
+    for r in &rep {
+        assert_eq!(r.items_error, 0, "{r:?}");
+    }
+    let frames: Vec<FrameRecord> = items(&dir.join("run-43"), FRAMES);
+    assert!(frames.iter().all(|f| (f.width, f.height) == (1920, 1440)));
+    let feats: Vec<glassrip_media_stages::schema::FrameFeatures> =
+        items(&dir.join("run-43"), glassrip_media_stages::schema::FEATURES);
+    assert_eq!(feats.len(), frames.len());
+}
