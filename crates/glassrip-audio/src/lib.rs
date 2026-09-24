@@ -16,10 +16,15 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod asr;
+pub mod assign;
+pub mod diarize;
 pub mod error;
 pub mod extract;
+pub mod gapfill;
 pub mod metrics;
 pub mod models;
+pub mod recluster;
+pub mod transcript;
 pub mod types;
 pub mod vocab;
 pub mod words;
