@@ -6,6 +6,7 @@
 //! top (screen classification combiner, board validation).
 
 pub mod backend;
+pub mod classify;
 pub mod error;
 pub mod geometry;
 pub mod image_prep;
