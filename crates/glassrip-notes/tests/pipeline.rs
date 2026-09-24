@@ -73,9 +73,9 @@ fn transcript() -> Vec<TranscriptSegment> {
     use Source::{Diarizer as D, GapFill as G};
     vec![
         segment("seg_00000", "L0", 0.0, "Welcome everyone, this is the kiosk relay planning session for the pilot.", D),
-        segment("seg_00001", "L1", 6.0, "Hey, Mira.", D),
-        segment("seg_00002", "L0", 7.4, "Hey.", D),
-        segment("seg_00003", "L0", 9.0, "So the relay pulls entries from the ledger service over REST and the kiosk app talks GraphQL to the relay.", D),
+        segment("seg_00001", "L1", 6.0, "Hey, Mira, glad you could join us.", D),
+        segment("seg_00002", "L0", 9.2, "Hey.", D),
+        segment("seg_00003", "L0", 10.0, "So the relay pulls entries from the ledger service over REST and the kiosk app talks GraphQL to the relay.", D),
         segment("seg_00004", "L1", 20.0, "Do we have to change anything in the badge flow, or can we leave it alone?", D),
         segment("seg_00005", "L0", 26.0, "Let's leave the badge flow alone for the pilot and focus on the relay side.", D),
         segment("seg_00006", "L2", 33.0, "I can take the ledger side and map entries to kit widgets.", D),
@@ -90,8 +90,8 @@ fn transcript() -> Vec<TranscriptSegment> {
 
 fn avery_lit(t: f64) -> bool {
     [
-        (0.0, 6.9),
-        (9.0, 17.4),
+        (0.0, 8.9),
+        (10.0, 18.4),
         (26.0, 32.4),
         (47.0, 51.4),
         (58.0, 63.2),

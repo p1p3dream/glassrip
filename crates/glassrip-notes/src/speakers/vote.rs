@@ -50,6 +50,12 @@ pub struct VoteParams {
     pub noise_max_talk_s: f64,
     /// Minimum label confidence for status `mapped`.
     pub min_mapped_confidence: f64,
+    /// Turns shorter than this get a sample before they start (ring hold check), seconds.
+    pub short_turn_s: f64,
+    /// How long before a short turn the hold sample is taken, seconds.
+    pub pre_offset_s: f64,
+    /// Weight of a short greeting answering a greeting by name.
+    pub w_response_echo: f64,
 }
 
 impl Default for VoteParams {
@@ -70,6 +76,9 @@ impl Default for VoteParams {
             gap_run_min_s: 0.8,
             noise_max_talk_s: 2.0,
             min_mapped_confidence: 0.2,
+            short_turn_s: 1.5,
+            pre_offset_s: 0.4,
+            w_response_echo: 1.2,
         }
     }
 }
@@ -103,6 +112,8 @@ pub struct GapRun {
 pub struct SamplePlan {
     /// Sample times per segment.
     pub segment_times: Vec<Vec<f64>>,
+    /// Hold-check sample before each short segment.
+    pub pre_times: Vec<Option<f64>>,
     /// Gap-fill runs.
     pub runs: Vec<GapRun>,
 }
@@ -116,6 +127,7 @@ impl SamplePlan {
             .iter()
             .flatten()
             .chain(self.runs.iter().flat_map(|r| r.times.iter()))
+            .chain(self.pre_times.iter().flatten())
         {
             m.entry(time_key(*t)).or_insert(*t);
         }
@@ -135,6 +147,13 @@ pub fn plan_samples(segments: &[TranscriptSegment], p: &VoteParams) -> SamplePla
             times.push(early);
         }
         plan.segment_times.push(times);
+        // Conferencing apps light the ring with a delay and keep it lit for a
+        // moment after speech stops, so a short turn right after someone else's
+        // can show the previous speaker's ring. A sample just before the turn
+        // tells a held ring from a new one.
+        plan.pre_times.push(
+            (s.end_s - s.start_s < p.short_turn_s).then(|| (s.start_s - p.pre_offset_s).max(0.0)),
+        );
 
         let mut i = 0;
         while i < s.words.len() {
@@ -290,8 +309,33 @@ pub fn vote(
     };
     let seg_obs: Vec<Vec<&FrameObservation>> =
         plan.segment_times.iter().map(|t| obs_for(t)).collect();
-    let seg_verdict: Vec<Option<Verdict>> =
-        seg_obs.iter().map(|o| visual_verdict(o, people)).collect();
+    let pre_obs: Vec<Option<&FrameObservation>> = (0..segments.len())
+        .map(|si| {
+            plan.pre_times
+                .get(si)
+                .copied()
+                .flatten()
+                .and_then(|t| frames.get(&time_key(t)))
+        })
+        .collect();
+    let seg_verdict: Vec<Option<Verdict>> = seg_obs
+        .iter()
+        .zip(&pre_obs)
+        .map(|(o, pre)| {
+            let v = visual_verdict(o, people)?;
+            let held = v.kind == CueKind::ActiveSpeakerHighlight
+                && pre.is_some_and(|pre| pre.highlighted().contains(&v.person_id.as_str()));
+            // a ring already lit before a short turn belongs to the previous turn
+            (!held).then_some(v)
+        })
+        .collect();
+    let response_weight = |a: &AddressEvent| {
+        if a.echo {
+            p.w_response_echo
+        } else {
+            p.w_response
+        }
+    };
 
     // label votes
     let mut labels: BTreeSet<&str> = BTreeSet::new();
@@ -367,7 +411,7 @@ pub fn vote(
                         t_s: r.start_s,
                         kind: CueKind::AddressResponse,
                         person_id: person.person_id.clone(),
-                        weight: kind_weight(CueKind::AddressResponse, p),
+                        weight: response_weight(a),
                         segment_id: Some(r.segment_id.clone()),
                         text: format!("answers \"{}\" with \"{}\"", a.sentence, r.text),
                     },
@@ -433,9 +477,14 @@ pub fn vote(
             .map(|m| m.values().filter(|v| **v > 0.0).sum())
             .unwrap_or(0.0)
     };
-    for (l, pid, v) in &cands {
-        if !mapped.contains_key(l) && *v >= 1.0 && *v / positive_sum(l) >= 0.7 {
-            mapped.insert(l, (*pid).clone());
+    // a second label on one participant only when the diarizer produced more
+    // labels than there are participants (a split cluster); otherwise a tile that
+    // looks lit for other reasons could pull two labels onto one person
+    if labels.len() > people.len() {
+        for (l, pid, v) in &cands {
+            if !mapped.contains_key(l) && *v >= 1.0 && *v / positive_sum(l) >= 0.7 {
+                mapped.insert(l, (*pid).clone());
+            }
         }
     }
     let confidence = |l: &str, pid: &str| -> f64 {
@@ -511,7 +560,7 @@ pub fn vote(
         }
         for a in responses.get(&si).into_iter().flatten() {
             if let Some(person) = people.get(a.person) {
-                *scores.entry(person.person_id.clone()).or_default() += p.w_response;
+                *scores.entry(person.person_id.clone()).or_default() += response_weight(a);
             }
         }
         for a in addressed.get(&si).into_iter().flatten() {
@@ -588,7 +637,11 @@ pub fn vote(
             source,
             reason,
             scores,
-            observations: seg_obs[si].iter().map(|o| (*o).clone()).collect(),
+            observations: pre_obs[si]
+                .into_iter()
+                .chain(seg_obs[si].iter().copied())
+                .cloned()
+                .collect(),
             spans: Vec::new(),
         });
     }
@@ -801,13 +854,19 @@ mod tests {
                     "Welcome", "everyone", "to", "the", "kiosk", "sync", "today", "folks.",
                 ],
             ),
-            seg("s1", "L1", 4.0, &["Hey,", "Mira."]),
-            // the diarizer put Mira's reply into the presenter's label
-            seg("s2", "L0", 5.2, &["Hey."]),
+            // Avery's greeting, put in Rohan's label by the diarizer
+            seg(
+                "s1",
+                "L1",
+                3.6,
+                &["Hey,", "Mira,", "glad", "you", "could", "join", "us."],
+            ),
+            // Mira's reply, put in the presenter's label
+            seg("s2", "L0", 6.8, &["Hey."]),
             seg(
                 "s3",
                 "L0",
-                6.0,
+                8.0,
                 &[
                     "So", "the", "relay", "pulls", "from", "the", "ledger", "service", "nightly.",
                 ],
@@ -815,7 +874,7 @@ mod tests {
             seg(
                 "s4",
                 "L1",
-                12.0,
+                13.0,
                 &[
                     "I", "can", "take", "the", "badge", "printer", "work", "this", "week.",
                 ],
@@ -829,12 +888,12 @@ mod tests {
         ];
         let p = VoteParams::default();
         let plan = plan_samples(&segs, &p);
-        // Avery lit during s0, s1 (the greeting is Avery's) and s3; Rohan during s4;
-        // nobody lit during s2 and s5 (Mira has no visible tile)
+        // Avery lit during s0, s1 and s3; Rohan during s4; nobody lit during s2
+        // and s5 (Mira has no visible tile)
         let frames = frames_for(&plan, |t| {
-            if (0.0..=4.8).contains(&t) || (6.0..=10.0).contains(&t) {
+            if (0.0..=6.5).contains(&t) || (8.0..=11.6).contains(&t) {
                 Some("avery-quinn")
-            } else if (12.0..=16.0).contains(&t) {
+            } else if (13.0..=16.6).contains(&t) {
                 Some("rohan-dasgupta")
             } else {
                 None
@@ -873,6 +932,66 @@ mod tests {
         for s in &out.segments {
             assert!((0.0..=1.0).contains(&s.confidence));
         }
+    }
+
+    #[test]
+    fn a_held_ring_does_not_claim_a_short_greeting_reply() {
+        let table = AliasTable::from_names(&["Avery Quinn", "Rohan Dasgupta", "Mira Okafor"]);
+        let segs = vec![
+            seg(
+                "s0",
+                "L0",
+                0.0,
+                &["Welcome", "to", "the", "relay", "sync", "everyone", "today"],
+            ),
+            seg("s1", "L0", 3.0, &["Hey,", "Mira."]),
+            // Mira's reply, put in the presenter's label by the diarizer
+            seg("s2", "L0", 4.2, &["Hey."]),
+            seg(
+                "s3",
+                "L0",
+                6.0,
+                &[
+                    "So", "the", "relay", "pulls", "from", "the", "ledger", "nightly",
+                ],
+            ),
+            seg(
+                "s4",
+                "L1",
+                12.0,
+                &["I", "will", "check", "the", "printer", "queue", "then"],
+            ),
+        ];
+        let p = VoteParams::default();
+        let plan = plan_samples(&segs, &p);
+        assert!(plan.pre_times[2].is_some() && plan.pre_times[0].is_none());
+        // Avery's ring stays lit through Mira's reply (hold), then Rohan speaks
+        let frames = frames_for(&plan, |t| {
+            if t < 10.0 {
+                Some("avery-quinn")
+            } else {
+                Some("rohan-dasgupta")
+            }
+        });
+        let addresses = find_addresses(&segs, &table, p.response_window_s, p.min_name_score);
+        assert!(addresses[0].echo);
+        let out = vote(&segs, &table, &addresses, &plan, &frames, &p);
+        let reply = &out.segments[2];
+        assert_eq!(reply.person_id.as_deref(), Some("mira-okafor"), "{reply:?}");
+        assert_eq!(reply.source, SpeakerSource::EvidenceRelabel);
+        assert_eq!(
+            reply.observations.len(),
+            3,
+            "hold sample plus two turn samples"
+        );
+        // without the hold rule the lit ring would have kept it
+        let no_hold = VoteParams {
+            short_turn_s: 0.0,
+            ..VoteParams::default()
+        };
+        let plan2 = plan_samples(&segs, &no_hold);
+        let out2 = vote(&segs, &table, &addresses, &plan2, &frames, &no_hold);
+        assert_eq!(out2.segments[2].person_id.as_deref(), Some("avery-quinn"));
     }
 
     #[test]

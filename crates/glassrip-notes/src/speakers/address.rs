@@ -42,7 +42,14 @@ pub struct AddressEvent {
     pub sentence: String,
     /// Segment that likely answers (the next segment, when it starts in time).
     pub response_segment: Option<usize>,
+    /// The answer is a short greeting or acknowledgment echoing a greeting
+    /// ("Hey, Name." then "Hey."), which is strong evidence it is Name's.
+    pub echo: bool,
 }
+
+const ECHO_WORDS: &[&str] = &[
+    "hey", "hi", "hello", "yes", "yeah", "yep", "yo", "morning", "thanks",
+];
 
 const GREETINGS: &[&str] = &[
     "hey", "hi", "hello", "thanks", "welcome", "bye", "morning", "sorry",
@@ -115,6 +122,15 @@ pub fn find_addresses(
                 } else {
                     None
                 };
+                let echo = kind == AddressKind::Greeting
+                    && response_segment
+                        .and_then(|r| segments.get(r))
+                        .is_some_and(|r| {
+                            r.words.len() <= 3
+                                && r.words
+                                    .first()
+                                    .is_some_and(|w| ECHO_WORDS.contains(&letters(&w.w).as_str()))
+                        });
                 out.push(AddressEvent {
                     segment: si,
                     word: start + k,
@@ -125,6 +141,7 @@ pub fn find_addresses(
                     kind,
                     sentence: sentence.join(" "),
                     response_segment,
+                    echo,
                 });
             }
             start = last + 1;
@@ -163,6 +180,8 @@ mod tests {
             .iter()
             .map(|e| (e.segment, e.person, e.kind, e.response_segment))
             .collect();
+        assert!(ev[0].echo, "\"Hey.\" answering \"Hey, Rohan.\" is an echo");
+        assert!(!ev[1].echo);
         assert_eq!(
             got,
             vec![
