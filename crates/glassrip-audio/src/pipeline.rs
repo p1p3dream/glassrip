@@ -405,6 +405,8 @@ pub async fn run(input: &Path, cfg: &PipelineConfig) -> Result<PipelineOutput> {
                         words_diarizer: by(Source::Diarizer),
                         words_gap_fill: by(Source::GapFill),
                         words_unassigned: by(Source::Unassigned),
+                        votes: Default::default(),
+                        evidence_total: 0,
                     }
                 })
                 .collect(),

@@ -4,6 +4,9 @@
 //! `schema_version`, `run_id`, `producer`, `inputs`, `params`, `items`. They
 //! live here until `glassrip-core` owns the shared envelope.
 
+use std::collections::BTreeMap;
+
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub use crate::recluster::Source;
@@ -187,7 +190,7 @@ pub struct SpeakersParams {
 }
 
 /// A known participant.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Person {
     /// Stable person id.
     pub person_id: String,
@@ -198,7 +201,7 @@ pub struct Person {
 }
 
 /// Resolution status of a speaker label.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SpeakerStatus {
     /// Mapped to a person.
@@ -210,7 +213,9 @@ pub enum SpeakerStatus {
 }
 
 /// Kind of evidence for a speaker mapping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceKind {
     /// Conferencing UI highlighted the active speaker.
@@ -219,10 +224,17 @@ pub enum EvidenceKind {
     DirectAddress,
     /// Talk time or role cue.
     RoleCue,
+    /// No visible tile is lit and exactly one participant has no visible tile.
+    AbsentTile,
+    /// The segment answers a direct address to the person.
+    AddressResponse,
+    /// The segment addresses the person by name, so its speaker is someone else
+    /// (negative evidence).
+    AddressedNotSpeaker,
 }
 
 /// One piece of evidence for a speaker mapping.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Evidence {
     /// Time of the evidence, seconds.
     pub t_s: f64,
@@ -230,10 +242,19 @@ pub struct Evidence {
     pub kind: EvidenceKind,
     /// Supporting text.
     pub text: String,
+    /// Person the evidence points at (or away from), when not the item's person.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_id: Option<String>,
+    /// Vote weight (negative for evidence against).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<f64>,
+    /// Transcript segment the evidence comes from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment_id: Option<String>,
 }
 
 /// One speaker label.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SpeakerItem {
     /// Diarization label.
     pub label: String,
@@ -259,6 +280,12 @@ pub struct SpeakerItem {
     /// Words carrying this label only as a placeholder.
     #[serde(default)]
     pub words_unassigned: usize,
+    /// Vote totals per person (speaker naming).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub votes: BTreeMap<String, f64>,
+    /// Evidence found before `evidence` was trimmed to the strongest items.
+    #[serde(default)]
+    pub evidence_total: usize,
 }
 
 /// The `glassrip.speakers` artifact.
@@ -303,6 +330,8 @@ mod tests {
                     words_diarizer: 3,
                     words_gap_fill: 0,
                     words_unassigned: 0,
+                    votes: BTreeMap::new(),
+                    evidence_total: 0,
                 }],
             },
             people: vec![],
