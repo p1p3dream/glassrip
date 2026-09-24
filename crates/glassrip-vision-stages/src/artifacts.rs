@@ -315,6 +315,9 @@ pub struct RequestLog {
     pub attempts: u32,
     pub repaired: bool,
     pub eval_count: Option<u32>,
+    /// Informational: prompt tokens the server evaluated for this request. It
+    /// excludes a cached prefix reused from an earlier request, so it can be
+    /// far below the prompt's size.
     pub prompt_eval_count: Option<u32>,
     pub done_reason: Option<String>,
 }

@@ -142,16 +142,12 @@ impl Default for MonitorConfig {
     }
 }
 
-/// Check a reply against the context budget: the request must have fit
-/// (`prompt_eval_count + eval_count <= num_ctx`), generation must not have
-/// stopped on the length limit, and the prompt must still hold the whole image
-/// (a `prompt_eval_count` below the image-token count means the context was
-/// shifted or truncated).
-pub fn check_usage(
-    raw: &RawResponse,
-    request: &VisionRequest,
-    num_ctx: u32,
-) -> Result<(), ErrorInfo> {
+/// Check a reply against the context budget: generation must not have stopped
+/// on the length limit, and `prompt_eval_count + eval_count` must fit
+/// `num_ctx`. Ollama reports only newly evaluated prompt tokens (a reused,
+/// cached prefix is excluded), so the sum is a lower bound on usage and a
+/// small `prompt_eval_count` is not an error.
+pub fn check_usage(raw: &RawResponse, num_ctx: u32) -> Result<(), ErrorInfo> {
     if raw.done_reason.as_deref() == Some("length") {
         return Err(ErrorInfo::new(
             ErrorCode::ModelRequest,
@@ -165,15 +161,6 @@ pub fn check_usage(
         return Err(ErrorInfo::new(
             ErrorCode::ModelRequest,
             format!("prompt {prompt} + output {output} tokens exceed num_ctx {num_ctx}"),
-        ));
-    }
-    let image = request.image.tokens();
-    if raw.prompt_eval_count.is_some() && prompt < image {
-        return Err(ErrorInfo::new(
-            ErrorCode::ModelRequest,
-            format!(
-                "prompt evaluated {prompt} tokens, fewer than the image's {image}: context shifted or truncated"
-            ),
         ));
     }
     Ok(())
@@ -407,7 +394,7 @@ impl PlacementMonitor {
             return Err(e);
         }
         let (value, raw) = result.map_err(|e| crate::placement::vision_error_info(&e))?;
-        check_usage(&raw, &request, self.cfg.num_ctx)?;
+        check_usage(&raw, self.cfg.num_ctx)?;
         Ok((value, raw))
     }
 
@@ -506,8 +493,7 @@ pub fn vision_error_info(e: &VisionError) -> ErrorInfo {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use glassrip_vision::{BackendId, Durations, EncodedImage, GenerationOptions};
-    use image::{DynamicImage, RgbImage};
+    use glassrip_vision::{BackendId, Durations};
     use std::sync::atomic::AtomicBool;
 
     struct Flaky {
@@ -655,25 +641,12 @@ mod tests {
     }
 
     #[test]
-    fn usage_checks_catch_truncation_and_shifts() {
-        #[derive(serde::Deserialize, schemars::JsonSchema)]
-        #[allow(dead_code)]
-        struct Empty {}
-        let img = EncodedImage::encode(&DynamicImage::ImageRgb8(RgbImage::new(280, 280))).unwrap();
-        let req = VisionRequest::for_output::<Empty>(
-            "p",
-            img,
-            GenerationOptions {
-                seed: 0,
-                num_predict: 10,
-            },
-        )
-        .unwrap();
-        // 280 x 280 px = 100 image tokens.
-        assert!(check_usage(&raw(Some(400), Some(200), "stop"), &req, 8192).is_ok());
-        assert!(check_usage(&raw(Some(400), Some(200), "length"), &req, 8192).is_err());
-        assert!(check_usage(&raw(Some(8000), Some(300), "stop"), &req, 8192).is_err());
-        assert!(check_usage(&raw(Some(50), Some(300), "stop"), &req, 8192).is_err());
-        assert!(check_usage(&raw(None, None, "stop"), &req, 8192).is_ok());
+    fn usage_checks_catch_truncation_but_not_cache_hits() {
+        assert!(check_usage(&raw(Some(400), Some(200), "stop"), 8192).is_ok());
+        assert!(check_usage(&raw(Some(400), Some(200), "length"), 8192).is_err());
+        assert!(check_usage(&raw(Some(8000), Some(300), "stop"), 8192).is_err());
+        // A cache hit reports few prompt tokens; that is not an error.
+        assert!(check_usage(&raw(Some(50), Some(300), "stop"), 8192).is_ok());
+        assert!(check_usage(&raw(None, None, "stop"), 8192).is_ok());
     }
 }

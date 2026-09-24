@@ -233,3 +233,39 @@ async fn server_that_never_returns_fails_the_item() {
         .unwrap_err();
     assert!(e.message.contains("did not answer"), "{e}");
 }
+
+#[tokio::test]
+async fn cache_hit_with_tiny_prompt_count_succeeds() {
+    let server = MockServer::start().await;
+    mount_ps(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/version"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"version": "0.0.1"})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/show"))
+        .respond_with(show("sha256-one"))
+        .mount(&server)
+        .await;
+    // A reused prompt prefix: only 3 new prompt tokens, fewer than the image.
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": MODEL,
+            "message": {"role": "assistant", "content": "{\"n\": 3}"},
+            "done": true,
+            "done_reason": "stop",
+            "prompt_eval_count": 3,
+            "eval_count": 8
+        })))
+        .mount(&server)
+        .await;
+    let m = monitor(&server, 10, Duration::from_secs(1));
+    let (answer, raw) = m
+        .infer_typed::<Answer>(request(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(answer.n, 3);
+    assert_eq!(raw.prompt_eval_count, Some(3));
+}
