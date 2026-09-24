@@ -308,11 +308,6 @@ pub fn derive_grids(board: &BoardStateItem) -> Vec<DerivedGrid<'_>> {
     }]
 }
 
-/// Final nodes (present at the end), falling back to every node.
-pub fn final_nodes(board: &BoardStateItem) -> Vec<&NodeState> {
-    board.final_nodes()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -10,7 +10,7 @@ use pulldown_cmark::{Event, Options, Parser, Tag};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::facts::{deferred_nodes, derive_grids, final_nodes, node_owners, owner_summary};
+use crate::facts::{deferred_nodes, derive_grids, node_owners, owner_summary};
 use crate::style::role_of;
 use crate::RenderError;
 
@@ -131,9 +131,9 @@ pub fn render_markdown(
         .iter()
         .map(|p| {
             if notes.presenter.as_deref() == Some(p.display_name.as_str()) {
-                format!("{} (presenting)", p.display_name)
+                format!("{} (presenting)", inline(&p.display_name))
             } else {
-                p.display_name.clone()
+                inline(&p.display_name)
             }
         })
         .collect();
@@ -159,7 +159,8 @@ pub fn render_markdown(
         let deferred = deferred_nodes(b, &notes.decisions);
         let owners = node_owners(b, notes);
         let grids = derive_grids(b);
-        let mut rows: Vec<[String; 4]> = final_nodes(b)
+        let mut rows: Vec<[String; 4]> = b
+            .final_nodes()
             .into_iter()
             .map(|n| {
                 let status = match deferred.get(&n.id) {
@@ -254,7 +255,10 @@ pub fn render_markdown(
             })
             .collect();
         if !items.is_empty() {
-            owners.push(Owner { name, items });
+            owners.push(Owner {
+                name: inline(&name),
+                items,
+            });
         }
     }
 
@@ -283,8 +287,8 @@ pub fn render_markdown(
         .iter()
         .map(|l| {
             [
-                l.label.clone(),
-                cell(l.name.clone()),
+                cell(inline(&l.label)),
+                cell(inline(&l.name)),
                 format!("{:.2}", l.confidence),
                 format!("{:.0} s", l.talk_time_s),
             ]

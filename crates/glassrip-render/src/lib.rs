@@ -86,6 +86,27 @@ fn write(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), RenderError> {
     std::fs::rename(&tmp, &path).map_err(err)
 }
 
+/// Letters, digits, `-` and `_` only (board ids and stems come from inputs and
+/// must not reach the file system as paths).
+pub fn file_safe(s: &str) -> String {
+    let out: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        "board".into()
+    } else {
+        out
+    }
+}
+
 /// Renders markdown and one SVG (plus PNG preview) per board into `out_dir`.
 pub fn render_all(
     notes: &MeetingNotes,
@@ -104,9 +125,13 @@ pub fn render_all(
         let text = svg::render_svg(&env, &scene)?;
         let (checks, png) = svg::validate_svg(&text, &scene, &params.fonts);
         let base = if multi {
-            format!("{stem}-{}-architecture", b.board_id)
+            format!(
+                "{}-{}-architecture",
+                file_safe(stem),
+                file_safe(&b.board_id)
+            )
         } else {
-            format!("{stem}-architecture")
+            format!("{}-architecture", file_safe(stem))
         };
         let svg_name = format!("{base}.svg");
         write(out_dir, &svg_name, text.as_bytes())?;
@@ -134,7 +159,7 @@ pub fn render_all(
         svg_text.push((b.board_id.clone(), text));
     }
     let md = markdown::render_markdown(&env, notes, boards, &links, meta)?;
-    let md_name = format!("{stem}-meeting-notes.md");
+    let md_name = format!("{}-meeting-notes.md", file_safe(stem));
     write(out_dir, &md_name, md.as_bytes())?;
     let present: BTreeSet<String> = files.iter().map(|f| f.name.clone()).collect();
     let md_checks = markdown::check_markdown(&md, &present);
@@ -157,4 +182,17 @@ pub fn render_all(
         svg_text,
         ok,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::file_safe;
+
+    #[test]
+    fn file_names_are_sanitized() {
+        assert_eq!(file_safe("board-1"), "board-1");
+        assert_eq!(file_safe("../etc/passwd"), "etc-passwd");
+        assert_eq!(file_safe("a b/c"), "a-b-c");
+        assert_eq!(file_safe("//"), "board");
+    }
 }

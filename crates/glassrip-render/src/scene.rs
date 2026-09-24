@@ -15,7 +15,7 @@ use glassrip_notes::notes::MeetingNotes;
 use glassrip_notes::text::{mmss, sanitize_dashes};
 use serde::Serialize;
 
-use crate::facts::{deferred_nodes, derive_grids, final_nodes, focus_node, short_name};
+use crate::facts::{deferred_nodes, derive_grids, focus_node, short_name};
 use crate::style::{role_of, text_width, wrap, wrap_lines, Role};
 
 /// Canvas width unless the board needs more.
@@ -493,7 +493,8 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
         .iter()
         .flat_map(|g| g.members.iter().map(|n| n.id.as_str()))
         .collect();
-    let nodes: Vec<_> = final_nodes(board)
+    let nodes: Vec<_> = board
+        .final_nodes()
         .into_iter()
         .filter(|n| !in_grid.contains(n.id.as_str()))
         .collect();
@@ -981,6 +982,8 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
             let (kind, color) = match s.kind {
                 StickyKind::Question => ("OPEN QUESTION", "#f59e0b"),
                 StickyKind::Milestone => ("MILESTONE", "#0891b2"),
+                // Appendix B specifies the idea header in indigo; no analytics
+                // cards share the canvas, so it is not ambiguous here
                 StickyKind::Idea => ("IDEA", "#6366f1"),
                 StickyKind::Note => ("NOTE", "#2563eb"),
             };

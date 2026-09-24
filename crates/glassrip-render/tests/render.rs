@@ -175,8 +175,7 @@ async fn run_render_stage(
         Vec::new()
     };
     (
-        rep.map(|r| r.items_error)
-            .map_err(|e| format!("{e:?}")),
+        rep.map(|r| r.items_error).map_err(|e| format!("{e:?}")),
         recs,
     )
 }
@@ -217,4 +216,20 @@ async fn failed_validation_fails_the_item_when_strict() {
     .await;
     assert_eq!(errors, Ok(0));
     assert!(!recs[0].outcome.result.clone().unwrap().ok);
+}
+
+#[test]
+fn board_text_with_css_like_words_passes_the_style_check() {
+    let (notes, mut board) = inputs();
+    board.nodes[0].text = "font: bold (style guide)".into();
+    let dir = tempfile::tempdir().unwrap();
+    let r = render_all(&notes, &[board], &params(dir.path().to_path_buf())).unwrap();
+    let (_, svg) = &r.svg[0];
+    assert!(r.svg_text[0].1.contains("font: bold"));
+    assert!(
+        svg.style_violations.is_empty(),
+        "{:?}",
+        svg.style_violations
+    );
+    assert!(svg.ok, "{svg:?}");
 }

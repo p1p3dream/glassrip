@@ -179,13 +179,50 @@ pub fn configure_fonts(db: &mut usvg::fontdb::Database, fonts: &FontConfig) -> O
     sans
 }
 
+/// CSS in an SVG: `<style>` element bodies and `style` attribute values. Text
+/// content is not CSS (and the template escapes it, so it cannot fake either).
+fn css_parts(svg: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = svg;
+    while let Some(i) = rest.find("<style") {
+        let after = &rest[i + 6..];
+        let Some(open_end) = after.find('>') else {
+            break;
+        };
+        let body = &after[open_end + 1..];
+        let end = body.find("</style>").unwrap_or(body.len());
+        out.push(&body[..end]);
+        rest = &body[end..];
+    }
+    for quote in ['"', '\''] {
+        let key = format!("style={quote}");
+        let mut rest = svg;
+        while let Some(i) = rest.find(&key) {
+            let after = &rest[i + key.len()..];
+            let end = after.find(quote).unwrap_or(after.len());
+            out.push(&after[..end]);
+            rest = &after[end..];
+        }
+    }
+    out
+}
+
+/// True when CSS uses the `font` shorthand property (not `font-size` etc.).
+fn has_font_shorthand(css: &str) -> bool {
+    let b = css.as_bytes();
+    css.match_indices("font").any(|(i, _)| {
+        let before_ok = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'-');
+        before_ok && css[i + 4..].trim_start().starts_with(':')
+    })
+}
+
 /// Style rules that do not need a parser.
 pub fn style_violations(svg: &str) -> Vec<String> {
     let mut v = Vec::new();
     if svg.contains("<marker") {
         v.push("uses <marker> (arrowheads must be polygons)".into());
     }
-    if svg.contains("font:") {
+    if css_parts(svg).iter().any(|css| has_font_shorthand(css)) {
         v.push("uses the font: shorthand".into());
     }
     if svg.contains('\u{2014}') || svg.contains('\u{2013}') {
@@ -298,5 +335,13 @@ mod tests {
                 .any(|v| v.contains("dash"))
         );
         assert!(style_violations("<svg><!-- ok - fine --></svg>").is_empty());
+        // the shorthand counts in CSS only, never in text content
+        assert!(style_violations("<svg><text>font: bold</text></svg>").is_empty());
+        assert!(style_violations(
+            "<svg><style>.a { font-size: 12px; font-family: Inter; }</style></svg>"
+        )
+        .is_empty());
+        assert!(!style_violations("<svg><style>.a { font: 12px Inter; }</style></svg>").is_empty());
+        assert!(!style_violations("<svg><text style=\"font : 12px x\">a</text></svg>").is_empty());
     }
 }
