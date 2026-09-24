@@ -1,0 +1,658 @@
+//! The `notes` stage.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use glassrip_audio::types::TranscriptSegment;
+use glassrip_core::envelope::{ErrorCode, ErrorInfo};
+use glassrip_core::runner::{
+    ArtifactSpec, InputDecl, ItemContext, Stage, StageError, StageInputs, WorkItem,
+};
+use schemars::JsonSchema;
+use semver::Version;
+use serde::{Deserialize, Serialize};
+
+use super::llm::{same_model, ChatRequest, LoadedModel, OllamaTextConfig, TextBackend};
+use super::prompt::{
+    board_digest, map_request, reduce_request, repair_context, repair_request, windows, RepairCase,
+};
+use super::validate::{
+    assemble, check, dropped, merge_board_questions, Checked, Corpus, Draft, Section,
+};
+use super::{CallRecord, Caveat, MeetingNotes, NotesReport, NotesStatus, SpeakerLine};
+use crate::board::BoardState;
+use crate::named::{named_lines, paragraphs, NamedLine};
+use crate::people::AliasTable;
+use crate::schemas;
+use crate::speakers::{LabelStatus, SpeakersDoc, SpeakersRecord};
+use crate::text::{mmss, sanitize_dashes};
+
+/// Parameters of `notes`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct NotesParams {
+    /// Text model tag.
+    pub text_model: String,
+    /// Vision model to unload before loading the text model (phase C).
+    pub vision_model: Option<String>,
+    /// Ollama settings.
+    pub ollama: OllamaTextConfig,
+    /// Maximum tokens generated per call.
+    pub num_predict: u32,
+    /// Transcript tokens per window.
+    pub window_tokens: usize,
+    /// Lines repeated between consecutive windows.
+    pub window_overlap_lines: usize,
+    /// Accept a text model partly in system memory.
+    pub allow_spill: bool,
+    /// Unload the text model when done.
+    pub unload_after: bool,
+    /// Title for the notes (default: the board title).
+    pub title: Option<String>,
+    /// Speaker confidence below which a transcript line is flagged.
+    pub low_confidence: f32,
+    /// Dropped share of drafted items above which the notes are degraded.
+    pub max_drop_rate: f64,
+    /// Empty key sections degrade the notes when the transcript is longer than this, seconds.
+    pub alarm_min_transcript_s: f64,
+    /// Merge transcript lines by one speaker separated by at most this, seconds.
+    pub paragraph_gap_s: f64,
+    /// Transcript lines sent with a repair request, at most.
+    pub repair_context_lines: usize,
+}
+
+impl Default for NotesParams {
+    fn default() -> Self {
+        Self {
+            text_model: "qwen3.6:27b".into(),
+            vision_model: Some("qwen2.5vl:7b".into()),
+            ollama: OllamaTextConfig::default(),
+            num_predict: 4096,
+            window_tokens: 6000,
+            window_overlap_lines: 4,
+            allow_spill: false,
+            unload_after: true,
+            title: None,
+            low_confidence: 0.5,
+            max_drop_rate: 0.3,
+            alarm_min_transcript_s: 300.0,
+            paragraph_gap_s: 2.0,
+            repair_context_lines: 160,
+        }
+    }
+}
+
+/// Inputs gathered by `plan`.
+#[derive(Debug)]
+pub struct NotesInput {
+    segments: Vec<TranscriptSegment>,
+    boards: Vec<BoardState>,
+    speakers: SpeakersDoc,
+}
+
+/// `notes`: board state, speakers and transcript to `glassrip.meeting_notes`.
+pub struct NotesStage {
+    params: NotesParams,
+    backend: Arc<dyn TextBackend>,
+}
+
+impl NotesStage {
+    /// A stage using `backend` for the text model.
+    pub fn new(params: NotesParams, backend: Arc<dyn TextBackend>) -> Self {
+        Self { params, backend }
+    }
+
+    fn model_err(e: impl std::fmt::Display) -> ErrorInfo {
+        ErrorInfo::new(ErrorCode::ModelRequest, e.to_string())
+    }
+
+    /// Phase C: unload the vision model, load the text model, check placement.
+    async fn enter_phase_c(&self) -> Result<Option<LoadedModel>, ErrorInfo> {
+        let p = &self.params;
+        if let Some(vm) = &p.vision_model {
+            let resident = self.backend.loaded().await.map_err(Self::model_err)?;
+            if resident.iter().any(|m| same_model(&m.name, vm)) {
+                self.backend.unload(vm).await.map_err(Self::model_err)?;
+                let deadline = Instant::now() + Duration::from_secs(60);
+                loop {
+                    let resident = self.backend.loaded().await.map_err(Self::model_err)?;
+                    if !resident.iter().any(|m| same_model(&m.name, vm)) {
+                        break;
+                    }
+                    if Instant::now() > deadline {
+                        return Err(ErrorInfo::new(
+                            ErrorCode::ModelRequest,
+                            format!("vision model {vm} still loaded 60 s after keep_alive 0"),
+                        ));
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
+        self.backend
+            .load(&p.text_model)
+            .await
+            .map_err(Self::model_err)?;
+        let placement = self
+            .backend
+            .loaded()
+            .await
+            .map_err(Self::model_err)?
+            .into_iter()
+            .find(|m| same_model(&m.name, &p.text_model));
+        match &placement {
+            Some(m) if m.size_vram < m.size && !p.allow_spill => Err(ErrorInfo::new(
+                ErrorCode::ModelRequest,
+                format!(
+                    "text model {} is only {:.0}% on the GPU ({} of {} bytes); free VRAM or pass allow_spill",
+                    p.text_model,
+                    100.0 * m.size_vram as f64 / m.size.max(1) as f64,
+                    m.size_vram,
+                    m.size
+                ),
+            )),
+            None => Err(ErrorInfo::new(ErrorCode::ModelRequest, format!("text model {} did not load", p.text_model))),
+            _ => Ok(placement),
+        }
+    }
+
+    /// One schema-constrained call, parsed as a [`Draft`], with one retry on a parse failure.
+    async fn call(
+        &self,
+        req: ChatRequest,
+        calls: &mut Vec<CallRecord>,
+    ) -> Result<Option<Draft>, ErrorInfo> {
+        let mut req = req;
+        for attempt in 0..2 {
+            let t0 = Instant::now();
+            let resp = self
+                .backend
+                .chat(&self.params.text_model, &req)
+                .await
+                .map_err(Self::model_err)?;
+            let parsed = serde_json::from_str::<Draft>(&resp.content);
+            calls.push(CallRecord {
+                purpose: if attempt == 0 {
+                    req.purpose.clone()
+                } else {
+                    format!("{} (retry)", req.purpose)
+                },
+                wall_s: t0.elapsed().as_secs_f64(),
+                prompt_tokens: resp.prompt_eval_count,
+                eval_tokens: resp.eval_count,
+                done_reason: resp.done_reason.clone(),
+                parse_error: parsed.as_ref().err().map(|e| e.to_string()),
+            });
+            match parsed {
+                Ok(d) => return Ok(Some(d)),
+                Err(e) if attempt == 0 => {
+                    if let Some(m) = req.messages.last_mut() {
+                        m.content.push_str(&format!(
+                            "\n\nYour previous reply was not valid JSON for the schema ({e}). Reply with complete, valid JSON only, and keep it shorter."
+                        ));
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        Ok(None)
+    }
+
+    async fn run(&self, input: &NotesInput, ctx: &ItemContext) -> Result<MeetingNotes, ErrorInfo> {
+        let started = Instant::now();
+        let p = &self.params;
+        let doc = &input.speakers;
+        let lines = named_lines(&input.segments, doc);
+        if lines.is_empty() {
+            return Err(ErrorInfo::new(ErrorCode::InvalidInput, "empty transcript"));
+        }
+        let mut table = AliasTable::default();
+        for person in &doc.people {
+            let i = table.add_person(&person.display_name);
+            for a in &person.aliases {
+                table.add_alias(i, a);
+            }
+        }
+        let people = table.people().to_vec();
+        let corpus = Corpus::new(&lines, &input.boards, table);
+        let digest = board_digest(&input.boards, &people);
+
+        let placement = self.enter_phase_c().await?;
+        let model_digest = self.backend.digest(&p.text_model).await.ok().flatten();
+
+        let mut calls = Vec::new();
+        let wins = windows(&lines, p.window_tokens, p.window_overlap_lines);
+        let mut drafts = Vec::new();
+        for (i, w) in wins.iter().enumerate() {
+            if ctx.cancel_token().is_cancelled() {
+                return Err(ErrorInfo::new(
+                    ErrorCode::Cancelled,
+                    "cancelled during notes",
+                ));
+            }
+            let req = map_request(i, wins.len(), w, &lines, &digest, &people, p.num_predict);
+            if let Some(d) = self.call(req, &mut calls).await? {
+                drafts.push(d);
+            }
+        }
+        let draft = if drafts.len() > 1 {
+            let req = reduce_request(&drafts, &digest, &people, p.num_predict);
+            match self.call(req, &mut calls).await? {
+                Some(d) => d,
+                None => {
+                    // fall back to the window drafts; Rust merges duplicates below
+                    let mut all = Draft::default();
+                    for d in &drafts {
+                        for s in Section::ALL {
+                            all.section_mut(s).extend(d.section(s).iter().cloned());
+                        }
+                    }
+                    all
+                }
+            }
+        } else {
+            drafts.into_iter().next().unwrap_or_default()
+        };
+
+        let mut checked: Vec<Checked> = Vec::new();
+        let mut dropped_items = Vec::new();
+        let mut cases = Vec::new();
+        for s in Section::ALL {
+            for item in draft.section(s) {
+                match check(s, item, &corpus) {
+                    Ok(c) => checked.push(c),
+                    Err(f) if f.fatal => dropped_items.push(dropped(s, item, f.reasons)),
+                    Err(f) => cases.push(RepairCase {
+                        section: s,
+                        item: item.clone(),
+                        reasons: f.reasons,
+                    }),
+                }
+            }
+        }
+        let failed_first = cases.len() + dropped_items.len();
+        let mut repaired = 0;
+        if !cases.is_empty() {
+            let ctx_lines = repair_context(&cases, &lines, p.repair_context_lines);
+            let req = repair_request(&cases, &lines, &ctx_lines, &digest, &people, p.num_predict);
+            let fixed = self.call(req, &mut calls).await?.unwrap_or_default();
+            let mut per_section_left: BTreeMap<Section, usize> = BTreeMap::new();
+            for c in &cases {
+                *per_section_left.entry(c.section).or_default() += 1;
+            }
+            let mut still: Vec<(Section, String, Vec<String>)> = Vec::new();
+            for s in Section::ALL {
+                for item in fixed.section(s) {
+                    let left = per_section_left.entry(s).or_default();
+                    if *left == 0 {
+                        break;
+                    }
+                    match check(s, item, &corpus) {
+                        Ok(c) => {
+                            *left -= 1;
+                            repaired += 1;
+                            checked.push(c);
+                        }
+                        Err(f) => still.push((s, item.main_text(), f.reasons)),
+                    }
+                }
+            }
+            // every failed item not replaced by a valid repair is dropped
+            let mut remaining: BTreeMap<Section, usize> = per_section_left;
+            for c in cases {
+                let left = remaining.entry(c.section).or_default();
+                if *left == 0 {
+                    continue;
+                }
+                *left -= 1;
+                let mut reasons = c.reasons.clone();
+                if let Some((_, _, r)) = still.iter().find(|x| x.0 == c.section) {
+                    reasons.push(format!("after repair: {}", r.join("; ")));
+                } else {
+                    reasons.push("after repair: not returned".into());
+                }
+                dropped_items.push(dropped(c.section, &c.item, reasons));
+            }
+        }
+        let mut sections = assemble(checked);
+        let board_added = merge_board_questions(&mut sections.open_questions, &input.boards);
+
+        let duration_s = input.segments.iter().map(|s| s.end_s).fold(0.0, f64::max);
+        let drafted = draft.len();
+        let drop_rate = dropped_items.len() as f64 / drafted.max(1) as f64;
+        let mut alarm = Vec::new();
+        if drop_rate > p.max_drop_rate {
+            alarm.push(format!(
+                "{:.0}% of drafted items failed validation",
+                drop_rate * 100.0
+            ));
+        }
+        if duration_s > p.alarm_min_transcript_s {
+            for (name, empty) in [
+                ("decisions", sections.decisions.is_empty()),
+                ("action items", sections.action_items.is_empty()),
+                ("summary", sections.summary.is_empty()),
+            ] {
+                if empty {
+                    alarm.push(format!("no {name}"));
+                }
+            }
+        }
+        let status = if alarm.is_empty() {
+            NotesStatus::Ok
+        } else {
+            NotesStatus::Degraded
+        };
+
+        let caveats = caveats(
+            &input.segments,
+            &lines,
+            doc,
+            &input.boards,
+            p,
+            &alarm,
+            dropped_items.len(),
+        );
+        let speakers = doc
+            .labels
+            .iter()
+            .map(|l| SpeakerLine {
+                label: l.label.clone(),
+                name: l
+                    .person_id
+                    .as_deref()
+                    .and_then(|pid| doc.display_name(pid))
+                    .map(str::to_string)
+                    .unwrap_or_else(|| match l.status {
+                        LabelStatus::Noise => "noise".into(),
+                        _ => "unresolved".into(),
+                    }),
+                status: match l.status {
+                    LabelStatus::Mapped => "mapped",
+                    LabelStatus::Noise => "noise",
+                    LabelStatus::Unresolved => "unresolved",
+                }
+                .into(),
+                confidence: l.confidence,
+                talk_time_s: l.talk_time_s,
+            })
+            .collect();
+        let presenter = doc
+            .summary
+            .as_ref()
+            .and_then(|s| s.presenter.as_deref())
+            .and_then(|pid| doc.display_name(pid))
+            .map(str::to_string);
+        if p.unload_after {
+            // best effort: the notes are complete either way
+            let _ = self.backend.unload(&p.text_model).await;
+        }
+        let items_kept = sections.decisions.len()
+            + sections.action_items.len()
+            + sections.open_questions.len()
+            + sections.timeline.len()
+            + sections.summary.len();
+        Ok(MeetingNotes {
+            title: p
+                .title
+                .clone()
+                .or_else(|| input.boards.iter().find_map(|b| b.title.clone())),
+            duration_s,
+            people,
+            presenter,
+            summary: sections.summary,
+            decisions: sections.decisions,
+            action_items: sections.action_items,
+            open_questions: sections.open_questions,
+            timeline: sections.timeline,
+            caveats,
+            speakers,
+            transcript: paragraphs(&lines, p.paragraph_gap_s, p.low_confidence),
+            report: NotesReport {
+                status,
+                model: p.text_model.clone(),
+                model_digest,
+                windows: wins.len(),
+                calls,
+                items_drafted: drafted + board_added,
+                items_kept,
+                items_failed_first_pass: failed_first,
+                items_repaired: repaired,
+                dropped: dropped_items,
+                drop_rate,
+                placement,
+                unloaded_vision_model: p.vision_model.clone(),
+                wall_s: started.elapsed().as_secs_f64(),
+            },
+        })
+    }
+}
+
+/// Caveats computed from the inputs (never from model text).
+fn caveats(
+    segments: &[TranscriptSegment],
+    lines: &[NamedLine],
+    doc: &SpeakersDoc,
+    boards: &[BoardState],
+    p: &NotesParams,
+    alarm: &[String],
+    dropped: usize,
+) -> Vec<Caveat> {
+    let mut out = Vec::new();
+    if !alarm.is_empty() {
+        out.push(Caveat {
+            kind: "degraded".into(),
+            text: format!(
+                "These notes are incomplete ({}). Check them against the transcript.",
+                alarm.join("; ")
+            ),
+        });
+    }
+    let unresolved: Vec<String> = doc
+        .labels
+        .iter()
+        .filter(|l| l.status != LabelStatus::Mapped)
+        .map(|l| format!("{} ({:.0} s)", l.label, l.talk_time_s))
+        .collect();
+    if !unresolved.is_empty() {
+        out.push(Caveat {
+            kind: "speakers".into(),
+            text: format!(
+                "Diarization labels not matched to a participant: {}.",
+                unresolved.join(", ")
+            ),
+        });
+    }
+    let low: Vec<&NamedLine> = lines
+        .iter()
+        .filter(|l| l.speaker_confidence < p.low_confidence)
+        .collect();
+    let relabeled: Vec<&NamedLine> = lines.iter().filter(|l| l.relabeled).collect();
+    if !low.is_empty() || !relabeled.is_empty() {
+        let examples: Vec<String> = relabeled
+            .iter()
+            .take(4)
+            .map(|l| {
+                let words: Vec<&str> = l.text.split_whitespace().take(6).collect();
+                format!(
+                    "{} \"{}\" ({})",
+                    mmss(l.start_s),
+                    words.join(" "),
+                    l.speaker
+                )
+            })
+            .collect();
+        let mut text = format!(
+            "{} of {} transcript lines have a low-confidence speaker (below {:.1}); {} were reassigned from the diarizer's label by on-screen speaker or direct-address cues",
+            low.len(),
+            lines.len(),
+            p.low_confidence,
+            relabeled.len()
+        );
+        if !examples.is_empty() {
+            text.push_str(&format!(", for example {}", examples.join(", ")));
+        }
+        text.push_str(". Flagged lines are marked in the transcript.");
+        out.push(Caveat {
+            kind: "speakers".into(),
+            text,
+        });
+    }
+    let (mut words, mut gap_words, mut gap_s) = (0usize, 0usize, 0.0f64);
+    let mut corrections: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut low_p = 0usize;
+    for s in segments {
+        for w in &s.words {
+            words += 1;
+            if w.source == glassrip_audio::recluster::Source::GapFill {
+                gap_words += 1;
+                gap_s += (w.end_s - w.start_s).max(0.0);
+            }
+            if let Some(raw) = &w.w_raw {
+                let clean = |x: &str| x.trim_matches(|c: char| !c.is_alphanumeric()).to_string();
+                *corrections.entry((clean(raw), clean(&w.w))).or_default() += 1;
+            } else if w.p < 0.3 && w.w.chars().next().is_some_and(char::is_uppercase) {
+                low_p += 1;
+            }
+        }
+    }
+    if gap_words > 0 {
+        let mut text = format!(
+            "{:.0}% of words ({gap_words} words, {:.0} s of speech) were attributed by gap filling, where the diarizer marked speech as silence; their speaker is less certain.",
+            100.0 * gap_words as f64 / words.max(1) as f64,
+            gap_s
+        );
+        if let Some(g) = doc.summary.as_ref().map(|s| &s.gap_fill) {
+            if g.runs_total > 0 {
+                text.push_str(&format!(
+                    " Checked against the video: {} of {} runs had an on-screen speaker cue; {} agreed, {} disagreed ({} relabeled, {} words).",
+                    g.runs_with_cue, g.runs_total, g.runs_agree, g.runs_contradict, g.runs_relabeled, g.words_relabeled
+                ));
+            }
+        }
+        out.push(Caveat {
+            kind: "gap_fill".into(),
+            text,
+        });
+    }
+    if !corrections.is_empty() || low_p > 0 {
+        let mut list: Vec<((String, String), usize)> = corrections.into_iter().collect();
+        list.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let shown: Vec<String> = list
+            .iter()
+            .take(8)
+            .map(|((r, c), n)| format!("\"{r}\" as \"{c}\" ({n})"))
+            .collect();
+        let mut text = String::from("The transcript is speech recognition output.");
+        if !shown.is_empty() {
+            text.push_str(&format!(
+                " Vocabulary corrections applied: {}.",
+                shown.join(", ")
+            ));
+        }
+        if low_p > 0 {
+            text.push_str(&format!(" {low_p} capitalized words were recognized with low confidence and may be misheard names or terms."));
+        }
+        out.push(Caveat {
+            kind: "misheard".into(),
+            text,
+        });
+    }
+    if dropped > 0 {
+        out.push(Caveat {
+            kind: "dropped".into(),
+            text: format!("{dropped} drafted items were removed because their citations or quotes could not be verified."),
+        });
+    }
+    if boards.is_empty() {
+        out.push(Caveat {
+            kind: "no_board".into(),
+            text: "No whiteboard was read; the notes come from the transcript only.".into(),
+        });
+    }
+    for c in &mut out {
+        c.text = sanitize_dashes(&c.text);
+    }
+    out
+}
+
+impl Stage for NotesStage {
+    type Params = NotesParams;
+    type Work = Arc<NotesInput>;
+    type Output = MeetingNotes;
+
+    fn name(&self) -> &'static str {
+        "notes"
+    }
+    fn version(&self) -> u32 {
+        1
+    }
+    fn output(&self) -> ArtifactSpec {
+        ArtifactSpec {
+            schema: schemas::MEETING_NOTES,
+            version: Version::new(1, 0, 0),
+        }
+    }
+    fn inputs(&self) -> Vec<InputDecl> {
+        vec![
+            InputDecl {
+                schema: schemas::BOARD_STATE,
+                major: crate::board::BOARD_STATE_MAJOR,
+            },
+            InputDecl {
+                schema: schemas::SPEAKERS,
+                major: 1,
+            },
+            InputDecl {
+                schema: schemas::TRANSCRIPT,
+                major: 1,
+            },
+        ]
+    }
+    fn params(&self) -> &NotesParams {
+        &self.params
+    }
+    fn item_timeout(&self) -> Option<Duration> {
+        Some(Duration::from_secs(3 * 3600))
+    }
+
+    fn plan(&self, inputs: &StageInputs) -> Result<Vec<WorkItem<Self::Work>>, StageError> {
+        let boards: Vec<BoardState> = inputs
+            .read_ok::<BoardState>(schemas::BOARD_STATE)?
+            .into_iter()
+            .map(|(_, b)| b)
+            .collect();
+        let speakers = SpeakersDoc::from_records(
+            inputs
+                .read_ok::<SpeakersRecord>(schemas::SPEAKERS)?
+                .into_iter()
+                .map(|(_, r)| r),
+        );
+        let mut segments: Vec<TranscriptSegment> = inputs
+            .read_ok::<TranscriptSegment>(schemas::TRANSCRIPT)?
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect();
+        segments.sort_by(|a, b| {
+            a.start_s
+                .total_cmp(&b.start_s)
+                .then(a.segment_id.cmp(&b.segment_id))
+        });
+        Ok(vec![WorkItem {
+            id: "meeting_notes".into(),
+            work: Arc::new(NotesInput {
+                segments,
+                boards,
+                speakers,
+            }),
+        }])
+    }
+
+    async fn process(
+        &self,
+        ctx: &ItemContext,
+        work: Self::Work,
+    ) -> Result<MeetingNotes, ErrorInfo> {
+        self.run(&work, ctx).await
+    }
+}
