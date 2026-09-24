@@ -477,18 +477,6 @@ fn badge(x: f64, y: f64, text: &str, fill: &str) -> Pill {
     }
 }
 
-/// Moves `p` down in steps until it overlaps none of `taken` (at most `tries` steps).
-fn nudge(mut p: Pill, taken: &[R], step: f64, tries: usize) -> Pill {
-    for _ in 0..tries {
-        if !taken.iter().any(|t| t.intersects(&p.r)) {
-            break;
-        }
-        p.r.y += step;
-        p.text.y += step;
-    }
-    p
-}
-
 /// Builds the scene for one board.
 pub fn build_scene(board: &BoardState, notes: &MeetingNotes) -> Scene {
     let nodes = final_nodes(board);
@@ -653,6 +641,11 @@ pub fn build_scene(board: &BoardState, notes: &MeetingNotes) -> Scene {
 
     // edges
     let mut taken: Vec<R> = cards_r.iter().map(|r| r.inflate(4.0)).collect();
+    taken.extend(
+        zones
+            .iter()
+            .filter_map(|z| z.badge.as_ref().map(|b| b.r.inflate(2.0))),
+    );
     let mut edges = Vec::new();
     let mut edge_anchor: BTreeMap<String, (f64, f64, bool)> = BTreeMap::new();
     let mut channel = 0usize;
@@ -876,20 +869,38 @@ pub fn build_scene(board: &BoardState, notes: &MeetingNotes) -> Scene {
                 let Some((mx, my, horizontal)) = edge_anchor.get(target).copied() else {
                     continue;
                 };
-                for (k, o) in owners.iter().enumerate() {
+                for o in owners.iter() {
                     let name = short_name(notes, o.person_id.as_deref(), &o.name_raw);
                     let w = (text_width(&name, 11.0, true) + 24.0).max(56.0);
-                    let (x, y) = if horizontal {
-                        (mx - w / 2.0, my + 10.0 + 28.0 * k as f64)
-                    } else {
-                        (mx - w - 10.0, my + 4.0 + 28.0 * k as f64)
-                    };
-                    let p = nudge(
-                        pill(x, y, &name, "#16a34a", "pill-text", 11.0, true),
-                        &taken,
-                        28.0,
-                        4,
+                    // candidates around the label anchor, nearest first
+                    let mut cands: Vec<(f64, f64)> = Vec::new();
+                    for step in 0..6 {
+                        let d = 28.0 * step as f64;
+                        if horizontal {
+                            cands.push((mx - w / 2.0, my + 10.0 + d));
+                            cands.push((mx - w / 2.0, my - 34.0 - d));
+                        } else {
+                            cands.push((mx - w - 10.0, my + 4.0 + d));
+                            cands.push((mx - w - 10.0, my - 28.0 - d));
+                            cands.push((mx + 10.0, my + 28.0 + d));
+                        }
+                    }
+                    let mut p = pill(
+                        cands[0].0,
+                        cands[0].1,
+                        &name,
+                        "#16a34a",
+                        "pill-text",
+                        11.0,
+                        true,
                     );
+                    for (x, y) in &cands {
+                        let cand = pill(*x, *y, &name, "#16a34a", "pill-text", 11.0, true);
+                        if free(&cand.r, &taken) {
+                            p = cand;
+                            break;
+                        }
+                    }
                     taken.push(p.r);
                     pills.push(p);
                 }
@@ -1285,6 +1296,11 @@ pub fn build_scene(board: &BoardState, notes: &MeetingNotes) -> Scene {
     blocking.push(("legend".into(), legend.r));
     for c in &cards {
         blocking.push((format!("card {}", c.id), c.r));
+    }
+    for z in &zones {
+        if let Some(b) = &z.badge {
+            blocking.push((format!("zone badge {}", z.label.text), b.r));
+        }
     }
     for (i, p) in pills.iter().enumerate() {
         blocking.push((format!("pill {i} {}", p.text.text), p.r));
