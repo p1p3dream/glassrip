@@ -1,0 +1,426 @@
+//! Prompts: board digest, transcript windows, map, reduce and repair messages.
+
+use std::fmt::Write as _;
+
+use super::llm::{ChatRequest, Message};
+use super::validate::{draft_schema, Draft, DraftItem, Section};
+use crate::board::{
+    event_text, first_seen, last_seen, target_text, BoardEvent, BoardExt, BoardStateItem,
+    EdgeOrientation, EdgeStyle, KeyframeTimes, NodeState, StickyKind,
+};
+use crate::named::NamedLine;
+use crate::people::Person;
+use crate::text::{content_tokens, estimate_tokens, jaccard, mmss};
+
+/// System prompt for every call.
+pub const SYSTEM: &str = "You write meeting notes from a speaker-attributed transcript and a summary of the whiteboard shown in the meeting. \
+Use only what was said or shown; never add facts. \
+Every item must cite the ids of the transcript lines that support it (segment_ids, for example seg_00012), and may also cite board event ids and keyframe ids from the board summary. Cite only ids that appear in the input. \
+The quote field must be copied exactly from one cited transcript line (3 to 20 consecutive words, keep the original wording and spelling) or be an empty string. \
+Decisions: choices the group settled on (what to do, what not to do, who does what), not ideas that were only floated. \
+Action items: one person (or everyone) who will do one concrete task; owner is a participant name or everyone; the task starts with a verb and names what is done. Never list greetings, farewells, thanks or small talk. \
+Open questions: questions raised and left unanswered. \
+Timeline: the main phases of the meeting in order, one short entry per phase. \
+Summary: the three to six most important points. \
+Write short plain sentences. Do not use em dashes.";
+
+/// One transcript line as the model sees it.
+pub fn format_line(l: &NamedLine) -> String {
+    format!(
+        "{} [{}] {}: {}",
+        l.segment_id,
+        mmss(l.start_s),
+        l.speaker,
+        l.text.trim()
+    )
+}
+
+/// Board summary listing every id the model may cite (event ids and keyframe
+/// ids; board elements themselves have no citable id).
+pub fn board_digest(boards: &[BoardStateItem], keyframes: &KeyframeTimes) -> String {
+    let mut s = String::new();
+    if boards.is_empty() {
+        return "No whiteboard was read.".into();
+    }
+    for b in boards {
+        let _ = writeln!(
+            s,
+            "Board {} (final state at {})",
+            b.board_id,
+            mmss(b.end_s())
+        );
+        s.push_str("Boxes in the final state:\n");
+        for n in b.final_nodes() {
+            let _ = writeln!(
+                s,
+                "- \"{}\" (from {})",
+                n.text,
+                mmss(first_seen(&n.lifetimes))
+            );
+        }
+        let removed: Vec<&NodeState> = b.nodes.iter().filter(|n| !n.in_final).collect();
+        if !removed.is_empty() {
+            s.push_str("Boxes removed during the meeting:\n");
+            for n in removed {
+                let until = last_seen(&n.lifetimes).map(mmss).unwrap_or_default();
+                let _ = writeln!(s, "- \"{}\" (seen until {until})", n.text);
+            }
+        }
+        s.push_str("Arrows (from caller to callee):\n");
+        let label = |id: &str| {
+            b.node(id)
+                .map(|n| n.text.clone())
+                .unwrap_or_else(|| id.to_string())
+        };
+        for e in b.final_edges() {
+            let arrow = match e.direction {
+                EdgeOrientation::Forward => "->",
+                EdgeOrientation::Bidirectional => "<->",
+                EdgeOrientation::Uncertain => "--",
+            };
+            let _ = writeln!(
+                s,
+                "- {} {arrow} {}{}{}",
+                label(&e.src),
+                label(&e.dst),
+                if e.label.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" labeled \"{}\"", e.label.trim())
+                },
+                if e.style == EdgeStyle::Dashed {
+                    " (dashed)"
+                } else {
+                    ""
+                }
+            );
+        }
+        let stickies = b.final_stickies();
+        if !stickies.is_empty() {
+            s.push_str("Sticky notes:\n");
+            for st in stickies {
+                let kind = match st.kind {
+                    StickyKind::Question => "question",
+                    StickyKind::Milestone => "milestone",
+                    StickyKind::Idea => "idea",
+                    StickyKind::Note => "note",
+                };
+                let _ = writeln!(
+                    s,
+                    "- {kind}: \"{}\" (from {})",
+                    st.text,
+                    mmss(first_seen(&st.lifetimes))
+                );
+            }
+        }
+        if !b.owner_assignments.is_empty() {
+            s.push_str("Owner tags:\n");
+            for o in &b.owner_assignments {
+                let until = if o.valid_to_s >= b.end_s() - 0.5 {
+                    String::new()
+                } else {
+                    format!(" until {}", mmss(o.valid_to_s))
+                };
+                let _ = writeln!(
+                    s,
+                    "- {} on {} from {}{until}",
+                    o.display_name,
+                    target_text(&o.target),
+                    mmss(o.valid_from_s)
+                );
+            }
+        }
+        let events: Vec<&BoardEvent> = b.events.iter().filter(|e| !e.baseline).collect();
+        if !events.is_empty() {
+            s.push_str("Board events (id, time, keyframe, what changed):\n");
+            for e in events {
+                let _ = writeln!(
+                    s,
+                    "- {} [{}] {} {}",
+                    e.event_id,
+                    mmss(e.t_s),
+                    e.keyframe_id,
+                    event_text(e)
+                );
+            }
+        }
+        let ks: Vec<String> = b
+            .board_keyframes
+            .iter()
+            .map(|k| match keyframes.get(k) {
+                Some(t) => format!("{k} ({})", mmss(t)),
+                None => k.clone(),
+            })
+            .collect();
+        if !ks.is_empty() {
+            let _ = writeln!(s, "Board keyframes: {}", ks.join(", "));
+        }
+    }
+    s
+}
+
+/// A transcript window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Window {
+    /// Line indices (into the named lines).
+    pub lines: Vec<usize>,
+}
+
+/// Splits lines into windows of at most `budget_tokens`, repeating the last
+/// `overlap` lines of a window at the start of the next.
+pub fn windows(lines: &[NamedLine], budget_tokens: usize, overlap: usize) -> Vec<Window> {
+    let cost: Vec<usize> = lines
+        .iter()
+        .map(|l| estimate_tokens(&format_line(l)) + 1)
+        .collect();
+    let mut out: Vec<Window> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let mut w = Vec::new();
+        let mut used = 0;
+        if let Some(prev) = out.last() {
+            let tail: Vec<usize> = prev
+                .lines
+                .iter()
+                .rev()
+                .take(overlap)
+                .rev()
+                .copied()
+                .collect();
+            for j in tail {
+                used += cost[j];
+                w.push(j);
+            }
+        }
+        let fresh_start = w.len();
+        while i < lines.len() && (w.len() == fresh_start || used + cost[i] <= budget_tokens) {
+            used += cost[i];
+            w.push(i);
+            i += 1;
+        }
+        out.push(Window { lines: w });
+    }
+    out
+}
+
+fn participants_line(people: &[Person]) -> String {
+    people
+        .iter()
+        .map(|p| p.display_name.clone())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Map request for one window.
+pub fn map_request(
+    idx: usize,
+    total: usize,
+    win: &Window,
+    lines: &[NamedLine],
+    digest: &str,
+    people: &[Person],
+    num_predict: u32,
+) -> ChatRequest {
+    let body: Vec<String> = win
+        .lines
+        .iter()
+        .filter_map(|i| lines.get(*i))
+        .map(format_line)
+        .collect();
+    let span = match (
+        win.lines.first().and_then(|i| lines.get(*i)),
+        win.lines.last().and_then(|i| lines.get(*i)),
+    ) {
+        (Some(a), Some(b)) => format!("{} to {}", mmss(a.start_s), mmss(b.end_s)),
+        _ => String::new(),
+    };
+    let user = format!(
+        "Participants: {}\n\nWhiteboard:\n{digest}\nTranscript part {} of {total} ({span}). Each line is: segment_id [mm:ss] speaker: text\n{}\n\nExtract the decisions, action items, open questions, timeline entries and summary points supported by this part. Return JSON only.",
+        participants_line(people),
+        idx + 1,
+        body.join("\n"),
+    );
+    ChatRequest {
+        purpose: format!("map {}/{total}", idx + 1),
+        messages: vec![
+            Message {
+                role: "system".into(),
+                content: SYSTEM.into(),
+            },
+            Message {
+                role: "user".into(),
+                content: user,
+            },
+        ],
+        format: draft_schema(),
+        num_predict,
+    }
+}
+
+/// Reduce request merging the drafts of several windows.
+pub fn reduce_request(
+    drafts: &[Draft],
+    digest: &str,
+    people: &[Person],
+    num_predict: u32,
+) -> ChatRequest {
+    let mut merged = Draft::default();
+    for d in drafts {
+        for s in Section::ALL {
+            merged.section_mut(s).extend(d.section(s).iter().cloned());
+        }
+    }
+    let candidates = serde_json::to_string_pretty(&merged).unwrap_or_default();
+    let user = format!(
+        "Participants: {}\n\nWhiteboard:\n{digest}\nThe notes below were drafted separately for consecutive parts of one meeting, so the same point can appear more than once. Merge them into one set of notes: combine duplicates into one item and keep the union of their citations, keep the clearest wording, drop items that do not meet the rules, order the timeline by time and merge it into at most 12 phases, and give three to six summary points. Copy segment_ids, event_ids, keyframe_ids and quotes only from the drafts. Return JSON only.\n\nDrafts:\n{candidates}",
+        participants_line(people),
+    );
+    ChatRequest {
+        purpose: "reduce".into(),
+        messages: vec![
+            Message {
+                role: "system".into(),
+                content: SYSTEM.into(),
+            },
+            Message {
+                role: "user".into(),
+                content: user,
+            },
+        ],
+        format: draft_schema(),
+        num_predict,
+    }
+}
+
+/// A failed item sent for repair.
+#[derive(Debug, Clone)]
+pub struct RepairCase {
+    /// Section.
+    pub section: Section,
+    /// The item.
+    pub item: DraftItem,
+    /// Validation failures.
+    pub reasons: Vec<String>,
+}
+
+/// Transcript lines relevant to the failing items: cited lines with neighbours,
+/// plus the best-matching lines by content words.
+pub fn repair_context(cases: &[RepairCase], lines: &[NamedLine], max_lines: usize) -> Vec<usize> {
+    let mut pick = std::collections::BTreeSet::new();
+    for c in cases {
+        for (i, l) in lines.iter().enumerate() {
+            if c.item.segment_ids.iter().any(|id| id == &l.segment_id) {
+                for j in i.saturating_sub(2)..=(i + 2).min(lines.len().saturating_sub(1)) {
+                    pick.insert(j);
+                }
+            }
+        }
+        let toks = content_tokens(&format!(
+            "{} {} {}",
+            c.item.main_text(),
+            c.item.quote,
+            c.item.owner
+        ));
+        let mut scored: Vec<(f64, usize)> = lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| (jaccard(&content_tokens(&l.text), &toks), i))
+            .filter(|(s, _)| *s > 0.0)
+            .collect();
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        for (_, i) in scored.into_iter().take(5) {
+            for j in i.saturating_sub(1)..=(i + 1).min(lines.len().saturating_sub(1)) {
+                pick.insert(j);
+            }
+        }
+    }
+    pick.into_iter().take(max_lines).collect()
+}
+
+/// Repair request listing each failure.
+pub fn repair_request(
+    cases: &[RepairCase],
+    lines: &[NamedLine],
+    context: &[usize],
+    digest: &str,
+    people: &[Person],
+    num_predict: u32,
+) -> ChatRequest {
+    let mut failures = String::new();
+    for (i, c) in cases.iter().enumerate() {
+        let item = serde_json::to_string(&c.item).unwrap_or_default();
+        let _ = writeln!(
+            failures,
+            "{}. section {}: {item}\n   problems: {}",
+            i + 1,
+            c.section.key(),
+            c.reasons.join("; ")
+        );
+    }
+    let ctx: Vec<String> = context
+        .iter()
+        .filter_map(|i| lines.get(*i))
+        .map(format_line)
+        .collect();
+    let user = format!(
+        "Participants: {}\n\nWhiteboard:\n{digest}\nThese drafted items failed validation:\n{failures}\nRelevant transcript lines (segment_id [mm:ss] speaker: text):\n{}\n\nReturn corrected versions of these items in their sections: cite segment ids that exist and support the item, copy quotes exactly from a cited line (or leave the quote empty), use a participant name or everyone as owner, and start tasks with a verb. Leave out any item the transcript does not support. Return JSON only.",
+        participants_line(people),
+        ctx.join("\n"),
+    );
+    ChatRequest {
+        purpose: "repair".into(),
+        messages: vec![
+            Message {
+                role: "system".into(),
+                content: SYSTEM.into(),
+            },
+            Message {
+                role: "user".into(),
+                content: user,
+            },
+        ],
+        format: draft_schema(),
+        num_predict,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line(i: usize) -> NamedLine {
+        NamedLine {
+            segment_id: format!("seg_{i:05}"),
+            start_s: i as f64 * 5.0,
+            end_s: i as f64 * 5.0 + 4.0,
+            person_id: None,
+            speaker: "Avery Quinn".into(),
+            text: "We should move the relay config into the ledger service this week.".into(),
+            text_raw: String::new(),
+            speaker_confidence: 1.0,
+            relabeled: false,
+            gap_fill_share: 0.0,
+        }
+    }
+
+    #[test]
+    fn windows_respect_budget_and_overlap() {
+        let lines: Vec<NamedLine> = (0..40).map(line).collect();
+        let per = estimate_tokens(&format_line(&lines[0])) + 1;
+        let ws = windows(&lines, per * 12, 2);
+        assert!(ws.len() >= 4);
+        for w in &ws {
+            assert!(w.lines.len() <= 12);
+        }
+        assert_eq!(ws[1].lines[..2], ws[0].lines[ws[0].lines.len() - 2..]);
+        let covered: std::collections::BTreeSet<usize> =
+            ws.iter().flat_map(|w| w.lines.clone()).collect();
+        assert_eq!(covered.len(), 40);
+        assert_eq!(windows(&lines[..3], 1_000_000, 2).len(), 1);
+    }
+
+    #[test]
+    fn line_format() {
+        assert!(format_line(&line(3)).starts_with("seg_00003 [00:15] Avery Quinn: We should"));
+    }
+}

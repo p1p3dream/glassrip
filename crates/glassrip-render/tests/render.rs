@@ -1,0 +1,235 @@
+//! Rendering the synthetic meeting: markdown and SVG snapshots plus validation.
+//!
+//! The board state is produced by glassrip-meeting's own consolidation (shared
+//! generator), and text is rendered with a bundled OFL font (Inter) with system
+//! fonts off, so validation is asserted the same way on every host.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+#[path = "../../glassrip-notes/tests/common/synthetic_board.rs"]
+mod synthetic_board;
+
+use std::path::PathBuf;
+
+use glassrip_core::cache::Cache;
+use glassrip_core::envelope::{ErrorCode, Producer, Record, SchemaReq};
+use glassrip_core::graph::{meeting_mode_stage_decls, Selection, StageGraph};
+use glassrip_core::jsonl;
+use glassrip_core::manifest::RunDir;
+use glassrip_core::runner::{Runner, RunnerOptions};
+use glassrip_notes::board::{BoardExt, BoardStateItem};
+use glassrip_notes::import;
+use glassrip_notes::notes::MeetingNotes;
+use glassrip_notes::schemas;
+use glassrip_render::markdown::MarkdownMeta;
+use glassrip_render::scene::{build_scene, overlaps};
+use glassrip_render::stage::RENDER_SCHEMA;
+use glassrip_render::svg::FontConfig;
+use glassrip_render::{render_all, RenderParams, RenderResult, RenderStage};
+use semver::Version;
+use tokio_util::sync::CancellationToken;
+
+const NOTES: &str = include_str!("fixtures/synthetic_notes.json");
+
+fn inputs() -> (MeetingNotes, BoardStateItem) {
+    (
+        serde_json::from_str(NOTES).unwrap(),
+        synthetic_board::synthetic_board().0,
+    )
+}
+
+fn bundled_fonts() -> FontConfig {
+    FontConfig {
+        system: false,
+        dirs: vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/assets/fonts")],
+    }
+}
+
+fn params(out: PathBuf) -> RenderParams {
+    RenderParams {
+        out_dir: out,
+        stem: "kiosk".into(),
+        meta: MarkdownMeta {
+            date: Some("2031-04-02, 10:00 to 10:02".into()),
+            source: None,
+        },
+        fonts: bundled_fonts(),
+        ..RenderParams::default()
+    }
+}
+
+#[test]
+fn defaults_are_strict() {
+    assert!(RenderParams::default().strict);
+}
+
+#[test]
+fn synthetic_meeting_renders_and_validates() {
+    let (notes, board) = inputs();
+    // the producer's board, as consumed here
+    assert!(board.is_final);
+    assert_eq!(board.final_nodes().len(), 4, "{:#?}", board.nodes);
+    assert!(board
+        .nodes
+        .iter()
+        .any(|n| n.text == "Old Sketch" && !n.in_final));
+    let dir = tempfile::tempdir().unwrap();
+    // GLASSRIP_RENDER_DUMP_DIR keeps the files for a visual check
+    let out = std::env::var("GLASSRIP_RENDER_DUMP_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| dir.path().to_path_buf());
+    let r = render_all(&notes, &[board], &params(out.clone())).unwrap();
+    assert!(r.markdown.ok, "{:?}", r.markdown);
+    let (_, svg) = &r.svg[0];
+    assert!(svg.ok, "{svg:?}");
+    assert!(svg.font_faces > 0);
+    assert_eq!(svg.text_rendered, svg.text_nodes);
+    assert_eq!(svg.layout_method, "board_positions");
+    for f in &r.files {
+        assert!(out.join(&f.name).is_file(), "{}", f.name);
+    }
+    let text = &r.svg_text[0].1;
+    assert!(!text.contains("<marker"));
+    assert!(
+        text.contains("DEFERRED (00:26)"),
+        "deferred badge from the decision"
+    );
+    assert!(
+        text.contains("url(#glow-api)"),
+        "focus glow on the relay card"
+    );
+    assert!(text.contains("moved from Ledger Service"));
+    assert!(text.contains("MILESTONE"));
+    assert!(r.markdown_text.contains("Removed (seen"));
+    insta::assert_snapshot!("synthetic_markdown", r.markdown_text);
+    insta::assert_snapshot!("synthetic_svg", text);
+}
+
+#[test]
+fn missing_positions_fall_back_to_sugiyama() {
+    let (notes, mut board) = inputs();
+    for n in &mut board.nodes {
+        n.bbox = None;
+    }
+    let scene = build_scene(&board, &notes);
+    assert_eq!(scene.layout_method, "sugiyama");
+    assert!(overlaps(&scene).is_empty(), "{:?}", overlaps(&scene));
+}
+
+#[test]
+fn coincident_boxes_are_separated() {
+    let (notes, mut board) = inputs();
+    for n in &mut board.nodes {
+        n.bbox = Some(glassrip_notes::board::BBox::new(10.0, 10.0, 60.0, 60.0));
+    }
+    let scene = build_scene(&board, &notes);
+    assert!(overlaps(&scene).is_empty(), "{:?}", overlaps(&scene));
+}
+
+/// Runs the render stage; returns the stage outcome and the records written.
+async fn run_render_stage(
+    params: RenderParams,
+) -> (Result<u64, String>, Vec<Record<RenderResult>>) {
+    let (notes, board) = inputs();
+    let dir = tempfile::tempdir().unwrap();
+    let run = RunDir::open(
+        &dir.path().join("run"),
+        "synthetic",
+        Producer::glassrip("0.1.0", None),
+    )
+    .unwrap();
+    import::write_artifact(
+        &run,
+        schemas::MEETING_NOTES,
+        Version::new(1, 0, 0),
+        serde_json::json!({}),
+        vec![("meeting_notes".to_string(), notes)],
+    )
+    .unwrap();
+    import::import_boards(&run, &[board]).unwrap();
+    let graph = StageGraph::new(meeting_mode_stage_decls()).unwrap();
+    let sel = Selection {
+        from: Some("render".into()),
+        ..Default::default()
+    };
+    let mut runner = Runner::new(
+        run,
+        graph,
+        &sel,
+        Cache::in_workspace(dir.path()),
+        RunnerOptions::default(),
+        CancellationToken::new(),
+    )
+    .unwrap();
+    let params = RenderParams {
+        out_dir: dir.path().join("out"),
+        ..params
+    };
+    let rep = runner.run_stage(&RenderStage::new(params)).await;
+    let path = runner.run_dir().artifact_path(RENDER_SCHEMA);
+    let recs = if path.is_file() {
+        jsonl::read::<Record<RenderResult>>(&path, &SchemaReq::new(RENDER_SCHEMA, 1))
+            .unwrap()
+            .items
+    } else {
+        Vec::new()
+    };
+    (
+        rep.map(|r| r.items_error).map_err(|e| format!("{e:?}")),
+        recs,
+    )
+}
+
+#[tokio::test]
+async fn render_stage_runs_on_the_core_runner() {
+    let (errors, recs) = run_render_stage(params(PathBuf::new())).await;
+    assert_eq!(errors, Ok(0));
+    let result = recs[0].outcome.result.clone().unwrap();
+    assert!(result.ok);
+    assert_eq!(result.files.len(), 3);
+}
+
+#[tokio::test]
+async fn failed_validation_fails_the_item_when_strict() {
+    // no fonts at all: text cannot render, so validation fails
+    let no_fonts = RenderParams {
+        fonts: FontConfig {
+            system: false,
+            dirs: vec![],
+        },
+        ..params(PathBuf::new())
+    };
+    let (outcome, recs) = run_render_stage(no_fonts.clone()).await;
+    let e = outcome.unwrap_err();
+    assert!(
+        e.contains("ErrorRateExceeded") && e.contains("errors: 1"),
+        "{e}"
+    );
+    if let Some(r) = recs.first() {
+        assert_eq!(r.outcome.error.clone().unwrap().code, ErrorCode::Validation);
+    }
+    // the same failure with strict off is recorded but does not fail the item
+    let (errors, recs) = run_render_stage(RenderParams {
+        strict: false,
+        ..no_fonts
+    })
+    .await;
+    assert_eq!(errors, Ok(0));
+    assert!(!recs[0].outcome.result.clone().unwrap().ok);
+}
+
+#[test]
+fn board_text_with_css_like_words_passes_the_style_check() {
+    let (notes, mut board) = inputs();
+    board.nodes[0].text = "font: bold (style guide)".into();
+    let dir = tempfile::tempdir().unwrap();
+    let r = render_all(&notes, &[board], &params(dir.path().to_path_buf())).unwrap();
+    let (_, svg) = &r.svg[0];
+    assert!(r.svg_text[0].1.contains("font: bold"));
+    assert!(
+        svg.style_violations.is_empty(),
+        "{:?}",
+        svg.style_violations
+    );
+    assert!(svg.ok, "{svg:?}");
+}

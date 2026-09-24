@@ -451,6 +451,8 @@ pub fn meeting_mode_stage_decls() -> Vec<StageDecl> {
                 "glassrip.board_state",
                 "glassrip.speakers",
                 "glassrip.transcript",
+                // keyframe times for board citations (board_state has ids only)
+                "glassrip.keyframes",
             ],
         ),
         d(

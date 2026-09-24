@@ -1,0 +1,106 @@
+# {{ title }}
+
+| | |
+|---|---|
+{% for k, v in meta %}
+| **{{ k }}** | {{ v }} |
+{% endfor %}
+
+## Summary
+
+{% for s in summary %}
+- {{ s }}
+{% else %}
+- No summary points passed validation.
+{% endfor %}
+{% for b in boards %}
+
+## Architecture{% if boards|length > 1 %}: {{ b.title }}{% endif %}
+
+
+{% if b.svg %}
+![{{ b.title }} architecture]({{ b.svg }})
+
+{% endif %}
+{% if b.png %}
+PNG preview: [{{ b.png }}]({{ b.png }})
+
+{% endif %}
+Arrows point from caller to callee, as drawn on the board. Final board state at {{ b.final_time }}.
+
+| Component | Role | Owner on the board | Status |
+|---|---|---|---|
+{% for r in b.rows %}
+| {{ r[0] }} | {{ r[1] }} | {{ r[2] }} | {{ r[3] }} |
+{% endfor %}
+{% if b.groups %}
+
+Groups on the board:
+
+{% for g in b.groups %}
+- {{ g }}
+{% endfor %}
+{% endif %}
+{% endfor %}
+
+## Decisions
+
+{% for d in decisions %}
+{{ loop.index }}. {{ d }}
+{% else %}
+No decisions passed validation.
+{% endfor %}
+
+## Owners and next steps
+
+{% for o in owners %}
+**{{ o.name }}**
+
+{% for it in o.items %}
+- {{ it }}
+{% endfor %}
+
+{% else %}
+No action items passed validation.
+
+{% endfor %}
+## Open questions
+
+{% for q in questions %}
+- {{ q }}
+{% else %}
+- None recorded.
+{% endfor %}
+
+## Timeline
+
+| Time | What happened |
+|---|---|
+{% for t in timeline %}
+| {{ t[0] }} | {{ t[1] }} |
+{% endfor %}
+
+## Caveats
+
+{% for c in caveats %}
+- {{ c }}
+{% else %}
+- None.
+{% endfor %}
+{% if speakers %}
+
+Speaker labels from diarization and how they were matched:
+
+| Diarization label | Speaker | Confidence | Talk time |
+|---|---|---|---|
+{% for s in speakers %}
+| {{ s[0] }} | {{ s[1] }} | {{ s[2] }} | {{ s[3] }} |
+{% endfor %}
+{% endif %}
+
+## Full transcript
+
+{% for p in transcript %}
+{{ p }}
+
+{% endfor %}

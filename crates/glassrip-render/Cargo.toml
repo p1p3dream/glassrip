@@ -1,0 +1,40 @@
+[package]
+name = "glassrip-render"
+version = "0.1.0"
+edition = "2021"
+description = "Markdown notes and house-style SVG rendering with validation for glassrip meeting mode"
+license = "MIT"
+publish = false
+
+[features]
+default = []
+# PP-OCRv5 tile reading for the example driver's visual speaker cues.
+ocr = ["glassrip-notes/ocr"]
+ocr-cuda = ["ocr", "glassrip-notes/ocr-cuda"]
+
+[dependencies]
+glassrip-core = { path = "../glassrip-core" }
+glassrip-notes = { path = "../glassrip-notes" }
+glassrip-meeting = { path = "../glassrip-meeting" }
+glassrip-vision = { path = "../glassrip-vision" }
+minijinja = { version = "2", default-features = false, features = ["builtins", "serde", "debug", "macros", "multi_template"] }
+pulldown-cmark = { version = "0.13", default-features = false }
+resvg = { version = "0.48", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
+rust-sugiyama = "0.4"
+schemars = "1.2"
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+clap = { version = "4", features = ["derive"] }
+glassrip-audio = { path = "../glassrip-audio" }
+insta = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process"] }
+tokio-util = "0.7"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

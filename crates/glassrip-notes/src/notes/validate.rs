@@ -1,0 +1,1208 @@
+//! The Rust side of the notes: what the model drafts is checked here.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use super::{
+    ActionItem, Decision, DroppedItem, Evidence, OpenQuestion, QuestionSource, Quote, QuoteMatch,
+    SummaryPoint, TimelineEntry,
+};
+use crate::board::{first_seen, BoardExt, BoardStateItem, KeyframeTimes, StickyKind};
+use crate::named::NamedLine;
+use crate::people::AliasTable;
+use crate::text::{content_tokens, is_stopword, jaccard, normalize, sanitize_dashes, tokens};
+
+/// Most `...` elisions in one quote.
+pub const MAX_ELISIONS: usize = 2;
+/// Fewest words in a quote.
+pub const MIN_QUOTE_TOKENS: usize = 5;
+/// Fewest words in each part of an elided quote.
+pub const MIN_PART_TOKENS: usize = 3;
+/// Share of the matched transcript span the quote's words must cover.
+pub const MIN_QUOTE_COVERAGE: f64 = 0.6;
+
+/// One drafted item (fields depend on the section).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DraftItem {
+    /// Statement (decisions, questions, timeline, summary).
+    #[serde(default)]
+    pub text: String,
+    /// Owner name (action items).
+    #[serde(default)]
+    pub owner: String,
+    /// Task (action items).
+    #[serde(default)]
+    pub task: String,
+    /// Transcript segment ids.
+    #[serde(default)]
+    pub segment_ids: Vec<String>,
+    /// Board event ids.
+    #[serde(default)]
+    pub event_ids: Vec<String>,
+    /// Keyframe ids.
+    #[serde(default)]
+    pub keyframe_ids: Vec<String>,
+    /// Verbatim quote from a cited segment (may be empty).
+    #[serde(default)]
+    pub quote: String,
+}
+
+impl DraftItem {
+    /// The item's main text (task for action items).
+    pub fn main_text(&self) -> String {
+        if self.task.is_empty() {
+            self.text.clone()
+        } else if self.owner.is_empty() {
+            self.task.clone()
+        } else {
+            format!("{}: {}", self.owner, self.task)
+        }
+    }
+}
+
+/// A drafted set of notes.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Draft {
+    /// Decisions.
+    #[serde(default)]
+    pub decisions: Vec<DraftItem>,
+    /// Action items.
+    #[serde(default)]
+    pub action_items: Vec<DraftItem>,
+    /// Open questions.
+    #[serde(default)]
+    pub open_questions: Vec<DraftItem>,
+    /// Timeline entries.
+    #[serde(default)]
+    pub timeline: Vec<DraftItem>,
+    /// Summary points.
+    #[serde(default)]
+    pub summary: Vec<DraftItem>,
+}
+
+/// A notes section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Section {
+    /// Decisions.
+    Decisions,
+    /// Action items.
+    ActionItems,
+    /// Open questions.
+    OpenQuestions,
+    /// Timeline.
+    Timeline,
+    /// Summary.
+    Summary,
+}
+
+impl Section {
+    /// All sections.
+    pub const ALL: [Section; 5] = [
+        Section::Decisions,
+        Section::ActionItems,
+        Section::OpenQuestions,
+        Section::Timeline,
+        Section::Summary,
+    ];
+
+    /// JSON key.
+    pub fn key(self) -> &'static str {
+        match self {
+            Section::Decisions => "decisions",
+            Section::ActionItems => "action_items",
+            Section::OpenQuestions => "open_questions",
+            Section::Timeline => "timeline",
+            Section::Summary => "summary",
+        }
+    }
+}
+
+impl Draft {
+    /// Items of a section.
+    pub fn section(&self, s: Section) -> &Vec<DraftItem> {
+        match s {
+            Section::Decisions => &self.decisions,
+            Section::ActionItems => &self.action_items,
+            Section::OpenQuestions => &self.open_questions,
+            Section::Timeline => &self.timeline,
+            Section::Summary => &self.summary,
+        }
+    }
+
+    /// Mutable items of a section.
+    pub fn section_mut(&mut self, s: Section) -> &mut Vec<DraftItem> {
+        match s {
+            Section::Decisions => &mut self.decisions,
+            Section::ActionItems => &mut self.action_items,
+            Section::OpenQuestions => &mut self.open_questions,
+            Section::Timeline => &mut self.timeline,
+            Section::Summary => &mut self.summary,
+        }
+    }
+
+    /// Items in all sections.
+    pub fn len(&self) -> usize {
+        Section::ALL.iter().map(|s| self.section(*s).len()).sum()
+    }
+
+    /// True when no section has items.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+fn ids_schema() -> Value {
+    json!({"type": "array", "items": {"type": "string"}, "maxItems": 8})
+}
+
+/// JSON schema of a [`Draft`] (sent as the Ollama `format`).
+pub fn draft_schema() -> Value {
+    let item = |fields: &[&str], max: u32| {
+        let mut props = serde_json::Map::new();
+        for f in fields {
+            props.insert((*f).to_string(), json!({"type": "string"}));
+        }
+        for f in ["segment_ids", "event_ids", "keyframe_ids"] {
+            props.insert(f.to_string(), ids_schema());
+        }
+        let mut required: Vec<&str> = fields.to_vec();
+        required.extend(["segment_ids", "event_ids", "keyframe_ids"]);
+        json!({
+            "type": "array", "maxItems": max,
+            "items": {"type": "object", "properties": props, "required": required}
+        })
+    };
+    json!({
+        "type": "object",
+        "properties": {
+            "decisions": item(&["text", "quote"], 12),
+            "action_items": item(&["owner", "task", "quote"], 16),
+            "open_questions": item(&["text", "quote"], 12),
+            "timeline": item(&["text"], 16),
+            "summary": item(&["text"], 8),
+        },
+        "required": ["decisions", "action_items", "open_questions", "timeline", "summary"]
+    })
+}
+
+#[derive(Debug, Clone)]
+struct SegText {
+    text: String,
+    text_raw: String,
+    norm: String,
+    norm_raw: String,
+    start_s: f64,
+    end_s: f64,
+}
+
+/// What citations and quotes are checked against.
+#[derive(Debug, Clone)]
+pub struct Corpus {
+    segs: BTreeMap<String, SegText>,
+    times: BTreeMap<String, f64>,
+    table: AliasTable,
+}
+
+impl Corpus {
+    /// Builds the corpus from named transcript lines and board states.
+    pub fn new(
+        lines: &[NamedLine],
+        boards: &[BoardStateItem],
+        keyframes: &KeyframeTimes,
+        table: AliasTable,
+    ) -> Self {
+        let mut segs: BTreeMap<String, SegText> = BTreeMap::new();
+        for l in lines {
+            let e = segs.entry(l.segment_id.clone()).or_insert_with(|| SegText {
+                text: String::new(),
+                text_raw: String::new(),
+                norm: String::new(),
+                norm_raw: String::new(),
+                start_s: l.start_s,
+                end_s: l.end_s,
+            });
+            for (dst, src) in [(&mut e.text, &l.text), (&mut e.text_raw, &l.text_raw)] {
+                if !dst.is_empty() {
+                    dst.push(' ');
+                }
+                dst.push_str(src);
+            }
+            e.start_s = e.start_s.min(l.start_s);
+            e.end_s = e.end_s.max(l.end_s);
+        }
+        for s in segs.values_mut() {
+            s.norm = normalize(&s.text);
+            s.norm_raw = normalize(&s.text_raw);
+        }
+        // citable board ids: events, and keyframes (times from glassrip.keyframes;
+        // an event's keyframe falls back to the event time)
+        let mut times = BTreeMap::new();
+        for b in boards {
+            for e in &b.events {
+                times.insert(e.event_id.clone(), e.t_s);
+                times
+                    .entry(e.keyframe_id.clone())
+                    .or_insert(keyframes.get(&e.keyframe_id).unwrap_or(e.t_s));
+            }
+            for k in &b.board_keyframes {
+                if let Some(t) = keyframes.get(k) {
+                    times.insert(k.clone(), t);
+                }
+            }
+        }
+        Self { segs, times, table }
+    }
+
+    /// The alias table.
+    pub fn table(&self) -> &AliasTable {
+        &self.table
+    }
+
+    /// Start and end of a segment.
+    pub fn segment_span(&self, id: &str) -> Option<(f64, f64)> {
+        self.segs.get(id).map(|s| (s.start_s, s.end_s))
+    }
+
+    /// Segment ids in time order.
+    pub fn segment_ids(&self) -> Vec<&str> {
+        let mut v: Vec<(&str, f64)> = self
+            .segs
+            .iter()
+            .map(|(k, s)| (k.as_str(), s.start_s))
+            .collect();
+        v.sort_by(|a, b| a.1.total_cmp(&b.1));
+        v.into_iter().map(|x| x.0).collect()
+    }
+
+    /// Finds a quote (with optional `...` elisions) in the cited segments.
+    /// Checks a quote (with optional `...` elisions) against the cited segments.
+    ///
+    /// A quote passes when it has at most [`MAX_ELISIONS`] elisions and at least
+    /// [`MIN_QUOTE_TOKENS`] tokens, every part has at least [`MIN_PART_TOKENS`]
+    /// tokens with one that is not a stopword, the parts appear in order in the
+    /// cited segments' verbatim text (else their corrected text), and the quote's
+    /// tokens cover at least [`MIN_QUOTE_COVERAGE`] of the transcript span they
+    /// match (elisions cannot skip most of what was said).
+    fn find_quote(&self, quote: &str, cited: &[&str]) -> Result<(QuoteMatch, String), String> {
+        let parts: Vec<Vec<String>> = quote
+            .split("...")
+            .flat_map(|p| p.split('\u{2026}'))
+            .map(tokens)
+            .filter(|p| !p.is_empty())
+            .collect();
+        if parts.len() > MAX_ELISIONS + 1 {
+            return Err(format!("quote has more than {MAX_ELISIONS} elisions"));
+        }
+        let total: usize = parts.iter().map(Vec::len).sum();
+        if total < MIN_QUOTE_TOKENS {
+            return Err(format!("quote is shorter than {MIN_QUOTE_TOKENS} words"));
+        }
+        if parts
+            .iter()
+            .any(|p| p.len() < MIN_PART_TOKENS || p.iter().all(|t| is_stopword(t)))
+        {
+            return Err(format!(
+                "each quoted part needs {MIN_PART_TOKENS} or more words, not only common words"
+            ));
+        }
+        let mut segs: Vec<(&str, &SegText)> = cited
+            .iter()
+            .filter_map(|id| self.segs.get(*id).map(|s| (*id, s)))
+            .collect();
+        segs.sort_by(|a, b| a.1.start_s.total_cmp(&b.1.start_s));
+        let mut best_coverage = 0.0f64;
+        for (raw, kind) in [(true, QuoteMatch::Raw), (false, QuoteMatch::Corrected)] {
+            // tokens of the cited segments in time order, with their segment
+            let hay: Vec<(&str, &str)> = segs
+                .iter()
+                .flat_map(|(id, s)| {
+                    let t = if raw { &s.norm_raw } else { &s.norm };
+                    t.split(' ')
+                        .filter(|w| !w.is_empty())
+                        .map(move |w| (*id, w))
+                })
+                .collect();
+            let at = |i: usize, part: &[String]| {
+                part.iter()
+                    .enumerate()
+                    .all(|(k, t)| hay.get(i + k).is_some_and(|h| h.1 == t))
+            };
+            let mut best: Option<(usize, usize)> = None;
+            for start in 0..hay.len() {
+                if !at(start, &parts[0]) {
+                    continue;
+                }
+                let mut pos = start + parts[0].len();
+                let mut ok = true;
+                for part in &parts[1..] {
+                    match (pos..hay.len()).find(|i| at(*i, part)) {
+                        Some(i) => pos = i + part.len(),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok && best.is_none_or(|(a, b)| pos - start < b - a) {
+                    best = Some((start, pos));
+                }
+            }
+            if let Some((a, b)) = best {
+                let coverage = total as f64 / (b - a) as f64;
+                if coverage >= MIN_QUOTE_COVERAGE {
+                    return Ok((kind, hay[a].0.to_string()));
+                }
+                best_coverage = best_coverage.max(coverage);
+            }
+        }
+        if best_coverage > 0.0 {
+            Err(format!(
+                "quote elides too much: it covers {:.0}% of the words it spans",
+                best_coverage * 100.0
+            ))
+        } else {
+            Err(format!("quote \"{quote}\" is not in the cited segments"))
+        }
+    }
+}
+
+/// An action-item owner.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Owner {
+    /// Participant (None: everyone).
+    pub person_id: Option<String>,
+    /// Display name.
+    pub name: String,
+}
+
+/// A drafted item that passed validation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Checked {
+    /// Section.
+    pub section: Section,
+    /// Text (task for action items), sanitized.
+    pub text: String,
+    /// Owners (action items).
+    pub owners: Vec<Owner>,
+    /// Citations.
+    pub evidence: Evidence,
+    /// Verified quote.
+    pub quote: Option<Quote>,
+    /// Start of the evidence, seconds.
+    pub t_start_s: f64,
+    /// End of the evidence, seconds.
+    pub t_end_s: f64,
+}
+
+/// Why a drafted item failed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Failure {
+    /// Reasons.
+    pub reasons: Vec<String>,
+    /// A repair cannot help (greetings, farewells).
+    pub fatal: bool,
+}
+
+const TASK_VERBS: &[&str] = &[
+    "add",
+    "adjust",
+    "align",
+    "analyze",
+    "ask",
+    "assess",
+    "assign",
+    "audit",
+    "build",
+    "change",
+    "check",
+    "clarify",
+    "clean",
+    "clone",
+    "collect",
+    "compare",
+    "configure",
+    "confirm",
+    "connect",
+    "contact",
+    "convert",
+    "coordinate",
+    "create",
+    "decide",
+    "define",
+    "deliver",
+    "demo",
+    "deploy",
+    "design",
+    "determine",
+    "develop",
+    "document",
+    "draft",
+    "draw",
+    "enable",
+    "estimate",
+    "evaluate",
+    "explore",
+    "export",
+    "extend",
+    "figure",
+    "file",
+    "finalize",
+    "find",
+    "finish",
+    "fix",
+    "follow",
+    "gather",
+    "get",
+    "hook",
+    "identify",
+    "implement",
+    "import",
+    "improve",
+    "inspect",
+    "install",
+    "integrate",
+    "investigate",
+    "learn",
+    "list",
+    "look",
+    "make",
+    "map",
+    "measure",
+    "meet",
+    "merge",
+    "migrate",
+    "model",
+    "move",
+    "offer",
+    "organize",
+    "own",
+    "pair",
+    "plan",
+    "post",
+    "prepare",
+    "present",
+    "prioritize",
+    "produce",
+    "propose",
+    "prototype",
+    "provide",
+    "publish",
+    "pull",
+    "push",
+    "read",
+    "rebuild",
+    "record",
+    "refactor",
+    "reach",
+    "remove",
+    "render",
+    "reorder",
+    "replace",
+    "report",
+    "request",
+    "research",
+    "resolve",
+    "review",
+    "run",
+    "schedule",
+    "scope",
+    "send",
+    "set",
+    "settle",
+    "share",
+    "ship",
+    "sketch",
+    "sort",
+    "spec",
+    "specify",
+    "split",
+    "start",
+    "store",
+    "study",
+    "submit",
+    "support",
+    "sync",
+    "take",
+    "talk",
+    "test",
+    "track",
+    "train",
+    "translate",
+    "try",
+    "understand",
+    "update",
+    "upload",
+    "validate",
+    "verify",
+    "wire",
+    "work",
+    "write",
+];
+
+const TASK_PREFIXES: &[&str] = &["to", "will", "should", "must", "needs", "need", "please"];
+
+const FAREWELLS: &[&str] = &[
+    "see you",
+    "see ya",
+    "bye",
+    "goodbye",
+    "talk to you later",
+    "talk later",
+    "catch you later",
+    "have a good",
+    "have a great",
+    "nice to meet",
+    "thanks everyone",
+    "thank you everyone",
+    "thanks for joining",
+    "hello",
+    "good morning",
+    "good afternoon",
+];
+
+/// True when the text is a greeting, thanks or farewell rather than content.
+pub fn is_greeting_or_farewell(text: &str) -> bool {
+    let n = normalize(text);
+    let toks = tokens(text);
+    if toks.len() <= 3
+        && toks.iter().any(|t| {
+            matches!(
+                t.as_str(),
+                "hi" | "hey" | "hello" | "bye" | "thanks" | "thank"
+            )
+        })
+    {
+        return true;
+    }
+    FAREWELLS
+        .iter()
+        .any(|f| n.starts_with(f) || n.contains(&format!(" {f} ")) || n.ends_with(&format!(" {f}")))
+        && content_tokens(text).len() <= 6
+}
+
+/// Checks the task has a leading verb and an object. Returns the reason if not.
+pub fn check_task(task: &str) -> Option<String> {
+    let toks = tokens(task);
+    let mut i = 0;
+    while toks
+        .get(i)
+        .is_some_and(|t| TASK_PREFIXES.contains(&t.as_str()))
+    {
+        i += 1;
+    }
+    let Some(verb) = toks.get(i) else {
+        return Some("empty task".into());
+    };
+    if !TASK_VERBS.contains(&verb.as_str()) {
+        return Some(format!(
+            "task must start with a task verb (found \"{verb}\")"
+        ));
+    }
+    let object = toks[i + 1..]
+        .iter()
+        .filter(|t| !crate::text::is_stopword(t))
+        .count();
+    if object == 0 || toks.len() < i + 3 {
+        return Some("task needs an object after the verb".into());
+    }
+    None
+}
+
+fn resolve_owners(raw: &str, table: &AliasTable) -> Result<Vec<Owner>, String> {
+    let mut out = Vec::new();
+    let replaced = raw.replace(" and ", ",").replace(['&', '/'], ",");
+    for part in replaced.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let n = normalize(part);
+        if matches!(
+            n.as_str(),
+            "everyone"
+                | "everybody"
+                | "all"
+                | "team"
+                | "the team"
+                | "whole team"
+                | "group"
+                | "the group"
+                | "all of us"
+        ) {
+            out.push(Owner {
+                person_id: None,
+                name: "Everyone".into(),
+            });
+            continue;
+        }
+        let m = table.match_screen_text(part).or_else(|| {
+            part.split_whitespace()
+                .next()
+                .and_then(|w| table.match_word(w))
+        });
+        match m.and_then(|m| table.person(m.person)) {
+            Some(p) => out.push(Owner {
+                person_id: Some(p.person_id.clone()),
+                name: p.display_name.clone(),
+            }),
+            None => return Err(format!("owner \"{part}\" is not a participant")),
+        }
+    }
+    if out.is_empty() {
+        return Err("action item has no owner".into());
+    }
+    out.dedup();
+    Ok(out)
+}
+
+/// Validates one drafted item.
+pub fn check(section: Section, item: &DraftItem, corpus: &Corpus) -> Result<Checked, Failure> {
+    let mut reasons = Vec::new();
+    let text = sanitize_dashes(if section == Section::ActionItems {
+        &item.task
+    } else {
+        &item.text
+    });
+    if tokens(&text).len() < 3 {
+        reasons.push("text too short".to_string());
+    }
+    if matches!(section, Section::Decisions | Section::ActionItems)
+        && is_greeting_or_farewell(&text)
+    {
+        return Err(Failure {
+            reasons: vec!["greeting or farewell".into()],
+            fatal: true,
+        });
+    }
+    let mut owners = Vec::new();
+    if section == Section::ActionItems {
+        if let Some(r) = check_task(&text) {
+            reasons.push(r);
+        }
+        match resolve_owners(&item.owner, corpus.table()) {
+            Ok(o) => owners = o,
+            Err(e) => reasons.push(e),
+        }
+    }
+    let evidence = Evidence {
+        segment_ids: dedup(&item.segment_ids),
+        event_ids: dedup(&item.event_ids),
+        keyframe_ids: dedup(&item.keyframe_ids),
+    };
+    if evidence.is_empty() {
+        reasons.push("no citations".into());
+    }
+    let needs_segment = matches!(
+        section,
+        Section::Decisions | Section::ActionItems | Section::OpenQuestions
+    );
+    if needs_segment && evidence.segment_ids.is_empty() {
+        reasons.push("must cite at least one transcript segment".into());
+    }
+    for id in &evidence.segment_ids {
+        if !corpus.segs.contains_key(id) {
+            reasons.push(format!("unknown segment id {id}"));
+        }
+    }
+    for id in evidence.event_ids.iter().chain(&evidence.keyframe_ids) {
+        if !corpus.times.contains_key(id) {
+            reasons.push(format!("unknown board id {id}"));
+        }
+    }
+    let mut quote = None;
+    let q = sanitize_dashes(item.quote.trim().trim_matches('"'));
+    if !q.is_empty() && reasons.is_empty() {
+        let cited: Vec<&str> = evidence.segment_ids.iter().map(String::as_str).collect();
+        match corpus.find_quote(&q, &cited) {
+            Ok((matched, segment_id)) => {
+                quote = Some(Quote {
+                    text: q,
+                    segment_id,
+                    matched,
+                })
+            }
+            Err(why) => reasons.push(why),
+        }
+    }
+    if !reasons.is_empty() {
+        return Err(Failure {
+            reasons,
+            fatal: false,
+        });
+    }
+    let mut times: Vec<(f64, f64)> = evidence
+        .segment_ids
+        .iter()
+        .filter_map(|id| corpus.segment_span(id))
+        .collect();
+    times.extend(
+        evidence
+            .event_ids
+            .iter()
+            .chain(&evidence.keyframe_ids)
+            .filter_map(|id| corpus.times.get(id).map(|t| (*t, *t))),
+    );
+    let t_start_s = times.iter().map(|t| t.0).fold(f64::INFINITY, f64::min);
+    let t_end_s = times.iter().map(|t| t.1).fold(f64::NEG_INFINITY, f64::max);
+    Ok(Checked {
+        section,
+        text,
+        owners,
+        evidence,
+        quote,
+        t_start_s: if t_start_s.is_finite() {
+            t_start_s
+        } else {
+            0.0
+        },
+        t_end_s: if t_end_s.is_finite() { t_end_s } else { 0.0 },
+    })
+}
+
+fn dedup(ids: &[String]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    ids.iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && seen.insert(s.clone()))
+        .collect()
+}
+
+/// Validated notes sections.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Sections {
+    /// Decisions.
+    pub decisions: Vec<Decision>,
+    /// Action items.
+    pub action_items: Vec<ActionItem>,
+    /// Open questions.
+    pub open_questions: Vec<OpenQuestion>,
+    /// Timeline.
+    pub timeline: Vec<TimelineEntry>,
+    /// Summary.
+    pub summary: Vec<SummaryPoint>,
+}
+
+/// Near-duplicate threshold (content-token Jaccard) within a section.
+const DUP_JACCARD: f64 = 0.7;
+
+/// Assembles checked items into sections: duplicates merged, times ordered, ids assigned.
+pub fn assemble(checked: Vec<Checked>) -> Sections {
+    let mut by_section: BTreeMap<Section, Vec<Checked>> = BTreeMap::new();
+    for c in checked {
+        let list = by_section.entry(c.section).or_default();
+        let toks = content_tokens(&c.text);
+        let same_owner = |a: &Checked| a.owners == c.owners;
+        match list
+            .iter_mut()
+            .find(|x| same_owner(x) && jaccard(&content_tokens(&x.text), &toks) >= DUP_JACCARD)
+        {
+            Some(x) => {
+                x.evidence.merge(&c.evidence);
+                x.t_start_s = x.t_start_s.min(c.t_start_s);
+                x.t_end_s = x.t_end_s.max(c.t_end_s);
+                if x.quote.is_none() {
+                    x.quote = c.quote;
+                }
+            }
+            None => list.push(c),
+        }
+    }
+    let mut out = Sections::default();
+    for (section, mut list) in by_section {
+        if section == Section::Timeline {
+            list.sort_by(|a, b| a.t_start_s.total_cmp(&b.t_start_s));
+        }
+        for (i, c) in list.into_iter().enumerate() {
+            let n = i + 1;
+            match section {
+                Section::Decisions => out.decisions.push(Decision {
+                    id: format!("d{n}"),
+                    text: c.text,
+                    t_start_s: c.t_start_s,
+                    t_end_s: c.t_end_s,
+                    evidence: c.evidence,
+                    quote: c.quote,
+                }),
+                Section::ActionItems => {
+                    for o in &c.owners {
+                        let k = out.action_items.len() + 1;
+                        out.action_items.push(ActionItem {
+                            id: format!("a{k}"),
+                            person_id: o.person_id.clone(),
+                            owner: o.name.clone(),
+                            task: c.text.clone(),
+                            t_s: c.t_start_s,
+                            t_end_s: c.t_end_s,
+                            evidence: c.evidence.clone(),
+                            quote: c.quote.clone(),
+                        });
+                    }
+                }
+                Section::OpenQuestions => out.open_questions.push(OpenQuestion {
+                    id: format!("q{n}"),
+                    text: c.text,
+                    source: QuestionSource::Transcript,
+                    t_s: Some(c.t_start_s),
+                    evidence: c.evidence,
+                    quote: c.quote,
+                }),
+                Section::Timeline => out.timeline.push(TimelineEntry {
+                    id: format!("t{n}"),
+                    t_start_s: c.t_start_s,
+                    t_end_s: c.t_end_s,
+                    text: c.text,
+                    evidence: c.evidence,
+                }),
+                Section::Summary => out.summary.push(SummaryPoint {
+                    id: format!("s{n}"),
+                    text: c.text,
+                    t_start_s: c.t_start_s,
+                    t_end_s: c.t_end_s,
+                    evidence: c.evidence,
+                }),
+            }
+        }
+    }
+    out
+}
+
+/// Similarity at which a board question and a transcript question are merged.
+const BOARD_MERGE_JACCARD: f64 = 0.3;
+
+/// Merges question stickies into the open questions. Returns how many were added.
+pub fn merge_board_questions(qs: &mut Vec<OpenQuestion>, boards: &[BoardStateItem]) -> usize {
+    let mut added = 0;
+    for b in boards {
+        for s in b.stickies.iter().filter(|s| s.kind == StickyKind::Question) {
+            let events = b.events_of(&s.id);
+            let mut keyframe_ids: Vec<String> =
+                events.iter().map(|e| e.keyframe_id.clone()).collect();
+            keyframe_ids.dedup();
+            let ev = Evidence {
+                segment_ids: vec![],
+                event_ids: events.iter().map(|e| e.event_id.clone()).collect(),
+                keyframe_ids,
+            };
+            let toks = content_tokens(&s.text);
+            let cites_sticky = |q: &OpenQuestion| {
+                q.evidence
+                    .event_ids
+                    .iter()
+                    .any(|e| ev.event_ids.contains(e))
+            };
+            let best = qs
+                .iter_mut()
+                .map(|q| {
+                    let score = jaccard(&content_tokens(&q.text), &toks);
+                    (score, q)
+                })
+                .filter(|(score, q)| *score >= BOARD_MERGE_JACCARD || cites_sticky(q))
+                .max_by(|a, b| a.0.total_cmp(&b.0));
+            match best {
+                Some((_, q)) => {
+                    q.source = QuestionSource::BoardAndTranscript;
+                    q.evidence.merge(&ev);
+                }
+                None => {
+                    added += 1;
+                    qs.push(OpenQuestion {
+                        id: String::new(),
+                        text: sanitize_dashes(s.text.trim()),
+                        source: QuestionSource::Board,
+                        t_s: Some(first_seen(&s.lifetimes)),
+                        evidence: ev,
+                        quote: None,
+                    });
+                }
+            }
+        }
+    }
+    qs.sort_by(|a, b| {
+        a.t_s
+            .unwrap_or(f64::MAX)
+            .total_cmp(&b.t_s.unwrap_or(f64::MAX))
+    });
+    for (i, q) in qs.iter_mut().enumerate() {
+        q.id = format!("q{}", i + 1);
+    }
+    added
+}
+
+/// Records a dropped item.
+pub fn dropped(section: Section, item: &DraftItem, reasons: Vec<String>) -> DroppedItem {
+    DroppedItem {
+        section: section.key().into(),
+        text: item.main_text(),
+        reasons,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::named::NamedLine;
+
+    fn line(id: &str, t: f64, text: &str, raw: &str) -> NamedLine {
+        NamedLine {
+            segment_id: id.into(),
+            start_s: t,
+            end_s: t + 3.0,
+            person_id: None,
+            speaker: "X".into(),
+            text: text.into(),
+            text_raw: raw.into(),
+            speaker_confidence: 0.9,
+            relabeled: false,
+            gap_fill_share: 0.0,
+        }
+    }
+
+    fn corpus() -> Corpus {
+        let lines = vec![
+            line(
+                "s1",
+                10.0,
+                "Let's skip the Ledgerly step for now.",
+                "Let's skip the Ledger Lee step for now.",
+            ),
+            line(
+                "s2",
+                14.0,
+                "We'll focus on the relay side.",
+                "We'll focus on the relay side.",
+            ),
+            line(
+                "s3",
+                60.0,
+                "I'll see you guys later.",
+                "I'll see you guys later.",
+            ),
+        ];
+        Corpus::new(
+            &lines,
+            &[],
+            &KeyframeTimes::default(),
+            AliasTable::from_names(&["Avery Quinn", "Rohan Dasgupta"]),
+        )
+    }
+
+    fn item(text: &str, ids: &[&str], quote: &str) -> DraftItem {
+        DraftItem {
+            text: text.into(),
+            segment_ids: ids.iter().map(|s| (*s).to_string()).collect(),
+            quote: quote.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn quotes_match_raw_then_corrected_and_across_segments() {
+        let c = corpus();
+        let ok = check(
+            Section::Decisions,
+            &item(
+                "Skip the ledger step for now",
+                &["s1"],
+                "skip the Ledger Lee step for",
+            ),
+            &c,
+        )
+        .unwrap();
+        assert_eq!(ok.quote.unwrap().matched, QuoteMatch::Raw);
+        let ok = check(
+            Section::Decisions,
+            &item(
+                "Skip the ledger step for now",
+                &["s1"],
+                "skip the Ledgerly step for now",
+            ),
+            &c,
+        )
+        .unwrap();
+        assert_eq!(ok.quote.unwrap().matched, QuoteMatch::Corrected);
+        let ok = check(
+            Section::Decisions,
+            &item(
+                "Skip it and focus on the relay",
+                &["s2", "s1"],
+                "skip the Ledgerly step ... focus on the relay side",
+            ),
+            &c,
+        )
+        .unwrap();
+        assert_eq!((ok.t_start_s, ok.t_end_s), (10.0, 17.0));
+        let err = check(
+            Section::Decisions,
+            &item(
+                "Skip the ledger step",
+                &["s2"],
+                "skip the Ledgerly step for now",
+            ),
+            &c,
+        )
+        .unwrap_err();
+        assert!(err.reasons[0].contains("not in the cited segments"));
+    }
+
+    #[test]
+    fn elided_quotes_cannot_launder_common_words() {
+        let mut lines = vec![line(
+            "s9",
+            100.0,
+            "We should move the relay config into the ledger service so that the kiosk team can ship the badge printer changes next month without waiting on us to review it.",
+            "We should move the relay config into the ledger service so that the kiosk team can ship the badge printer changes next month without waiting on us to review it.",
+        )];
+        lines.push(line(
+            "s1",
+            10.0,
+            "Let's skip the Ledgerly step for now.",
+            "Let's skip the Ledger Lee step for now.",
+        ));
+        let c = Corpus::new(
+            &lines,
+            &[],
+            &KeyframeTimes::default(),
+            AliasTable::from_names(&["Avery Quinn"]),
+        );
+        let fails = |quote: &str, why: &str| {
+            let e = check(
+                Section::Decisions,
+                &item("Move the relay config into the ledger", &["s9"], quote),
+                &c,
+            )
+            .unwrap_err();
+            assert!(
+                e.reasons.iter().any(|r| r.contains(why)),
+                "{quote}: {:?}",
+                e.reasons
+            );
+        };
+        // stopword-only parts
+        fails("we ... the ... to", "words");
+        fails("we should ... the ... to us", "words");
+        // too many elisions
+        fails(
+            "we should move ... relay config into ... ledger service so ... kiosk team can",
+            "elisions",
+        );
+        // too short overall
+        fails("relay config into", "shorter than");
+        // elision skips most of the segment
+        fails("we should move ... on us to review it", "elides too much");
+        // a real quote with one short elision passes
+        let ok = check(
+            Section::Decisions,
+            &item(
+                "Move the relay config into the ledger",
+                &["s9"],
+                "move the relay config ... the ledger service",
+            ),
+            &c,
+        )
+        .unwrap();
+        assert_eq!(ok.quote.unwrap().segment_id, "s9");
+    }
+
+    #[test]
+    fn unknown_ids_and_missing_citations_fail() {
+        let c = corpus();
+        let e = check(
+            Section::Decisions,
+            &item("Skip the ledger step", &["s9"], ""),
+            &c,
+        )
+        .unwrap_err();
+        assert!(e
+            .reasons
+            .iter()
+            .any(|r| r.contains("unknown segment id s9")));
+        let e = check(Section::Summary, &item("A summary point here", &[], ""), &c).unwrap_err();
+        assert!(e.reasons.iter().any(|r| r == "no citations"));
+    }
+
+    #[test]
+    fn action_items_need_owner_verb_object_and_no_farewells() {
+        let c = corpus();
+        let mut a = item("", &["s2"], "");
+        a.owner = "Rowan".into();
+        a.task = "Design the relay storage schema".into();
+        let ok = check(Section::ActionItems, &a, &c).unwrap();
+        assert_eq!(ok.owners[0].person_id.as_deref(), Some("rohan-dasgupta"));
+        a.task = "Backend: the relay".into();
+        assert!(check(Section::ActionItems, &a, &c).is_err());
+        a.task = "See you guys later".into();
+        a.segment_ids = vec!["s3".into()];
+        assert!(check(Section::ActionItems, &a, &c).unwrap_err().fatal);
+        a.owner = "Everyone and Avery".into();
+        a.task = "Push work to a branch early".into();
+        let ok = check(Section::ActionItems, &a, &c).unwrap();
+        assert_eq!(ok.owners.len(), 2);
+        a.owner = "Kristen".into();
+        assert!(check(Section::ActionItems, &a, &c).is_err());
+    }
+
+    #[test]
+    fn em_dashes_are_sanitized() {
+        let c = corpus();
+        let ok = check(
+            Section::Decisions,
+            &item("Skip the ledger step \u{2014} for now", &["s1"], ""),
+            &c,
+        )
+        .unwrap();
+        assert_eq!(ok.text, "Skip the ledger step, for now");
+    }
+
+    #[test]
+    fn duplicates_merge_and_board_questions_join() {
+        let c = corpus();
+        let a = check(
+            Section::OpenQuestions,
+            &item("Which widgets does the kiosk need?", &["s1"], ""),
+            &c,
+        )
+        .unwrap();
+        let b = check(
+            Section::OpenQuestions,
+            &item("Which widgets does the kiosk need", &["s2"], ""),
+            &c,
+        )
+        .unwrap();
+        let mut s = assemble(vec![a, b]);
+        assert_eq!(s.open_questions.len(), 1);
+        assert_eq!(s.open_questions[0].evidence.segment_ids, vec!["s1", "s2"]);
+        use crate::board::build;
+        let mut board = build::board("b", 90.0);
+        board.stickies = vec![
+            build::sticky("st1", "What widgets do we need for the kiosk?", 5.0, 90.0),
+            build::sticky("st2", "Do we change the badge flow?", 40.0, 90.0),
+            build::sticky("st3", "Clone the lobby page", 41.0, 90.0),
+        ];
+        board.events = vec![build::event(
+            "ev_1",
+            crate::board::EventKind::StickyAdded,
+            40.0,
+            "kf_2",
+            "st2",
+            "Do we change the badge flow?",
+        )];
+        let added = merge_board_questions(&mut s.open_questions, &[board]);
+        assert_eq!(added, 1);
+        assert_eq!(s.open_questions[1].evidence.event_ids, vec!["ev_1"]);
+        assert_eq!(s.open_questions[1].evidence.keyframe_ids, vec!["kf_2"]);
+        assert_eq!(
+            s.open_questions[0].source,
+            QuestionSource::BoardAndTranscript
+        );
+        assert_eq!(s.open_questions[1].source, QuestionSource::Board);
+        assert_eq!(s.open_questions[1].id, "q2");
+    }
+
+    #[test]
+    fn schema_requires_every_section() {
+        let s = draft_schema();
+        assert_eq!(s["required"].as_array().unwrap().len(), 5);
+        assert_eq!(
+            s["properties"]["action_items"]["items"]["required"][0],
+            "owner"
+        );
+    }
+}
