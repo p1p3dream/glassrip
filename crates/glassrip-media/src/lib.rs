@@ -5,6 +5,7 @@
 //! see the module docs for the exact OpenCV code paths each function follows.
 
 pub mod decode;
+pub mod ecc;
 pub mod error;
 pub mod gaussian;
 pub mod jpeg;
