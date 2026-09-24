@@ -1,8 +1,15 @@
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod extract;
 pub mod frames;
 pub mod output;
 pub mod pipeline;
+pub mod retry;
 pub mod stitch;
+
+#[cfg(test)]
+mod test_support;
 
 pub mod types {
     use serde::{Deserialize, Serialize};

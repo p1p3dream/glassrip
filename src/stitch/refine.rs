@@ -3,6 +3,13 @@ use reqwest::Client;
 use serde::Deserialize;
 use tokio::time::Duration;
 
+use crate::retry::{honors_retry_after, is_retryable_status, parse_retry_after, RetryPolicy};
+
+/// Default model for `--refine`.
+pub const DEFAULT_REFINE_MODEL: &str = "claude-opus-5-5";
+
+const API_BASE_URL: &str = "https://api.anthropic.com";
+
 const REFINE_SYSTEM: &str = r#"You are cleaning up a chunk of VLM-extracted text from a video recording. The text was extracted frame-by-frame and mechanically deduplicated, but quality issues remain.
 
 Fix these issues in this chunk:
@@ -47,13 +54,28 @@ pub async fn refine_text(text: &str, model: &str, num_agents: usize) -> Result<S
         .timeout(Duration::from_secs(600))
         .build()?;
 
+    let policy = RetryPolicy {
+        base_delay: Duration::from_secs(2),
+        ..RetryPolicy::default()
+    };
     let mut handles = Vec::with_capacity(total);
     for (i, chunk) in chunks.into_iter().enumerate() {
         let client = client.clone();
         let api_key = api_key.clone();
         let model = model.to_string();
+        let policy = policy.clone();
         handles.push(tokio::spawn(async move {
-            refine_chunk(&client, &api_key, &model, &chunk, i + 1, total).await
+            refine_chunk(
+                &client,
+                API_BASE_URL,
+                &api_key,
+                &model,
+                &chunk,
+                i + 1,
+                total,
+                &policy,
+            )
+            .await
         }));
     }
 
@@ -75,13 +97,16 @@ pub async fn refine_text(text: &str, model: &str, num_agents: usize) -> Result<S
     Ok(final_text)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn refine_chunk(
     client: &Client,
+    base_url: &str,
     api_key: &str,
     model: &str,
     chunk: &str,
     chunk_num: usize,
     total_chunks: usize,
+    policy: &RetryPolicy,
 ) -> Result<String> {
     let payload = serde_json::json!({
         "model": model,
@@ -97,29 +122,43 @@ async fn refine_chunk(
         ]
     });
 
-    let mut last_err = None;
-    for attempt in 0..3 {
+    let url = format!("{base_url}/v1/messages");
+    let max_attempts = policy.max_attempts.max(1);
+    let mut last_err = String::from("unknown");
+    let mut retry_after = None;
+
+    for attempt in 0..max_attempts {
         if attempt > 0 {
-            let wait = Duration::from_secs(2u64.pow(attempt as u32));
-            println!("  Agent {chunk_num}: retry {attempt}/2, waiting {wait:?}");
+            let wait = policy.delay_for(attempt - 1, retry_after.take());
+            println!(
+                "  Agent {chunk_num}: retry {attempt}/{}, waiting {wait:.2?}",
+                max_attempts - 1
+            );
             tokio::time::sleep(wait).await;
         }
 
-        let resp = client
-            .post("https://api.anthropic.com/v1/messages")
+        let resp = match client
+            .post(&url)
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")
             .json(&payload)
             .send()
             .await
-            .context("Failed to send request to Claude API")?;
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                last_err = format!("request to Claude API failed: {e}");
+                continue;
+            }
+        };
 
         let status = resp.status();
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS
-            || status.is_server_error()
-        {
+        if is_retryable_status(status) {
+            if honors_retry_after(status) {
+                retry_after = parse_retry_after(resp.headers());
+            }
             let body = resp.text().await.unwrap_or_default();
-            last_err = Some(format!("Claude API {status}: {body}"));
+            last_err = format!("Claude API {status}: {body}");
             continue;
         }
 
@@ -149,13 +188,16 @@ async fn refine_chunk(
             .collect::<Vec<_>>()
             .join("");
 
-        return Ok(strip_fences(text.trim()));
+        let cleaned = strip_fences(text.trim());
+        if cleaned.trim().is_empty() && !chunk.trim().is_empty() {
+            // Accepting this would silently delete the whole chunk.
+            last_err = "Claude API returned empty content for a non-empty chunk".into();
+            continue;
+        }
+        return Ok(cleaned);
     }
 
-    bail!(
-        "Agent {chunk_num} failed after 3 attempts: {}",
-        last_err.unwrap_or_else(|| "unknown".into())
-    );
+    bail!("Agent {chunk_num} failed after {max_attempts} attempts: {last_err}");
 }
 
 fn strip_fences(text: &str) -> String {
@@ -167,7 +209,7 @@ fn strip_fences(text: &str) -> String {
         return text.to_string();
     }
     let start = 1;
-    let end = if lines.last().map_or(false, |l| l.trim() == "```") {
+    let end = if lines.last().is_some_and(|l| l.trim() == "```") {
         lines.len() - 1
     } else {
         lines.len()
@@ -198,6 +240,80 @@ fn split_into_chunks(text: &str, n: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::test_support::{serve, Reply};
+
+    fn fast_policy() -> RetryPolicy {
+        RetryPolicy {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(50),
+            max_retry_after: Duration::from_secs(5),
+        }
+    }
+
+    fn text_reply(text: &str) -> Reply {
+        Reply::json(
+            200,
+            serde_json::json!({
+                "content": [{"type": "text", "text": text}],
+                "stop_reason": "end_turn"
+            }),
+        )
+    }
+
+    async fn run_chunk(url: &str) -> Result<String> {
+        let client = Client::new();
+        refine_chunk(&client, url, "key", "m", "some text", 1, 1, &fast_policy()).await
+    }
+
+    #[tokio::test]
+    async fn refine_retries_transport_errors() {
+        let server = serve(vec![Reply::Drop, text_reply("clean")]).await;
+        assert_eq!(run_chunk(&server.url).await.unwrap(), "clean");
+        assert_eq!(server.hits(), 2);
+    }
+
+    #[tokio::test]
+    async fn refine_honors_retry_after_on_429() {
+        let server = serve(vec![
+            Reply::json(429, serde_json::json!({})).header("Retry-After", "1"),
+            text_reply("clean"),
+        ])
+        .await;
+        let started = std::time::Instant::now();
+        assert_eq!(run_chunk(&server.url).await.unwrap(), "clean");
+        assert!(
+            started.elapsed() >= Duration::from_millis(950),
+            "Retry-After ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn refine_rejects_empty_content() {
+        let server = serve(vec![text_reply("")]).await;
+        let err = run_chunk(&server.url).await.unwrap_err();
+        assert!(err.to_string().contains("empty content"), "{err}");
+        assert_eq!(server.hits(), 3);
+    }
+
+    #[tokio::test]
+    async fn refine_recovers_after_empty_content() {
+        let server = serve(vec![text_reply("   "), text_reply("clean")]).await;
+        assert_eq!(run_chunk(&server.url).await.unwrap(), "clean");
+    }
+
+    #[tokio::test]
+    async fn refine_does_not_retry_client_errors() {
+        let server = serve(vec![Reply::json(401, serde_json::json!({"error": "auth"}))]).await;
+        assert!(run_chunk(&server.url).await.is_err());
+        assert_eq!(server.hits(), 1);
+    }
+
+    #[test]
+    fn default_refine_model_is_current() {
+        assert_eq!(DEFAULT_REFINE_MODEL, "claude-opus-5-5");
+    }
 
     #[test]
     fn split_even() {

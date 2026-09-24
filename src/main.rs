@@ -1,3 +1,6 @@
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
@@ -53,12 +56,20 @@ enum Commands {
         #[arg(long, default_value_t = 4)]
         parallel: usize,
 
+        /// Per-request VLM timeout in seconds
+        #[arg(long = "vlm-timeout", default_value_t = glassrip::extract::vlm::DEFAULT_TIMEOUT_SECS, value_parser = clap::value_parser!(u64).range(1..))]
+        vlm_timeout: u64,
+
+        /// Fraction of frames (0.0 to 1.0) allowed to fail extraction before the run fails
+        #[arg(long, default_value_t = glassrip::pipeline::DEFAULT_MAX_FRAME_FAILURE_RATE, value_parser = parse_rate)]
+        max_frame_failure_rate: f64,
+
         /// Refine output via parallel Claude agents (requires ANTHROPIC_API_KEY)
         #[arg(long)]
         refine: bool,
 
         /// Claude model for refinement
-        #[arg(long, default_value = "claude-opus-4-20250514")]
+        #[arg(long, default_value = glassrip::stitch::refine::DEFAULT_REFINE_MODEL)]
         refine_model: String,
 
         /// Number of parallel refine agents
@@ -83,6 +94,8 @@ async fn main() -> Result<()> {
             model_dir,
             work_dir,
             parallel,
+            vlm_timeout,
+            max_frame_failure_rate,
             refine,
             refine_model,
             refine_agents,
@@ -110,8 +123,72 @@ async fn main() -> Result<()> {
                 refine,
                 refine_model,
                 refine_agents: refine_agents.max(1),
+                vlm_timeout_secs: vlm_timeout,
+                max_frame_failure_rate,
             };
             glassrip::pipeline::run_pipeline(&args).await
         }
+    }
+}
+
+fn parse_rate(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    if (0.0..=1.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("{v} is not between 0.0 and 1.0"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scrape(args: &[&str]) -> Result<Commands, clap::Error> {
+        let mut argv = vec!["glassrip", "scrape", "video.mp4"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv).map(|c| c.command)
+    }
+
+    #[test]
+    fn robustness_flag_defaults() {
+        let Commands::Scrape {
+            vlm_timeout,
+            max_frame_failure_rate,
+            ..
+        } = scrape(&[]).unwrap();
+        assert_eq!(vlm_timeout, 120);
+        assert_eq!(max_frame_failure_rate, 0.10);
+    }
+
+    #[test]
+    fn refine_model_default() {
+        let Commands::Scrape { refine_model, .. } = scrape(&[]).unwrap();
+        assert_eq!(refine_model, "claude-opus-5-5");
+    }
+
+    #[test]
+    fn robustness_flags_parse() {
+        let Commands::Scrape {
+            vlm_timeout,
+            max_frame_failure_rate,
+            ..
+        } = scrape(&["--vlm-timeout", "300", "--max-frame-failure-rate", "0.25"]).unwrap();
+        assert_eq!(vlm_timeout, 300);
+        assert_eq!(max_frame_failure_rate, 0.25);
+    }
+
+    #[test]
+    fn failure_rate_out_of_range_rejected() {
+        assert!(scrape(&["--max-frame-failure-rate", "1.5"]).is_err());
+        assert!(scrape(&["--max-frame-failure-rate", "-0.1"]).is_err());
+        assert!(scrape(&["--max-frame-failure-rate", "NaN"]).is_err());
+    }
+
+    #[test]
+    fn zero_vlm_timeout_rejected() {
+        assert!(scrape(&["--vlm-timeout", "0"]).is_err());
+        let Commands::Scrape { vlm_timeout, .. } = scrape(&["--vlm-timeout", "1"]).unwrap();
+        assert_eq!(vlm_timeout, 1);
     }
 }

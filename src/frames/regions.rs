@@ -151,20 +151,16 @@ fn trim_ui_chrome(gray: &GrayImage, mut x0: u32, mut y0: u32, x1: u32, y1: u32) 
     if x1.saturating_sub(x0) > (w as f64 * 0.6) as u32 {
         let sx1 = (x0 + sidebar_px).min(w);
         let sy1 = y1.min(h);
-        if sx1 > x0 && sy1 > y0 {
-            if region_std_dev(gray, x0, y0, sx1, sy1) < 15.0 {
-                x0 += sidebar_px;
-            }
+        if sx1 > x0 && sy1 > y0 && region_std_dev(gray, x0, y0, sx1, sy1) < 15.0 {
+            x0 += sidebar_px;
         }
     }
 
     if y1.saturating_sub(y0) > (h as f64 * 0.5) as u32 {
         let ty1 = (y0 + tabbar_px).min(h);
         let tx1 = x1.min(w);
-        if ty1 > y0 && tx1 > x0 {
-            if region_std_dev(gray, x0, y0, tx1, ty1) < 20.0 {
-                y0 += tabbar_px;
-            }
+        if ty1 > y0 && tx1 > x0 && region_std_dev(gray, x0, y0, tx1, ty1) < 20.0 {
+            y0 += tabbar_px;
         }
     }
 

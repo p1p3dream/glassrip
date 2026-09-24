@@ -67,6 +67,33 @@ mod engine {
         anyhow::anyhow!("{e}")
     }
 
+    /// Name of the ONNX Runtime execution provider this build uses.
+    pub fn execution_provider() -> &'static str {
+        if cfg!(feature = "gpu-cuda") {
+            "CUDA"
+        } else {
+            "CPU"
+        }
+    }
+
+    fn session_builder() -> Result<ort::session::builder::SessionBuilder> {
+        let builder = Session::builder()
+            .map_err(ort_err)?
+            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
+            .map_err(ort_err)?;
+
+        // Without an explicit provider ONNX Runtime silently runs on CPU.
+        // error_on_failure turns a missing or broken CUDA install into an
+        // error instead of a quiet CPU fallback.
+        #[cfg(feature = "gpu-cuda")]
+        let builder = builder
+            .with_execution_providers([ort::ep::CUDA::default().build().error_on_failure()])
+            .map_err(ort_err)
+            .context("failed to register the CUDA execution provider")?;
+
+        Ok(builder)
+    }
+
     pub struct GpuOcrEngine {
         det_session: Session,
         rec_session: Session,
@@ -77,18 +104,12 @@ mod engine {
         pub fn new(model_dir: &Path) -> Result<Self> {
             super::check_models(model_dir)?;
 
-            let det_session = Session::builder()
-                .map_err(ort_err)?
-                .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
-                .map_err(ort_err)?
+            let det_session = session_builder()?
                 .commit_from_file(model_dir.join(super::DET_MODEL))
                 .map_err(ort_err)
                 .context("failed to load detection model")?;
 
-            let rec_session = Session::builder()
-                .map_err(ort_err)?
-                .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
-                .map_err(ort_err)?
+            let rec_session = session_builder()?
                 .commit_from_file(model_dir.join(super::REC_MODEL))
                 .map_err(ort_err)
                 .context("failed to load recognition model")?;
@@ -98,8 +119,9 @@ mod engine {
             let dictionary: Vec<String> = dict_text.lines().map(String::from).collect();
 
             eprintln!(
-                "  Loaded detection model and recognition model ({} chars in dictionary)",
-                dictionary.len()
+                "  Loaded detection model and recognition model ({} chars in dictionary) on {} execution provider",
+                dictionary.len(),
+                execution_provider()
             );
 
             Ok(Self {
@@ -123,8 +145,7 @@ mod engine {
                 if y2 <= y1 || y2 - y1 < 3 {
                     continue;
                 }
-                let crop =
-                    image::imageops::crop_imm(&rgb, 0, y1, rgb.width(), y2 - y1).to_image();
+                let crop = image::imageops::crop_imm(&rgb, 0, y1, rgb.width(), y2 - y1).to_image();
                 if let Ok(text) = self.recognize_line(&crop) {
                     let trimmed = text.trim();
                     if !trimmed.is_empty() {
@@ -136,38 +157,36 @@ mod engine {
             Ok(lines.join("\n"))
         }
 
-        pub fn extract_batch(&mut self, frame_paths: &[PathBuf]) -> Result<Vec<String>> {
+        /// One result per frame, in order; a failed frame does not stop the batch.
+        pub fn extract_batch(&mut self, frame_paths: &[PathBuf]) -> Vec<Result<String>> {
             frame_paths
                 .iter()
                 .map(|p| self.extract_code_from_frame(p))
                 .collect()
         }
 
-        fn detect_text_lines(
-            &mut self,
-            img: &image::RgbImage,
-        ) -> Result<Vec<(u32, u32)>> {
+        fn detect_text_lines(&mut self, img: &image::RgbImage) -> Result<Vec<(u32, u32)>> {
             let (orig_w, orig_h) = (img.width(), img.height());
 
             let scale = DET_MAX_SIDE as f32 / orig_w.max(orig_h) as f32;
             let scale = scale.min(1.0);
             let new_w = ((orig_w as f32 * scale) as u32).max(32);
             let new_h = ((orig_h as f32 * scale) as u32).max(32);
-            let new_w = (new_w + 31) / 32 * 32;
-            let new_h = (new_h + 31) / 32 * 32;
+            let new_w = new_w.div_ceil(32) * 32;
+            let new_h = new_h.div_ceil(32) * 32;
 
-            let resized = image::imageops::resize(
-                img, new_w, new_h, image::imageops::FilterType::Triangle,
-            );
+            let resized =
+                image::imageops::resize(img, new_w, new_h, image::imageops::FilterType::Triangle);
             let tensor = image_to_tensor(&resized, new_w, new_h);
             let input = Tensor::from_array(tensor).map_err(ort_err)?;
-            let outputs = self.det_session
-                .run(ort::inputs![input])
-                .map_err(ort_err)?;
+            let outputs = self.det_session.run(ort::inputs![input]).map_err(ort_err)?;
 
             let (shape, data) = outputs[0].try_extract_tensor::<f32>().map_err(ort_err)?;
             if shape.len() != 4 {
-                anyhow::bail!("unexpected detection model output rank: {}, expected 4", shape.len());
+                anyhow::bail!(
+                    "unexpected detection model output rank: {}, expected 4",
+                    shape.len()
+                );
             }
             let out_h = shape[2] as usize;
             let out_w = shape[3] as usize;
@@ -192,8 +211,8 @@ mod engine {
             let mut in_text = false;
             let mut line_start = 0usize;
 
-            for y in 0..out_h {
-                if row_density[y] > min_density {
+            for (y, &density) in row_density.iter().enumerate().take(out_h) {
+                if density > min_density {
                     if !in_text {
                         line_start = y;
                         in_text = true;
@@ -226,7 +245,6 @@ mod engine {
 
             Ok(lines)
         }
-
     }
 
     fn split_merged_lines(y1: u32, y2: u32, img_h: u32, out: &mut Vec<(u32, u32)>) {
@@ -248,7 +266,6 @@ mod engine {
     }
 
     impl GpuOcrEngine {
-
         fn recognize_line(&mut self, crop: &image::RgbImage) -> Result<String> {
             let (w, h) = (crop.width(), crop.height());
             if w == 0 || h == 0 {
@@ -259,20 +276,19 @@ mod engine {
             let new_w = ((w as f32 / h as f32) * new_h as f32).max(1.0) as u32;
             let padded_w = new_w.max(320);
 
-            let resized = image::imageops::resize(
-                crop, new_w, new_h, image::imageops::FilterType::Triangle,
-            );
+            let resized =
+                image::imageops::resize(crop, new_w, new_h, image::imageops::FilterType::Triangle);
 
             let tensor = rec_image_to_tensor(&resized, new_w, new_h, padded_w);
             let input = Tensor::from_array(tensor).map_err(ort_err)?;
-            let outputs = self
-                .rec_session
-                .run(ort::inputs![input])
-                .map_err(ort_err)?;
+            let outputs = self.rec_session.run(ort::inputs![input]).map_err(ort_err)?;
 
             let (shape, data) = outputs[0].try_extract_tensor::<f32>().map_err(ort_err)?;
             if shape.len() != 3 {
-                anyhow::bail!("unexpected recognition model output rank: {}, expected 3", shape.len());
+                anyhow::bail!(
+                    "unexpected recognition model output rank: {}, expected 3",
+                    shape.len()
+                );
             }
 
             // CTC decode: [1, seq_len, num_classes]
@@ -386,7 +402,32 @@ mod engine {
 }
 
 #[cfg(feature = "gpu")]
-pub use engine::GpuOcrEngine;
+pub use engine::{execution_provider, GpuOcrEngine};
+
+#[cfg(all(test, feature = "gpu"))]
+mod tests {
+    #[cfg(not(feature = "gpu-cuda"))]
+    #[test]
+    fn plain_gpu_feature_uses_cpu_provider() {
+        assert_eq!(super::execution_provider(), "CPU");
+    }
+
+    #[cfg(feature = "gpu-cuda")]
+    #[test]
+    fn gpu_cuda_feature_uses_cuda_provider() {
+        assert_eq!(super::execution_provider(), "CUDA");
+    }
+
+    #[test]
+    fn missing_models_error_before_session_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = super::GpuOcrEngine::new(dir.path()).err().unwrap();
+        assert!(
+            err.to_string().contains("GPU OCR models not found"),
+            "{err}"
+        );
+    }
+}
 
 #[cfg(not(feature = "gpu"))]
 pub struct GpuOcrEngine;
@@ -401,7 +442,10 @@ impl GpuOcrEngine {
         bail!("GPU OCR not available");
     }
 
-    pub fn extract_batch(&mut self, _frame_paths: &[PathBuf]) -> Result<Vec<String>> {
-        bail!("GPU OCR not available");
+    pub fn extract_batch(&mut self, frame_paths: &[PathBuf]) -> Vec<Result<String>> {
+        frame_paths
+            .iter()
+            .map(|_| Err(anyhow::anyhow!("GPU OCR not available")))
+            .collect()
     }
 }

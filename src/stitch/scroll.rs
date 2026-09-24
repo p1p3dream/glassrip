@@ -13,8 +13,8 @@ pub fn stitch_scroll_sequence(code_blocks: &[String]) -> String {
 
     let mut full_lines: Vec<&str> = code_blocks[0].split('\n').collect();
 
-    for i in 1..code_blocks.len() {
-        let curr_lines: Vec<&str> = code_blocks[i].split('\n').collect();
+    for block in code_blocks.iter().skip(1) {
+        let curr_lines: Vec<&str> = block.split('\n').collect();
         let tail_start = full_lines.len().saturating_sub(curr_lines.len());
         let tail = &full_lines[tail_start..];
         let overlap = find_overlap(tail, &curr_lines, 3);
@@ -44,7 +44,10 @@ pub fn stitch_all_revisions(revisions: &[String]) -> String {
             continue;
         }
 
-        let hashes: Vec<String> = lines.iter().map(|line| normalized_line_hash(line)).collect();
+        let hashes: Vec<String> = lines
+            .iter()
+            .map(|line| normalized_line_hash(line))
+            .collect();
         if accepted_hashes
             .iter()
             .any(|prior| block_similarity_from_hashes(prior, &hashes) > 0.75)
@@ -55,7 +58,10 @@ pub fn stitch_all_revisions(revisions: &[String]) -> String {
 
         if accumulated.is_empty() {
             accumulated = lines.iter().map(|l| l.to_string()).collect();
-            accumulated_norm = accumulated.iter().map(|l| normalized_line_hash(l)).collect();
+            accumulated_norm = accumulated
+                .iter()
+                .map(|l| normalized_line_hash(l))
+                .collect();
             continue;
         }
 
@@ -100,7 +106,25 @@ pub fn compute_diff(old_code: Option<&str>, new_code: &str) -> String {
     let diff = similar::TextDiff::from_lines(old, new_code);
     let unified = diff.unified_diff().context_radius(1).to_string();
 
-    unified.lines().skip(2).collect::<Vec<_>>().join("\n")
+    strip_file_headers(&unified)
+}
+
+/// Drop the `--- a` / `+++ b` file header pair if present. `similar` only emits
+/// it when `.header()` is set, so in practice the output starts at the first
+/// `@@` hunk header. Headers are matched by content and only before the first
+/// hunk, so removed lines whose text starts with `-- ` are never dropped.
+fn strip_file_headers(unified: &str) -> String {
+    let mut lines = unified.lines().peekable();
+    let mut out: Vec<&str> = Vec::new();
+    while let Some(line) = lines.peek() {
+        if line.starts_with("--- ") || line.starts_with("+++ ") {
+            lines.next();
+        } else {
+            break;
+        }
+    }
+    out.extend(lines);
+    out.join("\n")
 }
 
 fn find_overlap<S1: AsRef<str>, S2: AsRef<str>>(
@@ -184,7 +208,11 @@ fn find_reverse_overlap<S1: AsRef<str>, S2: AsRef<str>>(
     -1
 }
 
-fn find_overlap_from_hashes(prev_hashes: &[String], curr_hashes: &[String], min_overlap: usize) -> usize {
+fn find_overlap_from_hashes(
+    prev_hashes: &[String],
+    curr_hashes: &[String],
+    min_overlap: usize,
+) -> usize {
     if prev_hashes.is_empty() || curr_hashes.is_empty() {
         return 0;
     }
@@ -203,7 +231,11 @@ fn find_overlap_from_hashes(prev_hashes: &[String], curr_hashes: &[String], min_
     for n in (min_overlap..=fuzzy_max).rev() {
         let prev_tail = &prev_hashes[prev_hashes.len() - n..];
         let curr_head = &curr_hashes[..n];
-        let match_count = prev_tail.iter().zip(curr_head.iter()).filter(|(a, b)| a == b).count();
+        let match_count = prev_tail
+            .iter()
+            .zip(curr_head.iter())
+            .filter(|(a, b)| a == b)
+            .count();
         let non_blank = prev_tail.iter().filter(|h| **h != blank_hash).count();
         if match_count as f64 >= n as f64 * 0.85 && non_blank >= min_overlap {
             return n;
@@ -257,10 +289,7 @@ mod tests {
 
     #[test]
     fn overlapping_blocks() {
-        let blocks = vec![
-            "a\nb\nc\nd\ne".to_string(),
-            "c\nd\ne\nf\ng".to_string(),
-        ];
+        let blocks = vec!["a\nb\nc\nd\ne".to_string(), "c\nd\ne\nf\ng".to_string()];
         assert_eq!(stitch_scroll_sequence(&blocks), "a\nb\nc\nd\ne\nf\ng");
     }
 
@@ -285,6 +314,32 @@ mod tests {
         let result = compute_diff(Some("a\nb\nc"), "a\nB\nc");
         assert!(result.contains("-b"));
         assert!(result.contains("+B"));
+    }
+
+    #[test]
+    fn compute_diff_keeps_change_on_first_line() {
+        let result = compute_diff(Some("a\nb\nc\nd"), "A\nb\nc\nd");
+        assert!(result.starts_with("@@ -1,2 +1,2 @@"), "got: {result}");
+        assert!(
+            result.contains("\n-a\n"),
+            "first removed line dropped: {result}"
+        );
+        assert!(
+            result.contains("\n+A"),
+            "first added line dropped: {result}"
+        );
+    }
+
+    #[test]
+    fn compute_diff_keeps_removed_line_that_looks_like_header() {
+        let result = compute_diff(Some("-- x\nb"), "b");
+        assert!(result.contains("\n--- x"), "got: {result}");
+    }
+
+    #[test]
+    fn strip_file_headers_removes_only_leading_headers() {
+        let text = "--- a\n+++ b\n@@ -1 +1 @@\n-x\n+y";
+        assert_eq!(strip_file_headers(text), "@@ -1 +1 @@\n-x\n+y");
     }
 
     #[test]
@@ -334,9 +389,7 @@ mod tests {
         let result_lines: Vec<&str> = result.lines().collect();
         assert_eq!(
             result_lines,
-            vec![
-                "line1", "line2", "line3", "line4", "line5", "line6", "line7", "line8", "line9"
-            ]
+            vec!["line1", "line2", "line3", "line4", "line5", "line6", "line7", "line8", "line9"]
         );
     }
 
