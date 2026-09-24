@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use tokio::process::Command;
 use tokio::sync::Semaphore;
 
 use crate::extract::{gpu_ocr, ocr, vlm};
@@ -57,11 +57,22 @@ pub async fn run_pipeline(args: &ScrapeArgs) -> Result<()> {
     };
 
     println!("Work directory: {}", work_dir.display());
-    let video_path = args.video.canonicalize()?;
-    let duration = get_duration(&video_path);
+    let video_path = tokio::fs::canonicalize(&args.video)
+        .await
+        .with_context(|| format!("failed to resolve {}", args.video.display()))?;
+    let duration = get_duration(&video_path).await?;
 
     println!("Sampling frames...");
-    let frame_groups = sampler::sample_frames(&video_path, work_dir, args.ssim_threshold)?;
+    let frame_groups = {
+        let video_path = video_path.clone();
+        let work_dir = work_dir.to_path_buf();
+        let threshold = args.ssim_threshold;
+        tokio::task::spawn_blocking(move || {
+            sampler::sample_frames(&video_path, &work_dir, threshold)
+        })
+        .await
+        .context("frame sampling task failed")??
+    };
     let total_frames: usize = frame_groups.iter().map(|g| g.len()).sum();
     println!(
         "Found {total_frames} unique frames in {} groups",
@@ -73,42 +84,28 @@ pub async fn run_pipeline(args: &ScrapeArgs) -> Result<()> {
     }
 
     println!("Detecting code regions...");
-    let layout = if let Some(first) = frame_groups[0].first() {
-        regions::detect_code_region(&first.path)?
-    } else {
-        None
+    let layout = match frame_groups[0].first() {
+        Some(first) => {
+            let first_path = first.path.clone();
+            tokio::task::spawn_blocking(move || regions::detect_code_region(&first_path))
+                .await
+                .context("region detection task failed")??
+        }
+        None => None,
     };
 
     let cropped_dir = work_dir.join("cropped");
-    if cropped_dir.exists() {
-        std::fs::remove_dir_all(&cropped_dir)?;
+    if tokio::fs::try_exists(&cropped_dir).await? {
+        tokio::fs::remove_dir_all(&cropped_dir).await?;
     }
-    std::fs::create_dir_all(&cropped_dir)?;
+    tokio::fs::create_dir_all(&cropped_dir).await?;
 
-    let mut all_paths: Vec<PathBuf> = Vec::new();
-    let mut group_boundaries: Vec<(usize, usize)> = Vec::new();
-
-    for group in &frame_groups {
-        let start = all_paths.len();
-        for frame in group {
-            let path = if let Some(ref region) = layout {
-                let out_path = cropped_dir.join(format!(
-                    "crop_{}.png",
-                    frame
-                        .path
-                        .file_stem()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                ));
-                regions::crop_to_region(&frame.path, region, &out_path)?;
-                out_path
-            } else {
-                frame.path.clone()
-            };
-            all_paths.push(path);
-        }
-        group_boundaries.push((start, group.len()));
-    }
+    let (all_paths, group_boundaries) = {
+        let frame_groups = frame_groups.clone();
+        tokio::task::spawn_blocking(move || crop_frames(&frame_groups, layout.as_ref(), &cropped_dir))
+            .await
+            .context("cropping task failed")??
+    };
 
     let method = if args.gpu_ocr {
         "GPU OCR (PaddleOCR/ONNX)"
@@ -129,10 +126,16 @@ pub async fn run_pipeline(args: &ScrapeArgs) -> Result<()> {
     );
 
     let frame_results: Vec<Result<String>> = if args.gpu_ocr {
-        let mut engine = gpu_ocr::GpuOcrEngine::new(&args.model_dir)?;
-        println!("  GPU OCR engine initialized");
+        let model_dir = args.model_dir.clone();
+        let paths = all_paths.clone();
         let start = std::time::Instant::now();
-        let codes = engine.extract_batch(&all_paths);
+        let codes = tokio::task::spawn_blocking(move || -> Result<Vec<Result<String>>> {
+            let mut engine = gpu_ocr::GpuOcrEngine::new(&model_dir)?;
+            println!("  GPU OCR engine initialized");
+            Ok(engine.extract_batch(&paths))
+        })
+        .await
+        .context("GPU OCR task failed")??;
         let elapsed = start.elapsed().as_secs_f64();
         let fps = if elapsed > 0.001 {
             all_paths.len() as f64 / elapsed
@@ -340,41 +343,82 @@ fn build_revisions(
     revisions
 }
 
-fn get_duration(video_path: &Path) -> f64 {
-    let output = Command::new("ffprobe")
+/// `(start, len)` of each frame group within the flat frame list.
+type GroupBoundaries = Vec<(usize, usize)>;
+
+/// Crop every sampled frame to the detected code region (or pass frames
+/// through when no region was found). Returns the flat list of frame paths
+/// and `(start, len)` of each group within it.
+fn crop_frames(
+    frame_groups: &[Vec<SampledFrame>],
+    layout: Option<&CodeRegion>,
+    cropped_dir: &Path,
+) -> Result<(Vec<PathBuf>, GroupBoundaries)> {
+    let mut all_paths: Vec<PathBuf> = Vec::new();
+    let mut group_boundaries: Vec<(usize, usize)> = Vec::new();
+
+    for group in frame_groups {
+        let start = all_paths.len();
+        for frame in group {
+            let path = if let Some(region) = layout {
+                let out_path = cropped_dir.join(format!(
+                    "crop_{}.png",
+                    frame
+                        .path
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                ));
+                regions::crop_to_region(&frame.path, region, &out_path)?;
+                out_path
+            } else {
+                frame.path.clone()
+            };
+            all_paths.push(path);
+        }
+        group_boundaries.push((start, group.len()));
+    }
+
+    Ok((all_paths, group_boundaries))
+}
+
+async fn get_duration(video_path: &Path) -> Result<f64> {
+    let out = Command::new("ffprobe")
         .args([
             "-v",
-            "quiet",
+            "error",
             "-show_entries",
             "format=duration",
             "-of",
             "default=noprint_wrappers=1:nokey=1",
         ])
         .arg(video_path)
-        .output();
+        .output()
+        .await
+        .context("failed to run ffprobe (is it installed and on PATH?)")?;
 
-    match output {
-        Ok(out) => {
-            if !out.status.success() {
-                eprintln!("Warning: ffprobe failed to get video duration");
-                return 0.0;
-            }
-            match String::from_utf8_lossy(&out.stdout)
-                .trim()
-                .parse::<f64>()
-            {
-                Ok(d) => d,
-                Err(_) => {
-                    eprintln!("Warning: could not parse video duration");
-                    0.0
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("Warning: ffprobe not available: {e}");
-            0.0
-        }
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!(
+            "ffprobe could not read the duration of {} ({}): {}",
+            video_path.display(),
+            out.status,
+            stderr.trim()
+        );
     }
+    parse_duration(&String::from_utf8_lossy(&out.stdout))
+        .with_context(|| format!("bad duration for {}", video_path.display()))
+}
+
+fn parse_duration(stdout: &str) -> Result<f64> {
+    let text = stdout.trim();
+    let d: f64 = text
+        .parse()
+        .with_context(|| format!("ffprobe returned an unparseable duration {text:?}"))?;
+    if !d.is_finite() || d <= 0.0 {
+        anyhow::bail!("ffprobe returned a non-positive duration {d}");
+    }
+    Ok(d)
 }
 
 fn detect_language(code: &str) -> String {
@@ -585,6 +629,38 @@ mod tests {
             max_frame_failure_rate: DEFAULT_MAX_FRAME_FAILURE_RATE,
         };
         assert_eq!(args.vlm_options().timeout, std::time::Duration::from_secs(45));
+    }
+
+    #[test]
+    fn parse_duration_valid() {
+        assert_eq!(parse_duration("12.5\n").unwrap(), 12.5);
+    }
+
+    #[test]
+    fn parse_duration_rejects_garbage_and_zero() {
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("N/A").is_err());
+        assert!(parse_duration("0.000000").is_err());
+        assert!(parse_duration("-1").is_err());
+        assert!(parse_duration("nan").is_err());
+    }
+
+    #[tokio::test]
+    async fn get_duration_errors_on_unreadable_video() {
+        let dir = tempfile::tempdir().unwrap();
+        let bogus = dir.path().join("not_a_video.mp4");
+        std::fs::write(&bogus, b"definitely not a video").unwrap();
+        // Errors whether or not ffprobe is installed; never returns 0.0.
+        assert!(get_duration(&bogus).await.is_err());
+    }
+
+    #[test]
+    fn crop_frames_passthrough_without_region() {
+        let groups = vec![vec![frame(1.0), frame(2.0)], vec![frame(3.0)]];
+        let (paths, bounds) = crop_frames(&groups, None, Path::new("unused")).unwrap();
+        assert_eq!(paths.len(), 3);
+        assert_eq!(paths[2], PathBuf::from("f3.png"));
+        assert_eq!(bounds, vec![(0, 2), (2, 1)]);
     }
 
     #[test]
