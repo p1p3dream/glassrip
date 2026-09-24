@@ -72,6 +72,9 @@ pub struct OcrConfig {
     pub rec_batch: usize,
     /// Spans whose recognition confidence is below this are dropped.
     pub drop_score: f64,
+    /// CUDA memory arena limit per session, MiB. The server detector at 1920 px
+    /// needs about 3 GiB of working memory (spec 5.3 plans 1 to 2 GB).
+    pub cuda_mem_limit_mib: u32,
 }
 
 impl Default for OcrConfig {
@@ -86,6 +89,7 @@ impl Default for OcrConfig {
             rec_max_width: 3200,
             rec_batch: 8,
             drop_score: 0.5,
+            cuda_mem_limit_mib: 3072,
         }
     }
 }

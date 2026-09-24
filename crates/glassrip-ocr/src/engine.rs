@@ -51,7 +51,7 @@ pub fn execution_provider() -> &'static str {
     }
 }
 
-fn session_builder() -> Result<SessionBuilder, OcrError> {
+fn session_builder(cfg: &OcrConfig) -> Result<SessionBuilder, OcrError> {
     let builder = Session::builder()
         .map_err(rt)?
         .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -60,8 +60,15 @@ fn session_builder() -> Result<SessionBuilder, OcrError> {
     // error_on_failure turns a broken CUDA install into an error.
     #[cfg(feature = "cuda")]
     let builder = builder
-        .with_execution_providers([ort::ep::CUDA::default().build().error_on_failure()])
+        .with_execution_providers([ort::ep::CUDA::default()
+            .with_memory_limit(cfg.cuda_mem_limit_mib as usize * 1024 * 1024)
+            .with_arena_extend_strategy(ort::ep::ArenaExtendStrategy::SameAsRequested)
+            .with_conv_algorithm_search(ort::ep::cuda::ConvAlgorithmSearch::Heuristic)
+            .build()
+            .error_on_failure()])
         .map_err(|e| OcrError::Runtime(format!("CUDA execution provider: {e}")))?;
+    #[cfg(not(feature = "cuda"))]
+    let _ = cfg;
     Ok(builder)
 }
 
@@ -84,10 +91,10 @@ impl PpOcrEngine {
     pub fn new(dir: &Path, cfg: OcrConfig) -> Result<Self, OcrError> {
         let fingerprint = models::verify(dir)?;
         init_runtime()?;
-        let det = session_builder()?
+        let det = session_builder(&cfg)?
             .commit_from_file(dir.join(models::DET_FILE))
             .map_err(|e| OcrError::Runtime(format!("detector: {e}")))?;
-        let rec = session_builder()?
+        let rec = session_builder(&cfg)?
             .commit_from_file(dir.join(models::REC_FILE))
             .map_err(|e| OcrError::Runtime(format!("recognizer: {e}")))?;
         let dict = models::read_dict(dir)?;
