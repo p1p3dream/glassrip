@@ -23,11 +23,14 @@ pub mod cache;
 pub mod canonical;
 pub mod config;
 pub mod envelope;
+pub mod error;
 pub mod graph;
 pub mod jsonl;
 pub mod manifest;
+pub mod runner;
 pub mod versioning;
 
+pub use error::{Error, Result};
 
 /// Returns the blake3 hash of `bytes` as lowercase hex.
 pub fn blake3_hex(bytes: &[u8]) -> String {
