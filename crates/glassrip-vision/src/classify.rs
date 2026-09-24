@@ -48,9 +48,14 @@ pub struct ScreenClassOutput {
 }
 
 impl ScreenClassOutput {
-    /// Map the canvas box from thumbnail pixels to source frame pixels.
+    /// Map the canvas box from thumbnail pixels to source frame pixels, clamped to the frame.
+    ///
+    /// The model sometimes reports coordinates past the image edge, so the result is clamped.
     pub fn in_source_coords(mut self, prepared: &PreparedImage) -> Self {
-        self.canvas_bbox = self.canvas_bbox.to_source(prepared);
+        self.canvas_bbox = self.canvas_bbox.to_source(prepared).clamped(
+            f64::from(prepared.source_width),
+            f64::from(prepared.source_height),
+        );
         self
     }
 }

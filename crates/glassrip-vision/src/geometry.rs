@@ -54,6 +54,16 @@ impl BBox {
         Self::new(self.x1 * sx, self.y1 * sy, self.x2 * sx, self.y2 * sy)
     }
 
+    /// Clamp every coordinate into `[0, width] x [0, height]`.
+    pub fn clamped(&self, width: f64, height: f64) -> Self {
+        Self::new(
+            self.x1.clamp(0.0, width),
+            self.y1.clamp(0.0, height),
+            self.x2.clamp(0.0, width),
+            self.y2.clamp(0.0, height),
+        )
+    }
+
     /// Map a box in sent-image pixels back to source (canvas or frame) pixels.
     pub fn to_source(&self, prepared: &PreparedImage) -> Self {
         let (x1, y1) = prepared.to_source(self.x1, self.y1);
@@ -88,6 +98,8 @@ mod tests {
         assert!(b.is_inside(99.0, 50.0, 2.0));
         assert!(!BBox::new(5.0, 5.0, 5.0, 9.0).is_well_formed());
         assert!(!BBox::new(0.0, f64::NAN, 1.0, 1.0).is_well_formed());
+        let c = BBox::new(-5.0, 10.0, 120.0, 90.0).clamped(100.0, 50.0);
+        assert_eq!(c, BBox::new(0.0, 10.0, 100.0, 50.0));
     }
 
     #[test]
