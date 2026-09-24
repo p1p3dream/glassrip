@@ -22,7 +22,9 @@ impl Role {
     /// Card and zone color.
     pub fn color(self) -> &'static str {
         match self {
-            Role::Client => "#6366f1",
+            // Appendix B has no client color and reserves indigo for analytics;
+            // client apps use the external teal
+            Role::Client => "#0891b2",
             Role::Api => "#2563eb",
             Role::Processing => "#10b981",
             Role::Storage => "#7c3aed",

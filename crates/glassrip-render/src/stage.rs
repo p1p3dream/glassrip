@@ -6,7 +6,7 @@ use glassrip_core::envelope::{ErrorCode, ErrorInfo};
 use glassrip_core::runner::{
     ArtifactSpec, InputDecl, ItemContext, Stage, StageError, StageInputs, WorkItem,
 };
-use glassrip_notes::board::{BoardState, BOARD_STATE_MAJOR};
+use glassrip_notes::board::{BoardStateItem, BOARD_STATE_MAJOR};
 use glassrip_notes::notes::MeetingNotes;
 use glassrip_notes::schemas;
 use schemars::JsonSchema;
@@ -14,6 +14,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 
 use crate::markdown::MarkdownMeta;
+use crate::svg::FontConfig;
 use crate::{render_all, RenderResult};
 
 /// Schema of the render artifact.
@@ -28,8 +29,22 @@ pub struct RenderParams {
     pub stem: String,
     /// Header facts.
     pub meta: MarkdownMeta,
-    /// Fail the item when a validation check fails.
+    /// Fail the item when a validation check fails (default: true).
     pub strict: bool,
+    /// Fonts for the validation render.
+    pub fonts: FontConfig,
+}
+
+impl Default for RenderParams {
+    fn default() -> Self {
+        Self {
+            out_dir: PathBuf::from("out"),
+            stem: "meeting".into(),
+            meta: MarkdownMeta::default(),
+            strict: true,
+            fonts: FontConfig::default(),
+        }
+    }
 }
 
 /// `render`: meeting notes and board state to markdown and SVG.
@@ -48,7 +63,7 @@ impl RenderStage {
 #[derive(Debug)]
 pub struct RenderInput {
     notes: MeetingNotes,
-    boards: Vec<BoardState>,
+    boards: Vec<BoardStateItem>,
 }
 
 impl Stage for RenderStage {
@@ -92,7 +107,7 @@ impl Stage for RenderStage {
             .next()
             .ok_or_else(|| StageError::Invalid("no meeting notes".into()))?;
         let boards = inputs
-            .read_ok::<BoardState>(schemas::BOARD_STATE)?
+            .read_ok::<BoardStateItem>(schemas::BOARD_STATE)?
             .into_iter()
             .map(|(_, b)| b)
             .collect();
@@ -108,7 +123,7 @@ impl Stage for RenderStage {
         work: Self::Work,
     ) -> Result<RenderResult, ErrorInfo> {
         let p = &self.params;
-        let result = render_all(&work.notes, &work.boards, &p.out_dir, &p.stem, &p.meta)
+        let result = render_all(&work.notes, &work.boards, p)
             .map_err(|e| ErrorInfo::new(ErrorCode::Io, e.to_string()))?;
         if p.strict && !result.ok {
             let detail =

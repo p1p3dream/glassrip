@@ -53,7 +53,7 @@
           "seg_00007"
         ],
         "event_ids": [
-          "ev_003"
+          "ev-16"
         ],
         "keyframe_ids": []
       }
@@ -61,7 +61,7 @@
     {
       "id": "s3",
       "text": "Which kiosk widgets to build is still open",
-      "t_start_s": 12.0,
+      "t_start_s": 15.0,
       "t_end_s": 63.6,
       "evidence": {
         "segment_ids": [
@@ -69,7 +69,7 @@
         ],
         "event_ids": [],
         "keyframe_ids": [
-          "kf_0012"
+          "kf_000010"
         ]
       }
     }
@@ -164,7 +164,7 @@
           "seg_00006"
         ],
         "event_ids": [
-          "ev_003"
+          "ev-16"
         ],
         "keyframe_ids": []
       },
@@ -236,14 +236,16 @@
       "id": "q1",
       "text": "Which widgets does the kiosk need?",
       "source": "board_and_transcript",
-      "t_s": 12.0,
+      "t_s": 15.0,
       "evidence": {
         "segment_ids": [
           "seg_00010"
         ],
-        "event_ids": [],
+        "event_ids": [
+          "ev-9"
+        ],
         "keyframe_ids": [
-          "kf_0012"
+          "kf_000010"
         ]
       },
       "quote": {
@@ -262,10 +264,10 @@
           "seg_00004"
         ],
         "event_ids": [
-          "ev_002"
+          "ev-10"
         ],
         "keyframe_ids": [
-          "kf_0020"
+          "kf_000020"
         ]
       },
       "quote": {
@@ -279,7 +281,7 @@
     {
       "id": "t1",
       "t_start_s": 0.0,
-      "t_end_s": 17.0,
+      "t_end_s": 18.0,
       "text": "Avery walks through the relay, ledger and kiosk architecture",
       "evidence": {
         "segment_ids": [
@@ -287,7 +289,7 @@
           "seg_00003"
         ],
         "event_ids": [
-          "ev_001"
+          "ev-5"
         ],
         "keyframe_ids": []
       }
@@ -304,7 +306,7 @@
           "seg_00007"
         ],
         "event_ids": [
-          "ev_003"
+          "ev-16"
         ],
         "keyframe_ids": []
       }
@@ -321,7 +323,7 @@
           "seg_00011"
         ],
         "event_ids": [
-          "ev_004"
+          "ev-19"
         ],
         "keyframe_ids": []
       }
@@ -330,7 +332,7 @@
   "caveats": [
     {
       "kind": "speakers",
-      "text": "0 of 13 transcript lines have a low-confidence speaker (below 0.5); 2 were reassigned from the diarizer's label by on-screen speaker or direct-address cues, for example 00:06 \"Hey, Mira.\" (Avery Quinn), 00:07 \"Hey.\" (Mira Okafor). Flagged lines are marked in the transcript."
+      "text": "0 of 13 transcript lines have a low-confidence speaker (below 0.5); 2 were reassigned from the diarizer's label by on-screen speaker or direct-address cues, for example 00:06 \"Hey, Mira, glad you could join\" (Avery Quinn), 00:09 \"Hey.\" (Mira Okafor). Flagged lines are marked in the transcript."
     },
     {
       "kind": "gap_fill",
@@ -346,15 +348,15 @@
       "label": "L0",
       "name": "Avery Quinn",
       "status": "mapped",
-      "confidence": 0.8992962,
+      "confidence": 0.89317775,
       "talk_time_s": 34.8
     },
     {
       "label": "L1",
       "name": "Rohan Dasgupta",
       "status": "mapped",
-      "confidence": 0.8547427,
-      "talk_time_s": 14.400000000000002
+      "confidence": 0.8085047,
+      "talk_time_s": 16.400000000000002
     },
     {
       "label": "L2",
@@ -367,10 +369,10 @@
   "transcript": [
     {
       "start_s": 0.0,
-      "end_s": 6.8,
+      "end_s": 8.8,
       "speaker": "Avery Quinn",
       "person_id": "avery-quinn",
-      "text": "Welcome everyone, this is the kiosk relay planning session for the pilot. Hey, Mira.",
+      "text": "Welcome everyone, this is the kiosk relay planning session for the pilot. Hey, Mira, glad you could join us.",
       "segment_ids": [
         "seg_00000",
         "seg_00001"
@@ -378,8 +380,8 @@
       "flagged": true
     },
     {
-      "start_s": 7.4,
-      "end_s": 7.800000000000001,
+      "start_s": 9.2,
+      "end_s": 9.6,
       "speaker": "Mira Okafor",
       "person_id": "mira-okafor",
       "text": "Hey.",
@@ -389,8 +391,8 @@
       "flagged": true
     },
     {
-      "start_s": 9.0,
-      "end_s": 17.0,
+      "start_s": 10.0,
+      "end_s": 18.0,
       "speaker": "Avery Quinn",
       "person_id": "avery-quinn",
       "text": "So the relay pulls entries from the ledger service over REST and the kiosk app talks GraphQL to the relay.",

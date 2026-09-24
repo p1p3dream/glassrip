@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use glassrip_notes::board::{BoardState, GroupKind};
+use glassrip_notes::board::{first_seen, last_seen, removed_at, BoardExt, BoardStateItem};
 use glassrip_notes::notes::{MeetingNotes, NotesStatus, QuestionSource, Quote, QuoteMatch};
 use glassrip_notes::text::{mmss, sanitize_dashes};
 use minijinja::Environment;
@@ -10,13 +10,31 @@ use pulldown_cmark::{Event, Options, Parser, Tag};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::facts::{deferred_nodes, final_nodes, node_owners, owner_summary};
+use crate::facts::{deferred_nodes, derive_grids, final_nodes, node_owners, owner_summary};
 use crate::style::role_of;
 use crate::RenderError;
 
 /// Escapes text for a table cell.
 pub fn cell(s: String) -> String {
     s.replace('|', "\\|").replace(['\n', '\r'], " ")
+}
+
+/// Escapes model, board and transcript text for inline markdown, so it cannot
+/// start headings, emphasis, links, images, code spans or raw HTML. Pipes are
+/// left to [`cell`].
+pub fn inline(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' | '\r' => out.push(' '),
+            '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>' | '#' | '!' | '~' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 fn when(a: f64, b: f64) -> String {
@@ -31,9 +49,9 @@ fn quote(q: &Option<Quote>) -> String {
     match q {
         Some(q) if q.matched == QuoteMatch::Corrected => format!(
             " \"{}\" (quote matches the vocabulary-corrected transcript)",
-            q.text
+            inline(&q.text)
         ),
-        Some(q) => format!(" \"{}\"", q.text),
+        Some(q) => format!(" \"{}\"", inline(&q.text)),
         None => String::new(),
     }
 }
@@ -91,15 +109,14 @@ struct Ctx {
 pub fn render_markdown(
     env: &Environment<'_>,
     notes: &MeetingNotes,
-    boards: &[BoardState],
+    boards: &[BoardStateItem],
     links: &Links,
     meta: &MarkdownMeta,
 ) -> Result<String, RenderError> {
-    let s = |t: &str| sanitize_dashes(t);
+    let s = |t: &str| inline(&sanitize_dashes(t));
     let title = notes
         .title
         .clone()
-        .or_else(|| boards.iter().find_map(|b| b.title.clone()))
         .unwrap_or_else(|| "Meeting notes".into());
     let mut m = Vec::new();
     if let Some(d) = &meta.date {
@@ -141,65 +158,47 @@ pub fn render_markdown(
     for b in boards {
         let deferred = deferred_nodes(b, &notes.decisions);
         let owners = node_owners(b, notes);
+        let grids = derive_grids(b);
         let mut rows: Vec<[String; 4]> = final_nodes(b)
             .into_iter()
             .map(|n| {
-                let status = match deferred.get(&n.node_id) {
+                let status = match deferred.get(&n.id) {
                     Some(t) => format!("**Deferred** ({})", mmss(*t)),
-                    None => format!("On the board from {}", mmss(n.first_seen_s)),
+                    None => format!("On the board from {}", mmss(first_seen(&n.lifetimes))),
                 };
                 [
-                    cell(n.text.clone()),
+                    cell(s(&n.text)),
                     role_of(&n.text).describe().to_string(),
-                    cell(owner_summary(
-                        owners.get(&n.node_id).map_or(&[][..], Vec::as_slice),
-                    )),
+                    cell(s(&owner_summary(
+                        owners.get(&n.id).map_or(&[][..], Vec::as_slice),
+                    ))),
                     status,
                 ]
             })
             .collect();
-        for n in b.nodes.iter().filter(|n| n.last_seen_s.is_some()) {
+        for n in b.nodes.iter().filter(|n| !n.in_final) {
+            let gone = removed_at(&n.lifetimes)
+                .or_else(|| last_seen(&n.lifetimes))
+                .unwrap_or(0.0);
             rows.push([
-                cell(n.text.clone()),
+                cell(s(&n.text)),
                 role_of(&n.text).describe().to_string(),
                 "none shown".into(),
                 format!(
                     "Removed (seen {} to {})",
-                    mmss(n.first_seen_s),
-                    mmss(n.last_seen_s.unwrap_or(n.first_seen_s))
+                    mmss(first_seen(&n.lifetimes)),
+                    mmss(gone)
                 ),
             ]);
         }
-        let groups = b
-            .groups
+        let groups = grids
             .iter()
             .map(|g| {
-                let members: Vec<String> = g
-                    .members
-                    .iter()
-                    .map(|mm| {
-                        let mut t = mm.text.clone();
-                        if let Some(d) = &mm.detail {
-                            t.push_str(&format!(" ({d})"));
-                        }
-                        if mm.highlight {
-                            t.push_str(" [highlighted]");
-                        }
-                        t
-                    })
-                    .collect();
-                let kind = match g.kind {
-                    GroupKind::Grid => "grid",
-                    GroupKind::Container => "container",
-                };
-                let fed = g
-                    .fed_by
-                    .as_ref()
-                    .map(|f| format!(", fed by {f}"))
-                    .unwrap_or_default();
+                let members: Vec<String> = g.members.iter().map(|m| s(&m.text)).collect();
                 format!(
-                    "**{}** ({kind}{fed}, from {}): {}",
-                    g.label,
+                    "**Grouped boxes** ({} rows by {} columns, no arrows, from {}): {}",
+                    g.rows,
+                    g.columns,
                     mmss(g.first_seen_s),
                     members.join(", ")
                 )
@@ -211,10 +210,10 @@ pub fn render_markdown(
                 .map(|x| x.1.clone())
         };
         archs.push(Arch {
-            title: b.title.clone().unwrap_or_else(|| b.board_id.clone()),
+            title: s(&b.board_id),
             svg: find(&links.svg),
             png: find(&links.png),
-            final_time: mmss(b.final_t_s),
+            final_time: mmss(b.end_s()),
             rows,
             groups,
         });
@@ -296,11 +295,15 @@ pub fn render_markdown(
         .iter()
         .map(|p| {
             let who = if p.flagged {
-                format!("{} (speaker uncertain)", p.speaker)
+                format!("{} (speaker uncertain)", inline(&p.speaker))
             } else {
-                p.speaker.clone()
+                inline(&p.speaker)
             };
-            format!("[{}] {who}: {}", mmss(p.start_s), p.text.trim())
+            format!(
+                "[{}] {who}: {}",
+                mmss(p.start_s),
+                inline(&sanitize_dashes(p.text.trim()))
+            )
         })
         .collect();
 
@@ -473,6 +476,28 @@ mod tests {
         assert_eq!(c.bad_rows.len(), 1);
         assert_eq!(c.missing_targets, vec!["b.svg"]);
         assert_eq!(c.empty_links, 1);
+    }
+
+    #[test]
+    fn model_text_cannot_inject_markdown() {
+        let evil = "# Heading [click](http://x) **bold** <b>x</b> `code` ![img](a.png)";
+        let md = format!("- {}\n", inline(evil));
+        let mut opts = Options::empty();
+        opts.insert(Options::ENABLE_TABLES);
+        let bad = Parser::new_ext(&md, opts).any(|e| {
+            matches!(
+                e,
+                Event::Start(Tag::Heading { .. })
+                    | Event::Start(Tag::Link { .. })
+                    | Event::Start(Tag::Image { .. })
+                    | Event::Start(Tag::Strong)
+                    | Event::Start(Tag::Emphasis)
+                    | Event::Code(_)
+                    | Event::Html(_)
+                    | Event::InlineHtml(_)
+            )
+        });
+        assert!(!bad, "{md}");
     }
 
     #[test]

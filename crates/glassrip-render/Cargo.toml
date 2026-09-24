@@ -15,6 +15,8 @@ ocr-cuda = ["ocr", "glassrip-notes/ocr-cuda"]
 [dependencies]
 glassrip-core = { path = "../glassrip-core" }
 glassrip-notes = { path = "../glassrip-notes" }
+glassrip-meeting = { path = "../glassrip-meeting" }
+glassrip-vision = { path = "../glassrip-vision" }
 minijinja = { version = "2", default-features = false, features = ["builtins", "serde", "debug", "macros", "multi_template"] }
 pulldown-cmark = { version = "0.13", default-features = false }
 resvg = { version = "0.48", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }

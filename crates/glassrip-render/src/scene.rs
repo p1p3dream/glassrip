@@ -7,12 +7,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use glassrip_notes::board::{BoardState, EdgeStyle, GroupKind, StickyKind, TargetKind};
+use glassrip_notes::board::{
+    center, first_seen, target_text, BoardExt, BoardStateItem, EdgeOrientation, EdgeStyle,
+    OwnerAssignment, OwnerTarget, StickyKind,
+};
 use glassrip_notes::notes::MeetingNotes;
 use glassrip_notes::text::{mmss, sanitize_dashes};
 use serde::Serialize;
 
-use crate::facts::{deferred_nodes, final_nodes, focus_node, short_name};
+use crate::facts::{deferred_nodes, derive_grids, final_nodes, focus_node, short_name};
 use crate::style::{role_of, text_width, wrap, wrap_lines, Role};
 
 /// Canvas width unless the board needs more.
@@ -27,6 +30,8 @@ const ZONE_PAD_X: f64 = 32.0;
 const ZONE_PAD_TOP: f64 = 100.0;
 const ZONE_PAD_BOTTOM: f64 = 40.0;
 const PILL_H: f64 = 24.0;
+/// Bottom of the title and legend band; nothing else is placed above it.
+const LEGEND_BOTTOM: f64 = 124.0;
 
 /// Axis-aligned rectangle.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -178,8 +183,9 @@ pub struct Pill {
 pub struct EdgeArt {
     /// Path data.
     pub d: String,
-    /// Arrowhead polygon points.
-    pub arrow: String,
+    /// Arrowhead polygons (none when the direction is not established, two when
+    /// the arrow points both ways).
+    pub arrows: Vec<String>,
     /// Stroke color.
     pub color: &'static str,
     /// Stroke width.
@@ -310,6 +316,9 @@ pub struct Scene {
     /// Boxes that must not overlap (name, box).
     #[serde(skip)]
     pub blocking: Vec<(String, R)>,
+    /// Owner pills, notes and badges that found no free place (left out).
+    #[serde(skip)]
+    pub unplaced: Vec<String>,
 }
 
 fn arrowhead(tip: (f64, f64), from: (f64, f64)) -> ((f64, f64), String) {
@@ -340,13 +349,13 @@ fn path_d(points: &[(f64, f64)]) -> String {
 }
 
 /// Card centers in board units plus the method used.
-fn raw_positions(board: &BoardState, ids: &[String]) -> (Vec<(f64, f64)>, &'static str) {
+fn raw_positions(board: &BoardStateItem, ids: &[String]) -> (Vec<(f64, f64)>, &'static str) {
     let nodes: Vec<_> = ids.iter().filter_map(|id| board.node(id)).collect();
     if !nodes.is_empty() && nodes.iter().all(|n| n.bbox.is_some()) {
         return (
             nodes
                 .iter()
-                .filter_map(|n| n.bbox.map(|b| b.center()))
+                .filter_map(|n| n.bbox.map(|b| center(&b)))
                 .collect(),
             "board_positions",
         );
@@ -360,8 +369,8 @@ fn raw_positions(board: &BoardState, ids: &[String]) -> (Vec<(f64, f64)>, &'stat
         .map(|i| (i, (CARD_W, CARD_H)))
         .collect();
     let edges: Vec<(u32, u32)> = board
-        .edges
-        .iter()
+        .final_edges()
+        .into_iter()
         .filter_map(|e| Some((*index.get(e.src.as_str())?, *index.get(e.dst.as_str())?)))
         .filter(|(a, b)| a != b)
         .collect();
@@ -478,9 +487,17 @@ fn badge(x: f64, y: f64, text: &str, fill: &str) -> Pill {
 }
 
 /// Builds the scene for one board.
-pub fn build_scene(board: &BoardState, notes: &MeetingNotes) -> Scene {
-    let nodes = final_nodes(board);
-    let ids: Vec<String> = nodes.iter().map(|n| n.node_id.clone()).collect();
+pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
+    let grids = derive_grids(board);
+    let in_grid: BTreeSet<&str> = grids
+        .iter()
+        .flat_map(|g| g.members.iter().map(|n| n.id.as_str()))
+        .collect();
+    let nodes: Vec<_> = final_nodes(board)
+        .into_iter()
+        .filter(|n| !in_grid.contains(n.id.as_str()))
+        .collect();
+    let ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
     let (raw, layout_method) = raw_positions(board, &ids);
     let deferred = deferred_nodes(board, &notes.decisions);
     let focus = focus_node(board, &notes.decisions);
@@ -550,15 +567,24 @@ pub fn build_scene(board: &BoardState, notes: &MeetingNotes) -> Scene {
         let mut title = head_words.join(" ");
         let mut lines = Vec::new();
         let mut y = r.y + 58.0;
+        // everything stays inside the card: long titles wrap into at most two
+        // body lines, a long mono token is truncated, overflow lines are dropped
         let max_title = ((CARD_W - 24.0) / (14.0 * 0.6)) as usize;
         if title.chars().count() > max_title {
             let parts = wrap(&title, max_title);
             title = parts.first().cloned().unwrap_or_default();
             let rest = parts[1..].join(" ");
-            lines.push(tl(r.x + 12.0, y, rest, "body-strong"));
-            y += 20.0;
+            for l in wrap_lines(&rest, ((CARD_W - 24.0) / (12.0 * 0.6)) as usize, 2) {
+                lines.push(tl(r.x + 12.0, y, l, "body-strong"));
+                y += 20.0;
+            }
         }
         if !mono.is_empty() {
+            let mono = wrap_lines(
+                &mono.join(" "),
+                ((CARD_W - 24.0) / (11.0 * 0.62)) as usize,
+                1,
+            );
             lines.push(tl(r.x + 12.0, y, mono.join(" "), "mono"));
             y += 20.0;
         }
@@ -567,25 +593,26 @@ pub fn build_scene(board: &BoardState, notes: &MeetingNotes) -> Scene {
         lines.push(tl(
             r.x + 12.0,
             y,
-            format!("On the board from {}", mmss(n.first_seen_s)),
+            format!("On the board from {}", mmss(first_seen(&n.lifetimes))),
             "small",
         ));
-        if let Some(t) = deferred.get(&n.node_id) {
+        if let Some(t) = deferred.get(&n.id) {
             y += 18.0;
             lines.push(TextLine {
                 fill: Some("#b91c1c".into()),
                 ..tl(r.x + 12.0, y, format!("Deferred at {}", mmss(*t)), "small")
             });
         }
+        lines.retain(|l| l.y <= r.bottom() - 8.0);
         cards.push(Card {
-            id: n.node_id.clone(),
+            id: n.id.clone(),
             r: *r,
             color: role.color(),
             role: role.key(),
             title: tl(r.x + 12.0, r.y + 21.0, title, "heading"),
             lines,
-            dashed: deferred.contains_key(&n.node_id),
-            glow: focus.as_deref() == Some(n.node_id.as_str()),
+            dashed: deferred.contains_key(&n.id),
+            glow: focus.as_deref() == Some(n.id.as_str()),
         });
     }
 
@@ -650,7 +677,8 @@ pub fn build_scene(board: &BoardState, notes: &MeetingNotes) -> Scene {
     let mut edge_anchor: BTreeMap<String, (f64, f64, bool)> = BTreeMap::new();
     let mut channel = 0usize;
     let mut segments: Vec<((f64, f64), (f64, f64))> = Vec::new();
-    for e in &board.edges {
+    let final_edges = board.final_edges();
+    for e in &final_edges {
         let (Some(a), Some(b)) = (card_of.get(e.src.as_str()), card_of.get(e.dst.as_str())) else {
             continue;
         };
@@ -696,14 +724,29 @@ pub fn build_scene(board: &BoardState, notes: &MeetingNotes) -> Scene {
             channel += 1;
             via_channel = true;
         }
+        // arrowheads per the producer's direction: at dst (forward), at both
+        // ends (bidirectional) or none (not established)
         let n = pts.len();
-        let tip = pts[n - 1];
-        let (base, arrow) = arrowhead(tip, pts[n - 2]);
-        pts[n - 1] = base;
+        let mut arrows = Vec::new();
+        let (tip, start) = (pts[n - 1], pts[0]);
+        if matches!(
+            e.direction,
+            EdgeOrientation::Forward | EdgeOrientation::Bidirectional
+        ) {
+            let (base, arrow) = arrowhead(tip, pts[n - 2]);
+            pts[n - 1] = base;
+            arrows.push(arrow);
+        }
+        if e.direction == EdgeOrientation::Bidirectional {
+            let (base, arrow) = arrowhead(start, pts[1]);
+            pts[0] = base;
+            arrows.push(arrow);
+        }
         for w in pts.windows(2) {
             segments.push((w[0], w[1]));
         }
-        segments.push((base, tip));
+        segments.push((pts[n - 1], tip));
+        segments.push((start, pts[0]));
         let dashed = e.style == EdgeStyle::Dashed;
         // label at the middle of the longest segment
         let (li, _) = pts
@@ -714,11 +757,8 @@ pub fn build_scene(board: &BoardState, notes: &MeetingNotes) -> Scene {
         let (p0, p1) = (pts[li], pts[li + 1]);
         let horizontal = (p0.1 - p1.1).abs() < 0.5;
         let mid = ((p0.0 + p1.0) / 2.0, (p0.1 + p1.1) / 2.0);
-        edge_anchor.insert(e.edge_id.clone(), (mid.0, mid.1, horizontal));
-        let label = e
-            .label
-            .as_ref()
-            .map(|t| sanitize_dashes(t))
+        edge_anchor.insert(e.id.clone(), (mid.0, mid.1, horizontal));
+        let label = Some(sanitize_dashes(e.label.trim()))
             .filter(|t| !t.is_empty())
             .map(|text| {
                 let relation = dashed || text.chars().count() > 22;
@@ -775,7 +815,7 @@ pub fn build_scene(board: &BoardState, notes: &MeetingNotes) -> Scene {
         }
         edges.push(EdgeArt {
             d: path_d(&pts),
-            arrow,
+            arrows,
             color: if dashed { "#7c3aed" } else { "#0f172a" },
             width: if dashed { 1.5 } else { 2.0 },
             dash: dashed.then_some("6,4"),
@@ -793,118 +833,93 @@ pub fn build_scene(board: &BoardState, notes: &MeetingNotes) -> Scene {
     let mut pills: Vec<Pill> = Vec::new();
     let mut notes_txt: Vec<TextLine> = Vec::new();
     let mut note_boxes: Vec<R> = Vec::new();
+    // inside the canvas (below the legend) and clear of cards, labels and edges
     let free = |r: &R, taken: &[R]| {
-        !taken.iter().any(|t| t.intersects(r))
+        r.x >= MARGIN / 2.0
+            && r.right() <= width - MARGIN / 2.0
+            && r.y >= LEGEND_BOTTOM
+            && !taken.iter().any(|t| t.intersects(r))
             && !segments
                 .iter()
                 .any(|(a, b)| r.inflate(3.0).hits_segment(*a, *b))
     };
-    let label_of = |id: &str| {
-        board
-            .node(id)
-            .map(|n| n.text.clone())
-            .unwrap_or_else(|| id.to_string())
-    };
-    let mut per_node: BTreeMap<&str, Vec<&glassrip_notes::board::OwnerAssignment>> =
-        BTreeMap::new();
-    for o in board
-        .owner_assignments
-        .iter()
-        .filter(|o| o.valid_to_s.is_none())
-    {
-        per_node.entry(o.target_id.as_str()).or_default().push(o);
-    }
-    for (target, owners) in per_node {
-        let Some(first) = owners.first() else {
-            continue;
+    // first free candidate, else None (the item is left out and reported)
+    let first_free = |cands: &[R], taken: &[R]| cands.iter().copied().find(|c| free(c, taken));
+    let mut per_target: BTreeMap<String, Vec<&OwnerAssignment>> = BTreeMap::new();
+    for o in board.current_owners() {
+        let key = match &o.target {
+            OwnerTarget::Node { node_id, .. } => node_id.clone(),
+            OwnerTarget::Edge { edge_id, .. } => edge_id.clone(),
         };
-        match first.target_kind {
-            TargetKind::Node => {
-                let Some(r) = card_of.get(target) else {
-                    continue;
-                };
-                let mut x = r.x;
-                for o in owners {
-                    let name = short_name(notes, o.person_id.as_deref(), &o.name_raw);
-                    let mut p = pill(x, r.y - 34.0, &name, "#16a34a", "pill-text", 11.0, true);
-                    for _ in 0..40 {
-                        if free(&p.r, &taken) {
-                            break;
-                        }
-                        p.r.x += 12.0;
-                        p.text.x += 12.0;
-                    }
-                    x = p.r.right() + 8.0;
-                    let moved = board.owner_assignments.iter().find(|q| {
-                        q.owner_id != o.owner_id
-                            && q.person_id == o.person_id
-                            && q.name_raw == o.name_raw
-                            && q.valid_to_s
-                                .is_some_and(|t| (t - o.valid_from_s).abs() <= 5.0)
-                    });
-                    taken.push(p.r);
-                    if let Some(q) = moved {
-                        let from = match q.target_kind {
-                            TargetKind::Node => label_of(&q.target_id),
-                            TargetKind::Edge => "a link".into(),
-                        };
-                        let txt = format!("moved from {} ({})", from, mmss(o.valid_from_s));
-                        let tw = text_width(&txt, 10.0, false);
-                        let beside = R::new(p.r.right() + 8.0, p.r.y + 4.0, tw, 16.0);
-                        let above = R::new(p.r.x, p.r.y - 20.0, tw, 16.0);
-                        let nb = if free(&beside, &taken) || !free(&above, &taken) {
-                            beside
-                        } else {
-                            above
-                        };
-                        notes_txt.push(tl(nb.x, nb.y + 12.0, txt, "small"));
-                        taken.push(nb);
-                        note_boxes.push(nb);
-                        x = nb.right() + 8.0;
-                    }
-                    pills.push(p);
+        per_target.entry(key).or_default().push(o);
+    }
+    let mut unplaced: Vec<String> = Vec::new();
+    for (target, owners) in per_target {
+        for o in owners {
+            let name = short_name(notes, &o.person_id, &o.display_name);
+            let proto = pill(0.0, 0.0, &name, "#16a34a", "pill-text", 11.0, true);
+            let (w, h) = (proto.r.w, proto.r.h);
+            let cands: Vec<R> = match &o.target {
+                OwnerTarget::Node { .. } => {
+                    let Some(r) = card_of.get(target.as_str()) else {
+                        continue;
+                    };
+                    // above the card, sliding right (bounded), then below it
+                    let mut v: Vec<R> = (0..16)
+                        .map(|k| R::new(r.x + 12.0 * k as f64, r.y - 34.0, w, h))
+                        .collect();
+                    v.extend((0..4).map(|k| R::new(r.x + 12.0 * k as f64, r.bottom() + 8.0, w, h)));
+                    v
                 }
-            }
-            TargetKind::Edge => {
-                let Some((mx, my, horizontal)) = edge_anchor.get(target).copied() else {
-                    continue;
-                };
-                for o in owners.iter() {
-                    let name = short_name(notes, o.person_id.as_deref(), &o.name_raw);
-                    let w = (text_width(&name, 11.0, true) + 24.0).max(56.0);
-                    // candidates around the label anchor, nearest first
-                    let mut cands: Vec<(f64, f64)> = Vec::new();
+                OwnerTarget::Edge { .. } => {
+                    let Some((mx, my, horizontal)) = edge_anchor.get(target.as_str()).copied()
+                    else {
+                        continue;
+                    };
+                    let mut v = Vec::new();
                     for step in 0..6 {
                         let d = 28.0 * step as f64;
                         if horizontal {
-                            cands.push((mx - w / 2.0, my + 10.0 + d));
-                            cands.push((mx - w / 2.0, my - 34.0 - d));
+                            v.push(R::new(mx - w / 2.0, my + 10.0 + d, w, h));
+                            v.push(R::new(mx - w / 2.0, my - 34.0 - d, w, h));
                         } else {
-                            cands.push((mx - w - 10.0, my + 4.0 + d));
-                            cands.push((mx - w - 10.0, my - 28.0 - d));
-                            cands.push((mx + 10.0, my + 28.0 + d));
+                            v.push(R::new(mx - w - 10.0, my + 4.0 + d, w, h));
+                            v.push(R::new(mx - w - 10.0, my - 28.0 - d, w, h));
+                            v.push(R::new(mx + 10.0, my + 28.0 + d, w, h));
                         }
                     }
-                    let mut p = pill(
-                        cands[0].0,
-                        cands[0].1,
-                        &name,
-                        "#16a34a",
-                        "pill-text",
-                        11.0,
-                        true,
-                    );
-                    for (x, y) in &cands {
-                        let cand = pill(*x, *y, &name, "#16a34a", "pill-text", 11.0, true);
-                        if free(&cand.r, &taken) {
-                            p = cand;
-                            break;
-                        }
+                    v
+                }
+            };
+            let Some(pr) = first_free(&cands, &taken) else {
+                unplaced.push(format!("owner {name}"));
+                continue;
+            };
+            let p = pill(pr.x, pr.y, &name, "#16a34a", "pill-text", 11.0, true);
+            taken.push(p.r);
+            if let Some(from) = &o.moved_from {
+                let txt = format!(
+                    "moved from {} ({})",
+                    target_text(from),
+                    mmss(o.valid_from_s)
+                );
+                let tw = text_width(&txt, 10.0, false);
+                let spots = [
+                    R::new(p.r.right() + 8.0, p.r.y + 4.0, tw, 16.0),
+                    R::new(p.r.x, p.r.y - 20.0, tw, 16.0),
+                    R::new(p.r.right() - tw, p.r.y - 20.0, tw, 16.0),
+                    R::new(p.r.x, p.r.bottom() + 4.0, tw, 16.0),
+                ];
+                match first_free(&spots, &taken) {
+                    Some(nb) => {
+                        notes_txt.push(tl(nb.x, nb.y + 12.0, txt, "small"));
+                        taken.push(nb);
+                        note_boxes.push(nb);
                     }
-                    taken.push(p.r);
-                    pills.push(p);
+                    None => unplaced.push(format!("note {txt}")),
                 }
             }
+            pills.push(p);
         }
     }
     for (id, t) in &deferred {
@@ -912,26 +927,30 @@ pub fn build_scene(board: &BoardState, notes: &MeetingNotes) -> Scene {
             continue;
         };
         let text = format!("DEFERRED ({})", mmss(*t));
-        let mut b = badge(0.0, r.y - 34.0, &text, "#ef4444");
-        // right-aligned above the card; slide left, then up a row, to a free slot
-        let mut placed = false;
-        'rows: for row in 0..6 {
+        let mut b = badge(0.0, 0.0, &text, "#ef4444");
+        // right-aligned above the card; slide left, then up a row; then below
+        let mut cands = Vec::new();
+        for row in 0..4 {
             let y = r.y - 34.0 - 30.0 * row as f64;
             let mut x = r.right() - b.r.w;
             while x >= r.x - 200.0 {
-                let cand = R::new(x, y, b.r.w, b.r.h);
-                if free(&cand, &taken) {
-                    b.r = cand;
-                    placed = true;
-                    break 'rows;
-                }
+                cands.push(R::new(x, y, b.r.w, b.r.h));
                 x -= 12.0;
             }
         }
-        if !placed {
-            // last resort: below the card, where no pill or note is placed
-            b.r = R::new(r.right() - b.r.w, r.bottom() + 6.0, b.r.w, b.r.h);
-        }
+        cands.extend((0..3).map(|k| {
+            R::new(
+                r.right() - b.r.w,
+                r.bottom() + 6.0 + 30.0 * k as f64,
+                b.r.w,
+                b.r.h,
+            )
+        }));
+        let Some(br) = first_free(&cands, &taken) else {
+            unplaced.push(text);
+            continue;
+        };
+        b.r = br;
         b.text.x = b.r.cx();
         b.text.y = b.r.y + 16.0;
         taken.push(b.r);
@@ -940,8 +959,8 @@ pub fn build_scene(board: &BoardState, notes: &MeetingNotes) -> Scene {
 
     // stickies
     let mut stickies = Vec::new();
-    let mut sorted: Vec<_> = board.stickies.iter().collect();
-    sorted.sort_by(|a, b| a.first_seen_s.total_cmp(&b.first_seen_s));
+    let mut sorted = board.final_stickies();
+    sorted.sort_by(|a, b| first_seen(&a.lifetimes).total_cmp(&first_seen(&b.lifetimes)));
     let zones_bottom = zones.iter().map(|z| z.r.bottom()).fold(0.0, f64::max);
     let mut y = channels_bottom
         .max(zones_bottom)
@@ -959,13 +978,14 @@ pub fn build_scene(board: &BoardState, notes: &MeetingNotes) -> Scene {
         let x_start = (width - span) / 2.0;
         let mut row_h: f64 = 0.0;
         for (i, s) in row.iter().enumerate() {
-            let (kind, color) = match s.effective_kind() {
+            let (kind, color) = match s.kind {
                 StickyKind::Question => ("OPEN QUESTION", "#f59e0b"),
+                StickyKind::Milestone => ("MILESTONE", "#0891b2"),
                 StickyKind::Idea => ("IDEA", "#6366f1"),
                 StickyKind::Note => ("NOTE", "#2563eb"),
             };
             let text = s.text.trim();
-            let text = if s.effective_kind() == StickyKind::Idea {
+            let text = if s.kind == StickyKind::Idea {
                 text.trim_start_matches(|c: char| c.is_alphabetic())
                     .trim_start_matches(':')
                     .trim()
@@ -1061,205 +1081,77 @@ pub fn build_scene(board: &BoardState, notes: &MeetingNotes) -> Scene {
         bottom = b.r.bottom() + 24.0;
     }
 
-    // group panels
+    // grids of unconnected boxes, derived from their positions on the board
     let mut panels = Vec::new();
-    let groups: Vec<_> = board.groups.iter().collect();
-    for row in groups.chunks(2) {
-        let pw = if row.len() == 1 {
-            width - 2.0 * MARGIN
-        } else {
-            (width - 2.0 * MARGIN - 40.0) / 2.0
-        };
-        let mut row_h: f64 = 0.0;
-        for (i, g) in row.iter().enumerate() {
-            let px = MARGIN + i as f64 * (pw + 40.0);
-            let color = if g.kind == GroupKind::Grid {
-                "#2563eb"
-            } else {
-                "#7c3aed"
-            };
-            let mut shapes = Vec::new();
-            let mut texts = Vec::new();
-            let mut ppills = Vec::new();
-            let mut arrows = Vec::new();
-            let mut inner = bottom + 60.0;
-            texts.push(tl(
-                px + 16.0,
-                inner,
-                format!(
-                    "On the board from {} ({} cards)",
-                    mmss(g.first_seen_s),
-                    g.members.len()
-                ),
-                "small",
-            ));
-            inner += 16.0;
-            match g.kind {
-                GroupKind::Grid => {
-                    let cols = g.columns.unwrap_or(3).max(1) as usize;
-                    let cw = (pw - 32.0 - (cols as f64 - 1.0) * 16.0) / cols as f64;
-                    for (k, m) in g.members.iter().enumerate() {
-                        let r = R::new(
-                            px + 16.0 + (k % cols) as f64 * (cw + 16.0),
-                            inner + (k / cols) as f64 * 68.0,
-                            cw,
-                            52.0,
-                        );
-                        let (fill, stroke, sw, class) = if m.highlight {
-                            ("#dcfce7", "#10b981", 2.0, "grid-text-green")
-                        } else {
-                            ("#dbeafe", "#2563eb", 1.0, "grid-text")
-                        };
-                        shapes.push(Shape {
-                            r,
-                            rx: 8.0,
-                            fill,
-                            stroke,
-                            stroke_width: sw,
-                            dash: None,
-                            shadow: true,
-                        });
-                        let lines = wrap_lines(&m.text, (cw / 7.2) as usize, 2);
-                        let y0 = r.cy() + 4.0 - 8.0 * (lines.len() as f64 - 1.0);
-                        for (li, l) in lines.iter().enumerate() {
-                            texts.push(tc(r.cx(), y0 + 16.0 * li as f64, l.clone(), class));
-                        }
-                    }
-                    let rows = g.members.len().div_ceil(cols) as f64;
-                    inner += rows * 68.0;
-                    if g.members.iter().any(|m| m.highlight) {
-                        let sw = R::new(px + 16.0, inner + 4.0, 16.0, 16.0);
-                        shapes.push(Shape {
-                            r: sw,
-                            rx: 4.0,
-                            fill: "#dcfce7",
-                            stroke: "#10b981",
-                            stroke_width: 2.0,
-                            dash: None,
-                            shadow: false,
-                        });
-                        texts.push(tl(
-                            px + 40.0,
-                            inner + 16.0,
-                            "Green: drawn in a different color on the board",
-                            "small",
-                        ));
-                        inner += 28.0;
-                    }
-                }
-                GroupKind::Container => {
-                    let mut cx = px + 16.0;
-                    if let Some(f) = &g.fed_by {
-                        let fr = R::new(cx, inner + 28.0, 164.0, 72.0);
-                        shapes.push(Shape {
-                            r: fr,
-                            rx: 8.0,
-                            fill: "#e0e7ff",
-                            stroke: "#6366f1",
-                            stroke_width: 2.0,
-                            dash: None,
-                            shadow: true,
-                        });
-                        let lines = wrap_lines(f, 18, 2);
-                        let y0 = fr.cy() + 5.0 - 9.0 * (lines.len() as f64 - 1.0);
-                        for (li, l) in lines.iter().enumerate() {
-                            let mut t = tc(fr.cx(), y0 + 18.0 * li as f64, l.clone(), "card-title");
-                            t.fill = Some("#3730a3".into());
-                            texts.push(t);
-                        }
-                        let (base, arrow) =
-                            arrowhead((fr.right() + 52.0, fr.cy()), (fr.right(), fr.cy()));
-                        arrows.push((path_d(&[(fr.right(), fr.cy()), base]), arrow));
-                        cx = fr.right() + 60.0;
-                    }
-                    let cr = R::new(cx, inner, px + pw - 16.0 - cx, 128.0);
-                    shapes.push(Shape {
-                        r: cr,
-                        rx: 10.0,
-                        fill: "#f5f3ff",
-                        stroke: "#7c3aed",
-                        stroke_width: 1.5,
-                        dash: Some("6,3"),
-                        shadow: false,
-                    });
-                    let mut t = tl(cr.x + 16.0, cr.y + 18.0, g.label.to_uppercase(), "small");
-                    t.fill = Some("#5b21b6".into());
-                    texts.push(t);
-                    let m = g.members.len().max(1) as f64;
-                    let mw = ((cr.w - 32.0 - (m - 1.0) * 8.0) / m).min(160.0);
-                    for (k, mem) in g.members.iter().enumerate() {
-                        let r = R::new(cr.x + 16.0 + k as f64 * (mw + 8.0), cr.y + 30.0, mw, 80.0);
-                        shapes.push(Shape {
-                            r,
-                            rx: 8.0,
-                            fill: "#ede9fe",
-                            stroke: "#7c3aed",
-                            stroke_width: 1.0,
-                            dash: None,
-                            shadow: true,
-                        });
-                        let title = wrap_lines(&mem.text, (mw / 7.8) as usize, 2);
-                        for (li, l) in title.iter().enumerate() {
-                            texts.push(tl(
-                                r.x + 12.0,
-                                r.y + 26.0 + 16.0 * li as f64,
-                                l.clone(),
-                                "card-title",
-                            ));
-                        }
-                        if let Some(d) = &mem.detail {
-                            if d.trim().eq_ignore_ascii_case("new") {
-                                ppills.push(Pill {
-                                    r: R::new(r.x + 12.0, r.y + 52.0, 44.0, 18.0),
-                                    rx: 6.0,
-                                    fill: "#22c55e".into(),
-                                    stroke: None,
-                                    text: tc(r.x + 34.0, r.y + 65.0, "NEW", "label"),
-                                });
-                            } else {
-                                texts.push(tl(
-                                    r.x + 12.0,
-                                    r.y + 26.0 + 16.0 * title.len() as f64 + 4.0,
-                                    d.clone(),
-                                    "small",
-                                ));
-                            }
-                        }
-                    }
-                    inner += 128.0 + 12.0;
-                }
-            }
-            let r = R::new(px, bottom, pw, inner - bottom + 16.0);
-            row_h = row_h.max(r.h);
-            panels.push(Panel {
+    for g in &grids {
+        let pw = width - 2.0 * MARGIN;
+        let px = MARGIN;
+        let color = "#2563eb";
+        let mut shapes = Vec::new();
+        let mut texts = Vec::new();
+        let mut inner = bottom + 60.0;
+        texts.push(tl(
+            px + 16.0,
+            inner,
+            format!(
+                "Boxes without arrows, laid out in {} rows and {} columns; on the board from {}",
+                g.rows,
+                g.columns,
+                mmss(g.first_seen_s)
+            ),
+            "small",
+        ));
+        inner += 16.0;
+        let cols = g.columns.clamp(1, 6);
+        let cw = (pw - 32.0 - (cols as f64 - 1.0) * 16.0) / cols as f64;
+        for (k, m) in g.members.iter().enumerate() {
+            let r = R::new(
+                px + 16.0 + (k % cols) as f64 * (cw + 16.0),
+                inner + (k / cols) as f64 * 68.0,
+                cw,
+                52.0,
+            );
+            shapes.push(Shape {
                 r,
-                color,
-                title: tl(px + 16.0, bottom + 23.0, g.label.clone(), "heading"),
-                shapes,
-                texts,
-                pills: ppills,
-                arrows,
+                rx: 8.0,
+                fill: "#dbeafe",
+                stroke: "#2563eb",
+                stroke_width: 1.0,
+                dash: None,
+                shadow: true,
             });
+            let lines = wrap_lines(&sanitize_dashes(&m.text), (cw / 7.2) as usize, 2);
+            let y0 = r.cy() + 4.0 - 8.0 * (lines.len() as f64 - 1.0);
+            for (li, l) in lines.iter().enumerate() {
+                texts.push(tc(r.cx(), y0 + 16.0 * li as f64, l.clone(), "grid-text"));
+            }
         }
-        for p in panels.iter_mut().rev().take(row.len()) {
-            p.r.h = row_h;
-        }
-        bottom += row_h + 24.0;
+        inner += g.members.len().div_ceil(cols) as f64 * 68.0;
+        let r = R::new(px, bottom, pw, inner - bottom + 16.0);
+        panels.push(Panel {
+            r,
+            color,
+            title: tl(px + 16.0, bottom + 23.0, "Grouped boxes", "heading"),
+            shapes,
+            texts,
+            pills: Vec::new(),
+            arrows: Vec::new(),
+        });
+        bottom += r.h + 24.0;
     }
 
     let height = bottom + 40.0;
     let title_text = notes
         .title
         .clone()
-        .or_else(|| board.title.clone())
         .unwrap_or_else(|| "Meeting board".into());
     let subtitle = format!(
         "Architecture as drawn on the board during the meeting (final state at {})",
-        mmss(board.final_t_s)
+        mmss(board.end_s())
     );
     let footer = format!(
         "Source: board read from the meeting recording (final state at {}); owners from name tags on the board; deferrals and the banner from decisions validated against the transcript.",
-        mmss(board.final_t_s)
+        mmss(board.end_s())
     );
 
     // legend
@@ -1274,16 +1166,22 @@ pub fn build_scene(board: &BoardState, notes: &MeetingNotes) -> Scene {
         lx += lead + text_width(label, 12.0, false) + 28.0;
     };
     add("solid", "Request (caller to callee)", 48.0);
-    if board.edges.iter().any(|e| e.style == EdgeStyle::Dashed) {
+    if final_edges
+        .iter()
+        .any(|e| e.direction == EdgeOrientation::Uncertain)
+    {
+        add("undirected", "Direction not established", 40.0);
+    }
+    if final_edges.iter().any(|e| e.style == EdgeStyle::Dashed) {
         add("dashed", "Proposed relationship", 48.0);
     }
-    if !board.owner_assignments.is_empty() {
+    if !pills.iter().all(|p| p.fill != "#16a34a") {
         add("owner", "Owner tag on the board", 72.0);
     }
     if !deferred.is_empty() {
         add("deferred", "Deferred by a decision", 84.0);
     }
-    if !board.stickies.is_empty() {
+    if !stickies.is_empty() {
         add("sticky", "Board sticky", 28.0);
     }
     let lw = lx;
@@ -1341,6 +1239,7 @@ pub fn build_scene(board: &BoardState, notes: &MeetingNotes) -> Scene {
         footer: tc(width / 2.0, height - 24.0, footer, "small"),
         layout_method,
         blocking,
+        unplaced,
     }
 }
 
@@ -1348,6 +1247,24 @@ pub fn build_scene(board: &BoardState, notes: &MeetingNotes) -> Scene {
 pub fn overlaps(scene: &Scene) -> Vec<String> {
     let b = &scene.blocking;
     let mut out = Vec::new();
+    let canvas = R {
+        x: 0.0,
+        y: 0.0,
+        w: scene.width,
+        h: scene.height,
+    };
+    for (name, r) in b {
+        if r.x < canvas.x
+            || r.y < canvas.y
+            || r.right() > canvas.right()
+            || r.bottom() > canvas.bottom()
+        {
+            out.push(format!("{name} is outside the canvas"));
+        }
+    }
+    for u in &scene.unplaced {
+        out.push(format!("{u} could not be placed without overlapping"));
+    }
     for i in 0..b.len() {
         for j in (i + 1)..b.len() {
             if b[i].1.intersects(&b[j].1) {

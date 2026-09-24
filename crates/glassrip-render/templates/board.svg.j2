@@ -71,6 +71,9 @@
     <line x1="{{ it.x|n }}" y1="22" x2="{{ (it.x + 30)|n }}" y2="22" stroke="#0f172a" stroke-width="2"/>
     <polygon points="{{ (it.x + 40)|n }},22 {{ (it.x + 29)|n }},16 {{ (it.x + 29)|n }},28" fill="#0f172a"/>
     <text class="body" x="{{ (it.x + 48)|n }}" y="26">{{ it.label }}</text>
+{%- elif it.kind == "undirected" %}
+    <line x1="{{ it.x|n }}" y1="22" x2="{{ (it.x + 32)|n }}" y2="22" stroke="#0f172a" stroke-width="2"/>
+    <text class="body" x="{{ (it.x + 40)|n }}" y="26">{{ it.label }}</text>
 {%- elif it.kind == "dashed" %}
     <line x1="{{ it.x|n }}" y1="22" x2="{{ (it.x + 28)|n }}" y2="22" stroke="#7c3aed" stroke-width="1.5" stroke-dasharray="6,4"/>
     <polygon points="{{ (it.x + 38)|n }},22 {{ (it.x + 27)|n }},16 {{ (it.x + 27)|n }},28" fill="#7c3aed"/>
@@ -112,7 +115,9 @@
   <!-- edges -->
 {%- for e in edges %}
   <path d="{{ e.d }}" stroke="{{ e.color }}" stroke-width="{{ e.width|n }}" fill="none"{% if e.dash %} stroke-dasharray="{{ e.dash }}"{% endif %}/>
-  <polygon points="{{ e.arrow }}" fill="{{ e.color }}"/>
+{%- for a in e.arrows %}
+  <polygon points="{{ a }}" fill="{{ e.color }}"/>
+{%- endfor %}
 {%- if e.label %}
   {{ pill(e.label) }}
 {%- endif %}

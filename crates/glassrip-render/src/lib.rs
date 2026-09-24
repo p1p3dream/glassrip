@@ -19,7 +19,7 @@ pub mod svg;
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use glassrip_notes::board::BoardState;
+use glassrip_notes::board::BoardStateItem;
 use glassrip_notes::notes::MeetingNotes;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -89,11 +89,10 @@ fn write(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), RenderError> {
 /// Renders markdown and one SVG (plus PNG preview) per board into `out_dir`.
 pub fn render_all(
     notes: &MeetingNotes,
-    boards: &[BoardState],
-    out_dir: &Path,
-    stem: &str,
-    meta: &markdown::MarkdownMeta,
+    boards: &[BoardStateItem],
+    params: &RenderParams,
 ) -> Result<RenderResult, RenderError> {
+    let (out_dir, stem, meta): (&Path, &str, _) = (&params.out_dir, &params.stem, &params.meta);
     let env = svg::environment();
     let mut files = Vec::new();
     let mut links = markdown::Links::default();
@@ -103,7 +102,7 @@ pub fn render_all(
     for b in boards {
         let scene = scene::build_scene(b, notes);
         let text = svg::render_svg(&env, &scene)?;
-        let (checks, png) = svg::validate_svg(&text, &scene);
+        let (checks, png) = svg::validate_svg(&text, &scene, &params.fonts);
         let base = if multi {
             format!("{stem}-{}-architecture", b.board_id)
         } else {

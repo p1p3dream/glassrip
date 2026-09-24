@@ -25,7 +25,7 @@ use glassrip_core::graph::{meeting_mode_stage_decls, Selection, StageGraph};
 use glassrip_core::jsonl;
 use glassrip_core::manifest::RunDir;
 use glassrip_core::runner::{Runner, RunnerOptions};
-use glassrip_notes::board::BoardState;
+use glassrip_notes::board::BoardStateItem;
 use glassrip_notes::import;
 use glassrip_notes::notes::llm::{OllamaText, OllamaTextConfig};
 use glassrip_notes::notes::{MeetingNotes, NotesParams, NotesStage};
@@ -126,7 +126,7 @@ async fn main() {
     import::import_transcript(&run, &t).unwrap();
     let board_json: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&a.board).unwrap()).unwrap();
-    let boards: Vec<BoardState> = match board_json {
+    let boards: Vec<BoardStateItem> = match board_json {
         serde_json::Value::Array(_) => serde_json::from_value(board_json).unwrap(),
         v => vec![serde_json::from_value(v).unwrap()],
     };
@@ -284,7 +284,7 @@ async fn main() {
                 date: a.date.clone(),
                 source: None,
             },
-            strict: false,
+            ..RenderParams::default()
         });
         let rep = runner.run_stage(&stage).await.unwrap();
         let dir = runner.run_dir();

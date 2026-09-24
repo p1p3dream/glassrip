@@ -112,10 +112,34 @@ fn count_text(g: &usvg::Group, total: &mut usize, rendered: &mut usize) {
     }
 }
 
-/// Loads system fonts and maps the generic families to installed ones
-/// (Inter first). Returns the sans-serif family chosen.
-pub fn configure_fonts(db: &mut usvg::fontdb::Database) -> Option<String> {
-    db.load_system_fonts();
+/// Fonts available to the SVG validation render.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct FontConfig {
+    /// Load the host's system fonts.
+    pub system: bool,
+    /// Extra font directories, loaded first (tests ship an OFL font here).
+    pub dirs: Vec<std::path::PathBuf>,
+}
+
+impl Default for FontConfig {
+    fn default() -> Self {
+        Self {
+            system: true,
+            dirs: Vec::new(),
+        }
+    }
+}
+
+/// Loads fonts and maps the generic families to installed ones (Inter first,
+/// then common sans fonts, then any loaded family). Returns the sans-serif
+/// family chosen.
+pub fn configure_fonts(db: &mut usvg::fontdb::Database, fonts: &FontConfig) -> Option<String> {
+    for d in &fonts.dirs {
+        db.load_fonts_dir(d);
+    }
+    if fonts.system {
+        db.load_system_fonts();
+    }
     let families: std::collections::BTreeSet<String> = db
         .faces()
         .flat_map(|f| f.families.iter().map(|(n, _)| n.clone()))
@@ -134,7 +158,9 @@ pub fn configure_fonts(db: &mut usvg::fontdb::Database) -> Option<String> {
         "DejaVu Sans",
         "Liberation Sans",
         "Noto Sans",
-    ]);
+    ])
+    .or_else(|| families.iter().find(|f| f.starts_with("Inter")).cloned())
+    .or_else(|| families.iter().next().cloned());
     if let Some(f) = &sans {
         db.set_sans_serif_family(f.clone());
     }
@@ -145,7 +171,9 @@ pub fn configure_fonts(db: &mut usvg::fontdb::Database) -> Option<String> {
         "Liberation Mono",
         "Noto Sans Mono",
         "Courier New",
-    ]) {
+    ])
+    .or_else(|| sans.clone())
+    {
         db.set_monospace_family(f);
     }
     sans
@@ -177,9 +205,9 @@ pub fn style_violations(svg: &str) -> Vec<String> {
 }
 
 /// Parses, renders and checks an SVG. Returns the checks and the PNG bytes.
-pub fn validate_svg(svg: &str, scene: &Scene) -> (SvgChecks, Option<Vec<u8>>) {
+pub fn validate_svg(svg: &str, scene: &Scene, fonts: &FontConfig) -> (SvgChecks, Option<Vec<u8>>) {
     let mut opt = usvg::Options::default();
-    let sans = configure_fonts(opt.fontdb_mut());
+    let sans = configure_fonts(opt.fontdb_mut(), fonts);
     if let Some(f) = sans {
         opt.font_family = f;
     }
