@@ -228,7 +228,20 @@ impl KeyframesStage {
         }
         let sharp: Vec<f64> = frames.iter().map(|f| f.sharpness_lapvar).collect();
         let times: Vec<f64> = frames.iter().map(|f| f.pts_s).collect();
-        let (mut runs, bounds) = segment(n, &cache, self.segment_batch);
+        let (runs, mut bounds) = segment(n, &cache, self.segment_batch);
+        let production = self.scorer.is_production();
+        // Production only: one-sample states that differ from both neighbors become their
+        // own runs (the persistence rule cannot start a run for them); the unchanged merge
+        // below re-absorbs noise, and a host run split by an island that merged back is
+        // rejoined afterwards.
+        let islands: Vec<usize> = if production {
+            (1..n.saturating_sub(1))
+                .filter(|&i| cache.get(i - 1, i).differs() && cache.get(i, i + 1).differs())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let (mut runs, origin) = split_islands(runs, &islands, n);
         let merges = merge_singletons(
             &mut runs,
             &sharp,
@@ -239,6 +252,24 @@ impl KeyframesStage {
             },
             &cache,
         );
+        let runs = if islands.is_empty() {
+            runs
+        } else {
+            rejoin_islands(runs, &origin, &islands)
+        };
+        // Runs created by island splits start without a segmentation boundary: record the
+        // consecutive comparison that separates them.
+        let known: std::collections::HashSet<usize> = bounds.iter().map(|b| b.frame).collect();
+        for r in runs.iter().skip(1) {
+            let first = r[0];
+            if first > 0 && !known.contains(&first) {
+                bounds.push(segment::Boundary {
+                    frame: first,
+                    anchor: first - 1,
+                    comparison: cache.get(first - 1, first),
+                });
+            }
+        }
         if let Some(e) = oracle
             .error
             .lock()
@@ -249,7 +280,6 @@ impl KeyframesStage {
         }
         let end = end_s.max(times[n - 1]);
         let kfs = segment::keyframes(&runs, &times, &sharp, end, &bounds);
-        let production = self.scorer.is_production();
         let run_of: HashMap<usize, usize> = runs
             .iter()
             .enumerate()
@@ -310,6 +340,75 @@ impl KeyframesStage {
     }
 }
 
+/// Splits each island frame out of its run into a run of its own. Returns the runs (in
+/// frame order) and each frame's original run index.
+pub fn split_islands(
+    runs: Vec<Vec<usize>>,
+    islands: &[usize],
+    n: usize,
+) -> (Vec<Vec<usize>>, Vec<usize>) {
+    let mut origin = vec![0usize; n];
+    for (r, run) in runs.iter().enumerate() {
+        for &i in run {
+            origin[i] = r;
+        }
+    }
+    let is_island: std::collections::HashSet<usize> = islands.iter().copied().collect();
+    let mut out = Vec::with_capacity(runs.len() + islands.len());
+    for run in runs {
+        if run.len() == 1 {
+            out.push(run);
+            continue;
+        }
+        let mut cur = Vec::new();
+        for i in run {
+            if is_island.contains(&i) {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                out.push(vec![i]);
+            } else {
+                cur.push(i);
+            }
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+    }
+    (out, origin)
+}
+
+/// After the singleton merge: joins adjacent runs that came from the same original run,
+/// unless one of them is a surviving island.
+pub fn rejoin_islands(
+    runs: Vec<Vec<usize>>,
+    origin: &[usize],
+    islands: &[usize],
+) -> Vec<Vec<usize>> {
+    let is_island: std::collections::HashSet<usize> = islands.iter().copied().collect();
+    let surviving = |r: &Vec<usize>| r.len() == 1 && is_island.contains(&r[0]);
+    let same_origin = |r: &Vec<usize>| -> Option<usize> {
+        let o = origin[r[0]];
+        r.iter().all(|&i| origin[i] == o).then_some(o)
+    };
+    let mut out: Vec<Vec<usize>> = Vec::with_capacity(runs.len());
+    for run in runs {
+        if let Some(prev) = out.last_mut() {
+            let joinable = !surviving(prev)
+                && !surviving(&run)
+                && same_origin(prev).is_some()
+                && same_origin(prev) == same_origin(&run);
+            if joinable {
+                prev.extend(run);
+                prev.sort_unstable();
+                continue;
+            }
+        }
+        out.push(run);
+    }
+    out
+}
+
 impl Stage for KeyframesStage {
     type Params = KeyframesParams;
     type Work = Keyframe;
@@ -319,7 +418,7 @@ impl Stage for KeyframesStage {
         "keyframes"
     }
     fn version(&self) -> u32 {
-        1
+        2
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
@@ -373,5 +472,42 @@ impl Stage for KeyframesStage {
     }
     async fn process(&self, _ctx: &ItemContext, k: Keyframe) -> Result<Keyframe, ErrorInfo> {
         Ok(k)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn island_is_split_out_and_rejoined_when_merged_back() {
+        // Run 0..5 hosts island 2; run 5..7 is separate.
+        let runs = vec![vec![0, 1, 2, 3, 4], vec![5, 6]];
+        let (split, origin) = split_islands(runs, &[2], 7);
+        assert_eq!(split, vec![vec![0, 1], vec![2], vec![3, 4], vec![5, 6]]);
+        // Island survives the merge: it stays a keyframe between the two halves.
+        assert_eq!(
+            rejoin_islands(split.clone(), &origin, &[2]),
+            vec![vec![0, 1], vec![2], vec![3, 4], vec![5, 6]]
+        );
+        // Island merged into the left half: the host run is whole again, the next run
+        // (different origin) is untouched.
+        let merged = vec![vec![0, 1, 2], vec![3, 4], vec![5, 6]];
+        assert_eq!(
+            rejoin_islands(merged, &origin, &[2]),
+            vec![vec![0, 1, 2, 3, 4], vec![5, 6]]
+        );
+    }
+
+    #[test]
+    fn island_at_run_start_and_singletons() {
+        let runs = vec![vec![0, 1], vec![2, 3, 4], vec![5]];
+        let (split, origin) = split_islands(runs, &[2, 5], 6);
+        assert_eq!(split, vec![vec![0, 1], vec![2], vec![3, 4], vec![5]]);
+        // A surviving island is never joined with its origin neighbor.
+        assert_eq!(
+            rejoin_islands(split, &origin, &[2, 5]),
+            vec![vec![0, 1], vec![2], vec![3, 4], vec![5]]
+        );
     }
 }
