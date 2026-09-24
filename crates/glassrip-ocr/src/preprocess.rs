@@ -13,11 +13,15 @@ const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const STD: [f32; 3] = [0.229, 0.224, 0.225];
 
 /// Detector input: NCHW data plus the scales back to source pixels.
+/// `width` and `height` are the padded tensor size; the resized image fills
+/// the top-left `content_width` by `content_height` region.
 #[derive(Debug, Clone)]
 pub struct DetInput {
     pub data: Vec<f32>,
     pub width: usize,
     pub height: usize,
+    pub content_width: usize,
+    pub content_height: usize,
     pub scale_x: f64,
     pub scale_y: f64,
 }
@@ -64,6 +68,8 @@ pub fn det_input(image: &RgbImage, max_side: u32) -> DetInput {
         data,
         width: pw_us,
         height: ph_us,
+        content_width: rw as usize,
+        content_height: rh as usize,
         scale_x: f64::from(w) / f64::from(rw),
         scale_y: f64::from(h) / f64::from(rh),
     }
@@ -160,7 +166,31 @@ mod tests {
     fn det_input_limits_long_side() {
         let img = RgbImage::new(4000, 1000);
         let d = det_input(&img, 1920);
-        assert!(d.width <= 1920 + 16);
+        assert!(d.content_width <= 1920 + 16);
+        assert_eq!((d.width % 128, d.height % 128), (0, 0));
+        assert!(d.width >= d.content_width && d.width - d.content_width < 128);
+        assert!(d.height >= d.content_height && d.height - d.content_height < 128);
+    }
+
+    #[test]
+    fn det_padding_is_normalized_zero() {
+        let img = RgbImage::from_pixel(100, 60, Rgb([255, 255, 255]));
+        let d = det_input(&img, 1920);
+        assert_eq!((d.content_width, d.content_height), (96, 64));
+        assert_eq!((d.width, d.height), (128, 128));
+        let plane = d.width * d.height;
+        for c in 0..3 {
+            for y in 0..d.height {
+                for x in 0..d.width {
+                    let v = d.data[c * plane + y * d.width + x];
+                    if x < d.content_width && y < d.content_height {
+                        assert!(v > 0.0, "content at ({x},{y}) c{c}");
+                    } else {
+                        assert_eq!(v, 0.0, "padding at ({x},{y}) c{c}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

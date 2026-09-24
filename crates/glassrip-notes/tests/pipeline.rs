@@ -149,12 +149,21 @@ struct Replay {
     resident: Mutex<Vec<String>>,
     /// Report the text model as only half on the GPU.
     spill: bool,
+    /// Every prompt sent: (purpose, user message).
+    prompts: Mutex<Vec<(String, String)>>,
     ids: std::collections::BTreeMap<&'static str, String>,
 }
 
 #[async_trait]
 impl TextBackend for Replay {
     async fn chat(&self, model: &str, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+        self.prompts.lock().unwrap().push((
+            req.purpose.clone(),
+            req.messages
+                .last()
+                .map(|m| m.content.clone())
+                .unwrap_or_default(),
+        ));
         self.log
             .lock()
             .unwrap()
@@ -204,9 +213,26 @@ pub struct Outputs {
     pub speakers: SpeakersDoc,
     pub notes: MeetingNotes,
     pub log: Vec<String>,
+    pub prompts: Vec<(String, String)>,
 }
 
+/// The plain notes path (quality options off), as the assertions below expect.
 pub async fn run_pipeline(root: &std::path::Path) -> Outputs {
+    run_pipeline_with(root, |p| {
+        p.concise_items = false;
+        p.board_candidates = false;
+        p.cue_candidates = false;
+        p.board_questions_in_reduce = false;
+        p.precision_guard = false;
+        p.owner_actions = false;
+    })
+    .await
+}
+
+pub async fn run_pipeline_with(
+    root: &std::path::Path,
+    tune: impl FnOnce(&mut NotesParams),
+) -> Outputs {
     let run = RunDir::open(
         &root.join("run"),
         "synthetic",
@@ -278,13 +304,14 @@ pub async fn run_pipeline(root: &std::path::Path) -> Outputs {
         ..Replay::default()
     });
     backend.resident.lock().unwrap().push("vision:7b".into());
-    let notes_params = NotesParams {
+    let mut notes_params = NotesParams {
         text_model: "text:27b".into(),
         vision_model: Some("vision:7b".into()),
         window_tokens: 180,
         window_overlap_lines: 1,
         ..Default::default()
     };
+    tune(&mut notes_params);
     let notes_stage = NotesStage::new(notes_params, backend.clone());
     let rep = runner.run_stage(&notes_stage).await.unwrap();
     assert_eq!(rep.items_error, 0, "{rep:?}");
@@ -307,10 +334,12 @@ pub async fn run_pipeline(root: &std::path::Path) -> Outputs {
     .find_map(|r| r.outcome.result)
     .unwrap();
     let log = backend.log.lock().unwrap().clone();
+    let prompts = backend.prompts.lock().unwrap().clone();
     Outputs {
         speakers,
         notes,
         log,
+        prompts,
     }
 }
 
@@ -534,4 +563,57 @@ async fn a_spilled_text_model_is_refused_and_unloaded() {
         "no calls on a spilled model"
     );
     assert!(backend.resident.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn quality_options_keep_the_pipeline_sound() {
+    let dir = tempfile::tempdir().unwrap();
+    // the defaults are the measured quality options
+    let out = run_pipeline_with(dir.path(), |_| {}).await;
+    let n = &out.notes;
+    assert_eq!(n.report.status, NotesStatus::Ok);
+    // both committed decisions survive the precision guard
+    assert_eq!(n.decisions.len(), 2, "{:#?}", n.decisions);
+    // Avery's owner tag on the Kiosk App becomes an action; Mira's and Rohan's
+    // targets are already named by their own actions
+    let owned: Vec<(&str, &str)> = n
+        .action_items
+        .iter()
+        .filter(|a| a.task.starts_with("Own "))
+        .map(|a| (a.owner.as_str(), a.task.as_str()))
+        .collect();
+    assert_eq!(owned, vec![("Avery Quinn", "Own Kiosk App")]);
+    assert_eq!(n.action_items.len(), 6);
+    // the map prompts carried the board facts and the cue lines, and the
+    // reduce prompt the board's questions
+    let map = out
+        .prompts
+        .iter()
+        .find(|(p, _)| p.starts_with("map 1/"))
+        .map(|(_, u)| u.as_str())
+        .unwrap();
+    assert!(map.contains("Board facts from owner tags"), "{map}");
+    assert!(
+        map.contains("Mira Okafor moved from Ledger Service to Design Kit"),
+        "{map}"
+    );
+    assert!(
+        map.contains("Lines with decision or question cues"),
+        "{map}"
+    );
+    assert!(
+        map.contains("seg_00005"),
+        "the committing line is a cue: {map}"
+    );
+    let reduce = out
+        .prompts
+        .iter()
+        .find(|(p, _)| p == "reduce")
+        .map(|(_, u)| u.as_str())
+        .unwrap();
+    assert!(reduce.contains("already in the notes from the board's question stickies"));
+    assert!(
+        reduce.contains("Which widgets do we need for the kiosk?"),
+        "{reduce}"
+    );
 }

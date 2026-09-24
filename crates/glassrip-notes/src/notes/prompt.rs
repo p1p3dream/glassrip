@@ -24,6 +24,40 @@ Timeline: the main phases of the meeting in order, one short entry per phase. \
 Summary: the three to six most important points. \
 Write short plain sentences. Do not use em dashes.";
 
+/// Extra instructions and candidate blocks (see [`super::candidates`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PromptExtras {
+    /// Owner-tag facts from the board, with ids to cite.
+    pub board_facts: String,
+    /// Cue sentences per window (map calls only).
+    pub cues: Vec<Vec<String>>,
+    /// Question stickies already in the notes (reduce call only).
+    pub board_questions: Vec<String>,
+    /// Ask for short items in the speakers' own words.
+    pub concise: bool,
+}
+
+/// Rule appended to the system prompt when [`PromptExtras::concise`] is set.
+pub const CONCISE: &str = " Write each decision and task as the thing itself in a few words, keeping the speakers' key words: 'Skip the importer for now', not 'The team decided that the importer step would be skipped for the time being'. One item per decision or task; do not split one decision into several items.";
+
+fn system(extras: &PromptExtras) -> String {
+    if extras.concise {
+        format!("{SYSTEM}{CONCISE}")
+    } else {
+        SYSTEM.to_string()
+    }
+}
+
+fn board_block(extras: &PromptExtras) -> String {
+    if extras.board_facts.trim().is_empty() {
+        return String::new();
+    }
+    format!(
+        "\nBoard facts from owner tags (each is likely a decision or an action item: include the ones the transcript does not contradict, as an action item for the owner, citing the id in brackets as an event or keyframe id plus any transcript lines that discuss it):\n{}",
+        extras.board_facts
+    )
+}
+
 /// One transcript line as the model sees it.
 pub fn format_line(l: &NamedLine) -> String {
     format!(
@@ -212,15 +246,17 @@ fn participants_line(people: &[Person]) -> String {
 }
 
 /// Map request for one window.
+/// `part` is (index, count) of the window.
 pub fn map_request(
-    idx: usize,
-    total: usize,
+    part: (usize, usize),
     win: &Window,
     lines: &[NamedLine],
     digest: &str,
     people: &[Person],
     num_predict: u32,
+    extras: &PromptExtras,
 ) -> ChatRequest {
+    let (idx, total) = part;
     let body: Vec<String> = win
         .lines
         .iter()
@@ -234,18 +270,26 @@ pub fn map_request(
         (Some(a), Some(b)) => format!("{} to {}", mmss(a.start_s), mmss(b.end_s)),
         _ => String::new(),
     };
+    let cues = extras.cues.get(idx).filter(|c| !c.is_empty()).map(|c| {
+        format!(
+            "\n\nLines with decision or question cues (for each: include it as a decision, action item or open question when it is one, citing its segment id; leave it out when it is not):\n{}",
+            c.join("\n")
+        )
+    });
     let user = format!(
-        "Participants: {}\n\nWhiteboard:\n{digest}\nTranscript part {} of {total} ({span}). Each line is: segment_id [mm:ss] speaker: text\n{}\n\nExtract the decisions, action items, open questions, timeline entries and summary points supported by this part. Return JSON only.",
+        "Participants: {}\n\nWhiteboard:\n{digest}{}\nTranscript part {} of {total} ({span}). Each line is: segment_id [mm:ss] speaker: text\n{}{}\n\nExtract the decisions, action items, open questions, timeline entries and summary points supported by this part. Return JSON only.",
         participants_line(people),
+        board_block(extras),
         idx + 1,
         body.join("\n"),
+        cues.unwrap_or_default(),
     );
     ChatRequest {
         purpose: format!("map {}/{total}", idx + 1),
         messages: vec![
             Message {
                 role: "system".into(),
-                content: SYSTEM.into(),
+                content: system(extras),
             },
             Message {
                 role: "user".into(),
@@ -263,6 +307,7 @@ pub fn reduce_request(
     digest: &str,
     people: &[Person],
     num_predict: u32,
+    extras: &PromptExtras,
 ) -> ChatRequest {
     let mut merged = Draft::default();
     for d in drafts {
@@ -272,15 +317,29 @@ pub fn reduce_request(
     }
     let candidates = serde_json::to_string_pretty(&merged).unwrap_or_default();
     let user = format!(
-        "Participants: {}\n\nWhiteboard:\n{digest}\nThe notes below were drafted separately for consecutive parts of one meeting, so the same point can appear more than once. Merge them into one set of notes: combine duplicates into one item and keep the union of their citations, keep the clearest wording, drop items that do not meet the rules, order the timeline by time and merge it into at most 12 phases, and give three to six summary points. Copy segment_ids, event_ids, keyframe_ids and quotes only from the drafts. Return JSON only.\n\nDrafts:\n{candidates}",
+        "Participants: {}\n\nWhiteboard:\n{digest}\nThe notes below were drafted separately for consecutive parts of one meeting, so the same point can appear more than once. Merge them into one set of notes: combine duplicates into one item and keep the union of their citations, keep the clearest wording, drop items that do not meet the rules, order the timeline by time and merge it into at most 12 phases, and give three to six summary points. Copy segment_ids, event_ids, keyframe_ids and quotes only from the drafts.{}{} Return JSON only.\n\nDrafts:\n{candidates}",
         participants_line(people),
+        board_block(extras),
+        if extras.board_questions.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nThese questions are already in the notes from the board's question stickies; do not list them (or rewordings of them) as open questions:\n{}\n",
+                extras
+                    .board_questions
+                    .iter()
+                    .map(|q| format!("- {q}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        },
     );
     ChatRequest {
         purpose: "reduce".into(),
         messages: vec![
             Message {
                 role: "system".into(),
-                content: SYSTEM.into(),
+                content: system(extras),
             },
             Message {
                 role: "user".into(),

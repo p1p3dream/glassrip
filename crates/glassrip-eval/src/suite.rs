@@ -685,15 +685,29 @@ pub fn run_meeting(
     let transcript: Option<Vec<TranscriptSegment>> = run_art.items(views::schema::TRANSCRIPT)?;
     let speakers: Option<Vec<SpeakersRecord>> = run_art.items(views::schema::SPEAKERS)?;
     let notes: Option<Vec<MeetingNotes>> = run_art.items(views::schema::MEETING_NOTES)?;
+    // Errored items fail loudly: they are case errors (the no_case_errors gate),
+    // never silently left out of the scores.
+    let mut notes_errored = false;
     for schema in [
+        views::schema::KEYFRAMES,
         views::schema::SCREEN_CLASS,
         views::schema::BOARD_READING,
         views::schema::BOARD_STATE,
+        views::schema::TRANSCRIPT,
+        views::schema::SPEAKERS,
         views::schema::MEETING_NOTES,
     ] {
         let failed = run_art.failed_ids(schema)?;
         if !failed.is_empty() {
+            run.errors.push(format!(
+                "{schema}: {} item(s) errored: {}",
+                failed.len(),
+                failed.join(", ")
+            ));
             details.insert(format!("failed_items.{schema}"), json!(failed));
+            if schema == views::schema::MEETING_NOTES {
+                notes_errored = true;
+            }
         }
     }
     let m = &mut run.metrics;
@@ -885,9 +899,11 @@ pub fn run_meeting(
                 .iter()
                 .map(|a| PredItem {
                     text: a.task.clone(),
+                    // "Everyone" has no person id; resolve it by the owner name
                     person_id: a
                         .person_id
                         .as_deref()
+                        .or(Some(a.owner.as_str()))
                         .and_then(|p| resolve_person(golden, p)),
                 })
                 .collect();
@@ -910,6 +926,17 @@ pub fn run_meeting(
             let neg = negative_hits(&t.negative_action_items, &actions, SENTENCE_MATCH_DICE);
             m.insert("notes.negative_action_hits".into(), neg.len() as f64);
             details.insert("negative_action_hits".into(), json!(neg));
+        }
+        None if notes_errored => {
+            // the notes stage ran and failed: the section fails and its targets
+            // are evaluated against zero instead of being skipped
+            run.gate_failures
+                .push("meeting_notes: every notes item errored; notes section FAIL".into());
+            for prefix in ["notes.decision", "notes.action", "notes.question"] {
+                for k in ["precision", "recall", "f1"] {
+                    m.insert(format!("{prefix}.{k}"), 0.0);
+                }
+            }
         }
         None => run
             .not_run
