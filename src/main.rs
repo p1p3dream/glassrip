@@ -66,7 +66,7 @@ enum Commands {
         refine: bool,
 
         /// Claude model for refinement
-        #[arg(long, default_value = "claude-opus-4-20250514")]
+        #[arg(long, default_value = glassrip::stitch::refine::DEFAULT_REFINE_MODEL)]
         refine_model: String,
 
         /// Number of parallel refine agents
@@ -152,6 +152,12 @@ mod tests {
         let Commands::Scrape { vlm_timeout, max_frame_failure_rate, .. } = scrape(&[]).unwrap();
         assert_eq!(vlm_timeout, 120);
         assert_eq!(max_frame_failure_rate, 0.10);
+    }
+
+    #[test]
+    fn refine_model_default() {
+        let Commands::Scrape { refine_model, .. } = scrape(&[]).unwrap();
+        assert_eq!(refine_model, "claude-opus-5-5");
     }
 
     #[test]
