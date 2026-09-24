@@ -47,6 +47,31 @@ fn decode_with(path: &Path, bytes: &[u8], cs: ColorSpace) -> Result<(usize, usiz
     Ok((w, h, pixels))
 }
 
+/// What the exact decoder produced, or why the caller must fall back or fail.
+enum Exact<T> {
+    Done(T),
+    Fallback,
+}
+
+fn exact<T>(path: &Path, r: std::result::Result<T, JpegError>) -> Result<Exact<T>> {
+    match r {
+        Ok(v) => Ok(Exact::Done(v)),
+        Err(JpegError::Unsupported(_)) => Ok(Exact::Fallback),
+        Err(e @ (JpegError::Corrupt(_) | JpegError::Limits(_))) => Err(MediaError::Decode {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        }),
+    }
+}
+
+fn gray_plane(w: usize, h: usize, px: Vec<u8>) -> Result<Plane<u8>> {
+    Plane::from_vec(w, h, px).ok_or(MediaError::Size {
+        width: w,
+        height: h,
+        reason: "luma buffer length mismatch",
+    })
+}
+
 /// Decodes a JPEG file to its 8-bit luma plane.
 ///
 /// This corresponds to `cv2.imread(path, cv2.IMREAD_GRAYSCALE)`, which asks libjpeg for
@@ -58,21 +83,12 @@ pub fn decode_gray(path: &Path) -> Result<Plane<u8>> {
 
 /// Decodes in-memory JPEG bytes to luma. `path` is used only for error messages.
 pub fn decode_gray_bytes(path: &Path, bytes: &[u8]) -> Result<Plane<u8>> {
-    let (w, h, px) = match crate::jpeg::decode(bytes) {
-        Ok(d) => (d.width, d.height, d.gray()),
-        Err(JpegError::Unsupported(_)) => decode_with(path, bytes, ColorSpace::Luma)?,
-        Err(JpegError::Corrupt(m)) => {
-            return Err(MediaError::Decode {
-                path: path.to_path_buf(),
-                message: m,
-            })
-        }
+    let r = crate::jpeg::decode(bytes).and_then(|d| Ok((d.width, d.height, d.gray()?)));
+    let (w, h, px) = match exact(path, r)? {
+        Exact::Done(v) => v,
+        Exact::Fallback => decode_with(path, bytes, ColorSpace::Luma)?,
     };
-    Plane::from_vec(w, h, px).ok_or(MediaError::Size {
-        width: w,
-        height: h,
-        reason: "luma buffer length mismatch",
-    })
+    gray_plane(w, h, px)
 }
 
 /// Decodes a JPEG file to interleaved BGR, corresponding to `cv2.imread(path)`.
@@ -83,20 +99,38 @@ pub fn decode_bgr(path: &Path) -> Result<Bgr> {
 
 /// Decodes in-memory JPEG bytes to BGR. `path` is used only for error messages.
 pub fn decode_bgr_bytes(path: &Path, bytes: &[u8]) -> Result<Bgr> {
-    let exact = crate::jpeg::decode(bytes).and_then(|d| Ok((d.width, d.height, d.bgr()?)));
-    let (width, height, data) = match exact {
-        Ok(v) => v,
-        Err(JpegError::Unsupported(_)) => decode_with(path, bytes, ColorSpace::BGR)?,
-        Err(JpegError::Corrupt(m)) => {
-            return Err(MediaError::Decode {
-                path: path.to_path_buf(),
-                message: m,
-            })
-        }
+    let r = crate::jpeg::decode(bytes).and_then(|d| Ok((d.width, d.height, d.bgr()?)));
+    let (width, height, data) = match exact(path, r)? {
+        Exact::Done(v) => v,
+        Exact::Fallback => decode_with(path, bytes, ColorSpace::BGR)?,
     };
     Ok(Bgr {
         width,
         height,
         data,
     })
+}
+
+/// Decodes in-memory JPEG bytes to both luma and BGR, parsing and entropy-decoding the file
+/// once. Output is identical to [`decode_gray_bytes`] and [`decode_bgr_bytes`].
+pub fn decode_gray_and_bgr_bytes(path: &Path, bytes: &[u8]) -> Result<(Plane<u8>, Bgr)> {
+    let r = crate::jpeg::decode(bytes).and_then(|d| {
+        let g = d.gray()?;
+        let c = d.bgr()?;
+        Ok((d.width, d.height, g, c))
+    });
+    match exact(path, r)? {
+        Exact::Done((width, height, g, data)) => Ok((
+            gray_plane(width, height, g)?,
+            Bgr {
+                width,
+                height,
+                data,
+            },
+        )),
+        Exact::Fallback => Ok((
+            decode_gray_bytes(path, bytes)?,
+            decode_bgr_bytes(path, bytes)?,
+        )),
+    }
 }

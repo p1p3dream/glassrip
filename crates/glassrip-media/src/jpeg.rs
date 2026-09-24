@@ -27,13 +27,22 @@ pub enum JpegError {
     Corrupt(String),
     /// A valid stream that uses a feature outside this decoder's scope.
     Unsupported(Unsupported),
+    /// The declared image exceeds the decoder's size limits ([`MAX_DIMENSION`],
+    /// [`MAX_PIXELS`]). Checked before any pixel buffer is allocated.
+    Limits(String),
 }
+
+/// Largest accepted width or height, the same cap the `zune-jpeg` fallback uses.
+pub const MAX_DIMENSION: usize = 1 << 15;
+/// Largest accepted `width * height`.
+pub const MAX_PIXELS: usize = 1 << 28;
 
 impl fmt::Display for JpegError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             JpegError::Corrupt(m) => write!(f, "corrupt JPEG: {m}"),
             JpegError::Unsupported(u) => u.fmt(f),
+            JpegError::Limits(m) => write!(f, "JPEG exceeds size limits: {m}"),
         }
     }
 }
@@ -502,6 +511,9 @@ pub fn decode(data: &[u8]) -> Result<Decoded, JpegError> {
                 if width == 0 || height == 0 || !(nf == 1 || nf == 3) || seg.len() < 6 + 3 * nf {
                     return unsupported("component count or size");
                 }
+                if width > MAX_DIMENSION || height > MAX_DIMENSION || width * height > MAX_PIXELS {
+                    return Err(JpegError::Limits(format!("{width}x{height}")));
+                }
                 let mut comps = Vec::with_capacity(nf);
                 for i in 0..nf {
                     let b = &seg[6 + 3 * i..9 + 3 * i];
@@ -519,6 +531,7 @@ pub fn decode(data: &[u8]) -> Result<Decoded, JpegError> {
                         plane: Vec::new(),
                     });
                 }
+                check_sampling(&comps)?;
                 frame = Some((width, height, comps));
             }
             0xC2 | 0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => {
@@ -585,6 +598,23 @@ pub fn decode(data: &[u8]) -> Result<Decoded, JpegError> {
     })
 }
 
+/// Rejects sampling layouts this decoder does not reproduce: factors outside 1..=2, or a
+/// luma component that is not at the maximum factor (libjpeg would upsample luma then).
+fn check_sampling(comps: &[Component]) -> Result<(), JpegError> {
+    if comps
+        .iter()
+        .any(|c| c.h == 0 || c.v == 0 || c.h > 2 || c.v > 2)
+    {
+        return unsupported("sampling factors");
+    }
+    let hmax = comps.iter().map(|c| c.h).max().unwrap_or(1);
+    let vmax = comps.iter().map(|c| c.v).max().unwrap_or(1);
+    match comps.first() {
+        Some(y) if y.h == hmax && y.v == vmax => Ok(()),
+        _ => unsupported("luma is not the full-resolution component"),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_scan(
     data: &[u8],
@@ -598,14 +628,12 @@ fn decode_scan(
     ac: &[Option<Huffman>; 4],
     restart_interval: usize,
 ) -> Result<usize, JpegError> {
+    check_sampling(comps)?;
+    if width > MAX_DIMENSION || height > MAX_DIMENSION || width * height > MAX_PIXELS {
+        return Err(JpegError::Limits(format!("{width}x{height}")));
+    }
     let hmax = comps.iter().map(|c| c.h).max().unwrap_or(1);
     let vmax = comps.iter().map(|c| c.v).max().unwrap_or(1);
-    if comps
-        .iter()
-        .any(|c| c.h == 0 || c.v == 0 || c.h > 2 || c.v > 2)
-    {
-        return unsupported("sampling factors");
-    }
     let mcux = width.div_ceil(8 * hmax);
     let mcuy = height.div_ceil(8 * vmax);
     for c in comps.iter_mut() {
@@ -830,14 +858,22 @@ fn upsample(c: &Component, hmax: usize, vmax: usize, width: usize, height: usize
 
 impl Decoded {
     /// The luma plane, as libjpeg returns it for `JCS_GRAYSCALE` output.
-    pub fn gray(&self) -> Vec<u8> {
-        let c = &self.comps[0];
+    pub fn gray(&self) -> Result<Vec<u8>, JpegError> {
+        let Some(c) = self.comps.first() else {
+            return corrupt("no components");
+        };
+        if c.h != self.hmax || c.v != self.vmax {
+            return unsupported("luma is not the full-resolution component");
+        }
+        if c.pw < self.width || c.ph < self.height || c.plane.len() < c.pw * c.ph {
+            return corrupt("luma plane smaller than the image");
+        }
         let mut out = vec![0u8; self.width * self.height];
         for y in 0..self.height {
             out[y * self.width..(y + 1) * self.width]
                 .copy_from_slice(&c.plane[y * c.pw..y * c.pw + self.width]);
         }
-        out
+        Ok(out)
     }
 
     /// Interleaved BGR, as libjpeg returns it for `JCS_EXT_BGR` output with default settings.
@@ -845,7 +881,7 @@ impl Decoded {
         let (w, h) = (self.width, self.height);
         let mut out = vec![0u8; w * h * 3];
         if self.comps.len() == 1 {
-            let g = self.gray();
+            let g = self.gray()?;
             for (i, &v) in g.iter().enumerate() {
                 out[3 * i..3 * i + 3].copy_from_slice(&[v, v, v]);
             }
@@ -920,5 +956,107 @@ mod tests {
     #[test]
     fn rejects_non_jpeg() {
         assert!(matches!(decode(b"nope"), Err(JpegError::Corrupt(_))));
+    }
+
+    fn seg(out: &mut Vec<u8>, marker: u8, body: &[u8]) {
+        out.extend_from_slice(&[0xFF, marker]);
+        out.extend_from_slice(&((body.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(body);
+    }
+
+    /// Minimal baseline JPEG: all-ones quantization, one-symbol Huffman tables (DC diff 0,
+    /// AC end-of-block), so an empty scan decodes to mid-grey. `comps` is `(id, h, v)`.
+    fn synthetic_jpeg(w: u16, h: u16, comps: &[(u8, u8, u8)], scan: &[u8], eoi: bool) -> Vec<u8> {
+        let mut out = vec![0xFF, 0xD8];
+        let mut dqt = vec![0u8];
+        dqt.extend_from_slice(&[1u8; 64]);
+        seg(&mut out, 0xDB, &dqt);
+        let mut counts = [0u8; 16];
+        counts[0] = 1;
+        for class in [0x00u8, 0x10] {
+            let mut dht = vec![class];
+            dht.extend_from_slice(&counts);
+            dht.push(0);
+            seg(&mut out, 0xC4, &dht);
+        }
+        let mut sof = vec![8];
+        sof.extend_from_slice(&h.to_be_bytes());
+        sof.extend_from_slice(&w.to_be_bytes());
+        sof.push(comps.len() as u8);
+        for &(id, hs, vs) in comps {
+            sof.extend_from_slice(&[id, (hs << 4) | vs, 0]);
+        }
+        seg(&mut out, 0xC0, &sof);
+        let mut sos = vec![comps.len() as u8];
+        for &(id, _, _) in comps {
+            sos.extend_from_slice(&[id, 0x00]);
+        }
+        sos.extend_from_slice(&[0, 63, 0]);
+        seg(&mut out, 0xDA, &sos);
+        out.extend_from_slice(scan);
+        if eoi {
+            out.extend_from_slice(&[0xFF, 0xD9]);
+        }
+        out
+    }
+
+    #[test]
+    fn synthetic_420_decodes_to_mid_grey() {
+        let j = synthetic_jpeg(24, 20, &[(1, 2, 2), (2, 1, 1), (3, 1, 1)], &[], true);
+        let d = decode(&j).unwrap();
+        assert_eq!((d.width, d.height), (24, 20));
+        assert!(d.gray().unwrap().iter().all(|&v| v == 128));
+        assert!(d.bgr().unwrap().iter().all(|&v| v == 128));
+    }
+
+    #[test]
+    fn subsampled_luma_is_unsupported_not_a_panic() {
+        // Legal but unusual: luma h1v1 with chroma h2v2, and a truncated scan (no EOI).
+        let j = synthetic_jpeg(16, 16, &[(1, 1, 1), (2, 2, 2), (3, 2, 2)], &[0x00], false);
+        assert!(matches!(decode(&j), Err(JpegError::Unsupported(_))));
+        // The public entry points must not panic either (they fall back to zune-jpeg).
+        let p = std::path::Path::new("synthetic.jpg");
+        let _ = crate::decode::decode_gray_bytes(p, &j);
+        let _ = crate::decode::decode_bgr_bytes(p, &j);
+        let _ = crate::decode::decode_gray_and_bgr_bytes(p, &j);
+    }
+
+    #[test]
+    fn huge_declared_size_errors_before_allocating() {
+        let j = synthetic_jpeg(65535, 65535, &[(1, 1, 1)], &[], true);
+        assert!(j.len() < 300);
+        let t = std::time::Instant::now();
+        assert!(matches!(decode(&j), Err(JpegError::Limits(_))));
+        let p = std::path::Path::new("synthetic.jpg");
+        assert!(crate::decode::decode_gray_bytes(p, &j).is_err());
+        assert!(t.elapsed().as_millis() < 500);
+        // Within each side's cap but over the total pixel cap.
+        let j = synthetic_jpeg(32768, 32768, &[(1, 1, 1)], &[], true);
+        assert!(matches!(decode(&j), Err(JpegError::Limits(_))));
+    }
+
+    #[test]
+    fn gray_guards_undersized_luma_plane() {
+        let d = Decoded {
+            width: 16,
+            height: 16,
+            comps: vec![Component {
+                id: 1,
+                h: 1,
+                v: 1,
+                tq: 0,
+                td: 0,
+                ta: 0,
+                pw: 8,
+                ph: 8,
+                dw: 8,
+                dh: 8,
+                plane: vec![0; 64],
+            }],
+            hmax: 1,
+            vmax: 1,
+        };
+        assert!(matches!(d.gray(), Err(JpegError::Corrupt(_))));
+        assert!(d.bgr().is_err());
     }
 }

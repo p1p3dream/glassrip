@@ -4,7 +4,7 @@ use std::path::Path;
 
 use rayon::prelude::*;
 
-use crate::decode::{decode_bgr_bytes, decode_gray_bytes};
+use crate::decode::decode_gray_and_bgr_bytes;
 use crate::ecc::{find_transform_ecc_affine, EccOutcome, EccParams};
 use crate::error::{MediaError, Result};
 use crate::gaussian::blur_u8;
@@ -53,8 +53,7 @@ pub fn small_gray(gray: &Plane<u8>) -> Plane<f32> {
 
 /// Computes all per-frame features from JPEG bytes. `path` only labels errors.
 pub fn frame_features_from_bytes(path: &Path, bytes: &[u8]) -> Result<FrameFeatures> {
-    let gray = decode_gray_bytes(path, bytes)?;
-    let bgr = decode_bgr_bytes(path, bytes)?;
+    let (gray, bgr) = decode_gray_and_bgr_bytes(path, bytes)?;
     if gray.width % SMALL_W != 0
         || gray.height % SMALL_H != 0
         || gray.width / SMALL_W != gray.height / SMALL_H
