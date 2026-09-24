@@ -580,7 +580,10 @@ pub async fn run_meeting(
         }
         step(
             &runner,
-            &VocabularyStage::new(VocabularyParams::default()),
+            &VocabularyStage::new(VocabularyParams {
+                participants: opts.participants.clone(),
+                ..VocabularyParams::default()
+            }),
             &reports,
         )
         .await?;
