@@ -164,6 +164,51 @@ fn edge_labels_never_cover_zone_titles() {
     assert!(titled > 0, "the sweep produced zones with titles");
 }
 
+#[test]
+fn a_long_relation_label_between_touching_cards_is_placed_clear() {
+    // Put the design kit right next to the ledger: the dashed relation between
+    // them has no room on its path at full width.
+    let (notes, mut board) = inputs();
+    let ledger = board
+        .nodes
+        .iter()
+        .find(|n| n.text == "Ledger Service")
+        .and_then(|n| n.bbox)
+        .unwrap();
+    let w = ledger.x2 - ledger.x1;
+    for n in &mut board.nodes {
+        if n.text == "Design Kit" {
+            n.bbox = Some(glassrip_notes::board::BBox::new(
+                ledger.x2 + 0.05 * w,
+                ledger.y1,
+                ledger.x2 + 1.05 * w,
+                ledger.y2,
+            ));
+        }
+    }
+    let scene = build_scene(&board, &notes);
+    let o: Vec<String> = overlaps(&scene)
+        .into_iter()
+        .filter(|m| m.contains("edge label"))
+        .collect();
+    assert!(o.is_empty(), "{o:?}");
+    let e = scene
+        .edges
+        .iter()
+        .find(|e| {
+            e.label
+                .as_ref()
+                .is_some_and(|l| l.text.text.starts_with("Links between"))
+        })
+        .expect("the relation label is drawn");
+    if let Some((x1, y1, x2, y2)) = e.leader {
+        assert!(
+            (x1 - x2).abs() + (y1 - y2).abs() > 0.0,
+            "a leader has length"
+        );
+    }
+}
+
 /// Runs the render stage; returns the stage outcome and the records written.
 async fn run_render_stage(
     params: RenderParams,

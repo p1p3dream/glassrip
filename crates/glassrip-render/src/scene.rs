@@ -197,6 +197,9 @@ pub struct EdgeArt {
     /// Further lines of a label wrapped to fit (drawn inside its pill, under the
     /// first line).
     pub label_lines: Vec<TextLine>,
+    /// Leader line `(x1, y1, x2, y2)` from a label placed away from its connector
+    /// back to the connector.
+    pub leader: Option<(f64, f64, f64, f64)>,
 }
 
 /// A sticky card.
@@ -767,6 +770,7 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
         let mid = ((p0.0 + p1.0) / 2.0, (p0.1 + p1.1) / 2.0);
         edge_anchor.insert(e.id.clone(), (mid.0, mid.1, horizontal));
         let mut label_lines: Vec<TextLine> = Vec::new();
+        let mut leader: Option<(f64, f64, f64, f64)> = None;
         let label = Some(sanitize_dashes(e.label.trim()))
             .filter(|t| !t.is_empty())
             .map(|text| {
@@ -837,6 +841,41 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
                         }
                     }
                 }
+                // Still nothing on the path: the nearest free spot around its
+                // middle (rings every 40 px out to 320 px), joined to the path by a
+                // leader line.
+                if found.is_none() {
+                    let (lw, lh) = if lines.len() > 1 {
+                        (
+                            lines
+                                .iter()
+                                .map(|l| text_width(l, 12.0, false))
+                                .fold(0.0, f64::max)
+                                + 24.0,
+                            24.0 + 16.0 * (lines.len() - 1) as f64,
+                        )
+                    } else {
+                        (tw, h)
+                    };
+                    'rings: for ring in 1..=8 {
+                        let rad = 40.0 * f64::from(ring);
+                        for step in 0..12 {
+                            let a = f64::from(step) * std::f64::consts::PI / 6.0;
+                            let c = (mid.0 + rad * a.cos(), mid.1 + rad * a.sin());
+                            let r = R::new(c.0 - lw / 2.0, c.1 - lh / 2.0, lw, lh);
+                            if r.x >= MARGIN / 2.0
+                                && r.y >= LEGEND_BOTTOM
+                                && !taken.iter().any(|t| t.intersects(&r))
+                            {
+                                let near =
+                                    (mid.0.clamp(r.x, r.right()), mid.1.clamp(r.y, r.bottom()));
+                                leader = Some((near.0, near.1, mid.0, mid.1));
+                                found = Some(r);
+                                break 'rings;
+                            }
+                        }
+                    }
+                }
                 let r = found.unwrap_or_else(|| R::new(candidates[0].0, candidates[0].1, tw, h));
                 let text = lines[0].clone();
                 for (k, l) in lines.iter().enumerate().skip(1) {
@@ -877,6 +916,7 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
             dash: dashed.then_some("6,4"),
             label,
             label_lines,
+            leader,
         });
     }
     let channels_bottom = if channel > 0 {
