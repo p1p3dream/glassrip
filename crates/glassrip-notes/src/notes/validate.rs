@@ -12,7 +12,9 @@ use super::{
 use crate::board::{first_seen, BoardExt, BoardStateItem, EventKind, KeyframeTimes, StickyKind};
 use crate::named::NamedLine;
 use crate::people::AliasTable;
-use crate::text::{content_tokens, is_stopword, jaccard, normalize, sanitize_dashes, tokens};
+use crate::text::{
+    content_tokens, is_stopword, jaccard, names_target, normalize, sanitize_dashes, tokens,
+};
 
 /// Most `...` elisions in one quote.
 pub const MAX_ELISIONS: usize = 2;
@@ -204,9 +206,9 @@ pub struct Corpus {
     times: BTreeMap<String, f64>,
     table: AliasTable,
     /// Ids that show an owner tag appearing or moving (owner events, and the
-    /// keyframes that opened owner assignments), with the words of the person
-    /// and the target they concern.
-    owner_keys: BTreeMap<String, BTreeSet<String>>,
+    /// keyframes that opened owner assignments), with the content tokens of
+    /// each target they concern.
+    owner_keys: BTreeMap<String, Vec<Vec<String>>>,
 }
 
 /// Validation switches (see [`super::candidates`]).
@@ -269,12 +271,10 @@ impl Corpus {
                 }
             }
         }
-        let mut owner_keys: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut owner_keys: BTreeMap<String, Vec<Vec<String>>> = BTreeMap::new();
         for b in boards {
             for o in &b.owner_assignments {
-                let mut words: BTreeSet<String> =
-                    content_tokens(&o.display_name).into_iter().collect();
-                words.extend(content_tokens(&crate::board::target_text(&o.target)));
+                let words = content_tokens(&crate::board::target_text(&o.target));
                 for e in b.events.iter().filter(|e| {
                     matches!(e.kind, EventKind::OwnerAssigned | EventKind::OwnerMoved)
                         && e.subject == o.person_id
@@ -283,13 +283,13 @@ impl Corpus {
                     owner_keys
                         .entry(e.event_id.clone())
                         .or_default()
-                        .extend(words.iter().cloned());
+                        .push(words.clone());
                 }
                 if !o.opened_at_keyframe.is_empty() {
                     owner_keys
                         .entry(o.opened_at_keyframe.clone())
                         .or_default()
-                        .extend(words.iter().cloned());
+                        .push(words.clone());
                     times.entry(o.opened_at_keyframe.clone()).or_insert(
                         keyframes
                             .get(&o.opened_at_keyframe)
@@ -638,14 +638,14 @@ pub fn is_task_verb(word: &str) -> bool {
     TASK_VERBS.contains(&word)
 }
 
-/// Words of personal activities that are not work tasks ("grab a coffee").
+/// Words of personal activities that are not work tasks ("grab a coffee",
+/// "call my mom").
 const PERSONAL: &[&str] = &[
     "coffee",
     "lunch",
     "breakfast",
     "dinner",
     "snack",
-    "break",
     "bathroom",
     "restroom",
     "water",
@@ -656,6 +656,22 @@ const PERSONAL: &[&str] = &[
     "errand",
     "errands",
     "gym",
+    "dentist",
+    "haircut",
+    "groceries",
+    "grocery",
+    "pharmacy",
+    "babysitter",
+    "daycare",
+    "mom",
+    "dad",
+    "mother",
+    "father",
+    "kids",
+    "wife",
+    "husband",
+    "son",
+    "daughter",
 ];
 /// Phrases of leaving or pausing ("head out", "step away").
 const PERSONAL_PHRASES: &[&str] = &[
@@ -664,6 +680,8 @@ const PERSONAL_PHRASES: &[&str] = &[
     "step out",
     "grab a",
     "be right back",
+    "a break",
+    "quick break",
 ];
 
 /// True when a task is a personal activity rather than work.
@@ -810,17 +828,17 @@ pub fn check_with(
         section,
         Section::Decisions | Section::ActionItems | Section::OpenQuestions
     );
-    // board support counts only when the item names the person or the target
-    // of the owner-tag change it cites
-    let item_words: BTreeSet<String> = content_tokens(&format!("{text} {}", item.owner))
-        .into_iter()
-        .collect();
+    // board support counts only when the item names the target of the
+    // owner-tag change it cites: naming only the person is a name-drop, and
+    // one generic word ("app") does not name a target
+    let item_words: BTreeSet<String> = content_tokens(&text).into_iter().collect();
     let board_backed = evidence
         .event_ids
         .iter()
         .chain(&evidence.keyframe_ids)
         .filter_map(|id| corpus.owner_keys.get(id))
-        .any(|words| words.iter().any(|w| item_words.contains(w)));
+        .flatten()
+        .any(|target| names_target(&item_words, target));
     let board_ok = opts.board_support
         && board_backed
         && matches!(section, Section::Decisions | Section::ActionItems);
@@ -1329,6 +1347,111 @@ mod tests {
         let d = item("The team decided to skip the importer", &["s2"], "");
         let ok = check_with(Section::Decisions, &d, &c, &all).unwrap();
         assert_eq!(ok.text, "Skip the importer");
+    }
+
+    /// Avery owns the Kiosk App (keyframe kf_000040); s1 is descriptive, s2
+    /// opens with a personal future before a descriptive sentence.
+    fn guard_corpus() -> Corpus {
+        use crate::board::build;
+        let mut b = build::board("b", 100.0);
+        b.nodes = vec![build::node("n1", "Kiosk App", 0.0, 100.0, None)];
+        let mut o = build::owner(
+            "avery-quinn",
+            "Avery Quinn",
+            build::node_target(&b, "n1"),
+            40.0,
+            100.0,
+            None,
+        );
+        o.opened_at_keyframe = "kf_000040".into();
+        b.owner_assignments = vec![o];
+        let text = "I'll be right back. The importer reads the ledger nightly.";
+        let lines = vec![
+            line(
+                "s1",
+                10.0,
+                "The importer reads the ledger nightly.",
+                "The importer reads the ledger nightly.",
+            ),
+            line("s2", 20.0, text, text),
+        ];
+        Corpus::new(
+            &lines,
+            &[b],
+            &KeyframeTimes::default(),
+            AliasTable::from_names(&["Avery Quinn"]),
+        )
+    }
+
+    const ALL: CheckOptions = CheckOptions {
+        board_support: true,
+        precision_guard: true,
+        strip_prefix: true,
+    };
+
+    #[test]
+    fn a_personal_future_does_not_lend_a_commitment_to_its_segment() {
+        let c = guard_corpus();
+        let d = item("Keep the importer on REST", &["s2"], "");
+        let e = check_with(Section::Decisions, &d, &c, &ALL).unwrap_err();
+        assert!(e.reasons.iter().any(|r| r.contains("commits")), "{e:?}");
+    }
+
+    #[test]
+    fn board_support_needs_the_target_not_the_owner_name() {
+        let c = guard_corpus();
+        // the review's construction: the decision name-drops the owner of the
+        // cited keyframe and cites no transcript line
+        let mut d = item("Avery will draft the importer docs", &[], "");
+        d.keyframe_ids = vec!["kf_000040".into()];
+        let e = check_with(Section::Decisions, &d, &c, &ALL).unwrap_err();
+        assert!(
+            e.reasons.iter().any(|r| r.contains("transcript segment")),
+            "{e:?}"
+        );
+        // with a descriptive line cited, the guard is not bypassed either
+        d.segment_ids = vec!["s1".into()];
+        let e = check_with(Section::Decisions, &d, &c, &ALL).unwrap_err();
+        assert!(e.reasons.iter().any(|r| r.contains("commits")), "{e:?}");
+        // the owner named as an action's owner does not back the task
+        let a = DraftItem {
+            owner: "Avery".into(),
+            task: "Draft the importer docs".into(),
+            keyframe_ids: vec!["kf_000040".into()],
+            ..Default::default()
+        };
+        let e = check_with(Section::ActionItems, &a, &c, &ALL).unwrap_err();
+        assert!(
+            e.reasons.iter().any(|r| r.contains("transcript segment")),
+            "{e:?}"
+        );
+        // one generic target word is not the target
+        let mut d = item("Rewrite the app login", &["s1"], "");
+        d.keyframe_ids = vec!["kf_000040".into()];
+        let e = check_with(Section::Decisions, &d, &c, &ALL).unwrap_err();
+        assert!(e.reasons.iter().any(|r| r.contains("commits")), "{e:?}");
+        // naming the target is board support
+        let mut d = item("Avery owns the kiosk rollout", &[], "");
+        d.keyframe_ids = vec!["kf_000040".into()];
+        assert!(check_with(Section::Decisions, &d, &c, &ALL).is_ok());
+    }
+
+    #[test]
+    fn personal_errands_outside_the_old_list_are_not_tasks() {
+        let c = guard_corpus();
+        for task in ["Talk to mom after this", "Get the kids from school"] {
+            let a = DraftItem {
+                owner: "Avery".into(),
+                task: task.into(),
+                segment_ids: vec!["s1".into()],
+                ..Default::default()
+            };
+            let e = check_with(Section::ActionItems, &a, &c, &ALL).unwrap_err();
+            assert!(e.fatal, "{task}: {e:?}");
+        }
+        // "break" as a work verb is not a pause
+        assert!(!is_personal_activity("Break the importer into two jobs"));
+        assert!(is_personal_activity("Take a quick break"));
     }
 
     #[test]

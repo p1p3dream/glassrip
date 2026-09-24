@@ -10,11 +10,12 @@
 //!   (citing them) or leave out. Interrogative sentences are question cues;
 //!   first-person futures count only when they name a work task.
 //! - [`has_commitment`]: the decision precision guard: a sentence with an
-//!   assertive commitment cue (a separate, stricter list), not a question and
-//!   not hedged.
+//!   assertive group commitment cue (a separate, stricter list), a first-person
+//!   future naming a work task, or a group decision verb with an object; not a
+//!   question, not hedged, and not a personal activity.
 //! - [`owner_actions`]: owner tags still valid at the end become "Own <target>"
-//!   action items when the transcript corroborates them; they pass the same
-//!   validation as model items.
+//!   action items when a nearby line names the owner, or the owner speaks
+//!   about the target nearby; they pass the same validation as model items.
 //! - [`strip_item_prefix`]: removes narrative prefixes ("The team decided to").
 //! - [`windows_by_time`]: overlapping time windows.
 
@@ -30,7 +31,9 @@ use crate::board::{
     target_id, target_text, BoardEvent, BoardExt, BoardStateItem, EventKind, OwnerAssignment,
 };
 use crate::named::NamedLine;
-use crate::text::{content_tokens, estimate_tokens, mmss, sanitize_dashes};
+use crate::text::{
+    content_tokens, estimate_tokens, is_stopword, mmss, names_target, sanitize_dashes,
+};
 
 /// Owner events of an assignment: the owner tag of this person appearing on,
 /// or moving to, this target near the assignment's start.
@@ -144,14 +147,13 @@ const FIRST_PERSON_FUTURES: &[&str] = &[
     "i am going to",
 ];
 /// Assertive commitment cues for the precision guard (no hedges, no temporal
-/// scoping such as "for now").
+/// scoping such as "for now"). First-person futures are not here: they commit
+/// only when they name a work task (see [`first_person_work`]).
 const COMMIT_CUES: &[&str] = &[
     "let's",
     "let us",
     "we'll",
     "we will",
-    "i'll",
-    "i will",
     "go with",
     "decided",
     "we are going to",
@@ -187,10 +189,47 @@ const DECISION_VERBS: &[&str] = &[
     "adopting",
 ];
 
+/// Words right after a decision verb that make it a meeting-flow phrase
+/// ("we keep going", "we skip ahead", "we drop off"), not a decision.
+const CONTINUATIONS: &[&str] = &["going", "ahead", "along", "forward", "off", "rolling"];
+/// Movement verbs whose "on" means "proceed" ("we move on").
+const PROCEED_VERBS: &[&str] = &["move", "moving", "keep", "keeping"];
+/// Particles and prepositions between a decision verb and its object.
+const PARTICLES: &[&str] = &[
+    "on", "to", "with", "over", "up", "down", "out", "in", "into", "onto", "at", "for", "from",
+    "by", "back", "away",
+];
+/// Words that fill an object slot without naming anything decided ("we stay on
+/// track", "we move to the next item", "we pick this up tomorrow").
+const FLOW_WORDS: &[&str] = &[
+    "track", "now", "today", "tomorrow", "later", "next", "topic", "agenda", "item", "items",
+    "point", "thing", "things", "one", "bit", "minute", "second", "moment", "time", "then",
+    "anyway", "instead", "too", "all", "everyone", "guys", "folks", "okay", "right", "again",
+    "same", "quickly", "real", "quick",
+];
+
+/// A group subject, a decision verb and an object: "we keep the API on REST",
+/// "we're switching to weekly builds". The object must name something: flow
+/// continuations ("we keep going", "we move on") and flow words ("we stay on
+/// track") do not count.
 fn group_decision(n: &str) -> bool {
     let w: Vec<&str> = n.split_whitespace().collect();
-    w.windows(2)
-        .any(|p| matches!(p[0], "we" | "we're") && DECISION_VERBS.contains(&p[1]))
+    (0..w.len().saturating_sub(1)).any(|i| {
+        matches!(w[i], "we" | "we're")
+            && DECISION_VERBS.contains(&w[i + 1])
+            && decision_object(w[i + 1], &w[i + 2..])
+    })
+}
+
+fn decision_object(verb: &str, rest: &[&str]) -> bool {
+    match rest.first() {
+        None => return false,
+        Some(next) if CONTINUATIONS.contains(next) => return false,
+        Some(&"on") if PROCEED_VERBS.contains(&verb) => return false,
+        Some(_) => {}
+    }
+    rest.iter()
+        .any(|t| !is_stopword(t) && !PARTICLES.contains(t) && !FLOW_WORDS.contains(t))
 }
 
 /// Hedges that make a sentence tentative rather than a commitment.
@@ -254,14 +293,20 @@ fn first_person_work(n: &str) -> bool {
     })
 }
 
-/// True when a line holds a sentence with an assertive commitment: a
-/// commitment cue, not a question, and not hedged.
+/// True when a line holds a sentence with an assertive commitment: a group
+/// commitment cue, a first-person future naming a work task, or a group
+/// decision with an object (checked per clause, so "we move on, the importer
+/// is done" does not read "the importer" as the object); not a question, not
+/// hedged, and not a personal activity ("I'll be right back", "let's grab a
+/// coffee").
 pub fn has_commitment(text: &str) -> bool {
     split_sentences(text).iter().any(|s| {
         let n = cue_text(s);
-        (has_any(&n, COMMIT_CUES) || group_decision(&n))
-            && !is_question(s, &n)
-            && !has_any(&n, HEDGES)
+        let committed = has_any(&n, COMMIT_CUES)
+            || first_person_work(&n)
+            || s.split([',', ';', ':'])
+                .any(|clause| group_decision(&cue_text(clause)));
+        committed && !is_question(s, &n) && !has_any(&n, HEDGES) && !is_personal_activity(&n)
     })
 }
 
@@ -326,11 +371,14 @@ pub struct OwnerActionContext<'a> {
 }
 
 /// Owner tags still valid at the end of the board become "Own <target>" action
-/// items when corroborated: the owner's name or the target is mentioned in the
-/// transcript near the tag's appearance, or the tag was seen in two or more
-/// keyframes and the owner spoke in the meeting. Each item passes the same
-/// validation as model items and cites the board ids plus the corroborating
-/// lines. Owners who already have an action naming the target are skipped.
+/// items when a transcript line near the tag's appearance corroborates them:
+/// a line that mentions the owner by name, or a line the owner speaks that
+/// names the target (a distinctive word of it; one generic word such as "app"
+/// does not count, see [`names_target`]). How often the tag was seen and
+/// whether the owner spoke elsewhere are not evidence: a name used as a label
+/// persists on the board too. Each item passes the same validation as model
+/// items and cites the board ids plus the corroborating lines. Owners who
+/// already have an action naming the target are skipped.
 pub fn owner_actions(
     boards: &[BoardStateItem],
     existing: &[ActionItem],
@@ -345,8 +393,11 @@ pub fn owner_actions(
         for o in b.current_owners() {
             let target = sanitize_dashes(&target_text(&o.target));
             let key = content_tokens(&target);
+            let owner_id = Some(o.person_id.as_str());
+            // any shared word suppresses a duplicate (loose on purpose: it only
+            // ever removes a synthesized item)
             let named = |a: &ActionItem| {
-                a.person_id.as_deref() == Some(o.person_id.as_str()) && {
+                a.person_id.as_deref() == owner_id && {
                     let t = content_tokens(&a.task);
                     key.iter().any(|k| t.contains(k))
                 }
@@ -367,17 +418,12 @@ pub fn owner_actions(
                 .filter(|l| (l.start_s - o.valid_from_s).abs() <= ctx.near_s)
                 .filter(|l| {
                     let toks: BTreeSet<String> = content_tokens(&l.text).into_iter().collect();
-                    toks.contains(&first) || key.iter().any(|k| toks.contains(k))
+                    toks.contains(&first)
+                        || (l.person_id.as_deref() == owner_id && names_target(&toks, &key))
                 })
                 .map(|l| l.segment_id.clone())
                 .collect();
-            let keyframes: BTreeSet<&str> =
-                o.sightings.iter().map(|s| s.keyframe_id.as_str()).collect();
-            let spoke = ctx
-                .lines
-                .iter()
-                .any(|l| l.person_id.as_deref() == Some(o.person_id.as_str()));
-            if mentions.is_empty() && !(keyframes.len() >= 2 && spoke) {
+            if mentions.is_empty() {
                 continue;
             }
             let (event_ids, keyframe_ids) = assignment_ids(b, o);
@@ -727,11 +773,12 @@ mod tests {
         assert_eq!(got, vec![("Mira Okafor", "Own Ledger Store")], "{add:?}");
         assert_eq!(add[0].evidence.segment_ids, vec!["seg_00000"]);
         assert_eq!(add[0].evidence.keyframe_ids, vec!["kf_000100"]);
-        // persistence plus the owner speaking corroborates too
+        // persistence plus the owner speaking elsewhere is not corroboration: a
+        // name used as a label persists too
         let mut b2 = b.clone();
         b2.owner_assignments[1].sightings = vec![sighting("kf_000100"), sighting("kf_000120")];
         let add = owner_actions(std::slice::from_ref(&b2), &[], &ctx);
-        assert!(add.iter().any(|a| a.owner == "Rohan Dasgupta"), "{add:?}");
+        assert!(!add.iter().any(|a| a.owner == "Rohan Dasgupta"), "{add:?}");
         assert!(!add.iter().any(|a| a.owner == "Avery Quinn"));
         // an owner who already has an action naming the target gets no duplicate
         let existing = vec![ActionItem {
@@ -757,6 +804,121 @@ mod tests {
             ..ctx
         };
         assert!(owner_actions(std::slice::from_ref(&b), &[], &ctx2).is_empty());
+    }
+
+    /// Owners of the Kiosk App and Design Kit tags given a transcript, with the
+    /// labels seen in two keyframes so persistence alone would have counted.
+    fn label_tag_actions(lines: &[NamedLine]) -> Vec<(String, String)> {
+        let mut b = build::board("b", 600.0);
+        b.nodes = vec![
+            build::node("n2", "Kiosk App", 0.0, 600.0, None),
+            build::node("n4", "Design Kit", 0.0, 600.0, None),
+        ];
+        let mut o1 = build::owner(
+            "rohan-dasgupta",
+            "Rohan Dasgupta",
+            build::node_target(&b, "n2"),
+            100.0,
+            600.0,
+            None,
+        );
+        o1.opened_at_keyframe = "kf_000100".into();
+        o1.sightings = vec![sighting("kf_000100"), sighting("kf_000160")];
+        let mut o2 = build::owner(
+            "mira-okafor",
+            "Mira Okafor",
+            build::node_target(&b, "n4"),
+            100.0,
+            600.0,
+            None,
+        );
+        o2.opened_at_keyframe = "kf_000100".into();
+        o2.sightings = vec![sighting("kf_000100"), sighting("kf_000160")];
+        b.owner_assignments = vec![o1, o2];
+        let corpus = Corpus::new(
+            lines,
+            std::slice::from_ref(&b),
+            &KeyframeTimes::default(),
+            AliasTable::from_names(&["Mira Okafor", "Rohan Dasgupta", "Avery Quinn"]),
+        );
+        let ctx = OwnerActionContext {
+            lines,
+            corpus: &corpus,
+            opts: CheckOptions::default(),
+            near_s: 120.0,
+        };
+        owner_actions(std::slice::from_ref(&b), &[], &ctx)
+            .into_iter()
+            .map(|a| (a.owner, a.task))
+            .collect()
+    }
+
+    fn spoken(i: usize, t: f64, who: &str, text: &str) -> NamedLine {
+        let mut l = line(i, t, text);
+        l.person_id = Some(who.into());
+        l
+    }
+
+    #[test]
+    fn owner_tag_corroboration_needs_a_name_or_the_owner_on_topic() {
+        // talkative owners near the tag, off topic: not corroborated
+        let lines = vec![
+            spoken(0, 110.0, "rohan-dasgupta", "The weather is nice today."),
+            spoken(1, 115.0, "mira-okafor", "I can share my screen next."),
+        ];
+        assert!(label_tag_actions(&lines).is_empty());
+        // one generic target word nearby, from someone else: not corroborated
+        let lines = vec![
+            spoken(0, 110.0, "avery-quinn", "The app is slow again."),
+            spoken(1, 115.0, "avery-quinn", "The design looks off."),
+        ];
+        assert!(label_tag_actions(&lines).is_empty());
+        // one generic target word from the owners themselves: still not
+        let lines = vec![
+            spoken(0, 110.0, "rohan-dasgupta", "The app is slow again."),
+            spoken(1, 115.0, "mira-okafor", "The design looks off."),
+        ];
+        assert!(label_tag_actions(&lines).is_empty());
+        // a distinctive target word, but from someone other than the owner
+        let lines = vec![spoken(
+            0,
+            110.0,
+            "avery-quinn",
+            "The kiosk crashed twice today.",
+        )];
+        assert!(label_tag_actions(&lines).is_empty());
+        // the owner on topic, but far from the tag's appearance
+        let lines = vec![spoken(
+            0,
+            400.0,
+            "rohan-dasgupta",
+            "I'll look at the kiosk crash.",
+        )];
+        assert!(label_tag_actions(&lines).is_empty());
+        // the owner on topic near the tag, and a target made of generic words
+        // named in full: both corroborated
+        let lines = vec![
+            spoken(0, 110.0, "rohan-dasgupta", "I'll look at the kiosk crash."),
+            spoken(1, 115.0, "mira-okafor", "The design kit needs new icons."),
+        ];
+        let got = label_tag_actions(&lines);
+        assert_eq!(
+            got,
+            vec![
+                ("Rohan Dasgupta".to_string(), "Own Kiosk App".to_string()),
+                ("Mira Okafor".to_string(), "Own Design Kit".to_string()),
+            ]
+        );
+        // a name mention by anyone near the tag corroborates
+        let lines = vec![spoken(
+            0,
+            110.0,
+            "avery-quinn",
+            "Rohan, can you take that box?",
+        )];
+        let got = label_tag_actions(&lines);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0, "Rohan Dasgupta");
     }
 
     #[test]
@@ -802,6 +964,74 @@ mod tests {
         assert!(!has_commitment("Will we ship on Friday?"));
         assert!(!has_commitment("The importer reads the ledger nightly."));
         assert!(!has_commitment("Skipper is the name of the bot."));
+    }
+
+    #[test]
+    fn the_guard_ignores_personal_first_person_futures() {
+        // the review's constructions: personal futures are not commitments
+        assert!(!has_commitment("I'll be right back."));
+        assert!(!has_commitment("I'll grab a coffee before we start."));
+        assert!(!has_commitment("I'll be back in a minute or so."));
+        assert!(!has_commitment("I will be back in five."));
+        assert!(!has_commitment("I'll talk to my mom after this."));
+        assert!(!has_commitment("Let's take a quick break."));
+        assert!(!has_commitment("We'll grab lunch after this."));
+        // a multi-sentence segment: the personal first sentence does not lend
+        // a commitment to the descriptive second one
+        assert!(!has_commitment(
+            "I'll be right back. The importer reads the ledger nightly."
+        ));
+        // first-person futures that name a work task still commit
+        assert!(has_commitment("I'll take the backend."));
+        assert!(has_commitment("I will write the migration spec tonight."));
+        assert!(has_commitment("I'm going to draft the importer docs."));
+        // "break" as a work verb is not a pause
+        assert!(has_commitment("Let's break the importer into two jobs."));
+    }
+
+    #[test]
+    fn group_decisions_need_an_object() {
+        // the review's meeting-flow constructions
+        for s in [
+            "We move on.",
+            "We keep going.",
+            "We're moving on.",
+            "We drop off now.",
+            "We stay on track.",
+            "We skip ahead.",
+            "We pick this up tomorrow.",
+            "We move on to the next item.",
+            "We keep going with the demo.",
+            "We move on, the importer is done.",
+        ] {
+            assert!(!has_commitment(s), "{s}");
+        }
+        // decisions with an object
+        for s in [
+            "We keep the ledger API on REST for the pilot.",
+            "We're switching to weekly builds.",
+            "We stay on REST for the pilot.",
+            "We're moving back to the old importer.",
+            "We skip the review step.",
+            "Okay, we drop the badge printer.",
+        ] {
+            assert!(has_commitment(s), "{s}");
+        }
+    }
+
+    #[test]
+    fn personal_topics_outside_the_old_list_are_not_action_cues() {
+        let lines = vec![
+            line(0, 0.0, "I'll talk to my mom after this."),
+            line(1, 5.0, "I'll get the kids from school at three."),
+            line(2, 10.0, "I'll talk to the vendor about the kiosk."),
+        ];
+        let w = Window {
+            lines: (0..3).collect(),
+        };
+        let c = cue_lines(&w, &lines, 10);
+        assert_eq!(c.len(), 1, "{c:#?}");
+        assert!(c[0].starts_with("seg_00002"));
     }
 
     #[test]
