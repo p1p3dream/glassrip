@@ -193,9 +193,8 @@ async fn main() {
     let t0 = Instant::now();
     let rep = runner.run_stage(&stage).await.unwrap();
     summary.insert("name_speakers".into(), json!({"wall_s": t0.elapsed().as_secs_f64(), "status": format!("{:?}", rep.status), "items_error": rep.items_error}));
-    let dir = runner.run_dir();
     let recs = jsonl::read::<Record<SpeakersRecord>>(
-        &dir.artifact_path(schemas::SPEAKERS),
+        &runner.run_dir().artifact_path(schemas::SPEAKERS),
         &SchemaReq::new(schemas::SPEAKERS, 1),
     )
     .unwrap()
@@ -254,9 +253,8 @@ async fn main() {
             "notes".into(),
             json!({"wall_s": t0.elapsed().as_secs_f64(), "status": format!("{:?}", rep.status), "items_error": rep.items_error, "peak_vram_mib": peak.load(Ordering::SeqCst)}),
         );
-        let dir = runner.run_dir();
         let notes = jsonl::read::<Record<MeetingNotes>>(
-            &dir.artifact_path(schemas::MEETING_NOTES),
+            &runner.run_dir().artifact_path(schemas::MEETING_NOTES),
             &SchemaReq::new(schemas::MEETING_NOTES, 1),
         )
         .unwrap()
@@ -287,9 +285,8 @@ async fn main() {
             ..RenderParams::default()
         });
         let rep = runner.run_stage(&stage).await.unwrap();
-        let dir = runner.run_dir();
         let r = jsonl::read::<Record<RenderResult>>(
-            &dir.artifact_path(RENDER_SCHEMA),
+            &runner.run_dir().artifact_path(RENDER_SCHEMA),
             &SchemaReq::new(RENDER_SCHEMA, 1),
         )
         .unwrap()

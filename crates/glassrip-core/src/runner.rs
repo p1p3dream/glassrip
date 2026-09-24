@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
@@ -439,9 +439,14 @@ pub enum RunnerError {
 ///
 /// Holds a shared [`CacheLease`] for its lifetime, so `cache gc` cannot delete
 /// entries while a run is using them.
+///
+/// [`Runner::run_stage_shared`] takes `&self`, so independent stages can run
+/// concurrently on one runner (for example the audio branch next to board
+/// reading); the manifest is updated under a lock that is never held across an
+/// await.
 #[derive(Debug)]
 pub struct Runner {
-    run: RunDir,
+    run: Mutex<RunDir>,
     graph: StageGraph,
     plan: Plan,
     cache: Cache,
@@ -520,7 +525,7 @@ impl Runner {
         let plan = graph.plan(selection)?;
         let lease = cache.lease()?;
         Ok(Self {
-            run,
+            run: Mutex::new(run),
             graph,
             plan,
             cache,
@@ -531,20 +536,29 @@ impl Runner {
         })
     }
 
-    /// The run directory.
-    pub fn run_dir(&self) -> &RunDir {
-        &self.run
+    /// The run directory. Do not hold the guard across a call that runs a stage
+    /// (the stage updates the manifest through the same lock).
+    pub fn run_dir(&self) -> MutexGuard<'_, RunDir> {
+        self.run.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Mutable access to the run directory (for recording run-level manifest data).
     pub fn run_dir_mut(&mut self) -> &mut RunDir {
-        &mut self.run
+        self.run.get_mut().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Releases the runner and its cache lease, returning the (still locked) run
     /// directory.
     pub fn into_run_dir(self) -> RunDir {
         self.run
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Runs `f` on the run directory under the lock (never across an await).
+    fn with_run<R>(&self, f: impl FnOnce(&mut RunDir) -> R) -> R {
+        let mut guard = self.run.lock().unwrap_or_else(PoisonError::into_inner);
+        f(&mut guard)
     }
 
     /// The resolved stage plan.
@@ -559,6 +573,13 @@ impl Runner {
 
     /// Runs (or restores, or skips) one stage.
     pub async fn run_stage<S: Stage>(&mut self, stage: &S) -> Result<StageReport, RunnerError> {
+        self.run_stage_shared(stage).await
+    }
+
+    /// [`Runner::run_stage`] through a shared reference, so stages that do not
+    /// depend on each other can run concurrently (join their futures). The
+    /// caller is responsible for running a stage only after its inputs exist.
+    pub async fn run_stage_shared<S: Stage>(&self, stage: &S) -> Result<StageReport, RunnerError> {
         let name = stage.name();
         let found = stage_decl(stage);
         match self.graph.decl(name) {
@@ -580,7 +601,7 @@ impl Runner {
         let new_commands =
             std::mem::take(&mut *self.commands.lock().unwrap_or_else(PoisonError::into_inner));
         if !new_commands.is_empty() {
-            if let Err(e) = self.run.update(|m| m.commands.extend(new_commands)) {
+            if let Err(e) = self.with_run(|r| r.update(|m| m.commands.extend(new_commands))) {
                 warn!(stage = name, error = %e, "could not record commands in manifest");
             }
         }
@@ -606,18 +627,20 @@ impl Runner {
     }
 
     fn set_stage<F: FnOnce(&mut StageRecord)>(
-        &mut self,
+        &self,
         name: &str,
         version: u32,
         f: F,
     ) -> Result<(), ManifestError> {
-        self.run.update(|m| {
-            let record = m
-                .stages
-                .entry(name.to_string())
-                .or_insert_with(|| StageRecord::new(StageStatus::Pending, version));
-            record.stage_version = version;
-            f(record);
+        self.with_run(|run| {
+            run.update(|m| {
+                let record = m
+                    .stages
+                    .entry(name.to_string())
+                    .or_insert_with(|| StageRecord::new(StageStatus::Pending, version));
+                record.stage_version = version;
+                f(record);
+            })
         })
     }
 
@@ -703,7 +726,7 @@ impl Runner {
     }
 
     async fn run_stage_inner<S: Stage>(
-        &mut self,
+        &self,
         stage: &S,
         started: Instant,
     ) -> Result<StageReport, RunnerError> {
@@ -727,7 +750,7 @@ impl Runner {
             None => return Err(RunnerError::StageNotInGraph(name.to_string())),
             Some(StageDecision::Skip(reason)) => {
                 info!(stage = name, ?reason, "stage skipped by selection");
-                if !self.run.manifest().stages.contains_key(name) {
+                if !self.with_run(|r| r.manifest().stages.contains_key(name)) {
                     self.set_stage(name, version, |r| r.status = StageStatus::Skipped)?;
                 }
                 return Ok(report);
@@ -745,7 +768,7 @@ impl Runner {
         let mut input_refs = Vec::new();
         let mut input_hashes = Vec::new();
         for decl in stage.inputs() {
-            let path = self.run.artifact_path(decl.schema);
+            let path = self.with_run(|r| r.artifact_path(decl.schema));
             if !atomic::is_file(&path).map_err(Self::io_err(&path))? {
                 return Err(RunnerError::MissingInputArtifact {
                     stage: name.to_string(),
@@ -823,7 +846,9 @@ impl Runner {
         }
         .key()?;
         report.cache_key = Some(key.clone());
-        let out_path = self.run.artifact_path(output.schema);
+        let out_path = self.with_run(|r| r.artifact_path(output.schema));
+        let (run_id, producer) =
+            self.with_run(|r| (r.manifest().run_id.clone(), r.manifest().producer.clone()));
         let started_unix = unix_now();
         let key_text = key.to_string();
         self.set_stage(name, version, |r| {
@@ -847,8 +872,8 @@ impl Runner {
                     run_id: std::mem::take(&mut header.run_id),
                     cache_key: key.to_string(),
                 });
-                header.run_id = self.run.manifest().run_id.clone();
-                header.producer = self.run.manifest().producer.clone();
+                header.run_id = run_id.clone();
+                header.producer = producer.clone();
                 let line = jsonl::header_line(&header)?;
                 atomic::write_atomic_with(&out_path, |w| {
                     w.write_all(&line)?;
@@ -884,16 +909,15 @@ impl Runner {
         let mut header = EnvelopeHeader {
             schema: output.schema.to_string(),
             schema_version: output.version.clone(),
-            run_id: self.run.manifest().run_id.clone(),
-            producer: self.run.manifest().producer.clone(),
+            run_id,
+            producer,
             inputs: input_refs,
             params,
             content_hash: None,
             restored_from: None,
         };
         let partial = self
-            .run
-            .partials_dir()
+            .with_run(|r| r.partials_dir())
             .join(format!("{name}-{}.jsonl", &key.as_str()[..16]));
         let partial_exists = atomic::metadata_opt(&partial)
             .map_err(Self::io_err(&partial))?
@@ -1279,6 +1303,96 @@ mod tests {
         }
     }
 
+    /// Waits on a shared barrier in its only item: two of these finish only when
+    /// they run at the same time.
+    struct BarrierStage {
+        name: &'static str,
+        schema: &'static str,
+        barrier: Arc<tokio::sync::Barrier>,
+        params: NoParams,
+    }
+
+    impl Stage for BarrierStage {
+        type Params = NoParams;
+        type Work = ();
+        type Output = u64;
+
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn version(&self) -> u32 {
+            1
+        }
+        fn output(&self) -> ArtifactSpec {
+            ArtifactSpec {
+                schema: self.schema,
+                version: Version::new(1, 0, 0),
+            }
+        }
+        fn inputs(&self) -> Vec<InputDecl> {
+            Vec::new()
+        }
+        fn params(&self) -> &NoParams {
+            &self.params
+        }
+        fn plan(&self, _inputs: &StageInputs) -> Result<Vec<WorkItem<()>>, StageError> {
+            Ok(vec![WorkItem {
+                id: "only".into(),
+                work: (),
+            }])
+        }
+        async fn process(&self, _ctx: &ItemContext, _w: ()) -> Result<u64, ErrorInfo> {
+            self.barrier.wait().await;
+            Ok(1)
+        }
+    }
+
+    #[tokio::test]
+    async fn independent_stages_run_concurrently_on_one_runner() {
+        let env = env();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let stage = |name, schema| BarrierStage {
+            name,
+            schema,
+            barrier: Arc::clone(&barrier),
+            params: NoParams {},
+        };
+        let (left, right) = (stage("left", "x.left"), stage("right", "x.right"));
+        let graph = StageGraph::new(vec![stage_decl(&left), stage_decl(&right)]).unwrap();
+        let run = RunDir::open(
+            &env.root.join("run"),
+            "run",
+            Producer::glassrip("0.1.0", None),
+        )
+        .unwrap();
+        let runner = Runner::new(
+            run,
+            graph,
+            &Selection::default(),
+            env.cache.clone(),
+            RunnerOptions::default(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let both = async {
+            tokio::join!(
+                runner.run_stage_shared(&left),
+                runner.run_stage_shared(&right)
+            )
+        };
+        let (a, b) = tokio::time::timeout(Duration::from_secs(10), both)
+            .await
+            .expect("stages did not run concurrently");
+        assert_eq!(a.unwrap().status, StageStatus::Ok);
+        assert_eq!(b.unwrap().status, StageStatus::Ok);
+        let m = runner.run_dir().manifest().clone();
+        assert_eq!(m.stages["left"].status, StageStatus::Ok);
+        assert_eq!(m.stages["right"].status, StageStatus::Ok);
+        let run = runner.into_run_dir();
+        assert!(run.artifact_path("x.left").is_file());
+        assert!(run.artifact_path("x.right").is_file());
+    }
+
     fn graph() -> StageGraph {
         StageGraph::new(vec![
             StageDecl::new("source", SOURCE, &[]),
@@ -1357,7 +1471,7 @@ mod tests {
                 outcome: Outcome::ok(40)
             }
         );
-        let m = r1.run_dir().manifest();
+        let m = r1.run_dir().manifest().clone();
         assert_eq!(m.stages["source"].status, StageStatus::Ok);
         assert_eq!(m.commands.len(), 1);
         assert_eq!(m.commands[0].argv[0], "synthetic-tool");
@@ -1465,7 +1579,7 @@ mod tests {
             other => panic!("expected ErrorRateExceeded, got {other:?}"),
         }
         assert!(!r.run_dir().artifact_path(SOURCE).exists());
-        let rec = &r.run_dir().manifest().stages["source"];
+        let rec = r.run_dir().manifest().stages["source"].clone();
         assert_eq!((rec.status, rec.items_error), (StageStatus::Failed, 2));
         assert_eq!(
             r.run_dir().manifest().commands.len(),
