@@ -421,6 +421,7 @@ pub fn meeting_mode_stage_decls() -> Vec<StageDecl> {
                 "glassrip.board_validate",
                 "glassrip.edge_direction",
                 "glassrip.keyframes",
+                "glassrip.ocr",
             ],
         ),
         d("audio_extract", "glassrip.audio", &["glassrip.media_probe"]),

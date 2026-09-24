@@ -32,6 +32,8 @@ pub enum EventKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BoardEvent {
+    /// Stable id within the board state (assigned in time order).
+    pub event_id: String,
     /// Kind.
     pub kind: EventKind,
     /// Time (start of the keyframe where the change is first seen).
@@ -54,6 +56,9 @@ pub struct BoardEvent {
 pub enum SuppressReason {
     /// Aligned ink change below the threshold (pan or zoom only).
     InkBelowThreshold,
+    /// The ink change of this keyframe pair is unknown (non-adjacent keyframes or no
+    /// alignment), so the change cannot be told from pan or zoom.
+    InkUnknown,
 }
 
 /// A computed state change that did not pass the gate.
@@ -86,21 +91,22 @@ impl EventGate {
         }
     }
 
-    /// Emit when the event is baseline, the ink change is unknown, or it reaches the
-    /// threshold; otherwise record it as suppressed.
+    /// Emit when the event is baseline or the keyframe pair's ink change reaches the
+    /// threshold; otherwise record it as suppressed (below threshold, or unknown).
     pub fn offer(&mut self, e: BoardEvent) {
-        let open = e.baseline || e.ink_change.is_none_or(|v| v >= self.threshold);
-        if open {
-            self.events.push(e);
-        } else {
-            self.suppressed.push(SuppressedEvent {
-                event: e,
-                reason: SuppressReason::InkBelowThreshold,
-            });
+        let reason = match (e.baseline, e.ink_change) {
+            (true, _) => None,
+            (false, Some(v)) if v >= self.threshold => None,
+            (false, Some(_)) => Some(SuppressReason::InkBelowThreshold),
+            (false, None) => Some(SuppressReason::InkUnknown),
+        };
+        match reason {
+            None => self.events.push(e),
+            Some(reason) => self.suppressed.push(SuppressedEvent { event: e, reason }),
         }
     }
 
-    /// Sort both lists by time, then kind, then subject.
+    /// Sort both lists by time, then kind, then subject, and number the events.
     pub fn finish(mut self) -> (Vec<BoardEvent>, Vec<SuppressedEvent>) {
         let key = |e: &BoardEvent| (e.t_s, e.kind, e.subject.clone());
         self.events.sort_by(|a, b| {
@@ -113,6 +119,12 @@ impl EventGate {
                 .partial_cmp(&key(&b.event))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        for (i, e) in self.events.iter_mut().enumerate() {
+            e.event_id = format!("ev-{}", i + 1);
+        }
+        for (i, e) in self.suppressed.iter_mut().enumerate() {
+            e.event.event_id = format!("sup-{}", i + 1);
+        }
         (self.events, self.suppressed)
     }
 }
@@ -123,6 +135,7 @@ mod tests {
 
     fn ev(ink: Option<f64>, baseline: bool) -> BoardEvent {
         BoardEvent {
+            event_id: String::new(),
             kind: EventKind::NodeAdded,
             t_s: 1.0,
             keyframe_id: "kf".into(),
@@ -141,8 +154,11 @@ mod tests {
         g.offer(ev(Some(0.0), true));
         g.offer(ev(None, false));
         let (e, s) = g.finish();
-        assert_eq!(e.len(), 3);
-        assert_eq!(s.len(), 1);
-        assert_eq!(s[0].reason, SuppressReason::InkBelowThreshold);
+        assert_eq!(e.len(), 2);
+        assert_eq!(s.len(), 2);
+        assert!(s
+            .iter()
+            .any(|x| x.reason == SuppressReason::InkBelowThreshold));
+        assert!(s.iter().any(|x| x.reason == SuppressReason::InkUnknown));
     }
 }

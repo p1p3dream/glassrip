@@ -1,11 +1,11 @@
 //! Edge direction evidence and the cross-frame vote (spec 6.11, edge direction).
 //!
-//! Every keyframe contributes up to two independent verdicts per edge: the pixel check
-//! (skeleton walk plus arrowhead blob test) and the binary VLM check on endpoint
-//! crops. Verdicts are weighted by crop sharpness and zoom and summed per channel. A
-//! direction is kept only when both channels elect the same winner; otherwise the edge
-//! is `uncertain`. `bidirectional` needs both channels to see arrowheads at both ends,
-//! so opposite single-ended readings are never merged into it.
+//! The pixel check (skeleton walk plus arrowhead blob test) is authoritative: its
+//! verdicts are weighted by crop sharpness and zoom and summed across keyframes, and
+//! its majority direction is kept. Only when the pixel vote is inconclusive (no
+//! arrowhead found, or conflicting) is the VLM image-space answer used; an edge with
+//! neither stays `uncertain`. `bidirectional` needs arrowheads at both ends in the
+//! pixel check, so opposite single-ended readings are never merged into it.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -48,39 +48,6 @@ impl EndVerdict {
     }
 }
 
-/// Answer of the binary VLM check for one endpoint crop. `A` is the box at this end,
-/// `B` the box at the other end.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub enum EndpointAnswer {
-    /// An arrowhead at this end points into box A.
-    #[serde(rename = "points_to_A")]
-    PointsToA,
-    /// The arrowhead at this end points away from A, toward B.
-    #[serde(rename = "points_to_B")]
-    PointsToB,
-    /// The line ends here without an arrowhead.
-    #[serde(rename = "no_arrowhead")]
-    NoArrowhead,
-    /// Not decidable from the crop.
-    #[serde(rename = "unclear")]
-    Unclear,
-}
-
-/// Combine the answers for the `src` end (A = src) and the `dst` end (A = dst).
-pub fn vlm_verdict(src_end: EndpointAnswer, dst_end: EndpointAnswer) -> EndVerdict {
-    // An arrowhead pointing into the box at this end marks this end as the head.
-    let into = |a: EndpointAnswer| match a {
-        EndpointAnswer::PointsToA => Some(true),
-        EndpointAnswer::NoArrowhead => Some(false),
-        EndpointAnswer::PointsToB | EndpointAnswer::Unclear => None,
-    };
-    let (s, d) = (into(src_end), into(dst_end));
-    // "points_to_B" at one end is direct evidence that the other end is the head.
-    let s = s.or((dst_end == EndpointAnswer::PointsToB).then_some(true));
-    let d = d.or((src_end == EndpointAnswer::PointsToB).then_some(true));
-    EndVerdict::from_ends(s, d)
-}
-
 /// Final direction of a consolidated edge between nodes `a` and `b`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -95,14 +62,16 @@ pub enum EdgeDirection {
     Uncertain,
 }
 
-/// How the final direction was decided.
+/// Which channel decided the final direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum DirectionPolicy {
-    /// Keep a direction only when the pixel and VLM votes agree (spec default).
-    RequireAgreement,
-    /// Pixel vote alone; for runs without a vision backend. Recorded in the output.
-    PixelOnly,
+pub enum DirectionBasis {
+    /// The pixel majority (authoritative).
+    Pixel,
+    /// The VLM image-space answer, used because the pixel vote was inconclusive.
+    Vlm,
+    /// Neither channel decided.
+    None,
 }
 
 /// Weighted votes of one channel, in the `(a, b)` orientation.
@@ -178,16 +147,21 @@ pub struct DirectionVotes {
 }
 
 impl DirectionVotes {
-    /// Apply the policy: see the module docs.
-    pub fn decide(&self, policy: DirectionPolicy, min_share: f64) -> EdgeDirection {
-        let p = self.pixel.winner(min_share);
-        match policy {
-            DirectionPolicy::PixelOnly => p.unwrap_or(EdgeDirection::Uncertain),
-            DirectionPolicy::RequireAgreement => match (p, self.vlm.winner(min_share)) {
-                (Some(a), Some(b)) if a == b => a,
-                _ => EdgeDirection::Uncertain,
-            },
+    /// Pixel majority if decisive, else the VLM majority (single direction only),
+    /// else `uncertain`.
+    pub fn decide(&self, min_share: f64) -> (EdgeDirection, DirectionBasis) {
+        if let Some(d) = self.pixel.winner(min_share) {
+            return (d, DirectionBasis::Pixel);
         }
+        match self.vlm.winner(min_share) {
+            Some(d @ (EdgeDirection::AToB | EdgeDirection::BToA)) => (d, DirectionBasis::Vlm),
+            _ => (EdgeDirection::Uncertain, DirectionBasis::None),
+        }
+    }
+
+    /// True when the pixel vote has no decisive winner (the VLM fallback applies).
+    pub fn pixel_inconclusive(&self, min_share: f64) -> bool {
+        self.pixel.winner(min_share).is_none()
     }
 }
 
@@ -228,33 +202,32 @@ mod tests {
     }
 
     #[test]
-    fn vlm_answers_combine() {
-        use EndpointAnswer::*;
-        assert_eq!(vlm_verdict(NoArrowhead, PointsToA), EndVerdict::Forward);
-        assert_eq!(vlm_verdict(PointsToA, NoArrowhead), EndVerdict::Reverse);
-        assert_eq!(vlm_verdict(Unclear, PointsToB), EndVerdict::Reverse);
-        assert_eq!(vlm_verdict(PointsToA, PointsToA), EndVerdict::Bidirectional);
-        assert_eq!(vlm_verdict(Unclear, Unclear), EndVerdict::Unknown);
+    fn pixel_majority_is_authoritative() {
+        let mut v = DirectionVotes::default();
+        v.pixel.add(EndVerdict::Forward, 1.0);
+        v.vlm.add(EndVerdict::Reverse, 5.0);
+        assert_eq!(v.decide(0.6), (EdgeDirection::AToB, DirectionBasis::Pixel));
     }
 
     #[test]
-    fn agreement_rule() {
+    fn vlm_only_when_pixel_is_inconclusive() {
+        // No arrowhead found by pixels.
         let mut v = DirectionVotes::default();
-        v.pixel.add(EndVerdict::Forward, 1.0);
-        v.vlm.add(EndVerdict::Forward, 0.5);
+        v.pixel.add(EndVerdict::NoArrowhead, 1.0);
+        assert!(v.pixel_inconclusive(0.6));
         assert_eq!(
-            v.decide(DirectionPolicy::RequireAgreement, 0.6),
-            EdgeDirection::AToB
+            v.decide(0.6),
+            (EdgeDirection::Uncertain, DirectionBasis::None)
         );
-        v.vlm.add(EndVerdict::Reverse, 2.0);
-        assert_eq!(
-            v.decide(DirectionPolicy::RequireAgreement, 0.6),
-            EdgeDirection::Uncertain
-        );
-        assert_eq!(
-            v.decide(DirectionPolicy::PixelOnly, 0.6),
-            EdgeDirection::AToB
-        );
+        v.vlm.add(EndVerdict::Reverse, 1.0);
+        assert_eq!(v.decide(0.6), (EdgeDirection::BToA, DirectionBasis::Vlm));
+        // Conflicting pixel readings are inconclusive too.
+        let mut c = DirectionVotes::default();
+        c.pixel.add(EndVerdict::Forward, 1.0);
+        c.pixel.add(EndVerdict::Reverse, 1.0);
+        assert!(c.pixel_inconclusive(0.6));
+        c.vlm.add(EndVerdict::Forward, 1.0);
+        assert_eq!(c.decide(0.6), (EdgeDirection::AToB, DirectionBasis::Vlm));
     }
 
     #[test]
@@ -264,17 +237,14 @@ mod tests {
         v.pixel.add(EndVerdict::Reverse, 1.0);
         v.vlm.add(EndVerdict::Forward, 1.0);
         v.vlm.add(EndVerdict::Reverse, 1.0);
-        assert_eq!(
-            v.decide(DirectionPolicy::RequireAgreement, 0.6),
-            EdgeDirection::Uncertain
-        );
+        assert_eq!(v.decide(0.6).0, EdgeDirection::Uncertain);
         let mut b = DirectionVotes::default();
         b.pixel.add(EndVerdict::Bidirectional, 1.0);
-        b.vlm.add(EndVerdict::Bidirectional, 1.0);
-        assert_eq!(
-            b.decide(DirectionPolicy::RequireAgreement, 0.6),
-            EdgeDirection::Bidirectional
-        );
+        assert_eq!(b.decide(0.6).0, EdgeDirection::Bidirectional);
+        // The VLM channel alone never yields bidirectional.
+        let mut m = DirectionVotes::default();
+        m.vlm.add(EndVerdict::Bidirectional, 1.0);
+        assert_eq!(m.decide(0.6).0, EdgeDirection::Uncertain);
     }
 
     proptest! {

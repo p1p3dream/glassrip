@@ -43,6 +43,9 @@ pub struct Obs {
     pub local_id: Option<String>,
     /// Sticky color, for sticky observations.
     pub color: Option<StickyColor>,
+    /// This sighting alone may support the element (pixel check and reading
+    /// confidence agree, plus the second reader pass when one is configured).
+    pub single_ok: bool,
 }
 
 /// Votes over lists across all sightings.
@@ -485,6 +488,7 @@ mod tests {
                 cluster: usize::MAX,
                 local_id: None,
                 color: None,
+                single_ok: false,
             });
         }
         assert_eq!(t.votes().kind(), ObsList::Node);

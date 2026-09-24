@@ -29,7 +29,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::artifacts::{CanvasDims, EdgeDirectionItem, EdgeEvidence};
-use crate::direction::{frame_weight, DirectionPolicy, DirectionVotes, EdgeDirection, EndVerdict};
+use crate::direction::{frame_weight, DirectionBasis, DirectionVotes, EdgeDirection, EndVerdict};
 use crate::pixel_direction::{dist_to_bbox, exit_point};
 use crate::register::{
     map_bbox, register, Anchors, FrameRegistration, RegistrationMode, RegistrationParams,
@@ -38,8 +38,8 @@ use crate::text::{is_unreliable, normalize, AliasTable};
 
 use events::{BoardEvent, EventGate, EventKind, SuppressedEvent};
 use owners::{
-    apply_alternation, assign, AnchorKind, Corroborator, OwnerAssignment, OwnerParams,
-    OwnerSighting, OwnerTarget,
+    apply_alternation, assign, collapse_edge_pairs, AnchorKind, Corroborator, OwnerAssignment,
+    OwnerParams, OwnerSighting, OwnerTarget,
 };
 use tracks::{
     assign_frame, intervals, Interval, MatchParams, Obs, ObsList, SupportParams, Track, Visibility,
@@ -58,15 +58,43 @@ pub struct BoardFrame {
     pub t_end_s: f64,
     /// Representative time.
     pub t_rep_s: f64,
-    /// Canvas size of the crop the bboxes refer to.
+    /// Canvas size of the reading's coordinates, when recorded.
     pub canvas: Option<CanvasDims>,
+    /// Board title, when a producer extracted one (board splitting).
+    pub board_title: Option<String>,
     /// Validated reading.
     pub board: ValidatedBoard,
-    /// Largest aligned ink change at a keyframe boundary since the previous board
-    /// keyframe (`None` when unknown).
+    /// Aligned ink change between this board keyframe and the previous one, known
+    /// only when the two are adjacent keyframes (`None` otherwise).
     pub ink_change: Option<f64>,
     /// Edge direction evidence, when computed.
     pub directions: Option<EdgeDirectionItem>,
+    /// OCR spans inside the canvas, in the reading's coordinates (anchors).
+    pub ocr_anchors: Vec<TextAnchor>,
+}
+
+/// A text with its box, used as a registration anchor.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextAnchor {
+    /// Text.
+    pub text: String,
+    /// Box in the reading's canvas coordinates.
+    pub bbox: BBox,
+}
+
+/// A second board-reader pass that may confirm a single sighting (optional).
+pub trait SecondReader: Send + Sync {
+    /// True when the second pass also reads `text` in `keyframe_id`.
+    fn confirms(&self, keyframe_id: &str, text: &str) -> bool;
+}
+
+/// Hooks from other stages.
+#[derive(Clone, Copy)]
+pub struct Hooks<'a> {
+    /// Transcript corroboration of owner moves.
+    pub corroborator: &'a dyn Corroborator,
+    /// Second reader pass for single sightings.
+    pub second_reader: Option<&'a dyn SecondReader>,
 }
 
 /// Consolidation parameters.
@@ -89,21 +117,30 @@ pub struct ConsolidationParams {
     pub min_support_density: f64,
     /// Consecutive visible-but-absent keyframes that remove an element.
     pub removal_absent_keyframes: usize,
-    /// Length of the final stable board window.
+    /// Length of the final stable board window, in seconds, measured back from the end
+    /// of the last contiguous run of board keyframes. Default 120 s: long enough to
+    /// span a few keyframes at the 2 s sampling grid, short enough to exclude earlier
+    /// board states. Not a spec number; tune per corpus.
     pub final_window_s: f64,
+    /// The final window holds at least this many board keyframes when that many exist
+    /// (it is extended backward otherwise).
+    pub min_final_keyframes: usize,
+    /// Reading confidence (element and board) a single sighting needs, together with
+    /// the pixel check, to be kept.
+    pub single_sighting_min_conf: f64,
     /// Aligned ink change needed for a content event.
     pub ink_event_threshold: f64,
-    /// Direction decision policy.
-    pub direction_policy: DirectionPolicy,
     /// Share of the decisive weight a direction needs within a channel.
     pub vote_min_share: f64,
     /// Consecutive consistent keyframes to open or move an owner assignment.
     pub owner_confirm_keyframes: usize,
     /// A tag anchors to the nearest node within this many tag sizes.
     pub owner_node_anchor_share: f64,
-    /// Switches between an edge's ends that re-anchor a tag to the edge.
-    pub alternation_min_switches: usize,
-    /// Extend first assignments backward over untargeted sightings.
+    /// Alternations (A, B, A, B has 3) a strictly interleaving stretch between an
+    /// edge's ends needs before its sightings are re-anchored to the edge.
+    pub alternation_min_alternations: usize,
+    /// Record a flagged backfill interval over untargeted sightings before a first
+    /// assignment (never part of the confirmed assignment).
     pub backfill_untargeted_owners: bool,
 }
 
@@ -119,13 +156,14 @@ impl Default for ConsolidationParams {
             min_support_density: 0.10,
             removal_absent_keyframes: 2,
             final_window_s: 120.0,
+            min_final_keyframes: 3,
+            single_sighting_min_conf: 0.8,
             ink_event_threshold: 0.05,
-            direction_policy: DirectionPolicy::RequireAgreement,
             vote_min_share: 0.6,
             owner_confirm_keyframes: 2,
             owner_node_anchor_share: 1.5,
-            alternation_min_switches: 2,
-            backfill_untargeted_owners: true,
+            alternation_min_alternations: 3,
+            backfill_untargeted_owners: false,
         }
     }
 }
@@ -169,14 +207,20 @@ pub enum ElementRegistration {
 #[serde(deny_unknown_fields)]
 pub struct NodeState {
     /// Stable id.
+    #[serde(rename = "node_id")]
     pub id: String,
-    /// Display text (most frequent variant).
+    /// Current label.
     pub text: String,
-    /// Variants.
-    pub variants: Vec<TextVariant>,
+    /// Texts read for this node, most frequent first.
+    pub variants: Vec<String>,
+    /// Variants with their keyframe counts.
+    pub variant_counts: Vec<TextVariant>,
     /// Supported lifetimes.
     pub lifetimes: Vec<Lifetime>,
+    /// End of the last supported sighting.
+    pub last_seen_s: Option<f64>,
     /// Alive in the final window.
+    #[serde(rename = "in_final_state")]
     pub in_final: bool,
     /// Matching basis.
     pub registration: ElementRegistration,
@@ -230,7 +274,20 @@ pub struct StickyState {
     /// Supported lifetimes.
     pub lifetimes: Vec<Lifetime>,
     /// Alive in the final window.
+    #[serde(rename = "in_final_state")]
     pub in_final: bool,
+}
+
+/// Edge direction in the tail-to-head form downstream consumers read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeOrientation {
+    /// Arrowhead at `dst`.
+    Forward,
+    /// Not established (`src`, `dst` are `a`, `b`).
+    Uncertain,
+    /// Arrowheads at both ends.
+    Bidirectional,
 }
 
 /// A consolidated edge between nodes `a` and `b`.
@@ -247,16 +304,19 @@ pub struct EdgeState {
     pub a_text: String,
     /// Text of `b`.
     pub b_text: String,
-    /// Decided direction.
-    pub direction: EdgeDirection,
-    /// Tail node id when directed.
-    pub src: Option<String>,
-    /// Head node id when directed.
-    pub dst: Option<String>,
+    /// Decision in the `(a, b)` orientation.
+    pub decision: EdgeDirection,
+    /// Tail node id (`a` unless the decision is `b_to_a`).
+    pub src: String,
+    /// Head node id.
+    pub dst: String,
+    /// Direction of `src -> dst`.
+    pub direction: EdgeOrientation,
     /// Votes behind the decision.
     pub direction_votes: DirectionVotes,
-    /// Policy used.
-    pub direction_policy: DirectionPolicy,
+    /// Which channel decided (pixel is authoritative; VLM only when pixels were
+    /// inconclusive).
+    pub direction_basis: DirectionBasis,
     /// Most frequent non-empty label.
     pub label: String,
     /// Majority style.
@@ -277,6 +337,20 @@ pub struct RejectedOwnerTag {
     pub name_raw: String,
 }
 
+/// Where a keyframe's canvas size (and so the registration tolerance) came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CanvasSource {
+    /// Recorded with the reading.
+    Reading,
+    /// From the crop the pixel check ran on.
+    Crop,
+    /// Estimated from the extent of the elements (a lower bound; flagged).
+    Extent,
+    /// Unknown: no registration for this keyframe.
+    Unknown,
+}
+
 /// Registration record of one board keyframe.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -285,6 +359,10 @@ pub struct KeyframeRegistration {
     pub keyframe_id: String,
     /// Registration details.
     pub registration: FrameRegistration,
+    /// Source of the canvas size behind the residual tolerance.
+    pub canvas_source: CanvasSource,
+    /// OCR spans used as anchors.
+    pub ocr_anchors: usize,
 }
 
 /// The final stable board window.
@@ -305,6 +383,11 @@ pub struct FinalWindow {
 pub struct BoardStateItem {
     /// Board id.
     pub board_id: String,
+    /// This is the board's final state (the last stable board window).
+    #[serde(rename = "final")]
+    pub is_final: bool,
+    /// End of the final window.
+    pub t_end_s: Option<f64>,
     /// Board keyframes in time order.
     pub board_keyframes: Vec<String>,
     /// Registration per keyframe.
@@ -342,30 +425,42 @@ struct EdgeObs {
     segment: Segment,
 }
 
-fn canvas_of(f: &BoardFrame) -> Option<CanvasDims> {
-    f.canvas
-        .or_else(|| f.directions.as_ref().map(|d| d.canvas))
-        .or_else(|| {
-            let b = &f.board;
-            let xs = b
-                .nodes
-                .iter()
-                .map(|n| n.bbox.x2)
-                .chain(b.stickies.iter().map(|s| s.bbox.x2))
-                .chain(b.other_visible_text.iter().map(|t| t.bbox.x2));
-            let ys = b
-                .nodes
-                .iter()
-                .map(|n| n.bbox.y2)
-                .chain(b.stickies.iter().map(|s| s.bbox.y2))
-                .chain(b.other_visible_text.iter().map(|t| t.bbox.y2));
-            let w = xs.fold(0.0, f64::max);
-            let h = ys.fold(0.0, f64::max);
-            (w > 0.0 && h > 0.0).then_some(CanvasDims {
-                width: w,
-                height: h,
-            })
+fn canvas_of(f: &BoardFrame) -> (Option<CanvasDims>, CanvasSource) {
+    if let Some(c) = f.canvas {
+        return (Some(c), CanvasSource::Reading);
+    }
+    if let Some(d) = f
+        .directions
+        .as_ref()
+        .filter(|d| d.canvas.width > 0.0 && d.canvas.height > 0.0)
+    {
+        return (Some(d.canvas), CanvasSource::Crop);
+    }
+    let extent = {
+        let b = &f.board;
+        let xs = b
+            .nodes
+            .iter()
+            .map(|n| n.bbox.x2)
+            .chain(b.stickies.iter().map(|s| s.bbox.x2))
+            .chain(b.other_visible_text.iter().map(|t| t.bbox.x2));
+        let ys = b
+            .nodes
+            .iter()
+            .map(|n| n.bbox.y2)
+            .chain(b.stickies.iter().map(|s| s.bbox.y2))
+            .chain(b.other_visible_text.iter().map(|t| t.bbox.y2));
+        let w = xs.fold(0.0, f64::max);
+        let h = ys.fold(0.0, f64::max);
+        (w > 0.0 && h > 0.0).then_some(CanvasDims {
+            width: w,
+            height: h,
         })
+    };
+    match extent {
+        Some(c) => (Some(c), CanvasSource::Extent),
+        None => (None, CanvasSource::Unknown),
+    }
 }
 
 /// Boxes are usable for geometry when nodes do not all share one box.
@@ -407,12 +502,14 @@ fn median(mut v: Vec<f64>) -> f64 {
     }
 }
 
-/// Consolidate the board keyframes into one board state.
+/// Consolidate the keyframes of one board into its board state.
 pub fn consolidate(
     mut frames: Vec<BoardFrame>,
+    board_id: &str,
     params: &ConsolidationParams,
-    corroborator: &dyn Corroborator,
+    hooks: &Hooks<'_>,
 ) -> BoardStateItem {
+    let corroborator = hooks.corroborator;
     frames.sort_by(|a, b| a.t_rep_s.total_cmp(&b.t_rep_s));
     let n = frames.len();
     let fz = params.fuzzy_threshold;
@@ -431,11 +528,14 @@ pub fn consolidate(
                         b.other_visible_text
                             .iter()
                             .map(|x| (x.text.as_str(), &x.bbox)),
-                    ),
+                    )
+                    .chain(f.ocr_anchors.iter().map(|x| (x.text.as_str(), &x.bbox))),
             )
         })
         .collect();
-    let canvases: Vec<Option<CanvasDims>> = frames.iter().map(canvas_of).collect();
+    let canvas_info: Vec<(Option<CanvasDims>, CanvasSource)> =
+        frames.iter().map(canvas_of).collect();
+    let canvases: Vec<Option<CanvasDims>> = canvas_info.iter().map(|c| c.0).collect();
     let diagonals: Vec<f64> = canvases
         .iter()
         .map(|c| c.map(|c| c.diagonal()).unwrap_or(0.0))
@@ -463,6 +563,19 @@ pub fn consolidate(
             if is_unreliable(&nd.text) || params.participants.resolve(&nd.text).is_some() {
                 continue;
             }
+            // Single sightings: the pixel check traced a connector to this node and the
+            // reading is confident (plus the second reader pass when configured).
+            let pixel_ok = f.directions.as_ref().is_some_and(|d| {
+                d.edges.iter().any(|e| {
+                    (e.src == nd.local_id && e.pixel.src_end.is_some())
+                        || (e.dst == nd.local_id && e.pixel.dst_end.is_some())
+                })
+            });
+            let conf_ok = nd.conf >= params.single_sighting_min_conf
+                && f.board.confidence >= params.single_sighting_min_conf;
+            let reader_ok = hooks
+                .second_reader
+                .is_none_or(|r| r.confirms(&f.keyframe_id, &nd.text));
             obs.push(Obs {
                 frame: fi,
                 lists: vec![ObsList::Node],
@@ -471,6 +584,7 @@ pub fn consolidate(
                 cluster,
                 local_id: Some(nd.local_id.clone()),
                 color: None,
+                single_ok: pixel_ok && conf_ok && reader_ok,
             });
         }
         for s in &f.board.stickies {
@@ -485,6 +599,7 @@ pub fn consolidate(
                 cluster,
                 local_id: None,
                 color: Some(s.color),
+                single_ok: false,
             });
         }
         for t in &f.board.other_visible_text {
@@ -499,6 +614,7 @@ pub fn consolidate(
                 cluster,
                 local_id: None,
                 color: None,
+                single_ok: false,
             });
         }
         for e in &f.board.edges {
@@ -521,6 +637,7 @@ pub fn consolidate(
                     cluster,
                     local_id: None,
                     color: None,
+                    single_ok: false,
                 }),
             }
         }
@@ -580,7 +697,7 @@ pub fn consolidate(
                 },
                 n,
                 &support,
-                |_| false,
+                |f| t.obs.iter().any(|o| o.frame == f && o.single_ok),
             )
         })
         .collect();
@@ -598,8 +715,9 @@ pub fn consolidate(
         let mut v: Vec<usize> = (start..n)
             .filter(|&i| frames[i].t_rep_s >= end_s - params.final_window_s)
             .collect();
-        if v.is_empty() {
-            v.push(n - 1);
+        let want = params.min_final_keyframes.max(1).min(n);
+        if v.len() < want {
+            v = (n - want..n).collect();
         }
         v
     };
@@ -662,16 +780,18 @@ pub fn consolidate(
             ObsList::Node => {
                 let id = format!("node-{}", nodes.len() + 1);
                 node_id.insert(ti, id.clone());
-                let mut variants: Vec<TextVariant> = t
+                let mut variant_counts: Vec<TextVariant> = t
                     .variants()
                     .into_values()
                     .map(|(text, count)| TextVariant { text, count })
                     .collect();
-                variants.sort_by(|a, b| b.count.cmp(&a.count).then(a.text.cmp(&b.text)));
+                variant_counts.sort_by(|a, b| b.count.cmp(&a.count).then(a.text.cmp(&b.text)));
                 nodes.push(NodeState {
                     id,
                     text: t.current_text(fz),
-                    variants,
+                    variants: variant_counts.iter().map(|v| v.text.clone()).collect(),
+                    variant_counts,
+                    last_seen_s: lifetimes.iter().map(|l| l.last_seen_s).reduce(f64::max),
                     lifetimes,
                     in_final: alive_in_final(ivs),
                     registration: if t.obs.iter().any(|o| o.bbox.is_some()) {
@@ -827,15 +947,19 @@ pub fn consolidate(
                 }
             }
         }
-        let direction = votes.decide(params.direction_policy, params.vote_min_share);
+        let (direction, direction_basis) = votes.decide(params.vote_min_share);
         let (ida, idb) = match (node_id.get(&a), node_id.get(&b)) {
             (Some(x), Some(y)) => (x.clone(), y.clone()),
             _ => continue,
         };
         let (src, dst) = match direction {
-            EdgeDirection::AToB => (Some(ida.clone()), Some(idb.clone())),
-            EdgeDirection::BToA => (Some(idb.clone()), Some(ida.clone())),
-            _ => (None, None),
+            EdgeDirection::BToA => (idb.clone(), ida.clone()),
+            _ => (ida.clone(), idb.clone()),
+        };
+        let orientation = match direction {
+            EdgeDirection::AToB | EdgeDirection::BToA => EdgeOrientation::Forward,
+            EdgeDirection::Bidirectional => EdgeOrientation::Bidirectional,
+            EdgeDirection::Uncertain => EdgeOrientation::Uncertain,
         };
         let mut label_counts: BTreeMap<String, (String, u32)> = BTreeMap::new();
         for o in in_iv.iter().filter(|o| !o.label.is_empty()) {
@@ -863,11 +987,12 @@ pub fn consolidate(
             b: idb,
             a_text: text_of(a),
             b_text: text_of(b),
-            direction,
+            decision: direction,
             src,
             dst,
+            direction: orientation,
             direction_votes: votes,
-            direction_policy: params.direction_policy,
+            direction_basis,
             label,
             style: if dashed * 2 > in_iv.len() {
                 EdgeStyle::Dashed
@@ -887,8 +1012,12 @@ pub fn consolidate(
         })
     };
     let edge_target = |key: (usize, usize)| -> Option<OwnerTarget> {
-        edge_id_of.get(&key).map(|id| OwnerTarget::Edge {
+        let id = edge_id_of.get(&key)?;
+        let e = edges.iter().find(|e| &e.id == id)?;
+        Some(OwnerTarget::Edge {
             edge_id: id.clone(),
+            src: e.src.clone(),
+            dst: e.dst.clone(),
             a_text: text_of(key.0),
             b_text: text_of(key.1),
         })
@@ -974,13 +1103,19 @@ pub fn consolidate(
             let entry = by_person
                 .entry(person.person_id.clone())
                 .or_insert_with(|| (person.display_name.clone(), Vec::new()));
-            if entry.1.iter().any(|s| s.keyframe_id == f.keyframe_id) {
-                continue;
-            }
             let (t, anchor) = match target {
                 Some((t, a)) => (Some(t), a),
                 None => (None, AnchorKind::Untargeted),
             };
+            // Several tags of one person in a keyframe are kept when their targets
+            // differ (multi-target owners).
+            if entry
+                .1
+                .iter()
+                .any(|s| s.keyframe_id == f.keyframe_id && s.target == t)
+            {
+                continue;
+            }
             entry.1.push(OwnerSighting {
                 keyframe_id: f.keyframe_id.clone(),
                 t_start_s: f.t_start_s,
@@ -1002,10 +1137,11 @@ pub fn consolidate(
     };
     let mut owner_assignments: Vec<OwnerAssignment> = Vec::new();
     for (pid, (name, mut sightings)) in by_person {
+        collapse_edge_pairs(&mut sightings, &alternation_edges);
         apply_alternation(
             &mut sightings,
             &alternation_edges,
-            params.alternation_min_switches,
+            params.alternation_min_alternations,
         );
         owner_assignments.extend(assign(
             &pid,
@@ -1020,6 +1156,7 @@ pub fn consolidate(
     // 6. Events.
     let mut gate = EventGate::new(params.ink_event_threshold);
     let event = |kind: EventKind, f: usize, subject: &str, detail: String| BoardEvent {
+        event_id: String::new(),
         kind,
         t_s: frames[f].t_start_s,
         keyframe_id: frames[f].keyframe_id.clone(),
@@ -1083,7 +1220,7 @@ pub fn consolidate(
             if let Some(m) = m {
                 v.vlm.add(orient(m), 1.0);
             }
-            let d = v.decide(params.direction_policy, params.vote_min_share);
+            let (d, _) = v.decide(params.vote_min_share);
             if matches!(d, EdgeDirection::AToB | EdgeDirection::BToA) {
                 per_frame.push((o.frame, d));
             }
@@ -1102,39 +1239,40 @@ pub fn consolidate(
         }
     }
     let frame_of = |id: &str| frames.iter().position(|f| f.keyframe_id == id);
-    let mut by_pid: BTreeMap<&str, Vec<&OwnerAssignment>> = BTreeMap::new();
     for a in &owner_assignments {
-        by_pid.entry(a.person_id.as_str()).or_default().push(a);
-    }
-    for (pid, list) in by_pid {
-        for (k, a) in list.iter().enumerate() {
-            let Some(f) = frame_of(&a.opened_at_keyframe) else {
-                continue;
-            };
-            let kind = if k == 0 {
-                EventKind::OwnerAssigned
-            } else {
-                EventKind::OwnerMoved
-            };
-            gate.offer(event(
-                kind,
-                f,
-                pid,
-                format!("{} -> {}", a.display_name, a.target.texts().join(" - ")),
-            ));
-        }
+        let Some(f) = frame_of(&a.opened_at_keyframe) else {
+            continue;
+        };
+        // A move replaces an open target of the same person; anything else (a first
+        // assignment, an added target, a reopening) is an assignment.
+        let kind = if a.moved_from.is_some() {
+            EventKind::OwnerMoved
+        } else {
+            EventKind::OwnerAssigned
+        };
+        gate.offer(event(
+            kind,
+            f,
+            &a.person_id,
+            format!("{} -> {}", a.display_name, a.target.texts().join(" - ")),
+        ));
     }
     let (events, suppressed_events) = gate.finish();
 
     BoardStateItem {
-        board_id: "board-1".into(),
+        board_id: board_id.to_string(),
+        is_final: true,
+        t_end_s: window.as_ref().map(|w| w.end_s),
         board_keyframes: frames.iter().map(|f| f.keyframe_id.clone()).collect(),
         registration: frames
             .iter()
             .zip(regs)
-            .map(|(f, r)| KeyframeRegistration {
+            .zip(&canvas_info)
+            .map(|((f, r), c)| KeyframeRegistration {
                 keyframe_id: f.keyframe_id.clone(),
                 registration: r,
+                canvas_source: c.1,
+                ocr_anchors: f.ocr_anchors.len(),
             })
             .collect(),
         final_window: window,
@@ -1148,28 +1286,150 @@ pub fn consolidate(
     }
 }
 
-/// Largest aligned ink change at the keyframe boundaries since the previous board
-/// keyframe, for each board keyframe. `all` holds every keyframe's boundary ink change
-/// in time order; `board_index` the positions of the board keyframes in `all`.
-pub fn ink_since_previous_board(all: &[Option<f64>], board_index: &[usize]) -> Vec<Option<f64>> {
-    let mut out = Vec::with_capacity(board_index.len());
-    let mut prev: Option<usize> = None;
-    for &bi in board_index {
-        let from = prev.map(|p| p + 1).unwrap_or(bi);
-        let vals: Vec<f64> = all
-            .get(from..=bi.min(all.len().saturating_sub(1)))
-            .unwrap_or(&[])
-            .iter()
-            .filter_map(|v| *v)
-            .collect();
-        out.push(if vals.is_empty() {
-            None
-        } else {
-            Some(vals.iter().copied().fold(f64::NEG_INFINITY, f64::max))
-        });
-        prev = Some(bi);
+/// Split board keyframes into distinct boards (spec 8.1).
+///
+/// Keyframes are grouped by shared anchor texts (normalized, reliable texts of nodes,
+/// stickies, other text, and OCR spans): two keyframes sharing any text are on the
+/// same board. Groups that share no text are still one board (merged by text only)
+/// unless something separates them: their board titles differ, or no contiguous run of
+/// board keyframes contains both (a classify switch lies between every pair).
+/// Keyframes without any anchor text join the board of the nearest keyframe in time.
+/// Boards are returned in order of their first keyframe.
+pub fn split_boards(
+    mut frames: Vec<BoardFrame>,
+    params: &ConsolidationParams,
+) -> Vec<Vec<BoardFrame>> {
+    frames.sort_by(|a, b| a.t_rep_s.total_cmp(&b.t_rep_s));
+    let n = frames.len();
+    if n == 0 {
+        return Vec::new();
     }
-    out
+    let texts: Vec<std::collections::BTreeSet<String>> = frames
+        .iter()
+        .map(|f| {
+            let b = &f.board;
+            b.nodes
+                .iter()
+                .map(|x| x.text.as_str())
+                .chain(b.stickies.iter().map(|x| x.text.as_str()))
+                .chain(b.other_visible_text.iter().map(|x| x.text.as_str()))
+                .chain(f.ocr_anchors.iter().map(|x| x.text.as_str()))
+                .filter(|t| !is_unreliable(t))
+                .map(normalize)
+                .collect()
+        })
+        .collect();
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(p: &mut [usize], mut i: usize) -> usize {
+        while p[i] != i {
+            p[i] = p[p[i]];
+            i = p[i];
+        }
+        i
+    }
+    for i in 0..n {
+        for j in i + 1..n {
+            if !texts[i].is_empty() && texts[i].intersection(&texts[j]).next().is_some() {
+                let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+                parent[a.max(b)] = a.min(b);
+            }
+        }
+    }
+    // Contiguous runs of board keyframes.
+    let mut run = vec![0usize; n];
+    for i in 1..n {
+        run[i] =
+            run[i - 1] + usize::from(frames[i].keyframe_index != frames[i - 1].keyframe_index + 1);
+    }
+    let anchored: Vec<usize> = (0..n).filter(|&i| !texts[i].is_empty()).collect();
+    let roots: Vec<usize> = {
+        let mut r: Vec<usize> = anchored.iter().map(|&i| find(&mut parent, i)).collect();
+        r.sort_unstable();
+        r.dedup();
+        r
+    };
+    let title = |root: usize, parent: &mut Vec<usize>| -> Option<String> {
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for (i, f) in frames.iter().enumerate() {
+            if find(parent, i) == root {
+                if let Some(t) = f
+                    .board_title
+                    .as_deref()
+                    .map(normalize)
+                    .filter(|t| !t.is_empty())
+                {
+                    *counts.entry(t).or_default() += 1;
+                }
+            }
+        }
+        counts.into_iter().max_by_key(|e| e.1).map(|e| e.0)
+    };
+    let runs_of = |root: usize, parent: &mut Vec<usize>| -> std::collections::BTreeSet<usize> {
+        (0..n)
+            .filter(|&i| find(parent, i) == root)
+            .map(|i| run[i])
+            .collect()
+    };
+    let infos: Vec<(usize, Option<String>, std::collections::BTreeSet<usize>)> = roots
+        .iter()
+        .map(|&r| (r, title(r, &mut parent), runs_of(r, &mut parent)))
+        .collect();
+    // Merge groups that nothing separates.
+    let mut board_of: Vec<usize> = (0..infos.len()).collect();
+    for x in 0..infos.len() {
+        for y in x + 1..infos.len() {
+            let titles_differ = match (&infos[x].1, &infos[y].1) {
+                (Some(a), Some(b)) => {
+                    a != b && crate::difflib::ratio(a, b) < params.fuzzy_threshold
+                }
+                _ => false,
+            };
+            let share_run = infos[x].2.intersection(&infos[y].2).next().is_some();
+            if !titles_differ && share_run {
+                let (a, b) = (board_of[x], board_of[y]);
+                let (lo, hi) = (a.min(b), a.max(b));
+                for v in board_of.iter_mut() {
+                    if *v == hi {
+                        *v = lo;
+                    }
+                }
+            }
+        }
+    }
+    let mut board_idx = vec![usize::MAX; n];
+    for (k, info) in infos.iter().enumerate() {
+        for i in 0..n {
+            if find(&mut parent, i) == info.0 && !texts[i].is_empty() {
+                board_idx[i] = board_of[k];
+            }
+        }
+    }
+    // Keyframes without anchors join the nearest anchored keyframe's board.
+    for i in 0..n {
+        if board_idx[i] == usize::MAX {
+            let nearest = anchored
+                .iter()
+                .min_by(|&&a, &&b| {
+                    (frames[a].t_rep_s - frames[i].t_rep_s)
+                        .abs()
+                        .total_cmp(&(frames[b].t_rep_s - frames[i].t_rep_s).abs())
+                })
+                .map(|&a| board_idx[a]);
+            board_idx[i] = nearest.unwrap_or(0);
+        }
+    }
+    let mut boards: BTreeMap<usize, Vec<BoardFrame>> = BTreeMap::new();
+    let mut first_seen: Vec<usize> = Vec::new();
+    for (i, f) in frames.into_iter().enumerate() {
+        if !first_seen.contains(&board_idx[i]) {
+            first_seen.push(board_idx[i]);
+        }
+        boards.entry(board_idx[i]).or_default().push(f);
+    }
+    first_seen
+        .into_iter()
+        .filter_map(|b| boards.remove(&b))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1182,14 +1442,5 @@ mod tests {
         assert_eq!(sticky_kind("Beta milestone: March"), StickyKind::Milestone);
         assert_eq!(sticky_kind("Idea: batch the writes"), StickyKind::Idea);
         assert_eq!(sticky_kind("Clone the landing page"), StickyKind::Note);
-    }
-
-    #[test]
-    fn ink_since_previous_board_takes_the_max_over_skipped_keyframes() {
-        let all = [Some(0.2), Some(0.01), Some(0.3), Some(0.02), None];
-        assert_eq!(
-            ink_since_previous_board(&all, &[0, 1, 3, 4]),
-            vec![Some(0.2), Some(0.01), Some(0.3), None]
-        );
     }
 }

@@ -262,18 +262,10 @@ pub fn register(
         }
         cluster += 1;
     }
-    out.into_iter()
-        .map(|r| {
-            r.unwrap_or(FrameRegistration {
-                cluster: usize::MAX,
-                mode: RegistrationMode::TextOnly,
-                to_reference: Similarity::IDENTITY,
-                inliers: 0,
-                rms_px: 0.0,
-                via: None,
-            })
-        })
-        .collect()
+    // Every keyframe is assigned: each outer iteration registers at least its
+    // reference, and the loop ends only when none is left unregistered.
+    debug_assert!(out.iter().all(Option::is_some));
+    out.into_iter().flatten().collect()
 }
 
 /// Map a box through a similarity (bounding box of the mapped corners).
@@ -400,5 +392,35 @@ mod tests {
         let a1 = Anchors::from_items(items);
         let regs = register(&[a0, a1], &[2203.0; 2], &RegistrationParams::default());
         assert!(regs.iter().all(|r| r.mode == RegistrationMode::TextOnly));
+    }
+
+    #[test]
+    fn rotated_and_scaled_views_chain_to_one_reference() {
+        let t1 = Similarity {
+            scale: 1.4,
+            angle: 0.3,
+            tx: -200.0,
+            ty: 80.0,
+        };
+        let t2 = Similarity {
+            scale: 0.7,
+            angle: -0.25,
+            tx: 150.0,
+            ty: 210.0,
+        };
+        let a0 = anchors(&BOARD, &Similarity::IDENTITY);
+        let a1 = anchors(&BOARD, &t1);
+        let a2 = anchors(&BOARD[2..], &t2);
+        let regs = register(&[a0, a1, a2], &[1000.0; 3], &RegistrationParams::default());
+        assert!(regs.iter().all(|r| r.cluster == regs[0].cluster));
+        let inv0 = regs[0].to_reference.inverse().unwrap();
+        for (i, t) in [(1usize, t1), (2, t2)] {
+            let p = t.apply((650.0, 400.0));
+            let back = inv0.apply(regs[i].to_reference.apply(p));
+            assert!(
+                (back.0 - 650.0).abs() < 1e-6 && (back.1 - 400.0).abs() < 1e-6,
+                "{i}: {back:?}"
+            );
+        }
     }
 }
