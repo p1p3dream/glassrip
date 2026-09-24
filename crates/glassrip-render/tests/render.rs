@@ -128,8 +128,9 @@ fn coincident_boxes_are_separated() {
 
 #[test]
 fn edge_labels_never_cover_zone_titles() {
-    // Move each box over a grid of offsets: wherever an edge enters a zone, its
-    // label must not land on the zone's title.
+    // Move each box over a grid of offsets: wherever an edge runs, its label must
+    // not land on a zone title, a card, or anything else (a long relation label
+    // wraps when it does not fit on one line).
     let (notes, board) = inputs();
     let mut titled = 0;
     for i in 0..board.nodes.len() {
@@ -151,10 +152,10 @@ fn edge_labels_never_cover_zone_titles() {
                     .filter(|(n, _)| n.starts_with("zone title"))
                     .count();
                 // Crowded positions may leave a note unplaced (reported, not
-                // drawn); what this checks is that no zone title is covered.
+                // drawn); what this checks is that no label covers anything.
                 let o: Vec<String> = overlaps(&scene)
                     .into_iter()
-                    .filter(|m| m.contains("zone title"))
+                    .filter(|m| m.contains("zone title") || m.contains("edge label"))
                     .collect();
                 assert!(o.is_empty(), "node {i} moved by ({dx}, {dy}): {o:?}");
             }

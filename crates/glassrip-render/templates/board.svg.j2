@@ -120,6 +120,9 @@
 {%- endfor %}
 {%- if e.label %}
   {{ pill(e.label) }}
+{%- for t in e.label_lines %}
+  {{ text(t) }}
+{%- endfor %}
 {%- endif %}
 {%- endfor %}
 

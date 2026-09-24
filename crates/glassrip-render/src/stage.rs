@@ -75,7 +75,8 @@ impl Stage for RenderStage {
         "render"
     }
     fn version(&self) -> u32 {
-        1
+        // 2: edge labels avoid zone titles, slide along their path, and wrap.
+        2
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
