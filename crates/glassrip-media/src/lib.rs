@@ -12,6 +12,7 @@ pub mod gaussian;
 pub mod ink;
 pub mod jpeg;
 pub mod plane;
+pub mod production;
 pub mod resize;
 pub mod segment;
 pub mod sharpness;
