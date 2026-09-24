@@ -334,6 +334,29 @@ struct TagModel {
     model: String,
     #[serde(default)]
     digest: String,
+    #[serde(default)]
+    size: u64,
+}
+
+/// A model's size before it is loaded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelSize {
+    /// Bytes of the model files (`/api/tags` `size`); a lower bound on the loaded footprint.
+    pub file_bytes: Option<u64>,
+    /// Parameters in billions (`/api/show` `details.parameter_size`, for example `8.3B`).
+    pub parameter_size_b: Option<f64>,
+}
+
+/// Parses a parameter size such as `8.3B`, `32B`, or `700M` into billions.
+pub fn parse_parameter_size(s: &str) -> Option<f64> {
+    let t = s.trim();
+    let (num, scale) = match t.chars().last()? {
+        'B' | 'b' => (&t[..t.len() - 1], 1.0),
+        'M' | 'm' => (&t[..t.len() - 1], 1e-3),
+        'T' | 't' => (&t[..t.len() - 1], 1e3),
+        _ => (t, 1.0),
+    };
+    num.trim().parse::<f64>().ok().map(|v| v * scale)
 }
 
 /// Outcome of one HTTP attempt, before retry policy is applied.
@@ -818,6 +841,39 @@ impl OllamaBackend {
         Ok(digest)
     }
 
+    /// The model's size from `/api/tags` (file bytes) and `/api/show`
+    /// (parameter count), for scheduling before the model is loaded. Missing
+    /// fields are `None`; a model absent from the server is an error.
+    pub async fn model_size(&self) -> Result<ModelSize> {
+        let cancel = CancellationToken::new();
+        let (tags, _) = self
+            .with_retries(&cancel, || self.get_once("/api/tags"))
+            .await?;
+        let tags: TagsResponse = serde_json::from_value(tags)
+            .map_err(|e| VisionError::Protocol(format!("/api/tags response: {e}")))?;
+        let file_bytes = tags
+            .models
+            .into_iter()
+            .find(|m| same_model(&m.name, &m.model, &self.config.model))
+            .map(|m| m.size)
+            .filter(|s| *s > 0);
+        let body = json!({"model": self.config.model});
+        let (show, _) = self
+            .with_retries(&cancel, || {
+                self.post_once("/api/show", &body, self.config.metadata_timeout)
+            })
+            .await?;
+        let parameter_size_b = show
+            .get("details")
+            .and_then(|d| d.get("parameter_size"))
+            .and_then(Value::as_str)
+            .and_then(parse_parameter_size);
+        Ok(ModelSize {
+            file_bytes,
+            parameter_size_b,
+        })
+    }
+
     async fn loaded_model(&self) -> Result<Option<PsModel>> {
         let cancel = CancellationToken::new();
         let (ps, _) = self
@@ -1022,6 +1078,14 @@ mod tests {
         }
         assert_eq!(parse_retry_after(&h, now), Some(Duration::from_secs(30)));
         assert_eq!(parse_retry_after(&HeaderMap::new(), now), None);
+    }
+
+    #[test]
+    fn parameter_sizes_parse() {
+        assert_eq!(parse_parameter_size("8.3B"), Some(8.3));
+        assert_eq!(parse_parameter_size("32B"), Some(32.0));
+        assert!(parse_parameter_size("700M").is_some_and(|v| (v - 0.7).abs() < 1e-12));
+        assert_eq!(parse_parameter_size("x"), None);
     }
 
     #[test]

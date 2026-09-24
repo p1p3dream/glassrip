@@ -100,6 +100,8 @@ pub enum CheckKind {
     StageStart,
     /// Wait-for-server and re-preflight after a transient failure.
     Recovery,
+    /// Placement poll while ASR shares the GPU (spec 5.3).
+    AsrGuard,
 }
 
 /// One recorded check.
@@ -208,6 +210,9 @@ pub struct PlacementMonitor {
     digest: Mutex<Option<String>>,
     abort: Mutex<Option<ErrorInfo>>,
     checks: Mutex<Vec<PlacementCheck>>,
+    /// Set while an ASR guard holds new submissions; the periodic checks do
+    /// not lift a pause the guard owns.
+    asr_hold: std::sync::atomic::AtomicBool,
 }
 
 impl PlacementMonitor {
@@ -223,7 +228,45 @@ impl PlacementMonitor {
             digest: Mutex::new(None),
             abort: Mutex::new(None),
             checks: Mutex::new(Vec::new()),
+            asr_hold: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Runs `fut` (the ASR stage) while polling placement every `interval`,
+    /// starting immediately. When the vision model spills out of VRAM (the ASR
+    /// peak), new vision submissions pause until `fut` finishes (spec 5.3);
+    /// requests already in flight complete. whisper.cpp decodes every chunk
+    /// inside one call, so the poll is time based rather than per chunk.
+    pub async fn guard_asr<F: std::future::Future>(&self, fut: F, interval: Duration) -> F::Output {
+        tokio::pin!(fut);
+        let mut ticker = tokio::time::interval(interval.max(Duration::from_millis(1)));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let out = loop {
+            tokio::select! {
+                biased;
+                out = &mut fut => break out,
+                _ = ticker.tick() => self.asr_check().await,
+            }
+        };
+        if self.asr_hold.swap(false, Ordering::SeqCst) {
+            tracing::info!("ASR finished; resuming vision requests");
+            self.client.resume();
+        }
+        out
+    }
+
+    async fn asr_check(&self) {
+        let r = self.probe.placement().await.map_err(|e| e.to_string());
+        let spilling = matches!(&r, Ok(Some(p)) if !p.fully_on_gpu);
+        let mut rec = Self::check_record(CheckKind::AsrGuard, self.completed(), &r);
+        if spilling && !self.asr_hold.swap(true, Ordering::SeqCst) {
+            tracing::warn!(
+                "vision model spilling while ASR runs; pausing vision requests until ASR finishes"
+            );
+            self.client.pause();
+        }
+        rec.paused = self.asr_hold.load(Ordering::SeqCst);
+        self.record(rec);
     }
 
     pub fn client(&self) -> &VisionClient {
@@ -498,8 +541,11 @@ impl PlacementMonitor {
                 break;
             }
         }
-        // Resume so paused requests reach the abort check and fail fast.
-        self.client.resume();
+        // Resume so paused requests reach the abort check and fail fast; an
+        // ASR guard's hold stays until ASR finishes (unless the run aborts).
+        if !self.asr_hold.load(Ordering::SeqCst) || self.abort_error().is_some() {
+            self.client.resume();
+        }
     }
 }
 
@@ -702,5 +748,76 @@ mod tests {
         // A cache hit reports few prompt tokens; that is not an error.
         assert!(check_usage(&raw(Some(50), Some(300), "stop"), 8192).is_ok());
         assert!(check_usage(&raw(None, None, "stop"), 8192).is_ok());
+    }
+
+    /// Spills from the second poll on.
+    struct SpillsLater {
+        polls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl PlacementProbe for SpillsLater {
+        async fn preflight(&self) -> Result<Placement, VisionError> {
+            Ok(on_gpu())
+        }
+        async fn placement(&self) -> Result<Option<Placement>, VisionError> {
+            let n = self.polls.fetch_add(1, Ordering::SeqCst);
+            let mut p = on_gpu();
+            p.fully_on_gpu = n == 0;
+            Ok(Some(p))
+        }
+        async fn digest(&self) -> Result<String, VisionError> {
+            Ok("static".into())
+        }
+        async fn server_up(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn asr_guard_pauses_vision_on_spill_until_asr_ends() {
+        let client = VisionClient::new(Arc::new(Nop), 2).unwrap();
+        let probe = Arc::new(SpillsLater {
+            polls: AtomicUsize::new(0),
+        });
+        let m = PlacementMonitor::new(probe.clone(), client.clone(), MonitorConfig::default());
+        let watched = client.clone();
+        let asr = async move {
+            // Long enough for several polls.
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            watched.is_paused()
+        };
+        let paused_during = m.guard_asr(asr, Duration::from_millis(10)).await;
+        assert!(
+            paused_during,
+            "vision must be paused while ASR runs on a spill"
+        );
+        assert!(!client.is_paused(), "resumed once ASR finished");
+        let checks = m.checks();
+        assert!(checks.iter().all(|c| c.kind == CheckKind::AsrGuard));
+        assert!(checks.len() >= 2, "{checks:?}");
+        assert!(!checks[0].paused && checks.last().is_some_and(|c| c.paused));
+    }
+
+    #[tokio::test]
+    async fn asr_guard_leaves_vision_running_when_placement_holds() {
+        let client = VisionClient::new(Arc::new(Nop), 2).unwrap();
+        let m = PlacementMonitor::new(
+            Arc::new(StaticProbe),
+            client.clone(),
+            MonitorConfig::default(),
+        );
+        let watched = client.clone();
+        let paused = m
+            .guard_asr(
+                async move {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    watched.is_paused()
+                },
+                Duration::from_millis(5),
+            )
+            .await;
+        assert!(!paused);
+        assert!(!m.checks().is_empty());
     }
 }

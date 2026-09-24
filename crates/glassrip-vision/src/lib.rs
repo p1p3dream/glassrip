@@ -21,6 +21,6 @@ pub use backend::{
 pub use error::{FieldError, Result, VisionError};
 pub use geometry::BBox;
 pub use image_prep::{EncodedImage, PreparedImage, SizePlan};
-pub use ollama::{OllamaBackend, OllamaConfig, SelfTestReport};
+pub use ollama::{ModelSize, OllamaBackend, OllamaConfig, SelfTestReport};
 pub use pool::VisionClient;
 pub use schema::OutputSchema;

@@ -763,3 +763,29 @@ async fn format_is_the_structural_schema() {
     );
     assert_eq!(body["format"]["additionalProperties"], json!(false));
 }
+
+#[tokio::test]
+async fn model_size_comes_from_tags_and_show() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "models": [
+                {"name": "other:1b", "model": "other:1b", "digest": "x", "size": 1},
+                {"name": MODEL, "model": MODEL, "digest": DIGEST, "size": 21_000_000_000u64}
+            ]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/show"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "digest": DIGEST,
+            "details": {"parameter_size": "32.8B", "quantization_level": "Q4_K_M"}
+        })))
+        .mount(&server)
+        .await;
+    let size = backend(&server).model_size().await.unwrap();
+    assert_eq!(size.file_bytes, Some(21_000_000_000));
+    assert_eq!(size.parameter_size_b, Some(32.8));
+}
