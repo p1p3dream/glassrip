@@ -11,7 +11,7 @@ use glassrip_core::runner::{
     ArtifactSpec, InputDecl, ItemContext, KeyExtras, Stage, StageError, StageInputs, WorkItem,
 };
 
-use crate::schema::{FEATURES, FRAMES, FrameFeatures, FrameRecord, PairToPrev, SCREEN_QUADS, v1};
+use crate::schema::{FEATURES, FRAMES, FrameFeatures, FrameRecord, PairToPrev, v1};
 use crate::scoring::{Scorer, ScoringParams};
 
 /// Per-item work.
@@ -62,7 +62,7 @@ impl Stage for FeaturesStage {
         "features"
     }
     fn version(&self) -> u32 {
-        1
+        2
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
@@ -71,18 +71,11 @@ impl Stage for FeaturesStage {
         }
     }
     fn inputs(&self) -> Vec<InputDecl> {
-        // `screen_quads` is declared by the stage graph; features run on unrectified frames
-        // exactly as the prototype did, so the quads are not used here.
-        vec![
-            InputDecl {
-                schema: FRAMES,
-                major: 1,
-            },
-            InputDecl {
-                schema: SCREEN_QUADS,
-                major: 1,
-            },
-        ]
+        // Features run on unrectified frames exactly as the prototype did (spec 6.4).
+        vec![InputDecl {
+            schema: FRAMES,
+            major: 1,
+        }]
     }
     fn params(&self) -> &ScoringParams {
         &self.params

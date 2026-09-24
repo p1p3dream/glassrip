@@ -359,11 +359,8 @@ pub fn meeting_mode_stage_decls() -> Vec<StageDecl> {
             &["glassrip.media_probe", "glassrip.orientation"],
         ),
         d("screen_quad", "glassrip.screen_quads", &["glassrip.frames"]),
-        d(
-            "features",
-            "glassrip.features",
-            &["glassrip.frames", "glassrip.screen_quads"],
-        ),
+        // Features run on unrectified frames (spec 6.4), so they do not read the quads.
+        d("features", "glassrip.features", &["glassrip.frames"]),
         d(
             "keyframes",
             "glassrip.keyframes",
@@ -472,7 +469,9 @@ mod tests {
         let g = StageGraph::new(meeting_mode_stage_decls()).unwrap();
         let order = g.order();
         let pos = |s: &str| order.iter().position(|x| *x == s).unwrap();
-        assert!(pos("screen_quad") < pos("features"));
+        assert!(pos("frames") < pos("features") && pos("frames") < pos("screen_quad"));
+        assert!(pos("screen_quad") < pos("rectify") && pos("features") < pos("keyframes"));
+        assert!(!g.ancestors("features").unwrap().contains("screen_quad"));
         assert!(pos("keyframes") < pos("rectify"));
         assert!(pos("ocr_harvest") < pos("classify"));
         assert!(pos("ocr_harvest") < pos("asr"));
