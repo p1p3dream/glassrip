@@ -9,13 +9,15 @@
 //!   phrases (recall cues, hedges included), which the model must accept
 //!   (citing them) or leave out. Interrogative sentences are question cues;
 //!   first-person futures count only when they name a work task.
-//! - [`has_commitment`]: the decision precision guard: a sentence with an
-//!   assertive group commitment cue (a separate, stricter list), a first-person
-//!   future naming a work task, or a group decision verb with an object; not a
-//!   question, not hedged, and not a personal activity.
+//! - [`has_commitment`]: the decision precision guard, judged per clause: a
+//!   subject (a group cue, "we" with a decision verb, or a first-person future
+//!   with a task verb) and a verb with a real object (no flow continuations
+//!   or navigation objects); not a question, and the committing clause is not
+//!   hedged, conditional or a personal activity.
 //! - [`owner_actions`]: owner tags still valid at the end become "Own <target>"
-//!   action items when a nearby line names the owner, or the owner speaks
-//!   about the target nearby; they pass the same validation as model items.
+//!   action items when the owner speaks about the target nearby, or someone
+//!   else names the owner about the target nearby; they pass the same
+//!   validation as model items.
 //! - [`strip_item_prefix`]: removes narrative prefixes ("The team decided to").
 //! - [`windows_by_time`]: overlapping time windows.
 
@@ -32,7 +34,7 @@ use crate::board::{
 };
 use crate::named::NamedLine;
 use crate::text::{
-    content_tokens, estimate_tokens, is_stopword, mmss, names_target, sanitize_dashes,
+    content_tokens, estimate_tokens, is_stopword, mmss, names_target, sanitize_dashes, tokens,
 };
 
 /// Owner events of an assignment: the owner tag of this person appearing on,
@@ -146,18 +148,47 @@ const FIRST_PERSON_FUTURES: &[&str] = &[
     "i'm gonna",
     "i am going to",
 ];
-/// Assertive commitment cues for the precision guard (no hedges, no temporal
-/// scoping such as "for now"). First-person futures are not here: they commit
-/// only when they name a work task (see [`first_person_work`]).
-const COMMIT_CUES: &[&str] = &[
-    "let's",
-    "let us",
-    "we'll",
-    "we will",
-    "go with",
-    "decided",
-    "we are going to",
-    "we're going to",
+/// Group commitment cues for the precision guard, as word sequences; the verb
+/// follows (after fillers). No hedges and no temporal scoping ("for now").
+const GROUP_CUES: &[&[&str]] = &[
+    &["let's"],
+    &["let", "us"],
+    &["we'll"],
+    &["we", "will"],
+    &["we", "are", "going", "to"],
+    &["we're", "going", "to"],
+    &["we're", "gonna"],
+    &["decided"],
+];
+/// First-person future cues for the precision guard; a task verb follows
+/// within three words.
+const FIRST_PERSON_CUES: &[&[&str]] = &[
+    &["i'll"],
+    &["i", "will"],
+    &["i'm", "going", "to"],
+    &["i'm", "gonna"],
+    &["i", "am", "going", "to"],
+];
+/// Words between a cue and its verb ("let's just ship", "we'll not change",
+/// "decided to move").
+const FILLERS: &[&str] = &[
+    "just",
+    "also",
+    "definitely",
+    "then",
+    "now",
+    "actually",
+    "still",
+    "officially",
+    "not",
+    "to",
+    "all",
+];
+/// Verbs after a group cue that steer the conversation rather than decide
+/// ("let's see", "let's say", "we'll talk about it later").
+const NONCOMMITTAL: &[&str] = &[
+    "see", "say", "think", "hear", "talk", "chat", "discuss", "wait", "be", "have", "need", "hope",
+    "assume", "imagine", "suppose", "look", "recap",
 ];
 /// Decision verbs that commit when the group is the subject ("we keep the API
 /// on REST", "we're switching to weekly builds"). Status verbs ("we use", "we
@@ -175,6 +206,10 @@ const DECISION_VERBS: &[&str] = &[
     "pick",
     "choose",
     "adopt",
+    "push",
+    "postpone",
+    "cancel",
+    "go",
     "keeping",
     "sticking",
     "staying",
@@ -187,54 +222,108 @@ const DECISION_VERBS: &[&str] = &[
     "picking",
     "choosing",
     "adopting",
+    "pushing",
+    "postponing",
+    "cancelling",
+    "canceling",
 ];
 
-/// Words right after a decision verb that make it a meeting-flow phrase
-/// ("we keep going", "we skip ahead", "we drop off"), not a decision.
-const CONTINUATIONS: &[&str] = &["going", "ahead", "along", "forward", "off", "rolling"];
-/// Movement verbs whose "on" means "proceed" ("we move on").
-const PROCEED_VERBS: &[&str] = &["move", "moving", "keep", "keeping"];
-/// Particles and prepositions between a decision verb and its object.
+/// Words that make a verb phrase a meeting-flow phrase ("we keep going", "we
+/// skip ahead", "we drop off", "let's get started") when they come before any
+/// object.
+const CONTINUATIONS: &[&str] = &[
+    "going", "ahead", "along", "forward", "off", "rolling", "started",
+];
+/// Movement verbs whose "on" means "proceed" ("we move on", "let's go on").
+const PROCEED_VERBS: &[&str] = &["move", "moving", "keep", "keeping", "go", "carry"];
+/// Particles and prepositions between a verb and its object.
 const PARTICLES: &[&str] = &[
     "on", "to", "with", "over", "up", "down", "out", "in", "into", "onto", "at", "for", "from",
-    "by", "back", "away",
+    "by", "back", "away", "around", "aside",
 ];
-/// Words that fill an object slot without naming anything decided ("we stay on
-/// track", "we move to the next item", "we pick this up tomorrow").
+/// Particles that, after a pronoun, make a phrasal verb ("pick this up",
+/// "figure it out", "circle back").
+const PHRASAL: &[&str] = &[
+    "up", "down", "off", "back", "out", "over", "along", "away", "around", "aside",
+];
+/// Pronouns that stand in for a decided object ("we ship it").
+const PRONOUNS: &[&str] = &["it", "this", "that", "them", "these", "those"];
+/// Words that fill an object slot without naming anything decided: time,
+/// agenda and navigation words ("we stay on track", "we move to the next
+/// slide", "we skip to the end").
 const FLOW_WORDS: &[&str] = &[
-    "track", "now", "today", "tomorrow", "later", "next", "topic", "agenda", "item", "items",
-    "point", "thing", "things", "one", "bit", "minute", "second", "moment", "time", "then",
-    "anyway", "instead", "too", "all", "everyone", "guys", "folks", "okay", "right", "again",
-    "same", "quickly", "real", "quick",
+    "track",
+    "now",
+    "today",
+    "tomorrow",
+    "later",
+    "next",
+    "topic",
+    "topics",
+    "agenda",
+    "item",
+    "items",
+    "point",
+    "thing",
+    "things",
+    "one",
+    "bit",
+    "minute",
+    "second",
+    "moment",
+    "time",
+    "then",
+    "anyway",
+    "instead",
+    "too",
+    "all",
+    "everyone",
+    "guys",
+    "folks",
+    "people",
+    "okay",
+    "right",
+    "again",
+    "same",
+    "quickly",
+    "real",
+    "quick",
+    "slide",
+    "slides",
+    "end",
+    "start",
+    "beginning",
+    "top",
+    "section",
+    "question",
+    "questions",
+    "recap",
+    "here",
+    "there",
 ];
-
-/// A group subject, a decision verb and an object: "we keep the API on REST",
-/// "we're switching to weekly builds". The object must name something: flow
-/// continuations ("we keep going", "we move on") and flow words ("we stay on
-/// track") do not count.
-fn group_decision(n: &str) -> bool {
-    let w: Vec<&str> = n.split_whitespace().collect();
-    (0..w.len().saturating_sub(1)).any(|i| {
-        matches!(w[i], "we" | "we're")
-            && DECISION_VERBS.contains(&w[i + 1])
-            && decision_object(w[i + 1], &w[i + 2..])
-    })
-}
-
-fn decision_object(verb: &str, rest: &[&str]) -> bool {
-    match rest.first() {
-        None => return false,
-        Some(next) if CONTINUATIONS.contains(next) => return false,
-        Some(&"on") if PROCEED_VERBS.contains(&verb) => return false,
-        Some(_) => {}
-    }
-    rest.iter()
-        .any(|t| !is_stopword(t) && !PARTICLES.contains(t) && !FLOW_WORDS.contains(t))
-}
-
-/// Hedges that make a sentence tentative rather than a commitment.
+/// Words that open a subordinate clause; the guard judges clauses separately.
+const SUBORDINATORS: &[&str] = &[
+    "because", "though", "although", "before", "after", "while", "since", "unless", "if", "whereas",
+];
+/// Hedges and hypotheticals that make a clause tentative rather than a
+/// commitment.
 const HEDGES: &[&str] = &[
-    "maybe", "perhaps", "i think", "should", "might", "probably", "could", "not sure", "if we",
+    "maybe",
+    "perhaps",
+    "i think",
+    "should",
+    "might",
+    "probably",
+    "could",
+    "not sure",
+    "if we",
+    "let's say",
+    "say we",
+    "suppose",
+    "supposing",
+    "imagine",
+    "assuming",
+    "hypothetically",
 ];
 /// Phrases that open a question.
 const QUESTION_CUES: &[&str] = &[
@@ -278,7 +367,8 @@ fn is_question(sentence: &str, n: &str) -> bool {
 }
 
 /// The words after the first first-person future cue name a work task: a task
-/// verb within the next three words and no personal activity.
+/// verb within the next three words and no personal activity. Used by the
+/// recall cues; the guard applies the stricter [`clause_commits`].
 fn first_person_work(n: &str) -> bool {
     FIRST_PERSON_FUTURES.iter().any(|c| {
         let needle = format!(" {c} ");
@@ -293,20 +383,141 @@ fn first_person_work(n: &str) -> bool {
     })
 }
 
-/// True when a line holds a sentence with an assertive commitment: a group
-/// commitment cue, a first-person future naming a work task, or a group
-/// decision with an object (checked per clause, so "we move on, the importer
-/// is done" does not read "the importer" as the object); not a question, not
-/// hedged, and not a personal activity ("I'll be right back", "let's grab a
-/// coffee").
+fn starts_with_seq(w: &[&str], i: usize, seq: &[&str]) -> bool {
+    w.len() >= i + seq.len() && w[i..i + seq.len()] == *seq
+}
+
+/// The verb and what follows it name something decided: a content word that
+/// is not a flow word, reached before any continuation ("we keep going",
+/// "let's move on", "we keep right on going" do not commit), or a pronoun
+/// object of a decision or task verb that is not a phrasal particle's ("we
+/// ship it" commits, "we pick this up" does not).
+fn verb_commits(verb: &str, rest: &[&str]) -> bool {
+    if rest.first() == Some(&"on") && PROCEED_VERBS.contains(&verb) {
+        return false;
+    }
+    let pronoun_ok = DECISION_VERBS.contains(&verb) || is_task_verb(verb);
+    for (k, t) in rest.iter().enumerate() {
+        if CONTINUATIONS.contains(t) {
+            return false;
+        }
+        if PRONOUNS.contains(t) {
+            if pronoun_ok && !rest.get(k + 1).is_some_and(|p| PHRASAL.contains(p)) {
+                return true;
+            }
+            continue;
+        }
+        if !is_stopword(t) && !PARTICLES.contains(t) && !FLOW_WORDS.contains(t) {
+            return true;
+        }
+    }
+    false
+}
+
+/// One clause holds a commitment. Every leg finds a subject and a verb and
+/// then applies the same object test ([`verb_commits`]):
+///
+/// - a group cue ("let's", "we'll", "we're going to", "decided") and the verb
+///   after it, unless the verb steers the conversation ("let's see");
+/// - "we" or "we're" and a decision verb ("we keep the API", "we ship it");
+/// - a first-person future and a task verb within three words ("I'll write
+///   the spec"); "go with" needs one of these subjects too.
+fn clause_commits(w: &[&str]) -> bool {
+    for i in 0..w.len() {
+        for cue in GROUP_CUES {
+            if !starts_with_seq(w, i, cue) {
+                continue;
+            }
+            let mut j = i + cue.len();
+            if starts_with_seq(w, j, &["go", "ahead", "and"]) {
+                j += 3;
+            }
+            while w.get(j).is_some_and(|t| FILLERS.contains(t)) {
+                j += 1;
+            }
+            if let Some(verb) = w.get(j) {
+                if !NONCOMMITTAL.contains(verb) && verb_commits(verb, &w[j + 1..]) {
+                    return true;
+                }
+            }
+        }
+        if matches!(w[i], "we" | "we're")
+            && w.get(i + 1).is_some_and(|v| DECISION_VERBS.contains(v))
+            && verb_commits(w[i + 1], &w[i + 2..])
+        {
+            return true;
+        }
+        for cue in FIRST_PERSON_CUES {
+            if !starts_with_seq(w, i, cue) {
+                continue;
+            }
+            let rest = &w[i + cue.len()..];
+            for k in 0..rest.len().min(3) {
+                let v = rest[k];
+                let go_with = v == "go" && rest.get(k + 1) == Some(&"with");
+                if is_task_verb(v) || go_with {
+                    if verb_commits(v, &rest[k + 1..]) {
+                        return true;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Clauses of a sentence, as padded cue text: split on , ; : and before
+/// subordinators ("because", "though", "before", "if").
+fn clauses(sentence: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for part in sentence.split([',', ';', ':']) {
+        let n = cue_text(part);
+        let mut cur: Vec<&str> = Vec::new();
+        for w in n.split_whitespace() {
+            if SUBORDINATORS.contains(&w) && !cur.is_empty() {
+                out.push(format!(" {} ", cur.join(" ")));
+                cur.clear();
+            }
+            cur.push(w);
+        }
+        if !cur.is_empty() {
+            out.push(format!(" {} ", cur.join(" ")));
+        }
+    }
+    out
+}
+
+fn is_conditional(clause: &str) -> bool {
+    clause.starts_with(" if ") || clause.starts_with(" unless ")
+}
+
+/// A short clause that only hedges what follows ("maybe, ...", "I think, ...").
+fn is_hedge_only(clause: &str) -> bool {
+    has_any(clause, HEDGES) && clause.split_whitespace().count() <= 3
+}
+
+/// True when a line holds a clause with an assertive commitment
+/// ([`clause_commits`]) in a sentence that is not a question. The hedge and
+/// personal-activity vetoes apply to the committing clause only, plus a
+/// conditional clause next to it or a hedge-only clause before it: "we'll go
+/// with the second layout, though we should revisit it" commits, "I'll be
+/// right back" and "let's ship it if the tests pass" do not.
 pub fn has_commitment(text: &str) -> bool {
     split_sentences(text).iter().any(|s| {
-        let n = cue_text(s);
-        let committed = has_any(&n, COMMIT_CUES)
-            || first_person_work(&n)
-            || s.split([',', ';', ':'])
-                .any(|clause| group_decision(&cue_text(clause)));
-        committed && !is_question(s, &n) && !has_any(&n, HEDGES) && !is_personal_activity(&n)
+        if is_question(s, &cue_text(s)) {
+            return false;
+        }
+        let cs = clauses(s);
+        (0..cs.len()).any(|i| {
+            let c = &cs[i];
+            let w: Vec<&str> = c.split_whitespace().collect();
+            clause_commits(&w)
+                && !has_any(c, HEDGES)
+                && !is_personal_activity(c)
+                && !(i > 0 && (is_conditional(&cs[i - 1]) || is_hedge_only(&cs[i - 1])))
+                && !cs.get(i + 1).is_some_and(|n| is_conditional(n))
+        })
     })
 }
 
@@ -370,11 +581,115 @@ pub struct OwnerActionContext<'a> {
     pub near_s: f64,
 }
 
+/// First names that are also common English words ("let's mark that", "your
+/// bill"): they count as a mention only with the surname, or when addressing
+/// someone about the target ("Mark, can you take the kiosk?").
+const WORD_NAMES: &[&str] = &[
+    "mark", "bill", "drew", "grant", "may", "chase", "pat", "skip", "will", "rose", "art", "bob",
+    "frank", "joy", "faith", "hope", "grace", "dawn", "summer", "june", "april", "august", "rich",
+    "sandy", "ray", "gene", "jack", "sue", "guy", "rob", "don", "sky", "dean", "pierce", "hunter",
+    "cliff", "glen", "wade", "miles", "lane", "reed", "clay", "penny", "ruby", "amber", "iris",
+    "lily", "ivy", "holly", "crystal", "robin", "jay", "max", "rusty", "sonny", "sunny", "bud",
+    "buck", "cash", "earl", "harmony", "mercy", "page", "paige", "carol", "nick", "ted", "chip",
+    "sterling", "win", "early", "major", "royal", "star",
+];
+
+/// True when `words` introduce `first` ("I'm Avery", "my name is Avery",
+/// "this is Avery").
+fn self_introduction(words: &[String], first: &str) -> bool {
+    let intros: [&[&str]; 5] = [
+        &["im"],
+        &["i", "am"],
+        &["name", "is"],
+        &["this", "is"],
+        &["its"],
+    ];
+    words.iter().enumerate().any(|(i, w)| {
+        w == first
+            && intros.iter().any(|p| {
+                i >= p.len()
+                    && words[i - p.len()..i]
+                        .iter()
+                        .map(String::as_str)
+                        .eq(p.iter().copied())
+            })
+    })
+}
+
+/// True when `first` is used to address someone: a comma-, period- or
+/// question-delimited piece of the raw text that is only the name ("Mark,
+/// can you ...", "..., Mark?").
+fn vocative(text: &str, first: &str) -> bool {
+    text.split([',', '.', '?', '!', ';', ':'])
+        .any(|piece| tokens(piece) == [first])
+}
+
+/// Transcript lines within `near_s` of the tag's appearance that corroborate
+/// an owner tag:
+///
+/// - the owner speaking about the target (a distinctive word of it); or
+/// - someone else mentioning the owner by name about the target: the target
+///   is named in the same line or an adjacent line within the window. The
+///   owner's own speech and self-introductions ("I'm Avery") are not
+///   mentions, and a first name that is a common word ("mark", "bill")
+///   counts only with the surname or when addressing the owner in a line
+///   that names the target.
+fn corroborating_lines(
+    ctx: &OwnerActionContext<'_>,
+    o: &OwnerAssignment,
+    key: &[String],
+) -> Vec<String> {
+    let name = tokens(&o.display_name);
+    let Some(first) = name.first() else {
+        return Vec::new();
+    };
+    let surname = name.get(1);
+    let owner_id = Some(o.person_id.as_str());
+    let near = |l: &NamedLine| (l.start_s - o.valid_from_s).abs() <= ctx.near_s;
+    let names = |l: &NamedLine| {
+        let toks: BTreeSet<String> = content_tokens(&l.text).into_iter().collect();
+        names_target(&toks, key)
+    };
+    let lines = ctx.lines;
+    let topical = |i: usize| {
+        names(&lines[i])
+            || [i.checked_sub(1), Some(i + 1)]
+                .into_iter()
+                .flatten()
+                .filter_map(|j| lines.get(j))
+                .any(|l| near(l) && names(l))
+    };
+    let mut out = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        if !near(l) {
+            continue;
+        }
+        let ok = if l.person_id.as_deref() == owner_id {
+            names(l)
+        } else {
+            let words = tokens(&l.text);
+            let full =
+                surname.is_some_and(|s| words.windows(2).any(|p| &p[0] == first && &p[1] == s));
+            if self_introduction(&words, first) {
+                false
+            } else if WORD_NAMES.contains(&first.as_str()) {
+                (full && topical(i)) || (vocative(&l.text, first) && names(l))
+            } else {
+                words.contains(first) && topical(i)
+            }
+        };
+        if ok {
+            out.push(l.segment_id.clone());
+        }
+    }
+    out
+}
+
 /// Owner tags still valid at the end of the board become "Own <target>" action
-/// items when a transcript line near the tag's appearance corroborates them:
-/// a line that mentions the owner by name, or a line the owner speaks that
-/// names the target (a distinctive word of it; one generic word such as "app"
-/// does not count, see [`names_target`]). How often the tag was seen and
+/// items when a transcript line near the tag's appearance corroborates them
+/// (see [`corroborating_lines`]): the owner speaking about the target, or
+/// someone naming the owner about the target (one generic word such as "app"
+/// does not name it, see [`names_target`]). How often the tag was seen and
 /// whether the owner spoke elsewhere are not evidence: a name used as a label
 /// persists on the board too. Each item passes the same validation as model
 /// items and cites the board ids plus the corroborating lines. Owners who
@@ -394,35 +709,18 @@ pub fn owner_actions(
             let target = sanitize_dashes(&target_text(&o.target));
             let key = content_tokens(&target);
             let owner_id = Some(o.person_id.as_str());
-            // any shared word suppresses a duplicate (loose on purpose: it only
-            // ever removes a synthesized item)
+            // an existing action of this owner that names the target (a
+            // distinctive word of it; "app" alone names nothing)
             let named = |a: &ActionItem| {
                 a.person_id.as_deref() == owner_id && {
-                    let t = content_tokens(&a.task);
-                    key.iter().any(|k| t.contains(k))
+                    let t: BTreeSet<String> = content_tokens(&a.task).into_iter().collect();
+                    names_target(&t, &key)
                 }
             };
             if existing.iter().chain(out.iter()).any(named) {
                 continue;
             }
-            // corroboration
-            let first = o
-                .display_name
-                .split_whitespace()
-                .next()
-                .unwrap_or(&o.display_name)
-                .to_lowercase();
-            let mentions: Vec<String> = ctx
-                .lines
-                .iter()
-                .filter(|l| (l.start_s - o.valid_from_s).abs() <= ctx.near_s)
-                .filter(|l| {
-                    let toks: BTreeSet<String> = content_tokens(&l.text).into_iter().collect();
-                    toks.contains(&first)
-                        || (l.person_id.as_deref() == owner_id && names_target(&toks, &key))
-                })
-                .map(|l| l.segment_id.clone())
-                .collect();
+            let mentions = corroborating_lines(ctx, o, &key);
             if mentions.is_empty() {
                 continue;
             }
@@ -806,40 +1104,39 @@ mod tests {
         assert!(owner_actions(std::slice::from_ref(&b), &[], &ctx2).is_empty());
     }
 
-    /// Owners of the Kiosk App and Design Kit tags given a transcript, with the
-    /// labels seen in two keyframes so persistence alone would have counted.
-    fn label_tag_actions(lines: &[NamedLine]) -> Vec<(String, String)> {
+    /// "Own <target>" actions for label tags (seen in two keyframes, so
+    /// persistence alone would have counted) given owners as
+    /// `(person_id, name, target)` and a transcript.
+    fn tag_actions(owners: &[(&str, &str, &str)], lines: &[NamedLine]) -> Vec<(String, String)> {
         let mut b = build::board("b", 600.0);
-        b.nodes = vec![
-            build::node("n2", "Kiosk App", 0.0, 600.0, None),
-            build::node("n4", "Design Kit", 0.0, 600.0, None),
-        ];
-        let mut o1 = build::owner(
-            "rohan-dasgupta",
-            "Rohan Dasgupta",
-            build::node_target(&b, "n2"),
-            100.0,
-            600.0,
-            None,
-        );
-        o1.opened_at_keyframe = "kf_000100".into();
-        o1.sightings = vec![sighting("kf_000100"), sighting("kf_000160")];
-        let mut o2 = build::owner(
-            "mira-okafor",
-            "Mira Okafor",
-            build::node_target(&b, "n4"),
-            100.0,
-            600.0,
-            None,
-        );
-        o2.opened_at_keyframe = "kf_000100".into();
-        o2.sightings = vec![sighting("kf_000100"), sighting("kf_000160")];
-        b.owner_assignments = vec![o1, o2];
+        b.nodes = owners
+            .iter()
+            .enumerate()
+            .map(|(i, (_, _, t))| build::node(&format!("n{i}"), t, 0.0, 600.0, None))
+            .collect();
+        b.owner_assignments = owners
+            .iter()
+            .enumerate()
+            .map(|(i, (id, name, _))| {
+                let mut o = build::owner(
+                    id,
+                    name,
+                    build::node_target(&b, &format!("n{i}")),
+                    100.0,
+                    600.0,
+                    None,
+                );
+                o.opened_at_keyframe = "kf_000100".into();
+                o.sightings = vec![sighting("kf_000100"), sighting("kf_000160")];
+                o
+            })
+            .collect();
+        let names: Vec<&str> = owners.iter().map(|o| o.1).chain(["Avery Quinn"]).collect();
         let corpus = Corpus::new(
             lines,
             std::slice::from_ref(&b),
             &KeyframeTimes::default(),
-            AliasTable::from_names(&["Mira Okafor", "Rohan Dasgupta", "Avery Quinn"]),
+            AliasTable::from_names(&names),
         );
         let ctx = OwnerActionContext {
             lines,
@@ -851,6 +1148,15 @@ mod tests {
             .into_iter()
             .map(|a| (a.owner, a.task))
             .collect()
+    }
+
+    const ROHAN_MIRA: &[(&str, &str, &str)] = &[
+        ("rohan-dasgupta", "Rohan Dasgupta", "Kiosk App"),
+        ("mira-okafor", "Mira Okafor", "Design Kit"),
+    ];
+
+    fn label_tag_actions(lines: &[NamedLine]) -> Vec<(String, String)> {
+        tag_actions(ROHAN_MIRA, lines)
     }
 
     fn spoken(i: usize, t: f64, who: &str, text: &str) -> NamedLine {
@@ -909,16 +1215,143 @@ mod tests {
                 ("Mira Okafor".to_string(), "Own Design Kit".to_string()),
             ]
         );
-        // a name mention by anyone near the tag corroborates
+    }
+
+    #[test]
+    fn name_mentions_corroborate_only_about_the_target() {
+        // the review's constructions: a name mention about something else
+        for text in [
+            "Rohan, your mic is muted.",
+            "Rohan, can you take that box?",
+            "Thanks Rohan, that helps.",
+        ] {
+            let lines = vec![spoken(0, 110.0, "avery-quinn", text)];
+            assert!(label_tag_actions(&lines).is_empty(), "{text}");
+        }
+        // a self-introduction, even when misattributed and on topic
         let lines = vec![spoken(
             0,
             110.0,
             "avery-quinn",
-            "Rohan, can you take that box?",
+            "Hi, I'm Rohan Dasgupta, I lead the kiosk team.",
         )];
+        assert!(label_tag_actions(&lines).is_empty());
+        let lines = vec![spoken(
+            0,
+            110.0,
+            "avery-quinn",
+            "My name is Rohan and I work on the kiosk.",
+        )];
+        assert!(label_tag_actions(&lines).is_empty());
+        // the owner saying their own name is not a mention
+        let lines = vec![spoken(
+            0,
+            110.0,
+            "rohan-dasgupta",
+            "Rohan here, the build is green.",
+        )];
+        assert!(label_tag_actions(&lines).is_empty());
+        // a mention about the target, in the line or the adjacent line
+        let lines = vec![spoken(
+            0,
+            110.0,
+            "avery-quinn",
+            "Rohan, can you take the kiosk?",
+        )];
+        assert_eq!(label_tag_actions(&lines).len(), 1);
+        let lines = vec![
+            spoken(0, 110.0, "avery-quinn", "Rohan, one more thing."),
+            spoken(1, 114.0, "avery-quinn", "The kiosk needs an owner."),
+        ];
         let got = label_tag_actions(&lines);
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].0, "Rohan Dasgupta");
+    }
+
+    #[test]
+    fn common_word_first_names_need_the_surname_or_an_address() {
+        let owners = &[("mark-ellery", "Mark Ellery", "Kiosk App")];
+        // the review's constructions: the word, not the person
+        for text in [
+            "Let's mark that as done.",
+            "Put a question mark next to the kiosk box.",
+            "Let's mark the kiosk as blocked.",
+        ] {
+            let lines = vec![spoken(0, 110.0, "avery-quinn", text)];
+            assert!(tag_actions(owners, &lines).is_empty(), "{text}");
+        }
+        // addressing Mark about the target, or naming him in full, counts
+        for text in [
+            "Mark, can you take the kiosk?",
+            "Mark Ellery will look after the kiosk.",
+        ] {
+            let lines = vec![spoken(0, 110.0, "avery-quinn", text)];
+            assert_eq!(tag_actions(owners, &lines).len(), 1, "{text}");
+        }
+        // addressing Mark about something else does not
+        let lines = vec![spoken(0, 110.0, "avery-quinn", "Mark, your mic is muted.")];
+        assert!(tag_actions(owners, &lines).is_empty());
+    }
+
+    #[test]
+    fn an_existing_action_suppresses_only_when_it_names_the_target() {
+        let b = {
+            let mut b = build::board("b", 600.0);
+            b.nodes = vec![build::node("n0", "Kiosk App", 0.0, 600.0, None)];
+            let mut o = build::owner(
+                "rohan-dasgupta",
+                "Rohan Dasgupta",
+                build::node_target(&b, "n0"),
+                100.0,
+                600.0,
+                None,
+            );
+            o.opened_at_keyframe = "kf_000100".into();
+            b.owner_assignments = vec![o];
+            b
+        };
+        let lines = vec![spoken(
+            0,
+            110.0,
+            "rohan-dasgupta",
+            "I'll look at the kiosk crash.",
+        )];
+        let corpus = Corpus::new(
+            &lines,
+            std::slice::from_ref(&b),
+            &KeyframeTimes::default(),
+            AliasTable::from_names(&["Rohan Dasgupta"]),
+        );
+        let ctx = OwnerActionContext {
+            lines: &lines,
+            corpus: &corpus,
+            opts: CheckOptions::default(),
+            near_s: 120.0,
+        };
+        let existing = |task: &str| ActionItem {
+            id: "a1".into(),
+            person_id: Some("rohan-dasgupta".into()),
+            owner: "Rohan Dasgupta".into(),
+            task: task.into(),
+            t_s: 1.0,
+            t_end_s: 1.0,
+            evidence: Evidence::default(),
+            quote: None,
+        };
+        // "app" alone is another artifact: the owner action is still added
+        let add = owner_actions(
+            std::slice::from_ref(&b),
+            &[existing("Ship the app redesign")],
+            &ctx,
+        );
+        assert_eq!(add.len(), 1, "{add:?}");
+        // naming the kiosk suppresses the duplicate
+        let add = owner_actions(
+            std::slice::from_ref(&b),
+            &[existing("Fix the kiosk crash")],
+            &ctx,
+        );
+        assert!(add.is_empty(), "{add:?}");
     }
 
     #[test]
@@ -1014,8 +1447,90 @@ mod tests {
             "We're moving back to the old importer.",
             "We skip the review step.",
             "Okay, we drop the badge printer.",
+            // pronoun objects and the added decision verbs
+            "We ship it.",
+            "We keep it.",
+            "We push the release to next week.",
+            "We postpone the kiosk pilot.",
+            "We cancel the badge rollout.",
+            "We go with the second layout.",
         ] {
             assert!(has_commitment(s), "{s}");
+        }
+    }
+
+    #[test]
+    fn every_commitment_leg_needs_an_object() {
+        // round 3: the same meeting-flow phrases through "let's", "we'll",
+        // "we will", "decided" and first-person futures
+        for s in [
+            "Let's move on.",
+            "We'll keep going.",
+            "Let's wrap up.",
+            "We'll move on to the next topic.",
+            "Let's circle back to this.",
+            "Okay, let's move on people.",
+            "We will keep going.",
+            "We're going to move on.",
+            "We decided to move on.",
+            "Let's go ahead.",
+            "Let's get started.",
+            "Let's see how it goes.",
+            "Let's say we ship on Friday.",
+            "I'll move on to the next slide.",
+            // navigation objects and continuations anywhere before an object
+            "We move to the next slide.",
+            "We skip to the end.",
+            "We keep right on going.",
+            "Let's go to the agenda.",
+            "Let's jump to the next topic.",
+            // "go with" needs a subject that commits
+            "The banner doesn't go with the logo.",
+            "That color would go with anything.",
+        ] {
+            assert!(!has_commitment(s), "{s}");
+        }
+        for s in [
+            "Let's skip that step.",
+            "We'll go with the second layout.",
+            "Let's go ahead and ship the importer.",
+            "We decided to move the demo to Thursday.",
+            "Let's not change the ledger API.",
+            "I'll go with the blue theme.",
+            "We will ship the importer going forward.",
+        ] {
+            assert!(has_commitment(s), "{s}");
+        }
+    }
+
+    #[test]
+    fn vetoes_apply_to_the_committing_clause_only() {
+        // round 3: incidental personal words or hedges in another clause
+        for s in [
+            "We decided to move the demo to Thursday because of the kids' schedules.",
+            "Let's push the release because of the daycare closure.",
+            "We'll ship on Friday; my wife is on call all week.",
+            "Before I get the kids, I'll write the migration spec.",
+            "We'll go with the second layout, though we should revisit it next quarter.",
+            "Let's keep the REST API, and someone should write it up.",
+        ] {
+            assert!(has_commitment(s), "{s}");
+        }
+        // the committing clause itself, a conditional next to it, or a
+        // hedge-only clause before it still veto
+        for s in [
+            "Let's grab lunch, the importer can wait.",
+            "Let's ship it if the tests pass.",
+            "If the tests pass, let's ship it.",
+            "Maybe, we'll ship the importer.",
+            "I think, we keep the old API.",
+            "We should probably ship the importer, because it is ready.",
+            "I'll take a walk.",
+            "I'll get some air.",
+            "I'll take a quick call.",
+            "I'll get the door.",
+        ] {
+            assert!(!has_commitment(s), "{s}");
         }
     }
 

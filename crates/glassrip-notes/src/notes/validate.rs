@@ -13,7 +13,8 @@ use crate::board::{first_seen, BoardExt, BoardStateItem, EventKind, KeyframeTime
 use crate::named::NamedLine;
 use crate::people::AliasTable;
 use crate::text::{
-    content_tokens, is_stopword, jaccard, names_target, normalize, sanitize_dashes, tokens,
+    content_tokens, distinctive_tokens, is_stopword, jaccard, names_target, normalize,
+    sanitize_dashes, tokens,
 };
 
 /// Most `...` elisions in one quote.
@@ -206,9 +207,67 @@ pub struct Corpus {
     times: BTreeMap<String, f64>,
     table: AliasTable,
     /// Ids that show an owner tag appearing or moving (owner events, and the
-    /// keyframes that opened owner assignments), with the content tokens of
-    /// each target they concern.
-    owner_keys: BTreeMap<String, Vec<Vec<String>>>,
+    /// keyframes that opened owner assignments), with the owner and target of
+    /// each assignment they concern.
+    owner_keys: BTreeMap<String, Vec<OwnerKey>>,
+}
+
+/// The owner and target of an owner-tag change, as tokens.
+#[derive(Debug, Clone)]
+struct OwnerKey {
+    /// Tokens of the owner's display name.
+    name: Vec<String>,
+    /// Content tokens of the target.
+    target: Vec<String>,
+}
+
+/// Words that state ownership or assignment ("Avery owns the kiosk", "take
+/// the ledger", "assigned to").
+const OWNERSHIP_WORDS: &[&str] = &[
+    "own",
+    "owns",
+    "owned",
+    "owning",
+    "owner",
+    "owners",
+    "ownership",
+    "take",
+    "takes",
+    "taking",
+    "took",
+    "assign",
+    "assigns",
+    "assigned",
+    "assigning",
+    "assignment",
+    "responsible",
+    "lead",
+    "leads",
+    "leading",
+];
+
+impl OwnerKey {
+    /// The item's words refer to this owner-tag change: they name the target
+    /// and either the owner or the ownership ("Avery owns the kiosk rollout",
+    /// "Own the kiosk work"), or they name the target in full (every content
+    /// word, or most of at least two distinctive words). One shared word
+    /// ("Buy a new office printer" against "Badge Printer") is not enough.
+    fn backs(&self, words: &BTreeSet<String>) -> bool {
+        if self.target.is_empty() {
+            return false;
+        }
+        let owner_ref = self.name.iter().any(|t| words.contains(t))
+            || OWNERSHIP_WORDS.iter().any(|t| words.contains(*t));
+        if owner_ref && names_target(words, &self.target) {
+            return true;
+        }
+        if self.target.iter().all(|t| words.contains(t)) {
+            return true;
+        }
+        let distinctive = distinctive_tokens(&self.target);
+        let hit = distinctive.iter().filter(|t| words.contains(*t)).count();
+        hit >= 2 && hit * 2 > distinctive.len()
+    }
 }
 
 /// Validation switches (see [`super::candidates`]).
@@ -271,10 +330,13 @@ impl Corpus {
                 }
             }
         }
-        let mut owner_keys: BTreeMap<String, Vec<Vec<String>>> = BTreeMap::new();
+        let mut owner_keys: BTreeMap<String, Vec<OwnerKey>> = BTreeMap::new();
         for b in boards {
             for o in &b.owner_assignments {
-                let words = content_tokens(&crate::board::target_text(&o.target));
+                let words = OwnerKey {
+                    name: tokens(&o.display_name),
+                    target: content_tokens(&crate::board::target_text(&o.target)),
+                };
                 for e in b.events.iter().filter(|e| {
                     matches!(e.kind, EventKind::OwnerAssigned | EventKind::OwnerMoved)
                         && e.subject == o.person_id
@@ -682,12 +744,20 @@ const PERSONAL_PHRASES: &[&str] = &[
     "be right back",
     "a break",
     "quick break",
+    "take a walk",
+    "go for a walk",
+    "some air",
+    "fresh air",
+    "take a quick call",
+    "get the door",
+    "answer the door",
 ];
 
 /// True when a task is a personal activity rather than work.
 pub fn is_personal_activity(text: &str) -> bool {
     let toks = tokens(text);
-    let n = format!(" {} ", toks.join(" "));
+    // "walk through the design" is a work walkthrough, not a walk
+    let n = format!(" {} ", toks.join(" ")).replace(" walk through ", " walkthrough ");
     toks.iter().any(|t| PERSONAL.contains(&t.as_str()))
         || PERSONAL_PHRASES
             .iter()
@@ -828,17 +898,17 @@ pub fn check_with(
         section,
         Section::Decisions | Section::ActionItems | Section::OpenQuestions
     );
-    // board support counts only when the item names the target of the
-    // owner-tag change it cites: naming only the person is a name-drop, and
-    // one generic word ("app") does not name a target
-    let item_words: BTreeSet<String> = content_tokens(&text).into_iter().collect();
+    // board support counts only when the item's own text refers to the
+    // owner-tag change it cites (see OwnerKey::backs): a name-drop, one shared
+    // target word or a generic word does not; the owner field is not text
+    let item_words: BTreeSet<String> = tokens(&text).into_iter().collect();
     let board_backed = evidence
         .event_ids
         .iter()
         .chain(&evidence.keyframe_ids)
         .filter_map(|id| corpus.owner_keys.get(id))
         .flatten()
-        .any(|target| names_target(&item_words, target));
+        .any(|k| k.backs(&item_words));
     let board_ok = opts.board_support
         && board_backed
         && matches!(section, Section::Decisions | Section::ActionItems);
@@ -1430,10 +1500,89 @@ mod tests {
         d.keyframe_ids = vec!["kf_000040".into()];
         let e = check_with(Section::Decisions, &d, &c, &ALL).unwrap_err();
         assert!(e.reasons.iter().any(|r| r.contains("commits")), "{e:?}");
-        // naming the target is board support
+        // naming the target and the ownership is board support
         let mut d = item("Avery owns the kiosk rollout", &[], "");
         d.keyframe_ids = vec!["kf_000040".into()];
         assert!(check_with(Section::Decisions, &d, &c, &ALL).is_ok());
+    }
+
+    #[test]
+    fn one_shared_target_word_is_not_board_support() {
+        use crate::board::build;
+        let mut b = build::board("b", 100.0);
+        b.nodes = vec![
+            build::node("n1", "Badge Printer", 0.0, 100.0, None),
+            build::node("n2", "Kiosk App", 0.0, 100.0, None),
+        ];
+        let mut o1 = build::owner(
+            "mira-okafor",
+            "Mira Okafor",
+            build::node_target(&b, "n1"),
+            40.0,
+            100.0,
+            None,
+        );
+        o1.opened_at_keyframe = "kf_000040".into();
+        let mut o2 = build::owner(
+            "avery-quinn",
+            "Avery Quinn",
+            build::node_target(&b, "n2"),
+            50.0,
+            100.0,
+            None,
+        );
+        o2.opened_at_keyframe = "kf_000050".into();
+        b.owner_assignments = vec![o1, o2];
+        let text = "The importer reads the ledger nightly.";
+        let c = Corpus::new(
+            &[line("s1", 10.0, text, text)],
+            &[b],
+            &KeyframeTimes::default(),
+            AliasTable::from_names(&["Mira Okafor", "Avery Quinn"]),
+        );
+        let reject = |section: Section, d: &DraftItem| {
+            let e = check_with(section, d, &c, &ALL).unwrap_err();
+            assert!(
+                e.reasons
+                    .iter()
+                    .any(|r| r.contains("transcript segment") || r.contains("commits")),
+                "{d:?}: {e:?}"
+            );
+        };
+        // the review's constructions: one distinctive target word, no
+        // reference to the ownership
+        let mut d = item("Buy a new office printer", &[], "");
+        d.keyframe_ids = vec!["kf_000040".into()];
+        reject(Section::Decisions, &d);
+        d.segment_ids = vec!["s1".into()];
+        reject(Section::Decisions, &d);
+        let a = DraftItem {
+            owner: "Avery".into(),
+            task: "Rewrite the kiosk login flow".into(),
+            keyframe_ids: vec!["kf_000050".into()],
+            ..Default::default()
+        };
+        reject(Section::ActionItems, &a);
+        // the owner named in the text, an ownership verb, or the full target
+        let ok = |section: Section, d: &DraftItem| {
+            assert!(check_with(section, d, &c, &ALL).is_ok(), "{d:?}");
+        };
+        let mut d = item("Mira keeps the printer queue", &[], "");
+        d.keyframe_ids = vec!["kf_000040".into()];
+        ok(Section::Decisions, &d);
+        let mut d = item("Take over the printer drivers", &[], "");
+        d.keyframe_ids = vec!["kf_000040".into()];
+        ok(Section::Decisions, &d);
+        let mut d = item("Retire the badge printer", &[], "");
+        d.keyframe_ids = vec!["kf_000040".into()];
+        ok(Section::Decisions, &d);
+        let a = DraftItem {
+            owner: "Avery".into(),
+            task: "Own the Kiosk App".into(),
+            keyframe_ids: vec!["kf_000050".into()],
+            ..Default::default()
+        };
+        ok(Section::ActionItems, &a);
     }
 
     #[test]

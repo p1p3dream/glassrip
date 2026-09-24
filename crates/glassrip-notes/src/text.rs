@@ -111,6 +111,15 @@ const GENERIC_WORDS: &[&str] = &[
     "work",
 ];
 
+/// The tokens that are not generic words.
+pub fn distinctive_tokens(tokens: &[String]) -> Vec<String> {
+    tokens
+        .iter()
+        .filter(|t| !GENERIC_WORDS.contains(&t.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// True when `words` name a target whose content tokens are `target`: one of
 /// its distinctive tokens, or, for a target made only of generic words, all of
 /// them. One generic word ("app") never names a target.
