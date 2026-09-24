@@ -58,6 +58,7 @@ complete it.
 Never guess or invent text.
 - List each item once. Only list items you can actually see in THIS image. Use empty lists when \
 nothing applies.
+- Write the JSON on a single line, without indentation or line breaks.
 - \"conf\" and \"confidence\" are numbers from 0 to 1; \"confidence\" is how legible the board is in \
 this image.";
 

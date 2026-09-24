@@ -45,7 +45,12 @@ use crate::stages::{input, internal, load_rgb, text_hash};
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct BoardReadParams {
     pub seed: u64,
-    pub num_predict: u32,
+    /// Fixed context size of every request in the run (must match the backend).
+    pub num_ctx: u32,
+    /// Output budget per request: what `num_ctx` leaves after the image and
+    /// prompt, clamped to this range.
+    pub min_num_predict: u32,
+    pub max_num_predict: u32,
     pub target_long_edge_px: u32,
     pub min_long_edge_px: u32,
     pub low_res_upscale: f64,
@@ -62,11 +67,11 @@ impl Default for BoardReadParams {
     fn default() -> Self {
         Self {
             seed: 0,
-            // Dense boards (a 3x3 card grid plus stickies) need about 2,500
-            // output tokens; 2,048 truncated them. With at most about 2,700
-            // image tokens and 1,500 prompt and schema tokens the total stays
-            // within the fixed num_ctx of 8,192.
-            num_predict: 3072,
+            num_ctx: 8192,
+            // Dense boards (a 3x3 card grid plus stickies) truncated at 2,048
+            // output tokens; the budget is sized per request to fill num_ctx.
+            min_num_predict: 1024,
+            max_num_predict: 3072,
             target_long_edge_px: BOARD_LONG_EDGE,
             min_long_edge_px: LOW_RES_THRESHOLD,
             low_res_upscale: LOW_RES_UPSCALE,
@@ -77,6 +82,18 @@ impl Default for BoardReadParams {
             merge_text_ratio: 0.85,
         }
     }
+}
+
+/// Output tokens left by `num_ctx` after the image, the prompt (estimated at
+/// 3 bytes per token), message framing, and a small margin.
+pub fn output_budget(p: &BoardReadParams, request: &glassrip_vision::VisionRequest) -> u32 {
+    let used = request.image.tokens()
+        + glassrip_vision::ollama::estimate_text_tokens(&request.prompt)
+        + glassrip_vision::ollama::MESSAGE_OVERHEAD_TOKENS
+        + 64;
+    p.num_ctx
+        .saturating_sub(used)
+        .clamp(p.min_num_predict, p.max_num_predict.max(p.min_num_predict))
 }
 
 /// Crop the canvas out of the keyframe and paint the chrome masks.
@@ -305,11 +322,15 @@ impl BoardReadStage {
         prepared: PreparedImage,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<(BoardReadOutput, RequestLog), ErrorInfo> {
-        let options = GenerationOptions {
-            seed: self.params.seed,
-            num_predict: self.params.num_predict,
-        };
-        let request = board_read_request(&prepared, options).map_err(|e| vision_error_info(&e))?;
+        let mut request = board_read_request(
+            &prepared,
+            GenerationOptions {
+                seed: self.params.seed,
+                num_predict: self.params.min_num_predict,
+            },
+        )
+        .map_err(|e| vision_error_info(&e))?;
+        request.options.num_predict = output_budget(&self.params, &request);
         let key = request_key(&self.model, &request);
         let started = Instant::now();
         let reply = self
@@ -501,6 +522,27 @@ mod tests {
             other_visible_text: vec![],
             confidence: 0.8,
         }
+    }
+
+    #[test]
+    fn output_budget_fills_the_context() {
+        let p = BoardReadParams::default();
+        let img =
+            |w, h| prepare_board_image(&DynamicImage::ImageRgb8(RgbImage::new(w, h))).unwrap();
+        let opts = GenerationOptions {
+            seed: 0,
+            num_predict: 1,
+        };
+        let big = board_read_request(&img(1600, 1200), opts).unwrap();
+        let small = board_read_request(&img(800, 400), opts).unwrap();
+        let (b, s) = (output_budget(&p, &big), output_budget(&p, &small));
+        assert!(b < s, "{b} {s}");
+        assert!(b >= p.min_num_predict && s <= p.max_num_predict);
+        let total = big.image.tokens()
+            + glassrip_vision::ollama::estimate_text_tokens(&big.prompt)
+            + glassrip_vision::ollama::MESSAGE_OVERHEAD_TOKENS
+            + b;
+        assert!(total <= p.num_ctx || b == p.min_num_predict);
     }
 
     #[test]
