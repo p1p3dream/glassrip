@@ -231,9 +231,9 @@ mod tests {
             ("Widget Service", "Widgit Service", 0.9285714285714286),
             ("queue worker", "worker queue", 0.5),
             (
-                "frontend design system",
-                "/frontend design system",
-                0.9777777777777777,
+                "ledger writer queue",
+                "/ledger writer queue",
+                0.9743589743589743,
             ),
             ("Avery", "Averi", 0.8),
             ("", "", 1.0),
