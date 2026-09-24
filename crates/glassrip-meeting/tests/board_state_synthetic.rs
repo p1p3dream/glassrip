@@ -9,7 +9,7 @@ use glassrip_meeting::consolidate::owners::{
 };
 use glassrip_meeting::consolidate::{
     consolidate, split_boards, BoardFrame, BoardStateItem, CanvasSource, ConsolidationParams,
-    EdgeOrientation, Hooks, StickyKind, TextAnchor,
+    EdgeOrientation, FoldReason, Hooks, StickyKind, TextAnchor,
 };
 use glassrip_meeting::direction::{DirectionBasis, EdgeDirection, EndVerdict};
 use glassrip_meeting::pixel_direction::{EndEvidence, PixelEvidence, PixelStatus};
@@ -152,6 +152,7 @@ fn frames(specs: &[Spec]) -> Vec<BoardFrame> {
             directions: None,
             board_title: None,
             ocr_anchors: vec![],
+            title_hints: vec![],
         })
         .collect()
 }
@@ -888,4 +889,697 @@ fn output_matches_the_eval_contract_names() {
     assert!(t["src"].is_string() && t["dst"].is_string());
     assert!(v["owner_assignments"][0]["name_raw"].is_string());
     assert!(v["events"][0]["event_id"].is_string());
+}
+
+#[test]
+fn corroborated_title_bar_and_app_panel_text_are_not_content() {
+    let mut fr = frames(&(0..4).map(|_| base()).collect::<Vec<_>>());
+    for (i, f) in fr.iter_mut().enumerate() {
+        // The board title in the title bar band in every keyframe (persistent).
+        f.board.nodes.push(BoardNode {
+            local_id: "t1".into(),
+            text: "Widget Platform Plan (Draft)".into(),
+            bbox: BBox::new(20.0, 8.0, 330.0, 30.0),
+            conf: 0.9,
+        });
+        // An app panel entry (board list, elided) read as a node in one keyframe.
+        f.title_hints = vec!["Quarterly Roadmap Review Bo...".into()];
+        if i == 2 {
+            f.board.nodes.push(BoardNode {
+                local_id: "t3".into(),
+                text: "Quarterly Roadmap Review Board".into(),
+                bbox: BBox::new(900.0, 800.0, 1200.0, 830.0),
+                conf: 0.9,
+            });
+        }
+    }
+    let s = run(fr, &params());
+    let texts: Vec<&str> = s.nodes.iter().map(|n| n.text.as_str()).collect();
+    assert!(
+        !texts
+            .iter()
+            .any(|t| t.contains("Widget Platform") || t.contains("Roadmap")),
+        "{texts:?}"
+    );
+    assert_eq!(
+        s.board_title.as_deref(),
+        Some("Widget Platform Plan (Draft)")
+    );
+    assert_eq!(s.nodes.len(), 4);
+}
+
+#[test]
+fn a_same_text_node_far_from_the_title_bar_survives() {
+    let mut fr = frames(&(0..4).map(|_| base()).collect::<Vec<_>>());
+    for f in fr.iter_mut() {
+        f.board.nodes.push(BoardNode {
+            local_id: "t1".into(),
+            text: "Widget Platform Plan (Draft)".into(),
+            bbox: BBox::new(20.0, 8.0, 330.0, 30.0),
+            conf: 0.9,
+        });
+        // A real box on the board that captions the plan with the same words.
+        f.board.nodes.push(BoardNode {
+            local_id: "t2".into(),
+            text: "Widget Platform Plan (Draft)".into(),
+            bbox: BBox::new(900.0, 700.0, 1200.0, 760.0),
+            conf: 0.9,
+        });
+    }
+    let s = run(fr, &params());
+    let n: Vec<_> = s
+        .nodes
+        .iter()
+        .filter(|n| n.text.contains("Widget Platform"))
+        .collect();
+    assert_eq!(
+        n.len(),
+        1,
+        "{:?}",
+        s.nodes.iter().map(|n| &n.text).collect::<Vec<_>>()
+    );
+    assert!(n[0].in_final);
+}
+
+#[test]
+fn a_real_node_near_the_top_edge_survives() {
+    // A box whose bottom sits inside the top band in one zoomed keyframe, and lower
+    // down in the others: not persistent, not corroborated, so it is content.
+    let mut fr = frames(&(0..4).map(|_| base()).collect::<Vec<_>>());
+    for (i, f) in fr.iter_mut().enumerate() {
+        let y = if i == 1 { 5.0 } else { 300.0 };
+        f.board.nodes.push(BoardNode {
+            local_id: "t9".into(),
+            text: "Edge Cache Tier".into(),
+            bbox: BBox::new(1300.0, y, 1500.0, y + 35.0),
+            conf: 0.9,
+        });
+    }
+    // Also a single band reading of a board-like phrase never seen elsewhere.
+    fr[3].board.other_visible_text.push(TextItem {
+        text: "Settlement Batch Window".into(),
+        bbox: BBox::new(600.0, 5.0, 900.0, 30.0),
+    });
+    let s = run(fr, &params());
+    assert!(s
+        .nodes
+        .iter()
+        .any(|n| n.text == "Edge Cache Tier" && n.in_final));
+    assert!(s.board_title.is_none(), "{:?}", s.board_title);
+}
+
+fn grid_spec() -> Spec {
+    let cards = [
+        "Alpha card",
+        "Beta card",
+        "Gamma card",
+        "Delta card",
+        "Epsilon card",
+        "Zeta card",
+        "Eta card",
+        "Theta card",
+        "Iota card",
+    ];
+    let mut s = base();
+    s.stickies = cards
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            (
+                *t,
+                (
+                    900.0 + (i % 3) as f64 * 130.0,
+                    450.0 + (i / 3) as f64 * 110.0,
+                ),
+            )
+        })
+        .collect();
+    s
+}
+
+#[test]
+fn grid_stickies_carry_boxes_and_form_a_group_with_its_heading() {
+    let specs: Vec<Spec> = (0..3).map(|_| grid_spec()).collect();
+    let mut fr = frames(&specs);
+    for f in &mut fr {
+        f.board.other_visible_text.push(TextItem {
+            text: "Things to show first".into(),
+            bbox: BBox::new(900.0, 350.0, 1150.0, 380.0),
+        });
+    }
+    let s = run(fr, &params());
+    assert!(s
+        .stickies
+        .iter()
+        .all(|x| x.bbox.is_some() && x.last_seen.is_some()));
+    let g = s
+        .groups
+        .iter()
+        .find(|g| g.sticky_ids.len() == 9)
+        .unwrap_or_else(|| {
+            panic!(
+                "{:#?} {:?}",
+                s.groups,
+                s.stickies
+                    .iter()
+                    .map(|x| (&x.text, x.in_final))
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert_eq!((g.rows, g.cols), (3, 3));
+    assert_eq!(g.title.as_deref(), Some("Things to show first"));
+    let first = s.stickies.iter().find(|x| x.id == g.sticky_ids[0]).unwrap();
+    assert_eq!(first.text, "Alpha card");
+    assert!(!s.stickies.iter().any(|x| x.text == "Things to show first"));
+    assert!(!s.nodes.iter().any(|x| x.text == "Things to show first"));
+}
+
+#[test]
+fn a_later_view_adds_only_its_new_cards_as_a_group() {
+    // Frames 0-2 read the 3x3 grid. Frames 3-5 read the top two rows slightly off
+    // their columns (detached from the bottom row) and a new row of four cards under
+    // the bottom row. The late seven-card view shares three cards with the grid:
+    // a majority-overlap rule keeps it whole (duplicating those three cards); the
+    // new cards alone must form the second group.
+    let new_row = ["Lambda card", "Mu card", "Nu card", "Xi card"];
+    let specs: Vec<Spec> = (0..6)
+        .map(|f| {
+            let mut s = grid_spec();
+            if f >= 3 {
+                for c in s.stickies.iter_mut().take(6) {
+                    c.1 .0 += 50.0;
+                }
+                for (i, t) in new_row.iter().enumerate() {
+                    s.stickies.push((t, (900.0 + i as f64 * 130.0, 780.0)));
+                }
+            }
+            s
+        })
+        .collect();
+    let s = run(frames(&specs), &params());
+    let sizes: Vec<usize> = s.groups.iter().map(|g| g.sticky_ids.len()).collect();
+    assert_eq!(sizes, vec![9, 4], "{:#?}", s.groups);
+    let text_of = |id: &String| {
+        s.stickies
+            .iter()
+            .find(|x| &x.id == id)
+            .map(|x| x.text.clone())
+            .unwrap_or_default()
+    };
+    let second: Vec<String> = s.groups[1].sticky_ids.iter().map(text_of).collect();
+    assert_eq!(second, new_row.map(String::from).to_vec());
+}
+
+/// Base board with a "gRPC" box at `at` in every keyframe; the Queue to Ledger
+/// Store link is labeled "gRPC" in the keyframes `labeled` says.
+fn label_box_frames(at: (f64, f64), n: usize, labeled: impl Fn(usize) -> bool) -> Vec<BoardFrame> {
+    let specs: Vec<Spec> = (0..n)
+        .map(|f| {
+            let mut s = base();
+            s.nodes.push(("n5", "gRPC".to_string(), at));
+            if !labeled(f) {
+                s.edges[1].2 = "";
+            }
+            s
+        })
+        .collect();
+    frames(&specs)
+}
+
+fn lifted_as_label(s: &BoardStateItem, text: &str) -> bool {
+    s.folded.iter().any(|f| {
+        f.text == text && f.reason == FoldReason::EdgeLabel && f.into.starts_with("label of ")
+    })
+}
+
+#[test]
+fn an_edge_label_read_as_a_box_on_its_link_is_not_a_node() {
+    let s = run(label_box_frames((950.0, 215.0), 4, |_| true), &params());
+    assert!(!s.nodes.iter().any(|n| n.text == "gRPC"), "{:?}", s.nodes);
+    assert!(lifted_as_label(&s, "gRPC"), "{:?}", s.folded);
+    assert!(!s.events.iter().any(|e| e.detail == "gRPC"));
+    assert_eq!(s.edges.len(), 3);
+}
+
+#[test]
+fn an_edge_label_read_as_a_box_at_its_label_box_is_not_a_node() {
+    // Off the straight link (a curved connector), but touching the label box.
+    let mut fr = label_box_frames((950.0, 380.0), 4, |_| true);
+    for f in &mut fr {
+        for e in &mut f.board.edges {
+            if e.label == "gRPC" {
+                e.label_bbox = Some(BBox::new(900.0, 425.0, 1000.0, 445.0));
+            }
+        }
+    }
+    let s = run(fr, &params());
+    assert!(!s.nodes.iter().any(|n| n.text == "gRPC"), "{:?}", s.nodes);
+    assert!(lifted_as_label(&s, "gRPC"), "{:?}", s.folded);
+}
+
+#[test]
+fn an_isolated_caption_named_like_a_far_edge_label_stays_a_node() {
+    // Nothing touches the caption and nobody owns it; the same-label edge runs
+    // across the other side of the board.
+    let s = run(label_box_frames((250.0, 800.0), 4, |_| true), &params());
+    assert!(
+        s.nodes.iter().any(|n| n.text == "gRPC" && n.in_final),
+        "{:?} {:?}",
+        s.nodes,
+        s.folded
+    );
+    assert!(!lifted_as_label(&s, "gRPC"));
+}
+
+#[test]
+fn a_box_that_rarely_coincides_with_the_label_stays_a_node() {
+    // On the link, but the label was read in only one of six keyframes.
+    let s = run(label_box_frames((950.0, 215.0), 6, |f| f == 0), &params());
+    assert!(
+        s.nodes.iter().any(|n| n.text == "gRPC" && n.in_final),
+        "{:?} {:?}",
+        s.nodes,
+        s.folded
+    );
+}
+
+#[test]
+fn an_edge_label_read_as_a_sticky_on_its_link_is_not_a_sticky() {
+    let specs: Vec<Spec> = (0..4)
+        .map(|_| {
+            let mut s = base();
+            s.stickies.push(("gRPC", (950.0, 215.0)));
+            s
+        })
+        .collect();
+    let s = run(frames(&specs), &params());
+    assert!(
+        !s.stickies.iter().any(|x| x.text == "gRPC"),
+        "{:?}",
+        s.stickies
+    );
+    assert!(lifted_as_label(&s, "gRPC"), "{:?}", s.folded);
+}
+
+#[test]
+fn a_box_named_like_a_label_that_ends_an_edge_stays_a_node() {
+    let specs: Vec<Spec> = (0..4)
+        .map(|_| {
+            let mut s = base();
+            s.nodes.push(("n5", "HTTP".to_string(), (250.0, 800.0)));
+            s.edges.push(("n5", "n4", ""));
+            s
+        })
+        .collect();
+    let s = run(frames(&specs), &params());
+    assert!(
+        s.nodes.iter().any(|n| n.text == "HTTP" && n.in_final),
+        "{:?}",
+        s.nodes
+    );
+}
+
+#[test]
+fn fragments_fold_into_colocated_longer_stickies_only() {
+    let mut specs: Vec<Spec> = (0..5).map(|_| base()).collect();
+    for (i, s) in specs.iter_mut().enumerate() {
+        s.stickies.push(("Shared updates", (300.0, 780.0)));
+        s.stickies.push(("Tasks - due this week", (1300.0, 420.0)));
+        s.stickies.push(("Tasks", (450.0, 400.0)));
+        if i == 1 || i == 3 {
+            // A cut-off reading of the same card.
+            s.stickies.push(("updates", (320.0, 785.0)));
+        }
+    }
+    let s = run(frames(&specs), &params());
+    let texts: Vec<&str> = s.stickies.iter().map(|x| x.text.as_str()).collect();
+    assert!(!texts.contains(&"updates"), "{texts:?}");
+    assert!(
+        texts.contains(&"Shared updates")
+            && texts.contains(&"Tasks")
+            && texts.contains(&"Tasks - due this week")
+    );
+    assert!(s
+        .folded
+        .iter()
+        .any(|f| f.text == "updates" && f.into == "Shared updates"));
+}
+
+#[test]
+fn a_tag_moved_onto_a_connector_beside_a_box_is_a_move_to_that_box() {
+    let mut specs: Vec<Spec> = (0..6).map(|_| base()).collect();
+    for (i, s) in specs.iter_mut().enumerate() {
+        // Next to Ingest Gateway, then on the Queue -> Ledger Store connector right
+        // beside Ledger Store.
+        let at = if i < 4 {
+            (200.0, 120.0)
+        } else {
+            (1060.0, 210.0)
+        };
+        s.owners.push(("Avery", at, ""));
+    }
+    let s = run(frames(&specs), &params());
+    let a: Vec<_> = s
+        .owner_assignments
+        .iter()
+        .filter(|x| x.person_id == "p-avery")
+        .collect();
+    assert_eq!(a.len(), 2, "{a:#?}");
+    assert_eq!(a[1].target.texts(), vec!["Ledger Store"]);
+    assert_eq!(a[1].valid_from_s, 80.0);
+    assert!(a[1]
+        .moved_from
+        .as_ref()
+        .is_some_and(|m| m.texts() == vec!["Ingest Gateway"]));
+    assert!(s
+        .events
+        .iter()
+        .any(|e| e.kind == EventKind::OwnerMoved && e.keyframe_id == "kf04"));
+}
+
+#[test]
+fn one_tag_bridging_two_boxes_owns_both_nodes_not_their_link() {
+    let mut specs: Vec<Spec> = (0..4).map(|_| base()).collect();
+    for s in &mut specs {
+        s.nodes.push(("n6", "Left Pane".into(), (300.0, 450.0)));
+        s.nodes.push(("n7", "Right Pane".into(), (520.0, 450.0)));
+        s.edges.push(("n6", "n7", ""));
+        // Above the gap between the two boxes, touching neither the connector nor
+        // the gap.
+        s.owners.push(("Jordy", (410.0, 375.0), ""));
+    }
+    let s = run(frames(&specs), &params());
+    let mut t: Vec<String> = s
+        .owner_assignments
+        .iter()
+        .filter(|x| x.person_id == "p-jordan")
+        .flat_map(|x| {
+            x.target
+                .texts()
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    t.sort();
+    assert_eq!(
+        t,
+        vec!["Left Pane", "Right Pane"],
+        "{:#?}",
+        s.owner_assignments
+    );
+    assert!(s
+        .owner_assignments
+        .iter()
+        .all(|x| !matches!(x.target, OwnerTarget::Edge { .. })));
+}
+
+#[test]
+fn glyph_and_style_labels_are_stripped() {
+    let mut specs: Vec<Spec> = (0..3).map(|_| base()).collect();
+    for s in &mut specs {
+        s.edges = vec![
+            ("n1", "n2", "\u{2192}"),
+            ("n2", "n3", "solid"),
+            ("n2", "n4", "gRPC \u{2192}"),
+        ];
+    }
+    let s = run(frames(&specs), &params());
+    let mut labels: Vec<&str> = s.edges.iter().map(|e| e.label.as_str()).collect();
+    labels.sort();
+    assert_eq!(labels, vec!["", "", "gRPC"]);
+}
+
+#[test]
+fn a_node_read_with_an_imprecise_box_after_a_pan_stays_one_node() {
+    // Keyframes 2 and 3 are panned; in them the reader's Queue box is 120 px off.
+    let pan = Similarity {
+        scale: 1.0,
+        angle: 0.0,
+        tx: -100.0,
+        ty: 40.0,
+    };
+    let mut specs: Vec<Spec> = (0..4).map(|_| base()).collect();
+    specs[2].t = pan;
+    specs[3].t = pan;
+    let mut fr = frames(&specs);
+    for f in fr.iter_mut().skip(2) {
+        for n in &mut f.board.nodes {
+            if n.text == "Queue" {
+                n.bbox = BBox::new(n.bbox.x1 - 120.0, n.bbox.y1, n.bbox.x2 - 120.0, n.bbox.y2);
+            }
+        }
+    }
+    let s = run(fr, &params());
+    assert_eq!(
+        s.nodes.iter().filter(|n| n.text == "Queue").count(),
+        1,
+        "{:#?}",
+        s.nodes
+            .iter()
+            .map(|n| (&n.text, n.lifetimes.len()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn same_text_in_two_places_never_seen_together_stays_two_nodes() {
+    // "Client" on the left in keyframes 0-2 and a second "Client" on the right in
+    // keyframes 3-5, same view throughout: two elements.
+    let mut specs: Vec<Spec> = (0..6).map(|_| base()).collect();
+    for (i, s) in specs.iter_mut().enumerate() {
+        let x = if i < 3 { 250.0 } else { 1300.0 };
+        s.nodes.push(("n8", "Client".into(), (x, 420.0)));
+    }
+    let s = run(frames(&specs), &params());
+    assert_eq!(s.nodes.iter().filter(|n| n.text == "Client").count(), 2);
+}
+
+#[test]
+fn direction_votes_use_every_sighting_of_the_edge() {
+    // The edge is seen in keyframes 0-2 (head at Ingest Gateway), erased while both
+    // boxes stay in view, then seen again without a decisive head.
+    let mut specs: Vec<Spec> = (0..9).map(|_| base()).collect();
+    for s in specs.iter_mut().take(7).skip(3) {
+        s.edges.retain(|e| e.0 != "n1");
+    }
+    let mut fr = frames(&specs);
+    for (i, f) in fr.iter_mut().enumerate() {
+        let v = match i {
+            0..=2 => Some(EndVerdict::Reverse),
+            7 | 8 => Some(EndVerdict::NoArrowhead),
+            _ => None,
+        };
+        if let Some(v) = v {
+            f.directions = Some(dir_item(
+                &f.keyframe_id,
+                vec![evidence("n1", "n2", v, None)],
+            ));
+        }
+    }
+    let s = run(fr, &params());
+    let e = s.edges.iter().find(|e| e.label == "HTTP").expect("edge");
+    assert_eq!(e.direction, EdgeOrientation::Forward);
+    let src = s.nodes.iter().find(|n| n.id == e.src).unwrap();
+    assert_eq!(src.text, "Queue");
+}
+
+#[test]
+fn a_node_well_above_a_card_row_is_not_its_heading() {
+    let mut specs: Vec<Spec> = (0..3).map(|_| base()).collect();
+    for s in &mut specs {
+        s.stickies = vec![
+            ("Plan the rollout", (700.0, 845.0)),
+            ("Order the badges", (830.0, 845.0)),
+            ("Book the venue", (960.0, 845.0)),
+        ];
+    }
+    // Report Builder sits more than a card height above the row: a component, not a
+    // heading.
+    let s = run(frames(&specs), &params());
+    assert!(s.nodes.iter().any(|n| n.text == "Report Builder"));
+    let g = s
+        .groups
+        .iter()
+        .find(|g| g.sticky_ids.len() == 3)
+        .expect("row");
+    assert_eq!((g.rows, g.cols), (1, 3));
+    assert!(g.title.is_none());
+}
+
+#[test]
+fn late_reversal_sets_the_final_direction() {
+    // Head at Queue for six keyframes, then redrawn toward Ingest Gateway.
+    let mut fr = frames(&(0..9).map(|_| base()).collect::<Vec<_>>());
+    for (i, f) in fr.iter_mut().enumerate() {
+        let v = if i < 6 {
+            EndVerdict::Forward
+        } else {
+            EndVerdict::Reverse
+        };
+        f.directions = Some(dir_item(
+            &f.keyframe_id,
+            vec![evidence("n1", "n2", v, None)],
+        ));
+    }
+    let s = run(fr, &params());
+    let e = s.edges.iter().find(|e| e.label == "HTTP").expect("edge");
+    let src = s.nodes.iter().find(|n| n.id == e.src).unwrap();
+    assert_eq!(src.text, "Queue");
+    assert!(s
+        .events
+        .iter()
+        .chain(s.suppressed_events.iter().map(|x| &x.event))
+        .any(|ev| ev.kind == EventKind::EdgeReversed && ev.keyframe_id == "kf06"));
+}
+
+#[test]
+fn fragments_need_positive_geometric_evidence() {
+    // "Cache" on the left early; "Cache warmer" drawn elsewhere later. Never seen
+    // together, placed far apart: two elements.
+    let mut specs: Vec<Spec> = (0..8).map(|_| base()).collect();
+    for (i, s) in specs.iter_mut().enumerate() {
+        if i < 3 {
+            s.nodes.push(("n8", "Cache".into(), (250.0, 420.0)));
+        } else {
+            s.nodes.push(("n9", "Cache warmer".into(), (1300.0, 420.0)));
+        }
+    }
+    let s = run(frames(&specs), &params());
+    assert!(
+        s.nodes.iter().any(|n| n.text == "Cache"),
+        "{:?} {:?}",
+        s.nodes
+            .iter()
+            .map(|n| (&n.text, n.in_final))
+            .collect::<Vec<_>>(),
+        s.folded
+    );
+    assert!(s.folded.is_empty(), "{:?}", s.folded);
+    // Without any geometry (text-only readings) there is nothing to compare: no fold.
+    let mut fr = frames(&specs);
+    let full = BBox::new(0.0, 0.0, W, H);
+    for f in &mut fr {
+        for n in &mut f.board.nodes {
+            n.bbox = full;
+        }
+        for x in &mut f.board.stickies {
+            x.bbox = full;
+        }
+        for x in &mut f.board.other_visible_text {
+            x.bbox = full;
+        }
+    }
+    let s = run(fr, &params());
+    assert!(
+        s.nodes.iter().any(|n| n.text == "Cache"),
+        "{:?} {:?} {:?}",
+        s.nodes
+            .iter()
+            .map(|n| (&n.text, &n.variants))
+            .collect::<Vec<_>>(),
+        s.folded,
+        s.registration
+            .iter()
+            .map(|r| r.registration.mode)
+            .collect::<Vec<_>>()
+    );
+    assert!(s.folded.iter().all(|x| x.text != "Cache"));
+}
+
+#[test]
+fn edge_endpoints_are_never_group_headings() {
+    // A row of cards right under Report Builder, which is an edge endpoint.
+    let mut specs: Vec<Spec> = (0..3).map(|_| base()).collect();
+    for s in &mut specs {
+        s.stickies = vec![
+            ("Plan the rollout", (560.0, 760.0)),
+            ("Order the badges", (690.0, 760.0)),
+            ("Book the venue", (820.0, 760.0)),
+        ];
+    }
+    let s = run(frames(&specs), &params());
+    assert!(s.nodes.iter().any(|n| n.text == "Report Builder"));
+    assert!(s
+        .edges
+        .iter()
+        .any(|e| e.a_text == "Report Builder" || e.b_text == "Report Builder"));
+    let g = s
+        .groups
+        .iter()
+        .find(|g| g.sticky_ids.len() == 3)
+        .expect("row");
+    assert!(g.title.is_none());
+}
+
+#[test]
+fn text_well_above_a_card_row_is_not_its_heading() {
+    let mut specs: Vec<Spec> = (0..3).map(|_| base()).collect();
+    for s in &mut specs {
+        s.stickies = vec![
+            ("Plan the rollout", (560.0, 800.0)),
+            ("Order the badges", (690.0, 800.0)),
+            ("Book the venue", (820.0, 800.0)),
+        ];
+    }
+    let mut fr = frames(&specs);
+    for f in &mut fr {
+        // 250 px (2.5 card heights) above the row.
+        f.board.other_visible_text.push(TextItem {
+            text: "Venue notes".into(),
+            bbox: BBox::new(560.0, 470.0, 800.0, 500.0),
+        });
+    }
+    let s = run(fr, &params());
+    let g = s
+        .groups
+        .iter()
+        .find(|g| g.sticky_ids.len() == 3)
+        .expect("row");
+    assert!(g.title.is_none());
+}
+
+#[test]
+fn a_tag_between_two_unconnected_boxes_is_not_a_bridge() {
+    let mut specs: Vec<Spec> = (0..4).map(|_| base()).collect();
+    for s in &mut specs {
+        s.nodes.push(("n6", "Left Pane".into(), (300.0, 450.0)));
+        s.nodes.push(("n7", "Right Pane".into(), (520.0, 450.0)));
+        s.owners.push(("Jordy", (410.0, 375.0), ""));
+    }
+    let s = run(frames(&specs), &params());
+    assert!(s
+        .owner_assignments
+        .iter()
+        .filter(|x| x.person_id == "p-jordan")
+        .all(
+            |x| x.target.texts().len() == 1 && x.target.texts()[0] != "Left Pane"
+                || x.target.texts()[0] != "Right Pane"
+        ));
+    let owned: Vec<_> = s
+        .owner_assignments
+        .iter()
+        .filter(|x| x.person_id == "p-jordan")
+        .collect();
+    assert!(owned.len() < 2, "{owned:#?}");
+}
+
+#[test]
+fn board_state_1_0_0_items_still_parse() {
+    let s = run(
+        frames(&(0..3).map(|_| base()).collect::<Vec<_>>()),
+        &params(),
+    );
+    let mut v = serde_json::to_value(&s).unwrap();
+    // A 1.0.0 item has none of the fields added in 1.1.0.
+    for k in ["board_title", "groups", "folded"] {
+        v.as_object_mut().unwrap().remove(k);
+    }
+    for st in v["stickies"].as_array_mut().unwrap() {
+        st.as_object_mut().unwrap().remove("bbox");
+        st.as_object_mut().unwrap().remove("last_seen");
+    }
+    let old: BoardStateItem = serde_json::from_value(v).unwrap();
+    assert!(old.groups.is_empty() && old.board_title.is_none());
+    assert_eq!(old.stickies.len(), s.stickies.len());
 }

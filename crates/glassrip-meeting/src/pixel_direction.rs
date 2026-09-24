@@ -49,8 +49,14 @@ pub struct PixelCheckParams {
     /// Margin added around node boxes before masking, for sides without a detected
     /// outline, in pixels.
     pub node_margin_px: f64,
-    /// Search range for snapping a node box side to its drawn outline, in pixels.
+    /// Minimum search range for snapping a node box side to its drawn outline, in
+    /// pixels.
     pub outline_search_px: f64,
+    /// Search range as a share of the box's smaller side (reader boxes are off by
+    /// more on large boxes), capped by `outline_search_max_px`.
+    pub outline_search_share: f64,
+    /// Largest search range, in pixels.
+    pub outline_search_max_px: f64,
     /// Share of a side's middle span the outline must cover to be accepted.
     pub outline_min_cover: f64,
     /// Band masked beyond a detected outline, in pixels.
@@ -89,6 +95,8 @@ impl Default for PixelCheckParams {
             threshold_c: 12,
             node_margin_px: 4.0,
             outline_search_px: 8.0,
+            outline_search_share: 0.35,
+            outline_search_max_px: 48.0,
             outline_min_cover: 0.6,
             outline_band_px: 2.0,
             text_margin_px: 2.0,
@@ -600,15 +608,23 @@ struct Outline {
 }
 
 impl Outline {
-    /// Fit each side to the strongest straight stroke within `outline_search_px`,
-    /// allowing a slant of up to half that over the side's middle 70%. A side is
-    /// accepted when the line (with a 1 px band) covers `outline_min_cover` of it.
+    /// Fit each side to a straight stroke near it: the search range grows with the box
+    /// (`outline_search_share` of its smaller side, between `outline_search_px` and
+    /// `outline_search_max_px`), lines may slant by up to a tenth of the side's middle
+    /// 70%, and a line counts when it (with a 1 px band) covers `outline_min_cover` of
+    /// that span. The qualifying line closest to the given edge wins, so a
+    /// neighbouring box's outline is not taken.
     fn fit(stroke: &Mask, b: &BBox, p: &PixelCheckParams) -> Self {
         let (w, h) = (b.width(), b.height());
         let xs = (b.x1 + 0.15 * w, b.x2 - 0.15 * w);
         let ys = (b.y1 + 0.15 * h, b.y2 - 0.15 * h);
-        let r = p.outline_search_px.round().max(0.0) as isize;
-        let slope = (r / 2).max(1);
+        let r = (p.outline_search_share * w.min(h))
+            .clamp(
+                p.outline_search_px,
+                p.outline_search_max_px.max(p.outline_search_px),
+            )
+            .round()
+            .max(0.0) as isize;
         let fit_side = |horizontal: bool, base: f64| -> Side {
             let span = if horizontal { xs } else { ys };
             let (u0, u1) = (span.0.round() as isize, span.1.round() as isize);
@@ -625,6 +641,7 @@ impl Outline {
                 })
             };
             let b0 = base.round() as isize;
+            let slope = (((u1 - u0) as f64 * 0.1).ceil() as isize).clamp(1, (r / 2).max(1));
             let mut best: Option<(f64, isize, isize)> = None;
             for a in b0 - r..=b0 + r {
                 for e in a - slope..=a + slope {
@@ -636,10 +653,14 @@ impl Outline {
                         .count();
                     let cover = n as f64 / (u1 - u0 + 1) as f64;
                     let dist = (a - b0).abs() + (e - b0).abs();
+                    if cover < p.outline_min_cover {
+                        continue;
+                    }
                     let better = match best {
                         None => true,
                         Some((bc, ba, be)) => {
-                            cover > bc || (cover == bc && dist < (ba - b0).abs() + (be - b0).abs())
+                            let bd = (ba - b0).abs() + (be - b0).abs();
+                            dist < bd || (dist == bd && cover > bc)
                         }
                     };
                     if better {

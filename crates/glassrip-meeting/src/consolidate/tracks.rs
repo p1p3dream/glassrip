@@ -37,6 +37,8 @@ pub struct Obs {
     pub text: String,
     /// Box in the cluster reference frame, when the keyframe is registered.
     pub bbox: Option<BBox>,
+    /// Box in the keyframe's own canvas coordinates (none for edge labels).
+    pub raw_bbox: Option<BBox>,
     /// Registration cluster (only meaningful with `bbox`).
     pub cluster: usize,
     /// Node `local_id` in the keyframe, for node observations.
@@ -232,6 +234,9 @@ pub struct MatchParams {
     pub position_tolerance_px: f64,
     /// IoU for a same-place node with different text to count as a label change.
     pub label_change_min_iou: f64,
+    /// Largest offset, in reference pixels, at which a same-text reading may still
+    /// join a track when the view moved (imprecise boxes and registration).
+    pub off_position_max_px: f64,
 }
 
 fn center(b: &BBox) -> (f64, f64) {
@@ -240,7 +245,14 @@ fn center(b: &BBox) -> (f64, f64) {
 
 /// Assign each observation of one keyframe to a track (one-to-one, best score first),
 /// creating new tracks for the rest. Returns the track index of every observation.
-pub fn assign_frame(tracks: &mut Vec<Track>, obs: Vec<Obs>, p: &MatchParams) -> Vec<usize> {
+/// `view_moved(a, b)` says whether the registered view changed between keyframes `a`
+/// and `b`.
+pub fn assign_frame(
+    tracks: &mut Vec<Track>,
+    obs: Vec<Obs>,
+    p: &MatchParams,
+    view_moved: &dyn Fn(usize, usize) -> bool,
+) -> Vec<usize> {
     let mut cands: Vec<(f64, usize, usize)> = Vec::new();
     for (oi, o) in obs.iter().enumerate() {
         let on = normalize(&o.text);
@@ -268,8 +280,18 @@ pub fn assign_frame(tracks: &mut Vec<Track>, obs: Vec<Obs>, p: &MatchParams) -> 
                     if text_score >= p.fuzzy && same_place {
                         Some(2.0 + text_score)
                     } else if text_score >= p.fuzzy {
-                        // Same text in another place of the same canvas: another element.
-                        None
+                        // Same text in another place of the same canvas is another
+                        // element, except when a non-sticky reading is only a little
+                        // off and the view moved since the track was last seen: then
+                        // the offset is more likely an imprecise box or registration
+                        // than a second element. It still ranks below any same-place
+                        // match; duplicates within one keyframe stay apart through the
+                        // one-to-one assignment.
+                        let sticky_pair =
+                            o.lists.contains(&ObsList::Sticky) && t.votes().sticky > 0;
+                        let moved = t.obs.last().is_some_and(|l| view_moved(l.frame, o.frame));
+                        (!sticky_pair && moved && d <= p.off_position_max_px)
+                            .then_some(1.2 + text_score)
                     } else if iou >= p.label_change_min_iou
                         && o.lists.contains(&ObsList::Node)
                         && t.votes().node > 0
@@ -485,6 +507,7 @@ mod tests {
                 lists: vec![l],
                 text: text.into(),
                 bbox: None,
+                raw_bbox: None,
                 cluster: usize::MAX,
                 local_id: None,
                 color: None,

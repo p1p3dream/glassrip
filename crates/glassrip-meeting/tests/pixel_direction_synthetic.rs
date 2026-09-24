@@ -336,3 +336,78 @@ fn curved_connector_is_followed() {
     );
     assert_eq!(back.verdict, EndVerdict::Reverse, "{back:?}");
 }
+
+fn node_json(id: &str, b: &BBox) -> glassrip_vision::board::BoardNode {
+    glassrip_vision::board::BoardNode {
+        local_id: id.into(),
+        text: format!("Box {id}"),
+        bbox: *b,
+        conf: 0.9,
+    }
+}
+
+#[test]
+fn edge_label_boxes_are_masked_even_without_other_text() {
+    // A vertical connector with its head at the upper box and the label glyphs just
+    // below the head; the reading carries only the edge's label_bbox.
+    let mut c = Canvas::new(600, 520);
+    let top = BBox::new(200.0, 40.0, 340.0, 170.0);
+    let bottom = BBox::new(200.0, 260.0, 340.0, 390.0);
+    c.node(top);
+    c.node(bottom);
+    c.connector(&[(270.0, bottom.y1), (270.0, top.y2)], false, true, false);
+    let label = c.label(270.0, 196.0, 30.0);
+    let board = glassrip_vision::board::ValidatedBoard {
+        nodes: vec![node_json("n1", &top), node_json("n2", &bottom)],
+        edges: vec![glassrip_vision::board::BoardEdge {
+            src: "n1".into(),
+            dst: "n2".into(),
+            label: "REST".into(),
+            label_bbox: Some(label),
+            style: EdgeStyle::Solid,
+            conf: 0.9,
+        }],
+        stickies: vec![],
+        owner_tags: vec![],
+        other_visible_text: vec![],
+        confidence: 0.9,
+        chrome_rejected: vec![],
+        issues: vec![],
+        needs_reclassification: false,
+    };
+    let (ev, _, _) =
+        glassrip_meeting::stages::pixel_evidence(&c.img, &board, &PixelCheckParams::default());
+    // Read as top -> bottom, but the head is at the top: a reversal.
+    assert_eq!(
+        ev[0].pixel.verdict,
+        EndVerdict::Reverse,
+        "{:?}",
+        ev[0].pixel
+    );
+}
+
+#[test]
+fn reader_boxes_far_inside_the_outline_are_snapped() {
+    let mut c = Canvas::new(720, 420);
+    let (a, b) = (a_box(), b_box());
+    c.node(a);
+    c.node(b);
+    c.connector(&[(a.x2, 155.0), (b.x1, 155.0)], false, true, false);
+    // Both reader boxes sit 14 px inside the drawn outlines.
+    let shrink = |x: BBox| BBox::new(x.x1 + 14.0, x.y1 + 14.0, x.x2 - 14.0, x.y2 - 14.0);
+    let case = Case {
+        canvas: c,
+        nodes: vec![shrink(a), shrink(b)],
+        texts: vec![],
+    };
+    let ev = run(
+        &case,
+        &EdgeQuery {
+            src: shrink(a),
+            dst: shrink(b),
+            label: None,
+            style: EdgeStyle::Solid,
+        },
+    );
+    assert_eq!(ev.verdict, EndVerdict::Forward, "{ev:?}");
+}
