@@ -6,9 +6,14 @@
 
 pub mod decode;
 pub mod error;
+pub mod gaussian;
 pub mod jpeg;
 pub mod plane;
+pub mod resize;
+pub mod sharpness;
+pub mod ssim;
 pub mod util;
+pub mod warp;
 
 pub use error::{MediaError, Result};
 pub use plane::{Bgr, Plane};
