@@ -502,4 +502,92 @@ mod tests {
         assert_eq!((k[0].t_start, k[0].t_end, k[0].t_rep), (0.0, 4.0, 2.0));
         assert_eq!((k[1].t_start, k[1].t_end, k[1].t_rep), (4.0, 7.5, 4.0));
     }
+
+    /// `((template, input), (ssim, frac))`.
+    type Entry = ((usize, usize), (f64, f64));
+
+    /// Explicit `(template, input) -> (ssim, frac)` table; anything unlisted clearly differs.
+    struct Table(HashMap<(usize, usize), (f64, f64)>);
+
+    impl PairOracle for Table {
+        fn score(&self, a: usize, b: usize) -> (f64, f64, bool) {
+            let (s, f) = self.0.get(&(a, b)).copied().unwrap_or((0.1, 0.9));
+            (s, f, true)
+        }
+        fn ink(&self, _a: usize, _b: usize) -> f64 {
+            0.0
+        }
+    }
+
+    fn merge_with(runs: &mut Vec<Vec<usize>>, sharp: &[f64], table: &[Entry]) -> Vec<Merge> {
+        let o = Table(table.iter().copied().collect());
+        let cache = DiffCache::new(&o, Thresholds::default());
+        merge_singletons(runs, sharp, MergeParams::default(), &cache)
+    }
+
+    #[test]
+    fn merge_enables_second_merge_only_after_restart() {
+        // Runs [0], [1], [2,3,4]. Singleton 0 has one neighbour ([1]) and does not match it,
+        // so the first scan skips it. Singleton 1 then merges into [2,3,4] (rep 3). After the
+        // restart, 0's neighbour is [1,2,3,4] whose representative (3) matches 0.
+        let mut runs = vec![vec![0], vec![1], vec![2, 3, 4]];
+        let sharp = [100.0, 100.0, 100.0, 300.0, 100.0];
+        let merges = merge_with(
+            &mut runs,
+            &sharp,
+            &[
+                ((1, 0), (0.5, 0.5)),
+                ((3, 1), (0.9, 0.05)),
+                ((3, 0), (0.85, 0.1)),
+            ],
+        );
+        assert_eq!(runs, vec![vec![0, 1, 2, 3, 4]]);
+        let order: Vec<(usize, usize)> = merges.iter().map(|m| (m.frame, m.neighbor_rep)).collect();
+        assert_eq!(order, vec![(1, 3), (0, 3)]);
+        assert!(merges.iter().all(|m| !m.blurry));
+    }
+
+    #[test]
+    fn only_the_argmax_neighbour_is_tested() {
+        // Singleton 2 between [0,1] (rep 1) and [3,4] (rep 3). The left neighbour wins the
+        // argmax (s - f = 0.69) but fails s >= 0.70; the right one (s - f = 0.57) would match
+        // but is never tested. The frame is sharp, so nothing merges.
+        let mut runs = vec![vec![0, 1], vec![2], vec![3, 4]];
+        let sharp = [100.0, 150.0, 100.0, 150.0, 100.0];
+        let merges = merge_with(
+            &mut runs,
+            &sharp,
+            &[((1, 2), (0.69, 0.0)), ((3, 2), (0.72, 0.15))],
+        );
+        assert!(merges.is_empty());
+        assert_eq!(runs, vec![vec![0, 1], vec![2], vec![3, 4]]);
+    }
+
+    #[test]
+    fn blur_rule_uses_even_count_median_and_first_sharpest_representative() {
+        // Six frames: the median is the mean of the middle values 80 and 120, i.e. 100, so the
+        // blur threshold is 35. Using the lower middle (28) or upper middle (42) instead would
+        // flip one of the two cases below. Neighbour [3,4,5] has tied sharpest frames 4 and 5;
+        // the representative is 4 (first maximum). Scoring against 5 would match outright.
+        let table = [
+            ((1, 2), (0.4, 0.3)),
+            ((4, 2), (0.5, 0.3)),
+            ((5, 2), (0.9, 0.0)),
+        ];
+        for (x, merges_expected) in [(33.0, true), (38.0, false)] {
+            let mut runs = vec![vec![0, 1], vec![2], vec![3, 4, 5]];
+            let sharp = [80.0, 120.0, x, 60.0, 200.0, 200.0];
+            assert_eq!(median(&sharp), 100.0);
+            let merges = merge_with(&mut runs, &sharp, &table);
+            if merges_expected {
+                assert_eq!(runs, vec![vec![0, 1], vec![2, 3, 4, 5]], "x={x}");
+                assert_eq!(merges.len(), 1);
+                assert_eq!(merges[0].neighbor_rep, 4);
+                assert!(merges[0].blurry);
+            } else {
+                assert!(merges.is_empty(), "x={x}");
+                assert_eq!(runs, vec![vec![0, 1], vec![2], vec![3, 4, 5]]);
+            }
+        }
+    }
 }
