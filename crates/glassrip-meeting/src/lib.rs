@@ -6,11 +6,14 @@
 //! merges elements across keyframes with lifetimes and support rules, tracks owner
 //! tags as timed assignments, and computes change events.
 
+pub mod artifacts;
+pub mod consolidate;
 pub mod difflib;
 pub mod direction;
 pub mod pixel_direction;
 pub mod register;
 pub mod similarity;
 pub mod skeleton;
+pub mod stages;
 pub mod text;
 pub mod vlm_direction;
