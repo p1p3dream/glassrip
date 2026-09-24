@@ -1,0 +1,55 @@
+[package]
+name = "glassrip-media-stages"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Media-branch stages of glassrip meeting mode: probe, orient, frames, screen_quad, features, keyframes, rectify"
+publish = false
+
+[features]
+# Pure-Rust orientation fallback (ocrs), used when no ONNX feature is enabled.
+default = ["ocrs"]
+ocrs = ["dep:ocrs", "dep:rten"]
+# Orientation model through ONNX Runtime, using the prebuilt binaries `ort` downloads.
+onnx = ["dep:ort", "ort/download-binaries", "ort/tls-rustls"]
+# Orientation model with ONNX Runtime loaded at run time from ORT_DYLIB_PATH.
+onnx-dynamic = ["dep:ort", "ort/load-dynamic"]
+# onnx-dynamic plus the CUDA execution provider (fails loudly if CUDA cannot start).
+cuda = ["onnx-dynamic", "ort/cuda"]
+
+[dependencies]
+blake3 = { version = "1.8.7", features = ["rayon"] }
+fs-err = "3.3.1"
+fs4 = { version = "1.1.0", default-features = false, features = ["fs-err3"] }
+glassrip-core = { path = "../glassrip-core" }
+glassrip-media = { path = "../glassrip-media" }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+imageproc = { version = "0.25", default-features = false }
+ort = { version = "2.0.0-rc.13", optional = true, default-features = false, features = ["std"] }
+ocrs = { version = "0.13.1", optional = true, default-features = false, features = ["onnx"] }
+rayon = "1"
+rten = { version = "0.26", optional = true, default-features = false, features = ["onnx_format"] }
+schemars = { version = "1.2.2", features = ["semver1"] }
+semver = { version = "1.0.28", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.10"
+tempfile = "3.27.0"
+thiserror = "2"
+tokio = { version = "1.53.1", features = ["process", "rt", "rt-multi-thread", "sync", "macros", "time", "io-util"] }
+tokio-util = "0.7.19"
+toml = "1.1.6"
+tracing = "0.1.44"
+
+[dev-dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1.53.1", features = ["signal", "rt-multi-thread", "macros"] }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

@@ -288,6 +288,20 @@ pub struct FeaturesConfig {
     /// Dilation kernel size for the ink comparison.
     #[garde(range(min = 1, max = 63))]
     pub ink_dilate_px: u32,
+    /// `production`: largest accepted deviation of an alignment's linear part from the
+    /// identity (scale, shear); larger warps count as `align_failed`.
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub production_max_linear_dev: f64,
+    /// `production`: pairs whose warp covers less than this share of the frame count as
+    /// `align_failed`.
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub production_min_valid_frac: f64,
+    /// `production`: minimum phase-correlation response trusted as a translation.
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub production_min_phase_response: f64,
+    /// `production`: largest accepted translation as a share of width or height.
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub production_max_shift_frac: f64,
 }
 
 impl Default for FeaturesConfig {
@@ -307,6 +321,10 @@ impl Default for FeaturesConfig {
             ink_min_value: 80,
             ink_border_px: 20,
             ink_dilate_px: 5,
+            production_max_linear_dev: 0.15,
+            production_min_valid_frac: 0.5,
+            production_min_phase_response: 0.05,
+            production_max_shift_frac: 0.5,
         }
     }
 }
@@ -337,6 +355,11 @@ pub struct KeyframesConfig {
     /// sharpness merges regardless of content.
     #[garde(range(min = 0.0, max = 1.0))]
     pub merge_blur_ratio: f64,
+    /// `production`: the representative is the run frame nearest the run's temporal
+    /// center among frames within this share of the best sharpness (merged singletons
+    /// excluded). `prototype_compat` always takes the sharpest frame.
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub production_rep_sharpness_tolerance: f64,
 }
 
 impl Default for KeyframesConfig {
@@ -349,6 +372,7 @@ impl Default for KeyframesConfig {
             merge_min_ssim: 0.70,
             merge_max_changed_frac: 0.20,
             merge_blur_ratio: 0.35,
+            production_rep_sharpness_tolerance: 0.05,
         }
     }
 }

@@ -1,0 +1,42 @@
+# Model files used by the media stages. URLs are pinned to an upstream revision;
+# SHA-256 values were measured on the downloaded files. Binaries are never
+# committed. Paths are relative to $GLASSRIP_MODELS_DIR or ~/.glassrip/models.
+
+[[model]]
+name = "pp-lcnet-x1-0-doc-ori"
+path = "orient/PP-LCNet_x1_0_doc_ori.onnx"
+url = "https://huggingface.co/monkt/paddleocr-onnx/resolve/7b02d0a30a07ba2b92ad1ff5a8941ae2c633de65/preprocessing/doc-orientation/PP-LCNet_x1_0_doc_ori.onnx"
+sha256 = "f5516822af9262711e197ff224a8a9d884f8046a6321b762e34f8cbf082c45ef"
+license = "Apache-2.0"
+
+# Text-line detector used to find lines for the 180 degree confirmation.
+[[model]]
+name = "pp-ocrv3-det"
+path = "orient/PP-OCRv3_det.onnx"
+url = "https://huggingface.co/monkt/paddleocr-onnx/resolve/7b02d0a30a07ba2b92ad1ff5a8941ae2c633de65/detection/v3/det.onnx"
+sha256 = "ee40e80071ba3a320d4efda75f3e22047a7d049e9bf7bcaaf9daea23fc21b935"
+license = "Apache-2.0"
+
+# PP-OCRv5 English recognizer: confidence at the chosen angle versus its 180 degree flip.
+[[model]]
+name = "en-pp-ocrv5-mobile-rec"
+path = "orient/en_PP-OCRv5_mobile_rec.onnx"
+url = "https://huggingface.co/monkt/paddleocr-onnx/resolve/7b02d0a30a07ba2b92ad1ff5a8941ae2c633de65/languages/english/rec.onnx"
+sha256 = "4e16deb22c4da6468bdca539b2cd3c8687825538b67109177c47d359ab994cd7"
+license = "Apache-2.0"
+
+# ocrs models for the pure-Rust orientation fallback (no ONNX Runtime). The upstream URLs
+# are not versioned; the pinned hash makes any upstream change fail loudly.
+[[model]]
+name = "ocrs-text-detection"
+path = "ocrs/text-detection.onnx"
+url = "https://ocrs-models.s3-accelerate.amazonaws.com/text-detection.onnx"
+sha256 = "a917b23dbd9524b465df7e922641b3ff2981623df4ded5a0234004ef2fee7cfe"
+license = "MIT OR Apache-2.0"
+
+[[model]]
+name = "ocrs-text-recognition"
+path = "ocrs/text-recognition.onnx"
+url = "https://ocrs-models.s3-accelerate.amazonaws.com/text-recognition.onnx"
+sha256 = "86c145c2edb96c8caed5b1ebb8f44d706408922211451c309c625157dd6061c5"
+license = "MIT OR Apache-2.0"
