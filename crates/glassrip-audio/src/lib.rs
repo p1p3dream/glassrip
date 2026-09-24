@@ -15,9 +15,13 @@
 //! 7. [`transcript`]: `glassrip.transcript` and `glassrip.speakers` artifacts ([`types`]).
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod asr;
 pub mod error;
 pub mod extract;
+pub mod metrics;
 pub mod models;
 pub mod types;
+pub mod vocab;
+pub mod words;
 
 pub use error::{AudioError, Result};
