@@ -50,6 +50,91 @@ pub fn content_tokens(s: &str) -> Vec<String> {
     tokens(s).into_iter().filter(|t| !is_stopword(t)).collect()
 }
 
+/// Words too generic to identify a board target on their own ("Kiosk App" is
+/// identified by "kiosk", not "app").
+const GENERIC_WORDS: &[&str] = &[
+    "api",
+    "apis",
+    "app",
+    "apps",
+    "application",
+    "backend",
+    "box",
+    "client",
+    "code",
+    "component",
+    "components",
+    "config",
+    "core",
+    "data",
+    "database",
+    "db",
+    "design",
+    "doc",
+    "docs",
+    "feature",
+    "features",
+    "flow",
+    "frontend",
+    "item",
+    "items",
+    "kit",
+    "layer",
+    "main",
+    "model",
+    "module",
+    "new",
+    "old",
+    "page",
+    "part",
+    "piece",
+    "platform",
+    "project",
+    "screen",
+    "server",
+    "service",
+    "services",
+    "setup",
+    "side",
+    "store",
+    "stuff",
+    "system",
+    "systems",
+    "team",
+    "thing",
+    "things",
+    "tool",
+    "tools",
+    "ui",
+    "ux",
+    "view",
+    "work",
+];
+
+/// The tokens that are not generic words.
+pub fn distinctive_tokens(tokens: &[String]) -> Vec<String> {
+    tokens
+        .iter()
+        .filter(|t| !GENERIC_WORDS.contains(&t.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// True when `words` name a target whose content tokens are `target`: one of
+/// its distinctive tokens, or, for a target made only of generic words, all of
+/// them. One generic word ("app") never names a target.
+pub fn names_target(words: &std::collections::BTreeSet<String>, target: &[String]) -> bool {
+    let distinctive: Vec<&String> = target
+        .iter()
+        .filter(|t| !GENERIC_WORDS.contains(&t.as_str()))
+        .collect();
+    if distinctive.is_empty() {
+        !target.is_empty() && target.iter().all(|t| words.contains(t))
+    } else {
+        distinctive.into_iter().any(|t| words.contains(t))
+    }
+}
+
 /// Jaccard similarity of two token sets.
 pub fn jaccard(a: &[String], b: &[String]) -> f64 {
     use std::collections::BTreeSet;

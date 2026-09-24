@@ -9,10 +9,13 @@ use super::{
     ActionItem, Decision, DroppedItem, Evidence, OpenQuestion, QuestionSource, Quote, QuoteMatch,
     SummaryPoint, TimelineEntry,
 };
-use crate::board::{first_seen, BoardExt, BoardStateItem, KeyframeTimes, StickyKind};
+use crate::board::{first_seen, BoardExt, BoardStateItem, EventKind, KeyframeTimes, StickyKind};
 use crate::named::NamedLine;
 use crate::people::AliasTable;
-use crate::text::{content_tokens, is_stopword, jaccard, normalize, sanitize_dashes, tokens};
+use crate::text::{
+    content_tokens, distinctive_tokens, is_stopword, jaccard, names_target, normalize,
+    sanitize_dashes, tokens,
+};
 
 /// Most `...` elisions in one quote.
 pub const MAX_ELISIONS: usize = 2;
@@ -203,6 +206,81 @@ pub struct Corpus {
     segs: BTreeMap<String, SegText>,
     times: BTreeMap<String, f64>,
     table: AliasTable,
+    /// Ids that show an owner tag appearing or moving (owner events, and the
+    /// keyframes that opened owner assignments), with the owner and target of
+    /// each assignment they concern.
+    owner_keys: BTreeMap<String, Vec<OwnerKey>>,
+}
+
+/// The owner and target of an owner-tag change, as tokens.
+#[derive(Debug, Clone)]
+struct OwnerKey {
+    /// Tokens of the owner's display name.
+    name: Vec<String>,
+    /// Content tokens of the target.
+    target: Vec<String>,
+}
+
+/// Words that state ownership or assignment ("Avery owns the kiosk", "take
+/// the ledger", "assigned to").
+const OWNERSHIP_WORDS: &[&str] = &[
+    "own",
+    "owns",
+    "owned",
+    "owning",
+    "owner",
+    "owners",
+    "ownership",
+    "take",
+    "takes",
+    "taking",
+    "took",
+    "assign",
+    "assigns",
+    "assigned",
+    "assigning",
+    "assignment",
+    "responsible",
+    "lead",
+    "leads",
+    "leading",
+];
+
+impl OwnerKey {
+    /// The item's words refer to this owner-tag change: they name the target
+    /// and either the owner or the ownership ("Avery owns the kiosk rollout",
+    /// "Own the kiosk work"), or they name the target in full (every content
+    /// word, or most of at least two distinctive words). One shared word
+    /// ("Buy a new office printer" against "Badge Printer") is not enough.
+    fn backs(&self, words: &BTreeSet<String>) -> bool {
+        if self.target.is_empty() {
+            return false;
+        }
+        let owner_ref = self.name.iter().any(|t| words.contains(t))
+            || OWNERSHIP_WORDS.iter().any(|t| words.contains(*t));
+        if owner_ref && names_target(words, &self.target) {
+            return true;
+        }
+        if self.target.iter().all(|t| words.contains(t)) {
+            return true;
+        }
+        let distinctive = distinctive_tokens(&self.target);
+        let hit = distinctive.iter().filter(|t| words.contains(*t)).count();
+        hit >= 2 && hit * 2 > distinctive.len()
+    }
+}
+
+/// Validation switches (see [`super::candidates`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CheckOptions {
+    /// Decisions and action items may be supported by an owner-tag change on
+    /// the board instead of a transcript segment.
+    pub board_support: bool,
+    /// Decisions need a speaker commitment in a cited segment, or an owner-tag
+    /// change on the board.
+    pub precision_guard: bool,
+    /// Remove narrative prefixes ("The team decided to") from decisions and tasks.
+    pub strip_prefix: bool,
 }
 
 impl Corpus {
@@ -252,7 +330,42 @@ impl Corpus {
                 }
             }
         }
-        Self { segs, times, table }
+        let mut owner_keys: BTreeMap<String, Vec<OwnerKey>> = BTreeMap::new();
+        for b in boards {
+            for o in &b.owner_assignments {
+                let words = OwnerKey {
+                    name: tokens(&o.display_name),
+                    target: content_tokens(&crate::board::target_text(&o.target)),
+                };
+                for e in b.events.iter().filter(|e| {
+                    matches!(e.kind, EventKind::OwnerAssigned | EventKind::OwnerMoved)
+                        && e.subject == o.person_id
+                        && (e.t_s - o.valid_from_s).abs() <= 30.0
+                }) {
+                    owner_keys
+                        .entry(e.event_id.clone())
+                        .or_default()
+                        .push(words.clone());
+                }
+                if !o.opened_at_keyframe.is_empty() {
+                    owner_keys
+                        .entry(o.opened_at_keyframe.clone())
+                        .or_default()
+                        .push(words.clone());
+                    times.entry(o.opened_at_keyframe.clone()).or_insert(
+                        keyframes
+                            .get(&o.opened_at_keyframe)
+                            .unwrap_or(o.valid_from_s),
+                    );
+                }
+            }
+        }
+        Self {
+            segs,
+            times,
+            table,
+            owner_keys,
+        }
     }
 
     /// The alias table.
@@ -582,6 +695,75 @@ pub fn is_greeting_or_farewell(text: &str) -> bool {
         && content_tokens(text).len() <= 6
 }
 
+/// True for a verb that starts a task.
+pub fn is_task_verb(word: &str) -> bool {
+    TASK_VERBS.contains(&word)
+}
+
+/// Words of personal activities that are not work tasks ("grab a coffee",
+/// "call my mom").
+const PERSONAL: &[&str] = &[
+    "coffee",
+    "lunch",
+    "breakfast",
+    "dinner",
+    "snack",
+    "bathroom",
+    "restroom",
+    "water",
+    "drink",
+    "nap",
+    "doctor",
+    "appointment",
+    "errand",
+    "errands",
+    "gym",
+    "dentist",
+    "haircut",
+    "groceries",
+    "grocery",
+    "pharmacy",
+    "babysitter",
+    "daycare",
+    "mom",
+    "dad",
+    "mother",
+    "father",
+    "kids",
+    "wife",
+    "husband",
+    "son",
+    "daughter",
+];
+/// Phrases of leaving or pausing ("head out", "step away").
+const PERSONAL_PHRASES: &[&str] = &[
+    "head out",
+    "step away",
+    "step out",
+    "grab a",
+    "be right back",
+    "a break",
+    "quick break",
+    "take a walk",
+    "go for a walk",
+    "some air",
+    "fresh air",
+    "take a quick call",
+    "get the door",
+    "answer the door",
+];
+
+/// True when a task is a personal activity rather than work.
+pub fn is_personal_activity(text: &str) -> bool {
+    let toks = tokens(text);
+    // "walk through the design" is a work walkthrough, not a walk
+    let n = format!(" {} ", toks.join(" ")).replace(" walk through ", " walkthrough ");
+    toks.iter().any(|t| PERSONAL.contains(&t.as_str()))
+        || PERSONAL_PHRASES
+            .iter()
+            .any(|p| n.contains(&format!(" {p} ")))
+}
+
 /// Checks the task has a leading verb and an object. Returns the reason if not.
 pub fn check_task(task: &str) -> Option<String> {
     let toks = tokens(task);
@@ -655,12 +837,28 @@ fn resolve_owners(raw: &str, table: &AliasTable) -> Result<Vec<Owner>, String> {
 
 /// Validates one drafted item.
 pub fn check(section: Section, item: &DraftItem, corpus: &Corpus) -> Result<Checked, Failure> {
+    check_with(section, item, corpus, &CheckOptions::default())
+}
+
+/// Validates one drafted item with options.
+pub fn check_with(
+    section: Section,
+    item: &DraftItem,
+    corpus: &Corpus,
+    opts: &CheckOptions,
+) -> Result<Checked, Failure> {
     let mut reasons = Vec::new();
-    let text = sanitize_dashes(if section == Section::ActionItems {
+    let raw_text = if section == Section::ActionItems {
         &item.task
     } else {
         &item.text
-    });
+    };
+    let text = if opts.strip_prefix && matches!(section, Section::Decisions | Section::ActionItems)
+    {
+        sanitize_dashes(&super::candidates::strip_item_prefix(raw_text))
+    } else {
+        sanitize_dashes(raw_text)
+    };
     if tokens(&text).len() < 3 {
         reasons.push("text too short".to_string());
     }
@@ -673,6 +871,12 @@ pub fn check(section: Section, item: &DraftItem, corpus: &Corpus) -> Result<Chec
         });
     }
     let mut owners = Vec::new();
+    if section == Section::ActionItems && is_personal_activity(&text) {
+        return Err(Failure {
+            reasons: vec!["personal activity, not a work task".into()],
+            fatal: true,
+        });
+    }
     if section == Section::ActionItems {
         if let Some(r) = check_task(&text) {
             reasons.push(r);
@@ -694,8 +898,36 @@ pub fn check(section: Section, item: &DraftItem, corpus: &Corpus) -> Result<Chec
         section,
         Section::Decisions | Section::ActionItems | Section::OpenQuestions
     );
-    if needs_segment && evidence.segment_ids.is_empty() {
+    // board support counts only when the item's own text refers to the
+    // owner-tag change it cites (see OwnerKey::backs): a name-drop, one shared
+    // target word or a generic word does not; the owner field is not text
+    let item_words: BTreeSet<String> = tokens(&text).into_iter().collect();
+    let board_backed = evidence
+        .event_ids
+        .iter()
+        .chain(&evidence.keyframe_ids)
+        .filter_map(|id| corpus.owner_keys.get(id))
+        .flatten()
+        .any(|k| k.backs(&item_words));
+    let board_ok = opts.board_support
+        && board_backed
+        && matches!(section, Section::Decisions | Section::ActionItems);
+    if needs_segment && evidence.segment_ids.is_empty() && !board_ok {
         reasons.push("must cite at least one transcript segment".into());
+    }
+    if opts.precision_guard && section == Section::Decisions && !board_backed {
+        let committed = evidence.segment_ids.iter().any(|id| {
+            corpus.segs.get(id).is_some_and(|s| {
+                super::candidates::has_commitment(&s.text)
+                    || super::candidates::has_commitment(&s.text_raw)
+            })
+        });
+        if !committed {
+            reasons.push(
+                "a decision must cite a line where someone commits to it (or an owner-tag change on the board)"
+                    .into(),
+            );
+        }
     }
     for id in &evidence.segment_ids {
         if !corpus.segs.contains_key(id) {
@@ -1099,6 +1331,276 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ok.quote.unwrap().segment_id, "s9");
+    }
+
+    #[test]
+    fn board_support_precision_guard_and_prefixes() {
+        use crate::board::build;
+        let mut b = build::board("b", 100.0);
+        b.nodes = vec![build::node("n1", "Kiosk App", 0.0, 100.0, None)];
+        let mut o = build::owner(
+            "avery-quinn",
+            "Avery Quinn",
+            build::node_target(&b, "n1"),
+            40.0,
+            100.0,
+            None,
+        );
+        o.opened_at_keyframe = "kf_000040".into();
+        b.owner_assignments = vec![o];
+        let lines = vec![
+            line(
+                "s1",
+                10.0,
+                "The importer reads the ledger nightly.",
+                "The importer reads the ledger nightly.",
+            ),
+            line(
+                "s2",
+                20.0,
+                "Let's skip the importer for now.",
+                "Let's skip the importer for now.",
+            ),
+        ];
+        let c = Corpus::new(
+            &lines,
+            &[b],
+            &KeyframeTimes::default(),
+            AliasTable::from_names(&["Avery Quinn"]),
+        );
+        let all = CheckOptions {
+            board_support: true,
+            precision_guard: true,
+            strip_prefix: true,
+        };
+        // an owner-tag action with only the board citation
+        let mut a = DraftItem {
+            owner: "Avery".into(),
+            task: "Own the Kiosk App work".into(),
+            keyframe_ids: vec!["kf_000040".into()],
+            ..Default::default()
+        };
+        assert!(check_with(Section::ActionItems, &a, &c, &all).is_ok());
+        assert!(
+            check(Section::ActionItems, &a, &c).is_err(),
+            "off by default"
+        );
+        // a keyframe that did not open an owner tag is not board support
+        a.keyframe_ids = vec!["kf_999999".into()];
+        assert!(check_with(Section::ActionItems, &a, &c, &all).is_err());
+        // the guard: a decision citing only a descriptive line fails
+        let d = item("The team decided to skip the importer", &["s1"], "");
+        let e = check_with(Section::Decisions, &d, &c, &all).unwrap_err();
+        assert!(e.reasons.iter().any(|r| r.contains("commits")), "{e:?}");
+        // citing an unrelated owner-tag change does not bypass the guard
+        let mut d = item("The team decided to skip the importer", &["s1"], "");
+        d.keyframe_ids = vec!["kf_000040".into()];
+        let e = check_with(Section::Decisions, &d, &c, &all).unwrap_err();
+        assert!(e.reasons.iter().any(|r| r.contains("commits")), "{e:?}");
+        // a decision about that owner tag's target is board-backed
+        let mut d = item("Avery owns the Kiosk App work", &["s1"], "");
+        d.keyframe_ids = vec!["kf_000040".into()];
+        assert!(check_with(Section::Decisions, &d, &c, &all).is_ok());
+        // personal activities are not tasks
+        let coffee = DraftItem {
+            owner: "Avery".into(),
+            task: "Get coffee before the next session".into(),
+            segment_ids: vec!["s2".into()],
+            ..Default::default()
+        };
+        let e = check_with(Section::ActionItems, &coffee, &c, &all).unwrap_err();
+        assert!(
+            e.fatal && e.reasons[0].contains("personal activity"),
+            "{e:?}"
+        );
+        // citing the committing line passes, with the prefix removed
+        let d = item("The team decided to skip the importer", &["s2"], "");
+        let ok = check_with(Section::Decisions, &d, &c, &all).unwrap();
+        assert_eq!(ok.text, "Skip the importer");
+    }
+
+    /// Avery owns the Kiosk App (keyframe kf_000040); s1 is descriptive, s2
+    /// opens with a personal future before a descriptive sentence.
+    fn guard_corpus() -> Corpus {
+        use crate::board::build;
+        let mut b = build::board("b", 100.0);
+        b.nodes = vec![build::node("n1", "Kiosk App", 0.0, 100.0, None)];
+        let mut o = build::owner(
+            "avery-quinn",
+            "Avery Quinn",
+            build::node_target(&b, "n1"),
+            40.0,
+            100.0,
+            None,
+        );
+        o.opened_at_keyframe = "kf_000040".into();
+        b.owner_assignments = vec![o];
+        let text = "I'll be right back. The importer reads the ledger nightly.";
+        let lines = vec![
+            line(
+                "s1",
+                10.0,
+                "The importer reads the ledger nightly.",
+                "The importer reads the ledger nightly.",
+            ),
+            line("s2", 20.0, text, text),
+        ];
+        Corpus::new(
+            &lines,
+            &[b],
+            &KeyframeTimes::default(),
+            AliasTable::from_names(&["Avery Quinn"]),
+        )
+    }
+
+    const ALL: CheckOptions = CheckOptions {
+        board_support: true,
+        precision_guard: true,
+        strip_prefix: true,
+    };
+
+    #[test]
+    fn a_personal_future_does_not_lend_a_commitment_to_its_segment() {
+        let c = guard_corpus();
+        let d = item("Keep the importer on REST", &["s2"], "");
+        let e = check_with(Section::Decisions, &d, &c, &ALL).unwrap_err();
+        assert!(e.reasons.iter().any(|r| r.contains("commits")), "{e:?}");
+    }
+
+    #[test]
+    fn board_support_needs_the_target_not_the_owner_name() {
+        let c = guard_corpus();
+        // the review's construction: the decision name-drops the owner of the
+        // cited keyframe and cites no transcript line
+        let mut d = item("Avery will draft the importer docs", &[], "");
+        d.keyframe_ids = vec!["kf_000040".into()];
+        let e = check_with(Section::Decisions, &d, &c, &ALL).unwrap_err();
+        assert!(
+            e.reasons.iter().any(|r| r.contains("transcript segment")),
+            "{e:?}"
+        );
+        // with a descriptive line cited, the guard is not bypassed either
+        d.segment_ids = vec!["s1".into()];
+        let e = check_with(Section::Decisions, &d, &c, &ALL).unwrap_err();
+        assert!(e.reasons.iter().any(|r| r.contains("commits")), "{e:?}");
+        // the owner named as an action's owner does not back the task
+        let a = DraftItem {
+            owner: "Avery".into(),
+            task: "Draft the importer docs".into(),
+            keyframe_ids: vec!["kf_000040".into()],
+            ..Default::default()
+        };
+        let e = check_with(Section::ActionItems, &a, &c, &ALL).unwrap_err();
+        assert!(
+            e.reasons.iter().any(|r| r.contains("transcript segment")),
+            "{e:?}"
+        );
+        // one generic target word is not the target
+        let mut d = item("Rewrite the app login", &["s1"], "");
+        d.keyframe_ids = vec!["kf_000040".into()];
+        let e = check_with(Section::Decisions, &d, &c, &ALL).unwrap_err();
+        assert!(e.reasons.iter().any(|r| r.contains("commits")), "{e:?}");
+        // naming the target and the ownership is board support
+        let mut d = item("Avery owns the kiosk rollout", &[], "");
+        d.keyframe_ids = vec!["kf_000040".into()];
+        assert!(check_with(Section::Decisions, &d, &c, &ALL).is_ok());
+    }
+
+    #[test]
+    fn one_shared_target_word_is_not_board_support() {
+        use crate::board::build;
+        let mut b = build::board("b", 100.0);
+        b.nodes = vec![
+            build::node("n1", "Badge Printer", 0.0, 100.0, None),
+            build::node("n2", "Kiosk App", 0.0, 100.0, None),
+        ];
+        let mut o1 = build::owner(
+            "mira-okafor",
+            "Mira Okafor",
+            build::node_target(&b, "n1"),
+            40.0,
+            100.0,
+            None,
+        );
+        o1.opened_at_keyframe = "kf_000040".into();
+        let mut o2 = build::owner(
+            "avery-quinn",
+            "Avery Quinn",
+            build::node_target(&b, "n2"),
+            50.0,
+            100.0,
+            None,
+        );
+        o2.opened_at_keyframe = "kf_000050".into();
+        b.owner_assignments = vec![o1, o2];
+        let text = "The importer reads the ledger nightly.";
+        let c = Corpus::new(
+            &[line("s1", 10.0, text, text)],
+            &[b],
+            &KeyframeTimes::default(),
+            AliasTable::from_names(&["Mira Okafor", "Avery Quinn"]),
+        );
+        let reject = |section: Section, d: &DraftItem| {
+            let e = check_with(section, d, &c, &ALL).unwrap_err();
+            assert!(
+                e.reasons
+                    .iter()
+                    .any(|r| r.contains("transcript segment") || r.contains("commits")),
+                "{d:?}: {e:?}"
+            );
+        };
+        // the review's constructions: one distinctive target word, no
+        // reference to the ownership
+        let mut d = item("Buy a new office printer", &[], "");
+        d.keyframe_ids = vec!["kf_000040".into()];
+        reject(Section::Decisions, &d);
+        d.segment_ids = vec!["s1".into()];
+        reject(Section::Decisions, &d);
+        let a = DraftItem {
+            owner: "Avery".into(),
+            task: "Rewrite the kiosk login flow".into(),
+            keyframe_ids: vec!["kf_000050".into()],
+            ..Default::default()
+        };
+        reject(Section::ActionItems, &a);
+        // the owner named in the text, an ownership verb, or the full target
+        let ok = |section: Section, d: &DraftItem| {
+            assert!(check_with(section, d, &c, &ALL).is_ok(), "{d:?}");
+        };
+        let mut d = item("Mira keeps the printer queue", &[], "");
+        d.keyframe_ids = vec!["kf_000040".into()];
+        ok(Section::Decisions, &d);
+        let mut d = item("Take over the printer drivers", &[], "");
+        d.keyframe_ids = vec!["kf_000040".into()];
+        ok(Section::Decisions, &d);
+        let mut d = item("Retire the badge printer", &[], "");
+        d.keyframe_ids = vec!["kf_000040".into()];
+        ok(Section::Decisions, &d);
+        let a = DraftItem {
+            owner: "Avery".into(),
+            task: "Own the Kiosk App".into(),
+            keyframe_ids: vec!["kf_000050".into()],
+            ..Default::default()
+        };
+        ok(Section::ActionItems, &a);
+    }
+
+    #[test]
+    fn personal_errands_outside_the_old_list_are_not_tasks() {
+        let c = guard_corpus();
+        for task in ["Talk to mom after this", "Get the kids from school"] {
+            let a = DraftItem {
+                owner: "Avery".into(),
+                task: task.into(),
+                segment_ids: vec!["s1".into()],
+                ..Default::default()
+            };
+            let e = check_with(Section::ActionItems, &a, &c, &ALL).unwrap_err();
+            assert!(e.fatal, "{task}: {e:?}");
+        }
+        // "break" as a work verb is not a pause
+        assert!(!is_personal_activity("Break the importer into two jobs"));
+        assert!(is_personal_activity("Take a quick break"));
     }
 
     #[test]

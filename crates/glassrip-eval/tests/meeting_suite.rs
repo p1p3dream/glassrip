@@ -247,6 +247,73 @@ fn degraded_notes_fail_the_gate_and_missing_artifacts_are_reported() {
     assert_eq!(run.not_run.len(), 4, "{:?}", run.not_run);
 }
 
+#[test]
+fn errored_notes_fail_the_section_and_errored_items_are_case_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    ra::write_with_errors(
+        dir.path(),
+        schema::MEETING_NOTES,
+        vec![],
+        &["meeting_notes"],
+    )
+    .unwrap();
+    ra::write_with_errors(
+        dir.path(),
+        schema::BOARD_STATE,
+        vec![(
+            "board-1".into(),
+            ra::board(
+                "board-1",
+                true,
+                Some(60.0),
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+            ),
+        )],
+        &["board-2"],
+    )
+    .unwrap();
+    let run = run_meeting(&golden(), &RunArtifacts::scan(dir.path()).unwrap(), 2.0).unwrap();
+    // never skipped: the notes section fails and its metrics read zero
+    assert!(
+        run.gate_failures
+            .iter()
+            .any(|g| g.contains("notes section FAIL")),
+        "{:?}",
+        run.gate_failures
+    );
+    assert!(
+        !run.not_run.iter().any(|n| n.contains("notes")),
+        "{:?}",
+        run.not_run
+    );
+    assert_eq!(run.metrics.get("notes.decision.recall"), Some(&0.0));
+    assert_eq!(run.metrics.get("notes.action.precision"), Some(&0.0));
+    // both errored artifacts are case errors (the no_case_errors gate)
+    assert_eq!(run.errors.len(), 2, "{:?}", run.errors);
+    assert!(run.errors.iter().any(|e| e.contains("board-2")));
+}
+
+#[test]
+fn everyone_actions_match_by_owner_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut g = golden();
+    g.transcript.action_items[0].person_id = Some("everyone".into());
+    write(
+        dir.path(),
+        schema::MEETING_NOTES,
+        vec![(
+            "meeting_notes",
+            ra::notes("ok", &[], &[(None, "write the parser")], &[]),
+        )],
+    );
+    let run = run_meeting(&g, &RunArtifacts::scan(dir.path()).unwrap(), 2.0).unwrap();
+    assert_eq!(run.metrics.get("notes.action.recall"), Some(&1.0));
+}
+
 fn board_metrics(states: Vec<Value>) -> glassrip_eval::suite::Metrics {
     let dir = tempfile::tempdir().unwrap();
     let items: Vec<(String, Value)> = states
