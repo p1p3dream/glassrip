@@ -18,11 +18,15 @@
 //!    the region when the region lies inside its registered view, OCR read none of
 //!    the element's text there, and the keyframe read another established element
 //!    near that place, which confirms the registration there. Absence outside the
-//!    view, or in a view with nothing known read near the place, is not removal. An element never placed on the board (text-only registration) seen
-//!    in a single keyframe cannot be checked against later views and is not final.
+//!    view, or in a view with nothing known read near the place, is not removal.
+//!    An element never placed on the board (text-only registration) seen in a
+//!    single keyframe cannot be checked against later views and is not final.
 //! 4. Edges are keyed by their two node tracks; an endpoint that is not a supported
 //!    node drops the edge (nodes are never created from endpoints). Directions come
-//!    from the weighted vote over `glassrip.edge_direction` evidence.
+//!    from the weighted vote over `glassrip.edge_direction` evidence. An edge is
+//!    absent from a keyframe that read (or covers) both of its ends without it, but
+//!    only once the board's aligned ink changed since the edge was last read:
+//!    readers often leave a connector out of a reading, erasing one changes ink.
 //! 5. Owner tags become timed assignments ([`owners`]).
 //! 6. Events are computed from the state changes and gated on ink ([`events`]).
 
@@ -1197,15 +1201,23 @@ pub fn consolidate(
         let ivs = intervals(
             &seen,
             // An edge is absent from a keyframe that read both of its ends (or
-            // covers both places) without reading the edge.
+            // covers both places) without reading the edge, once the board's ink
+            // changed since the edge was last read: readers often leave a
+            // connector out of one reading, while erasing one changes the ink.
             |f| {
                 let present = |t: &Track| {
                     t.obs.iter().any(|o| o.frame == f && o.bbox.is_some())
                         || track_covered(t, f) == Visibility::Visible
                 };
+                let from = seen.iter().rev().find(|&&s| s < f).map_or(0, |&s| s + 1);
+                let inked = (from..=f).any(|k| {
+                    frames[k]
+                        .ink_change
+                        .is_some_and(|x| x >= params.ink_event_threshold)
+                });
                 if seen.contains(&f) {
                     Visibility::Unknown
-                } else if present(ta) && present(tb) {
+                } else if inked && present(ta) && present(tb) {
                     Visibility::Visible
                 } else {
                     Visibility::Unknown

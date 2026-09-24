@@ -1693,3 +1693,29 @@ fn ocr_text_at_the_place_means_the_reader_missed_it() {
     assert!(rb.in_final, "{rb:?}");
     assert!(rb.lifetimes.iter().all(|l| l.removed_at_s.is_none()));
 }
+
+#[test]
+fn an_edge_left_out_of_readings_stays_until_the_ink_changes() {
+    // Keyframes 5 to 8 read both ends of the gRPC edge but not the edge itself.
+    let mut specs: Vec<Spec> = (0..9)
+        .map(|_| Spec {
+            ink: Some(0.01),
+            ..base()
+        })
+        .collect();
+    for s in specs.iter_mut().skip(5) {
+        s.edges.retain(|e| e.2 != "gRPC");
+    }
+    let grpc = |s: &BoardStateItem| s.edges.iter().find(|e| e.label == "gRPC").cloned().unwrap();
+    // No ink change: the reader left it out.
+    let s = run(frames(&specs), &params());
+    let e = grpc(&s);
+    assert!(e.in_final, "{e:?}");
+    assert!(e.lifetimes.iter().all(|l| l.removed_at_s.is_none()));
+    // The connector is erased at keyframe 5: the ink changes there.
+    specs[5].ink = Some(0.2);
+    let s = run(frames(&specs), &params());
+    let e = grpc(&s);
+    assert!(!e.in_final, "{e:?}");
+    assert_eq!(e.lifetimes.last().unwrap().removed_at_s, Some(100.0));
+}
