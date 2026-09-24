@@ -63,7 +63,10 @@ pub fn ssim_dedup(frames: Vec<SampledFrame>, threshold: f64) -> Vec<SampledFrame
 
     let mut prev_gray = first_gray;
     let mut iter = frames.into_iter();
-    let mut kept = vec![iter.next().unwrap()];
+    let Some(first) = iter.next() else {
+        return vec![];
+    };
+    let mut kept = vec![first];
 
     for frame in iter {
         let curr_gray = match load_gray(&frame.path, 320) {
@@ -88,23 +91,20 @@ pub fn ssim_dedup(frames: Vec<SampledFrame>, threshold: f64) -> Vec<SampledFrame
 }
 
 pub fn detect_scroll_sequences(frames: Vec<SampledFrame>) -> Vec<Vec<SampledFrame>> {
-    if frames.is_empty() {
-        return vec![];
-    }
+    let mut groups: Vec<Vec<SampledFrame>> = Vec::new();
+    let mut current: Vec<SampledFrame> = Vec::new();
 
-    let mut iter = frames.into_iter();
-    let mut groups: Vec<Vec<SampledFrame>> = vec![vec![iter.next().unwrap()]];
-
-    for frame in iter {
-        let is_scroll = {
-            let prev = groups.last().unwrap().last().unwrap();
-            is_vertical_scroll(&prev.path, &frame.path)
-        };
-        if is_scroll {
-            groups.last_mut().unwrap().push(frame);
-        } else {
-            groups.push(vec![frame]);
+    for frame in frames {
+        let is_scroll = current
+            .last()
+            .is_some_and(|prev| is_vertical_scroll(&prev.path, &frame.path));
+        if !is_scroll && !current.is_empty() {
+            groups.push(std::mem::take(&mut current));
         }
+        current.push(frame);
+    }
+    if !current.is_empty() {
+        groups.push(current);
     }
 
     groups
@@ -151,27 +151,7 @@ fn extract_via_select_filter(
     }
 
     let frame_files = collect_frame_files(frames_dir, "kf_");
-
-    if frame_files.len() != keyframe_times.len() && !keyframe_times.is_empty() {
-        eprintln!(
-            "Warning: {} keyframe files but {} timestamps; timestamps may be inaccurate",
-            frame_files.len(),
-            keyframe_times.len()
-        );
-    }
-
-    Ok(frame_files
-        .into_iter()
-        .enumerate()
-        .map(|(i, path)| SampledFrame {
-            timestamp: keyframe_times.get(i).copied().unwrap_or_else(|| {
-                eprintln!("Warning: no timestamp for keyframe {i}, estimating");
-                i as f64 * 2.0
-            }),
-            path,
-            is_keyframe: true,
-        })
-        .collect())
+    pair_frames_with_times(frame_files, keyframe_times, true, "keyframe")
 }
 
 fn extract_via_scene_change(
@@ -213,16 +193,36 @@ fn extract_via_scene_change(
     }
 
     let frame_files = collect_frame_files(frames_dir, "sc_");
+    pair_frames_with_times(frame_files, timestamps, false, "scene-change")
+}
+
+/// Pair ffmpeg output files with the `pts_time` values parsed from showinfo.
+/// A count mismatch means at least one frame has no real timestamp, so it is
+/// an error; timestamps are never estimated.
+fn pair_frames_with_times(
+    frame_files: Vec<PathBuf>,
+    times: Vec<f64>,
+    is_keyframe: bool,
+    kind: &str,
+) -> Result<Vec<SampledFrame>> {
+    if frame_files.len() != times.len() {
+        anyhow::bail!(
+            "ffmpeg {kind} extraction wrote {} frame files but reported {} pts_time values; \
+             refusing to guess timestamps",
+            frame_files.len(),
+            times.len()
+        );
+    }
+    if let Some((i, t)) = times.iter().enumerate().find(|(_, t)| !t.is_finite()) {
+        anyhow::bail!("ffmpeg {kind} frame {i} has a non-finite pts_time ({t})");
+    }
     Ok(frame_files
         .into_iter()
-        .enumerate()
-        .map(|(i, path)| SampledFrame {
-            timestamp: timestamps.get(i).copied().unwrap_or_else(|| {
-                eprintln!("Warning: no timestamp for scene frame {i}, estimating");
-                i as f64 * 5.0
-            }),
+        .zip(times)
+        .map(|(path, timestamp)| SampledFrame {
+            timestamp,
             path,
-            is_keyframe: false,
+            is_keyframe,
         })
         .collect())
 }
@@ -367,4 +367,87 @@ fn is_vertical_scroll(prev_path: &Path, curr_path: &Path) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(name: &str, t: f64) -> SampledFrame {
+        SampledFrame {
+            timestamp: t,
+            path: PathBuf::from(name),
+            is_keyframe: true,
+        }
+    }
+
+    #[test]
+    fn pair_frames_uses_real_times() {
+        let files = vec![PathBuf::from("kf_1.png"), PathBuf::from("kf_2.png")];
+        let frames = pair_frames_with_times(files, vec![0.5, 3.25], true, "keyframe")
+            .unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].timestamp, 0.5);
+        assert_eq!(frames[1].timestamp, 3.25);
+        assert!(frames.iter().all(|f| f.is_keyframe));
+    }
+
+    #[test]
+    fn pair_frames_errors_on_missing_times() {
+        let files = vec![PathBuf::from("kf_1.png"), PathBuf::from("kf_2.png")];
+        let err = pair_frames_with_times(files, vec![0.5], true, "keyframe").unwrap_err();
+        assert!(err.to_string().contains("2 frame files but reported 1"), "{err}");
+    }
+
+    #[test]
+    fn pair_frames_errors_when_no_times_parsed() {
+        let files = vec![PathBuf::from("sc_1.png")];
+        assert!(pair_frames_with_times(files, vec![], false, "scene-change").is_err());
+    }
+
+    #[test]
+    fn pair_frames_errors_on_extra_times() {
+        let files = vec![PathBuf::from("kf_1.png")];
+        assert!(pair_frames_with_times(files, vec![1.0, 2.0], true, "keyframe").is_err());
+    }
+
+    #[test]
+    fn pair_frames_empty_is_ok() {
+        assert!(pair_frames_with_times(vec![], vec![], true, "keyframe")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn parse_pts_time_from_showinfo_line() {
+        let line = "[Parsed_showinfo_1 @ 0x1] n:   0 pts:  12800 pts_time:1.0667 duration: 512";
+        assert_eq!(parse_pts_time(line), Some(1.0667));
+        assert_eq!(parse_pts_time("no timing here"), None);
+    }
+
+    #[test]
+    fn scroll_sequences_empty_and_single() {
+        assert!(detect_scroll_sequences(vec![]).is_empty());
+        let groups = detect_scroll_sequences(vec![frame("missing_a.png", 1.0)]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 1);
+    }
+
+    #[test]
+    fn scroll_sequences_unreadable_frames_start_new_groups() {
+        let groups = detect_scroll_sequences(vec![
+            frame("missing_a.png", 1.0),
+            frame("missing_b.png", 2.0),
+            frame("missing_c.png", 3.0),
+        ]);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[2][0].timestamp, 3.0);
+    }
+
+    #[test]
+    fn ssim_dedup_empty_and_unreadable() {
+        assert!(ssim_dedup(vec![], 0.95).is_empty());
+        let frames = vec![frame("missing_a.png", 1.0), frame("missing_b.png", 2.0)];
+        assert_eq!(ssim_dedup(frames, 0.95).len(), 2);
+    }
 }
