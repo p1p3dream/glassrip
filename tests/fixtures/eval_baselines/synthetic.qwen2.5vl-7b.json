@@ -6,10 +6,10 @@
   "repetitions": 1,
   "metrics": {
     "board.chrome_fp": {
-      "mean": 14.0,
+      "mean": 17.0,
       "spread": 0.0,
-      "min": 14.0,
-      "max": 14.0,
+      "min": 17.0,
+      "max": 17.0,
       "runs": 1
     },
     "board.edge.direction_accuracy": {
@@ -229,7 +229,7 @@
       "metric": "board.chrome_fp",
       "op": "<=",
       "threshold": 0.0,
-      "value": 14.0,
+      "value": 17.0,
       "pass": false,
       "spec": "9.3 UI-chrome false positives"
     }
@@ -445,11 +445,12 @@
         "latency_s": 17.164,
         "pred_screen": "whiteboard",
         "score": {
-          "chrome_fp": 3,
+          "chrome_fp": 4,
           "chrome_hits": [
             "Riley Park",
             "Casey Moreno",
-            "Quinn Adler"
+            "Quinn Adler",
+            "100% Fit Undo"
           ],
           "core_nodes": {
             "correct": 0,
@@ -607,11 +608,12 @@
         "latency_s": 21.418,
         "pred_screen": "whiteboard",
         "score": {
-          "chrome_fp": 3,
+          "chrome_fp": 4,
           "chrome_hits": [
             "Riley Park",
             "Casey Moreno",
-            "Quinn Adler"
+            "Quinn Adler",
+            "100% Fit Undo"
           ],
           "core_nodes": {
             "correct": 0,
@@ -1116,10 +1118,11 @@
         "latency_s": 33.546,
         "pred_screen": "whiteboard",
         "score": {
-          "chrome_fp": 2,
+          "chrome_fp": 3,
           "chrome_hits": [
             "Casey Moreno",
-            "Quinn Adler"
+            "Quinn Adler",
+            "100% Fit Undo"
           ],
           "core_nodes": {
             "correct": 1,
@@ -1453,5 +1456,6 @@
       }
     }
   },
+  "status": "pass",
   "passed": true
 }

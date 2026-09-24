@@ -14,8 +14,18 @@ use std::collections::BTreeMap;
 /// Jaro-Winkler threshold at which two labels are the same element.
 pub const LABEL_MATCH_JW: f64 = 0.9;
 
-/// Default token Dice threshold for sentence-level matches (notes items).
-pub const SENTENCE_MATCH_DICE: f64 = 0.5;
+/// Default content-word Dice threshold for sentence-level matches (notes items).
+pub const SENTENCE_MATCH_DICE: f64 = 0.6;
+
+/// Function words ignored by [`content_dice`].
+pub const STOPWORDS: &[&str] = &[
+    "a", "an", "the", "and", "or", "but", "of", "to", "for", "in", "on", "at", "by", "with",
+    "from", "into", "as", "is", "are", "was", "were", "be", "been", "it", "its", "this", "that",
+    "these", "those", "we", "i", "you", "he", "she", "they", "our", "us", "your", "my", "me",
+    "will", "would", "should", "can", "could", "do", "does", "did", "so", "just", "now", "then",
+    "what", "how", "which", "who", "ll", "s", "re", "ve", "d", "m", "t", "not", "if", "there",
+    "here", "about",
+];
 
 /// Lowercases, maps every non-alphanumeric character to a space, and collapses
 /// whitespace. `ledger_api.py` and `Ledger API py` normalize equally.
@@ -174,6 +184,24 @@ pub fn token_dice(a: &str, b: &str) -> f64 {
     2.0 * inter as f64 / (na + nb) as f64
 }
 
+/// [`token_dice`] after removing [`STOPWORDS`]; when either side has no content
+/// word left, falls back to [`token_dice`] on the full texts.
+pub fn content_dice(a: &str, b: &str) -> f64 {
+    let strip = |t: &str| {
+        normalize_label(t)
+            .split(' ')
+            .filter(|w| !w.is_empty() && !STOPWORDS.contains(w))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let (sa, sb) = (strip(a), strip(b));
+    if sa.is_empty() || sb.is_empty() {
+        token_dice(a, b)
+    } else {
+        token_dice(&sa, &sb)
+    }
+}
+
 /// Median of a slice (average of the two middle values for even counts); `None` when empty.
 pub fn median(values: &[f64]) -> Option<f64> {
     if values.is_empty() {
@@ -236,6 +264,19 @@ mod tests {
         assert!((token_dice("skip the step", "skip step now") - 4.0 / 6.0).abs() < 1e-12);
         assert_eq!(token_dice("", ""), 1.0);
         assert_eq!(token_dice("a", ""), 0.0);
+    }
+
+    #[test]
+    fn content_dice_hand_computed() {
+        // {defer, importer} vs {defer, importer}: stopwords "the", "now" removed
+        assert_eq!(
+            content_dice("defer the importer", "defer importer now"),
+            1.0
+        );
+        // {skip, sanity, step} vs {skip, step}: 2*2/5
+        assert!((content_dice("skip the sanity step", "skip that step") - 0.8).abs() < 1e-12);
+        // only stopwords on one side: full-text Dice fallback
+        assert_eq!(content_dice("it is", "it is"), 1.0);
     }
 
     #[test]

@@ -10,7 +10,10 @@
 //!   when the unordered endpoint pair is the same. Direction is then correct
 //!   when the prediction is `forward` and its tail is the gold tail.
 //! - A chrome false positive is any predicted element (node, sticky, owner tag,
-//!   edge label, other visible text) whose label matches a chrome string.
+//!   edge label, other visible text) whose label matches a chrome string, or
+//!   contains one as a contiguous token sequence (`Riley Park (Presenting)`
+//!   contains `Riley Park`), unless the element matches a gold label of the
+//!   board (so a real node such as `Share Service` is not chrome).
 
 use glassrip_vision::BBox;
 use serde::{Deserialize, Serialize};
@@ -380,9 +383,43 @@ fn same_pair(a: (&str, &str), b: (&str, &str)) -> bool {
     (a.0 == b.0 && a.1 == b.1) || (a.0 == b.1 && a.1 == b.0)
 }
 
-/// True when `text` matches any chrome string.
+/// True when the normalized tokens of `needle` occur contiguously in `hay`.
+pub fn contains_tokens(hay: &str, needle: &str) -> bool {
+    let h = crate::text::normalize_label(hay);
+    let n = crate::text::normalize_label(needle);
+    if n.is_empty() {
+        return false;
+    }
+    let h: Vec<&str> = h.split(' ').collect();
+    let n: Vec<&str> = n.split(' ').collect();
+    h.windows(n.len()).any(|w| w == n.as_slice())
+}
+
+/// True when `text` matches a chrome string or contains one as tokens.
 pub fn is_chrome(text: &str, chrome: &[String]) -> bool {
-    !text.trim().is_empty() && chrome.iter().any(|c| labels_match(text, c))
+    !text.trim().is_empty()
+        && chrome
+            .iter()
+            .any(|c| labels_match(text, c) || contains_tokens(text, c))
+}
+
+fn gold_labels(gold: &GoldBoard) -> Vec<&str> {
+    gold.nodes
+        .iter()
+        .flat_map(|n| texts(&n.text, &n.aliases))
+        .chain(
+            gold.stickies
+                .iter()
+                .flat_map(|s| texts(&s.text, &s.aliases)),
+        )
+        .chain(
+            gold.edges
+                .iter()
+                .flat_map(|e| texts(&e.label, &e.label_aliases)),
+        )
+        .chain(gold.owners.iter().map(|o| o.name.as_str()))
+        .filter(|t| !t.trim().is_empty())
+        .collect()
 }
 
 /// Scores a predicted board against gold content and chrome strings.
@@ -485,8 +522,10 @@ pub fn score_board(gold: &GoldBoard, pred: &PredBoard, chrome: &[String]) -> Boa
         .chain(pred.owner_tags.iter().map(|o| o.name.as_str()))
         .chain(pred.edges.iter().map(|e| e.label.as_str()))
         .chain(pred.other_text.iter().map(String::as_str));
+    let gold_texts = gold_labels(gold);
     for t in candidates {
-        if is_chrome(t, chrome) {
+        let is_gold = gold_texts.iter().any(|g| labels_match(t, g));
+        if !is_gold && is_chrome(t, chrome) {
             s.chrome_fp += 1;
             s.chrome_hits.push(t.to_string());
         }
@@ -745,6 +784,26 @@ mod tests {
         );
         assert_eq!(s.owner_fp, 2);
         assert_eq!(s.chrome_fp, 1);
+    }
+
+    #[test]
+    fn chrome_containment_but_not_gold_labels() {
+        let chrome = vec!["Riley Park".to_string(), "Share".to_string()];
+        assert!(is_chrome("Riley Park (Presenting)", &chrome));
+        assert!(is_chrome("100% Share Undo", &chrome));
+        assert!(!is_chrome("Shared cache", &chrome));
+        let gold = GoldBoard {
+            nodes: vec![gnode("s", "Share Service", None)],
+            ..Default::default()
+        };
+        let pred = PredBoard {
+            nodes: vec![pnode("Share Service", None)],
+            other_text: vec!["Riley Park (Presenting)".into(), "Share".into()],
+            ..Default::default()
+        };
+        let s = score_board(&gold, &pred, &chrome);
+        // the gold node containing "Share" is not chrome; the banner and "Share" are
+        assert_eq!(s.chrome_fp, 2);
     }
 
     #[test]

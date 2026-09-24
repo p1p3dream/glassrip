@@ -2,16 +2,17 @@
 //! by text similarity (spec 9.3), plus negative action items (farewells) that
 //! must not appear.
 //!
-//! A predicted item matches a gold item when the token Dice coefficient
-//! ([`crate::text::token_dice`]) against the gold text or any alias is at least
-//! the threshold (default [`crate::text::SENTENCE_MATCH_DICE`], 0.5). When the
+//! A predicted item matches a gold item when the content-word Dice coefficient
+//! ([`crate::text::content_dice`], stopwords removed) against the gold text or
+//! any alias is at least the threshold (default
+//! [`crate::text::SENTENCE_MATCH_DICE`], 0.6). When the
 //! gold item names a person, the prediction must name the same person.
 //! Matching is one-to-one and greedy by score.
 
 use serde::{Deserialize, Serialize};
 
 use super::{greedy_match, Counts};
-use crate::text::token_dice;
+use crate::text::content_dice;
 
 /// A gold notes item.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -44,7 +45,7 @@ pub struct PredItem {
 pub fn item_similarity(gold: &GoldItem, pred: &str) -> f64 {
     std::iter::once(gold.text.as_str())
         .chain(gold.aliases.iter().map(String::as_str))
-        .map(|g| token_dice(g, pred))
+        .map(|g| content_dice(g, pred))
         .fold(0.0, f64::max)
 }
 
@@ -72,7 +73,7 @@ pub fn negative_hits(negatives: &[String], pred: &[PredItem], threshold: f64) ->
         .filter(|p| {
             negatives
                 .iter()
-                .any(|n| token_dice(n, &p.text) >= threshold)
+                .any(|n| content_dice(n, &p.text) >= threshold)
         })
         .map(|p| p.text.clone())
         .collect()
@@ -102,12 +103,12 @@ mod tests {
     fn decisions_hand_computed() {
         let gold = vec![g("defer the importer", None), g("ship weekly builds", None)];
         let pred = vec![
-            // Dice({defer, the, importer}, {defer, importer, now}) = 4/6 = 0.667
+            // content words {defer, importer} on both sides: 1.0
             p("defer importer now", None),
             // unrelated
             p("lunch at noon", None),
         ];
-        let (c, m) = score_items(&gold, &pred, 0.5);
+        let (c, m) = score_items(&gold, &pred, 0.6);
         assert_eq!(
             c,
             Counts {
@@ -123,11 +124,11 @@ mod tests {
     fn action_items_need_person() {
         let gold = vec![g("write the parser", Some("p1"))];
         let wrong_person = vec![p("write the parser", Some("p2"))];
-        assert_eq!(score_items(&gold, &wrong_person, 0.5).0.tp, 0);
+        assert_eq!(score_items(&gold, &wrong_person, 0.6).0.tp, 0);
         let no_person = vec![p("write the parser", None)];
-        assert_eq!(score_items(&gold, &no_person, 0.5).0.tp, 0);
+        assert_eq!(score_items(&gold, &no_person, 0.6).0.tp, 0);
         let right = vec![p("write the parser", Some("p1"))];
-        assert_eq!(score_items(&gold, &right, 0.5).0.tp, 1);
+        assert_eq!(score_items(&gold, &right, 0.6).0.tp, 1);
     }
 
     #[test]
@@ -138,14 +139,14 @@ mod tests {
             person_id: None,
             t_s: None,
         }];
-        // Dice with alias {skip, importer} vs {skip, importer, step}: 4/5 = 0.8
+        // content Dice with alias {skip, importer} vs {skip, importer, step}: 4/5 = 0.8
         assert!((item_similarity(&gold[0], "skip importer step") - 0.8).abs() < 1e-12);
         let hits = negative_hits(
             &["see you later".into()],
             &[p("I'll see you guys later", None), p("write tests", None)],
-            0.5,
+            0.6,
         );
-        // Dice({see, you, later}, {i, ll, see, you, guys, later}) = 6/9 = 0.667
+        // content words {see, later} vs {see, guys, later}: 4/5 = 0.8
         assert_eq!(hits, vec!["I'll see you guys later".to_string()]);
     }
 }
