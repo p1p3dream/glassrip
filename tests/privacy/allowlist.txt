@@ -3,3 +3,6 @@
 #
 # The audio crate's tokenizer word list contains "viv" as a generic word.
 crates/glassrip-audio/common_words.txt: viv
+crates/glassrip-notes/src/people.rs: ellipsis
+crates/glassrip-vision-stages/src/layout.rs: ellipsis
+crates/glassrip-vision-stages/src/stages/vocabulary.rs: ellipsis
