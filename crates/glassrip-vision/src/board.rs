@@ -2,7 +2,8 @@
 //! validation rules that need no pixels.
 //!
 //! The model sees only the canvas crop and reports every element with a bbox in
-//! the pixels of the image it was sent. [`BoardReadOutput::to_canvas_coords`]
+//! the pixels of the image it was sent. [`BoardReadOutput::to_canvas_coords`] turns the wire
+//! form into a [`BoardReading`] in canvas pixels, the form artifacts store
 //! maps those boxes to canvas (crop source) pixels before [`validate_board`].
 
 use std::collections::{HashMap, HashSet};
@@ -82,9 +83,76 @@ pub enum StickyColor {
     Other,
 }
 
+/// A node (box) on the board. Boxes are in canvas pixels.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BoardNode {
+    pub local_id: String,
+    pub text: String,
+    pub bbox: BBox,
+    pub conf: f64,
+}
+
+/// A connector between two nodes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BoardEdge {
+    pub src: String,
+    pub dst: String,
+    /// Empty string when the line carries no text.
+    pub label: String,
+    /// Box around the label text; `None` without a label or box.
+    #[serde(default)]
+    pub label_bbox: Option<BBox>,
+    pub style: EdgeStyle,
+    pub conf: f64,
+}
+
+/// A sticky note.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Sticky {
+    pub text: String,
+    pub color: StickyColor,
+    pub bbox: BBox,
+}
+
+/// An owner tag (a green note holding a name).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerTag {
+    /// Name exactly as written on the tag.
+    pub name_raw: String,
+    /// `local_id` of the node the tag sits on or next to, or empty.
+    pub near: String,
+    pub bbox: BBox,
+}
+
+/// Other canvas text.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TextItem {
+    pub text: String,
+    pub bbox: BBox,
+}
+
+/// One board reading in canvas pixels (the form stored in artifacts and
+/// validated). Boxes serialize as `{x1, y1, x2, y2}` objects.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BoardReading {
+    pub nodes: Vec<BoardNode>,
+    pub edges: Vec<BoardEdge>,
+    pub stickies: Vec<Sticky>,
+    pub owner_tags: Vec<OwnerTag>,
+    pub other_visible_text: Vec<TextItem>,
+    pub confidence: f64,
+}
+
+/// Wire form of a node: what the model writes (`bbox_2d` array, sent-image pixels).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WireNode {
     pub local_id: String,
     pub text: String,
     #[serde(rename = "bbox_2d", with = "crate::geometry::bbox2d")]
@@ -94,14 +162,13 @@ pub struct BoardNode {
     pub conf: f64,
 }
 
+/// Wire form of an edge; `label_bbox_2d` of `[0, 0, 0, 0]` means no box.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct BoardEdge {
+pub struct WireEdge {
     pub src: String,
     pub dst: String,
-    /// Empty string when the line carries no text.
     pub label: String,
-    /// Box around the label text; `None` (written `[0, 0, 0, 0]`) without a label.
     #[serde(rename = "label_bbox_2d", with = "crate::geometry::opt_bbox2d")]
     #[schemars(with = "[f64; 4]")]
     pub label_bbox: Option<BBox>,
@@ -110,9 +177,10 @@ pub struct BoardEdge {
     pub conf: f64,
 }
 
+/// Wire form of a sticky.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct Sticky {
+pub struct WireSticky {
     pub text: String,
     pub color: StickyColor,
     #[serde(rename = "bbox_2d", with = "crate::geometry::bbox2d")]
@@ -120,64 +188,102 @@ pub struct Sticky {
     pub bbox: BBox,
 }
 
+/// Wire form of an owner tag.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct OwnerTag {
-    /// Name exactly as written on the tag.
+pub struct WireOwnerTag {
     pub name_raw: String,
-    /// `local_id` of the node the tag sits on or next to, or empty.
     pub near: String,
     #[serde(rename = "bbox_2d", with = "crate::geometry::bbox2d")]
     #[schemars(with = "[f64; 4]")]
     pub bbox: BBox,
 }
 
+/// Wire form of other canvas text.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct TextItem {
+pub struct WireText {
     pub text: String,
     #[serde(rename = "bbox_2d", with = "crate::geometry::bbox2d")]
     #[schemars(with = "[f64; 4]")]
     pub bbox: BBox,
 }
 
-/// Model output for one board read. Array lengths are bounded to keep the schema grammar small.
+/// Model output for one board read (the wire schema: Qwen2.5-VL `bbox_2d`
+/// arrays in sent-image pixels). Array lengths are bounded to keep the
+/// grammar small. Convert with [`BoardReadOutput::to_canvas_coords`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BoardReadOutput {
     #[schemars(length(max = 60))]
-    pub nodes: Vec<BoardNode>,
+    pub nodes: Vec<WireNode>,
     #[schemars(length(max = 80))]
-    pub edges: Vec<BoardEdge>,
+    pub edges: Vec<WireEdge>,
     #[schemars(length(max = 60))]
-    pub stickies: Vec<Sticky>,
+    pub stickies: Vec<WireSticky>,
     #[schemars(length(max = 20))]
-    pub owner_tags: Vec<OwnerTag>,
+    pub owner_tags: Vec<WireOwnerTag>,
     #[schemars(length(max = 20))]
-    pub other_visible_text: Vec<TextItem>,
+    pub other_visible_text: Vec<WireText>,
     #[schemars(range(min = 0.0, max = 1.0))]
     pub confidence: f64,
 }
 
 impl BoardReadOutput {
-    /// Map every bbox from sent-image pixels to canvas pixels.
-    pub fn to_canvas_coords(mut self, prepared: &PreparedImage) -> Self {
-        for n in &mut self.nodes {
-            n.bbox = n.bbox.to_source(prepared);
+    /// Map every box from sent-image pixels to canvas pixels.
+    pub fn to_canvas_coords(self, prepared: &PreparedImage) -> BoardReading {
+        let m = |b: BBox| b.to_source(prepared);
+        BoardReading {
+            nodes: self
+                .nodes
+                .into_iter()
+                .map(|n| BoardNode {
+                    local_id: n.local_id,
+                    text: n.text,
+                    bbox: m(n.bbox),
+                    conf: n.conf,
+                })
+                .collect(),
+            edges: self
+                .edges
+                .into_iter()
+                .map(|e| BoardEdge {
+                    src: e.src,
+                    dst: e.dst,
+                    label: e.label,
+                    label_bbox: e.label_bbox.map(m),
+                    style: e.style,
+                    conf: e.conf,
+                })
+                .collect(),
+            stickies: self
+                .stickies
+                .into_iter()
+                .map(|s| Sticky {
+                    text: s.text,
+                    color: s.color,
+                    bbox: m(s.bbox),
+                })
+                .collect(),
+            owner_tags: self
+                .owner_tags
+                .into_iter()
+                .map(|o| OwnerTag {
+                    name_raw: o.name_raw,
+                    near: o.near,
+                    bbox: m(o.bbox),
+                })
+                .collect(),
+            other_visible_text: self
+                .other_visible_text
+                .into_iter()
+                .map(|t| TextItem {
+                    text: t.text,
+                    bbox: m(t.bbox),
+                })
+                .collect(),
+            confidence: self.confidence,
         }
-        for s in &mut self.stickies {
-            s.bbox = s.bbox.to_source(prepared);
-        }
-        for o in &mut self.owner_tags {
-            o.bbox = o.bbox.to_source(prepared);
-        }
-        for t in &mut self.other_visible_text {
-            t.bbox = t.bbox.to_source(prepared);
-        }
-        for e in &mut self.edges {
-            e.label_bbox = e.label_bbox.map(|b| b.to_source(prepared));
-        }
-        self
     }
 }
 
@@ -497,7 +603,7 @@ pub fn repair_inverted(b: &BBox, canvas: CanvasSize, tolerance: f64) -> Option<B
 /// 6. Owner tag `near` must reference a kept node or be empty.
 /// 7. Flag re-classification when `confidence == 0` or nothing remains.
 pub fn validate_board(
-    output: BoardReadOutput,
+    output: BoardReading,
     canvas: CanvasSize,
     cfg: &BoardValidationConfig,
 ) -> ValidatedBoard {
@@ -508,7 +614,7 @@ pub fn validate_board(
         rejected: Vec::new(),
         issues: Vec::new(),
     };
-    let BoardReadOutput {
+    let BoardReading {
         nodes,
         edges,
         stickies,
@@ -811,8 +917,8 @@ mod tests {
         }
     }
 
-    fn empty_output() -> BoardReadOutput {
-        BoardReadOutput {
+    fn empty_output() -> BoardReading {
+        BoardReading {
             nodes: vec![],
             edges: vec![],
             stickies: vec![],
@@ -831,18 +937,29 @@ mod tests {
 
     #[test]
     fn bbox_2d_wire_format() -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let n = node("n1", "Widget Service", 100.0, 200.0);
+        let n = WireNode {
+            local_id: "n1".into(),
+            text: "Widget Service".into(),
+            bbox: BBox::new(100.0, 200.0, 220.0, 260.0),
+            conf: 0.9,
+        };
         let v = serde_json::to_value(&n)?;
         assert_eq!(
             v["bbox_2d"],
             serde_json::json!([100.0, 200.0, 220.0, 260.0])
         );
         assert!(v.get("bbox").is_none());
-        let back: BoardNode = serde_json::from_value(v)?;
+        let back: WireNode = serde_json::from_value(v)?;
         assert_eq!(back, n);
         let short =
             serde_json::json!({"local_id": "n", "text": "t", "bbox_2d": [1, 2, 3], "conf": 0.5});
-        assert!(serde_json::from_value::<BoardNode>(short).is_err());
+        assert!(serde_json::from_value::<WireNode>(short).is_err());
+        // Artifacts (the domain form) use box objects and null for no label box.
+        let d = serde_json::to_value(node("n1", "Widget Service", 100.0, 200.0))?;
+        assert_eq!(d["bbox"]["x2"], serde_json::json!(220.0));
+        assert!(d.get("bbox_2d").is_none());
+        let e = serde_json::to_value(edge("n1", "n2", ""))?;
+        assert!(e["label_bbox"].is_null());
         let schema = crate::schema::OutputSchema::for_type::<BoardReadOutput>()?;
         let text = schema.text();
         assert!(
@@ -917,7 +1034,7 @@ mod tests {
         );
         assert!(v.edges[2].label_bbox.is_none());
         // Wire format: [0, 0, 0, 0] means no label box.
-        let e: BoardEdge = serde_json::from_value(serde_json::json!({
+        let e: WireEdge = serde_json::from_value(serde_json::json!({
             "src": "n1", "dst": "n2", "label": "", "label_bbox_2d": [0, 0, 0, 0],
             "style": "solid", "conf": 0.5
         }))

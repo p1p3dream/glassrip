@@ -367,7 +367,8 @@ mod tests {
         }
     }
 
-    const ANSWER: &str = r#"{"screen_type":"whiteboard","app_hint":"","canvas_bbox":{"x1":0,"y1":0,"x2":10,"y2":10},"confidence":0.9}"#;
+    const ANSWER: &str =
+        r#"{"screen_type":"whiteboard","app_hint":"","bbox_2d":[0,0,10,10],"confidence":0.9}"#;
 
     fn request() -> VisionRequest {
         let img = DynamicImage::ImageRgb8(RgbImage::new(16, 16));
