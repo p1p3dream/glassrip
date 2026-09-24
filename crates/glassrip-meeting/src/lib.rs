@@ -7,6 +7,10 @@
 //! tags as timed assignments, and computes change events.
 
 pub mod difflib;
+pub mod direction;
+pub mod pixel_direction;
 pub mod register;
 pub mod similarity;
+pub mod skeleton;
 pub mod text;
+pub mod vlm_direction;
