@@ -93,6 +93,29 @@ pub fn boxes_from_map(
     out
 }
 
+/// Zero the probability map outside the content region of a padded detector
+/// input, so no text box can start in the padding. `content_*` and `input_*`
+/// are in detector input pixels; the map may be scaled relative to the input.
+pub fn mask_padding(
+    prob: &mut [f32],
+    map_w: usize,
+    map_h: usize,
+    content_w: usize,
+    content_h: usize,
+    input_w: usize,
+    input_h: usize,
+) {
+    let keep_w = (content_w * map_w).div_ceil(input_w.max(1)).min(map_w);
+    let keep_h = (content_h * map_h).div_ceil(input_h.max(1)).min(map_h);
+    for (y, row) in prob.chunks_mut(map_w.max(1)).take(map_h).enumerate() {
+        if y >= keep_h {
+            row.fill(0.0);
+        } else {
+            row[keep_w..].fill(0.0);
+        }
+    }
+}
+
 /// Sort boxes into reading order: lines top to bottom, left to right within a
 /// line. A box joins the current line when its vertical center lies within half
 /// the line's first box height of that box's center.
@@ -165,6 +188,39 @@ mod tests {
             }
         }
         m
+    }
+
+    #[test]
+    fn padding_mask_drops_components_outside_the_content() {
+        // Input 128x128 with 96x64 content; the map is half the input size.
+        let (w, h) = (64, 64);
+        let mut m = map_with(
+            &[
+                (5, 5, 30, 12, 0.9),   // inside the content
+                (50, 5, 62, 12, 0.9),  // wholly in the right padding
+                (5, 40, 30, 48, 0.9),  // wholly in the bottom padding
+                (40, 20, 60, 28, 0.9), // straddles the right edge
+            ],
+            w,
+            h,
+        );
+        mask_padding(&mut m, w, h, 96, 64, 128, 128);
+        assert!(m[10 * w + 50..10 * w + 62].iter().all(|&v| v == 0.0));
+        assert!(m[44 * w..45 * w].iter().all(|&v| v == 0.0));
+        let cfg = OcrConfig::default();
+        let boxes = boxes_from_map(&m, w, h, 2.0, 2.0, 200, 200, &cfg);
+        assert_eq!(boxes.len(), 2, "{boxes:?}");
+        // The straddling component is cut at the content edge (map column 48).
+        let straddle = boxes.iter().find(|b| b.bbox.x1 > 60.0).unwrap();
+        assert!(straddle.bbox.x2 <= (48.0 + 8.0) * 2.0, "{straddle:?}");
+    }
+
+    #[test]
+    fn padding_mask_is_a_no_op_without_padding() {
+        let mut m = map_with(&[(0, 0, 10, 10, 0.9)], 10, 10);
+        let before = m.clone();
+        mask_padding(&mut m, 10, 10, 20, 20, 20, 20);
+        assert_eq!(m, before);
     }
 
     #[test]

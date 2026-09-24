@@ -134,8 +134,18 @@ impl PpOcrEngine {
         let (mh, mw) = (shape[2].max(0) as usize, shape[3].max(0) as usize);
         let sx = input.scale_x * input.width as f64 / mw.max(1) as f64;
         let sy = input.scale_y * input.height as f64 / mh.max(1) as f64;
+        let mut prob = data.to_vec();
+        db::mask_padding(
+            &mut prob,
+            mw,
+            mh,
+            input.content_width,
+            input.content_height,
+            input.width,
+            input.height,
+        );
         Ok(db::boxes_from_map(
-            data,
+            &prob,
             mw,
             mh,
             sx,

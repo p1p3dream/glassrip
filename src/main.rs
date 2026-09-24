@@ -104,22 +104,32 @@ fn exit_now(code: i32) -> ! {
     use std::io::Write;
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "cuda"))]
     {
         // SAFETY: `_exit` takes no pointers and never returns; skipping the
-        // exit handlers is the purpose (see above).
+        // exit handlers is the purpose (see above). Only the dynamically
+        // loaded CUDA runtime needs this; other builds tear down normally.
         unsafe { libc::_exit(code) }
     }
-    #[cfg(not(unix))]
+    #[cfg(not(all(unix, feature = "cuda")))]
     std::process::exit(code)
 }
 
 fn run_cli() -> Result<i32> {
+    // `try_parse` keeps help, version, and usage errors on the `exit_now`
+    // path; `Cli::parse` would exit from inside clap and run the exit hooks.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            let _ = e.print();
+            return Ok(e.exit_code());
+        }
+    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("cannot start the async runtime")?;
-    let result = runtime.block_on(run(Cli::parse()));
+    let result = runtime.block_on(run(cli));
     // Joins the blocking pool, so no worker is mid-write when the process ends.
     drop(runtime);
     result
