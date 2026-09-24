@@ -1,9 +1,9 @@
 //! Parity gate for `prototype_compat` mode.
 //!
-//! Recomputes per-frame sharpness, consecutive-pair SSIM / changed fraction / ink change and
-//! the final keyframe runs from the prototype's input frames, and compares them with the
-//! prototype's saved outputs. All data, including the SHA-256 digests that pin it, is supplied
-//! at runtime; nothing derived from the reference data lives in this repository.
+//! Recomputes per-frame sharpness, consecutive-pair scores and the final keyframe runs from
+//! the prototype's input frames and compares them with the prototype's saved outputs. All
+//! data, including the SHA-256 digests that pin it, is supplied at runtime; nothing derived
+//! from the reference data lives in this repository.
 //!
 //! ```text
 //! parity --frames DIR --reference DIR --keyframes FILE
@@ -13,11 +13,23 @@
 //! `--reference` holds `pair_scores.json` and `ink_pairs.json`; `--keyframes` is the
 //! prototype's `keyframes.json`. `--checksums` (default `REFERENCE/parity_checksums.sha256`)
 //! is a `sha256sum`-style file with one `<hex digest>  <name>` line for each of
-//! `pair_scores.json`, `ink_pairs.json` and `frames` (all frames concatenated in filename
-//! order). Exits 0 when every criterion passes, 1 on a parity failure and 2 on a usage or
-//! input error, including any checksum mismatch. `--segment-batch` sets how many upcoming
-//! anchor comparisons are evaluated speculatively in parallel (default: threads, at most 8);
-//! it changes speed only, never results.
+//! `pair_scores.json`, `ink_pairs.json`, `keyframes.json` and `frames` (all frames
+//! concatenated in filename order).
+//!
+//! Gated criteria (all must hold for exit 0):
+//! 1. All four input digests match the checksums file (otherwise exit 2 before computing).
+//! 2. Per-frame sharpness within 0.1% relative of `pair_scores.json`.
+//! 3. Consecutive-pair SSIM, changed fraction and ECC shift within 0.005 absolute of
+//!    `pair_scores.json`.
+//! 4. Consecutive-pair ink change within 0.005 absolute of `ink_pairs.json`.
+//! 5. Run starts identical to `keyframes.json`, except at most 2 differences, each with a
+//!    computed score within 0.005 of a segmentation or merge threshold.
+//! 6. Every reference run not touching such an allowed difference has identical membership
+//!    (start frame plus `n_merged` consecutive frames), `t_rep` and `t_end`.
+//!
+//! Exits 0 on pass, 1 on a parity failure, 2 on a usage or input error. `--segment-batch`
+//! sets how many upcoming anchor comparisons are evaluated speculatively in parallel
+//! (default: threads, at most 8); it changes speed only, never results.
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
@@ -38,6 +50,10 @@ use glassrip_media::segment::{
 const TOL_SHARP_REL: f64 = 1e-3;
 const TOL_PAIR: f64 = 0.005;
 const TOL_INK: f64 = 0.005;
+const TOL_SHIFT: f64 = 0.005;
+
+const USAGE: &str = "usage: parity --frames DIR --reference DIR --keyframes FILE \
+                     [--checksums FILE] [--duration SECS] [--report FILE] [--segment-batch N]";
 const MAX_BOUNDARY_DIFFS: usize = 2;
 const EXPLAIN_MARGIN: f64 = 0.005;
 
@@ -72,15 +88,7 @@ fn parse_args() -> Result<Args, BoxError> {
             "--duration" => duration = Some(val()?.parse::<f64>()?),
             "--report" => report = Some(PathBuf::from(val()?)),
             "--segment-batch" => segment_batch = Some(val()?.parse::<usize>()?),
-            "-h" | "--help" => {
-                return Err(
-                    "usage: parity --frames DIR --reference DIR --keyframes FILE \
-                            [--checksums FILE] [--duration SECS] [--report FILE] \
-                            [--segment-batch N]"
-                        .into(),
-                )
-            }
-            other => return Err(format!("unknown argument {other}").into()),
+            other => return Err(format!("unknown argument {other}\n{USAGE}").into()),
         }
     }
     Ok(Args {
@@ -101,7 +109,6 @@ struct PairRecord {
     sharp: f64,
     ssim: Option<f64>,
     frac: Option<f64>,
-    #[allow(dead_code)]
     shift: Option<f64>,
 }
 
@@ -254,6 +261,11 @@ fn run() -> Result<bool, BoxError> {
             sha256_file(&ink_path)?,
             want("ink_pairs.json")?,
         ),
+        (
+            "keyframes.json",
+            sha256_file(&args.keyframes)?,
+            want("keyframes.json")?,
+        ),
         ("frames", sha256_concat(&paths)?, want("frames")?),
     ];
     let mut inputs_ok = true;
@@ -266,7 +278,6 @@ fn run() -> Result<bool, BoxError> {
         inputs_ok &= ok;
         println!("  {:<22} {}  {}", name, verdict(ok), got);
     }
-    println!("  keyframes file         {}", sha256_file(&args.keyframes)?);
     if !inputs_ok {
         return Err(
             "input checksums do not match the pinned reference; refusing to compare".into(),
@@ -350,6 +361,7 @@ fn run() -> Result<bool, BoxError> {
     let mut s_ssim = Stat::default();
     let mut s_frac = Stat::default();
     let mut s_ink = Stat::default();
+    let mut s_shift = Stat::default();
     let mut align_fail_pairs = Vec::new();
     for i in 0..n {
         let r = &pairs_ref[i];
@@ -366,6 +378,11 @@ fn run() -> Result<bool, BoxError> {
         s_ssim.add(i, (p.score.ssim - rs).abs(), TOL_PAIR);
         s_frac.add(i, (p.score.changed_frac - rf).abs(), TOL_PAIR);
         s_ink.add(i, (p.ink_change - ink_ref[i - 1]).abs(), TOL_INK);
+        s_shift.add(
+            i,
+            (p.score.shift - r.shift.unwrap_or(f64::NAN)).abs(),
+            TOL_SHIFT,
+        );
         if !p.score.ecc.ok() || !p.ink_align_ok {
             align_fail_pairs.push(i);
         }
@@ -437,22 +454,53 @@ fn run() -> Result<bool, BoxError> {
     let n_diffs = only_ref.len() + only_got.len();
     let boundaries_ok = n_diffs <= MAX_BOUNDARY_DIFFS && all_explained;
 
-    // Informational: for runs present in both, compare t_rep and run length.
+    // 7. Run details: membership, t_rep and t_end for every reference run, exempting only
+    // runs whose start or end is one of the allowed boundary differences above.
+    let affected: BTreeSet<i64> = only_ref.iter().chain(only_got.iter()).copied().collect();
     let got_by_start: HashMap<i64, &glassrip_media::segment::Keyframe> =
         kfs.iter().map(|k| (k.t_start as i64, k)).collect();
-    let mut rep_mismatch = Vec::new();
-    for r in &kf_ref.keyframes {
-        if let Some(g) = got_by_start.get(&(r.t_start as i64)) {
-            if g.t_rep != r.t_rep || g.frames.len() != r.n_merged || g.t_end != r.t_end {
-                rep_mismatch.push(json!({"t_start": r.t_start,
-                    "ref": {"t_rep": r.t_rep, "n": r.n_merged, "t_end": r.t_end},
-                    "got": {"t_rep": g.t_rep, "n": g.frames.len(), "t_end": g.t_end}}));
+    let mut detail_mismatch = Vec::new();
+    let mut detail_exempt = Vec::new();
+    let covered: usize = kf_ref.keyframes.iter().map(|k| k.n_merged).sum();
+    if covered != n {
+        detail_mismatch.push(json!({"error": "reference runs do not cover every frame",
+            "covered": covered, "frames": n}));
+    }
+    for (k, r) in kf_ref.keyframes.iter().enumerate() {
+        let start = r.t_start as i64;
+        let next = kf_ref.keyframes.get(k + 1).map(|x| x.t_start as i64);
+        let touches = affected.contains(&start) || next.is_some_and(|e| affected.contains(&e));
+        let Some(&si) = idx_of.get(&start) else {
+            detail_mismatch.push(json!({"t_start": r.t_start, "error": "start is not a frame"}));
+            continue;
+        };
+        let ref_members: Vec<usize> = (si..si + r.n_merged).collect();
+        let entry = match got_by_start.get(&start) {
+            Some(g) if g.frames == ref_members && g.t_rep == r.t_rep && g.t_end == r.t_end => {
+                continue
             }
+            Some(g) => json!({"t_start": r.t_start,
+                "ref": {"t_rep": r.t_rep, "n": r.n_merged, "t_end": r.t_end},
+                "got": {"t_rep": g.t_rep, "n": g.frames.len(), "t_end": g.t_end,
+                        "first": g.frames.first(), "last": g.frames.last()}}),
+            None => json!({"t_start": r.t_start, "error": "no computed run starts here"}),
+        };
+        if touches {
+            detail_exempt.push(entry);
+        } else {
+            detail_mismatch.push(entry);
         }
     }
+    let details_ok = detail_mismatch.is_empty();
 
     let total = t_total.elapsed().as_secs_f64();
-    let pass = s_sharp.pass() && s_ssim.pass() && s_frac.pass() && s_ink.pass() && boundaries_ok;
+    let pass = s_sharp.pass()
+        && s_ssim.pass()
+        && s_frac.pass()
+        && s_shift.pass()
+        && s_ink.pass()
+        && boundaries_ok
+        && details_ok;
 
     println!("== per-frame and consecutive-pair values");
     let line = |name: &str, s: &Stat, tol: &str| {
@@ -471,6 +519,7 @@ fn run() -> Result<bool, BoxError> {
     line("sharpness", &s_sharp, "0.1% relative");
     line("ssim", &s_ssim, "0.005");
     line("frac", &s_frac, "0.005");
+    line("shift", &s_shift, "0.005");
     line("ink", &s_ink, "0.005");
     println!(
         "  ECC non-convergence on consecutive pairs (pair or ink path): {}",
@@ -490,10 +539,12 @@ fn run() -> Result<bool, BoxError> {
         println!("    {e}");
     }
     println!(
-        "  runs with identical start but different t_rep / length / t_end: {}",
-        rep_mismatch.len()
+        "  {}  run details (membership, t_rep, t_end): {} mismatches, {} exempt next to allowed boundary differences",
+        verdict(details_ok),
+        detail_mismatch.len(),
+        detail_exempt.len()
     );
-    for m in &rep_mismatch {
+    for m in detail_mismatch.iter().chain(detail_exempt.iter()) {
         println!("    {m}");
     }
     println!("== timing");
@@ -505,18 +556,19 @@ fn run() -> Result<bool, BoxError> {
             "result": verdict(pass),
             "mode": "prototype_compat",
             "inputs": checks.iter().map(|(n, g, w)| json!({"name": n, "sha256": g, "expected": w})).collect::<Vec<_>>(),
-            "keyframes_sha256": sha256_file(&args.keyframes)?,
             "n_frames": n,
             "duration": duration,
             "sharpness": s_sharp.json(),
             "ssim": s_ssim.json(),
             "frac": s_frac.json(),
+            "shift": s_shift.json(),
             "ink": s_ink.json(),
             "ecc_nonconvergence_pairs": align_fail_pairs,
             "boundaries": {"pass": boundaries_ok, "reference_runs": ref_starts.len(),
                 "computed_runs": got_starts.len(), "differences": explanations,
                 "segment_runs_before_merge": n_segment_runs, "merges": merges},
-            "run_detail_mismatches": rep_mismatch,
+            "run_details": {"pass": details_ok, "mismatches": detail_mismatch,
+                "exempt": detail_exempt},
             "timing_s": {"features": t_feat, "pairs": t_pairs, "segmentation": t_seg, "total": total,
                 "threads": rayon::current_num_threads()},
         });
@@ -527,6 +579,17 @@ fn run() -> Result<bool, BoxError> {
 }
 
 fn main() -> ExitCode {
+    if std::env::args().skip(1).any(|a| a == "-h" || a == "--help") {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+    eprintln!(
+        "parity: warning: built without the x86_64 `fma` target feature. Results are \
+         unaffected (f32::mul_add is always a single fused rounding), but it runs through a \
+         software routine and the harness is roughly 2x slower. Build with \
+         RUSTFLAGS=\"-C target-cpu=x86-64-v3\" (or native) for full speed."
+    );
     match run() {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::from(1),
