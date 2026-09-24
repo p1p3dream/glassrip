@@ -4,7 +4,9 @@
 //! these hold:
 //! 1. its mean token probability is below `max_p`, or below `max_p_proper_noun`
 //!    when every word of the span and of the term is capitalized (whisper tends
-//!    to emit a known proper noun with fair confidence for an unfamiliar name);
+//!    to emit a known proper noun with fair confidence for an unfamiliar name).
+//!    That exception never applies to a sentence-initial word or to a word in
+//!    the embedded common-English list (`common_words.txt`);
 //! 2. its phonetic key equals the term's key;
 //! 3. the normalized letter edit distance is at most `max_norm_edit`.
 //!
@@ -12,6 +14,27 @@
 //! (`th`→`t`, `ph`→`f`, ...), voiced and unvoiced stops and fricatives are merged
 //! (`d`→`t`, `b`→`p`, `g`→`k`, `v`→`f`, `z`→`s`), vowels after the first letter
 //! and `h`, `w`, `y` are dropped, and repeats collapse.
+
+use std::collections::HashSet;
+use std::sync::OnceLock;
+
+const COMMON_WORDS: &str = include_str!("../common_words.txt");
+
+fn common_words() -> &'static HashSet<&'static str> {
+    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| {
+        COMMON_WORDS
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect()
+    })
+}
+
+/// True when the lowercase form of `word` is in the embedded common-word list.
+pub fn is_common_word(word: &str) -> bool {
+    common_words().contains(letters(word).as_str())
+}
 
 /// Correction thresholds.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -162,11 +185,8 @@ impl Vocabulary {
         let terms = terms
             .iter()
             .filter_map(|t| {
-                let words: Vec<String> = t
-                    .as_ref()
-                    .split_whitespace()
-                    .map(str::to_string)
-                    .collect();
+                let words: Vec<String> =
+                    t.as_ref().split_whitespace().map(str::to_string).collect();
                 if words.is_empty() {
                     return None;
                 }
@@ -245,8 +265,11 @@ pub fn correct(
                 continue;
             }
             let mean_p = span.iter().map(|(_, p)| *p).sum::<f32>() / n as f32;
-            let proper = cores.iter().all(|c| starts_upper(c))
-                && term.words.iter().all(|w| starts_upper(w));
+            let sentence_initial = i == 0 || words[i - 1].0.trim_end().ends_with(['.', '?', '!']);
+            let proper = !sentence_initial
+                && cores.iter().all(|c| starts_upper(c))
+                && term.words.iter().all(|w| starts_upper(w))
+                && !cores.iter().any(|c| is_common_word(c));
             let limit = if proper {
                 cfg.max_p.max(cfg.max_p_proper_noun)
             } else {
@@ -298,7 +321,10 @@ mod tests {
         assert_eq!(levenshtein(&['a'], &[]), 1);
         assert_eq!(levenshtein::<char>(&[], &['x', 'y']), 2);
         assert_eq!(
-            levenshtein(&"kitten".chars().collect::<Vec<_>>(), &"sitting".chars().collect::<Vec<_>>()),
+            levenshtein(
+                &"kitten".chars().collect::<Vec<_>>(),
+                &"sitting".chars().collect::<Vec<_>>()
+            ),
             3
         );
     }
@@ -306,7 +332,12 @@ mod tests {
     #[test]
     fn replaces_low_probability_sound_alike_and_keeps_punctuation() {
         let vocab = Vocabulary::new(&["Kethra", "Zorbin"]);
-        let words = [("Hi", 0.9), ("Ketra,", 0.3), ("and", 0.95), ("Sorpin.", 0.4)];
+        let words = [
+            ("Hi", 0.9),
+            ("Ketra,", 0.3),
+            ("and", 0.95),
+            ("Sorpin.", 0.4),
+        ];
         let out = correct(&words, &vocab, &CorrectionConfig::default());
         assert_eq!(out[0], None);
         assert_eq!(out[1].as_deref(), Some("Kethra,"));
@@ -326,11 +357,54 @@ mod tests {
         let vocab = Vocabulary::new(&["Kethra", "zorbin"]);
         let cfg = CorrectionConfig::default();
         // capitalized word and term: 0.7 is below the proper-noun limit
-        assert_eq!(correct(&[("Ketra,", 0.7)], &vocab, &cfg)[0].as_deref(), Some("Kethra,"));
+        assert_eq!(
+            correct(&[("Hi", 0.9), ("Ketra,", 0.7)], &vocab, &cfg)[1].as_deref(),
+            Some("Kethra,")
+        );
         // lowercase word: the normal limit applies
-        assert_eq!(correct(&[("ketra", 0.7)], &vocab, &cfg)[0], None);
+        assert_eq!(
+            correct(&[("hi", 0.9), ("ketra", 0.7)], &vocab, &cfg)[1],
+            None
+        );
         // lowercase term: the normal limit applies
-        assert_eq!(correct(&[("Sorpin", 0.7)], &vocab, &cfg)[0], None);
+        assert_eq!(
+            correct(&[("Hi", 0.9), ("Sorpin", 0.7)], &vocab, &cfg)[1],
+            None
+        );
+    }
+
+    #[test]
+    fn proper_noun_exception_skips_sentence_starts() {
+        let vocab = Vocabulary::new(&["Kethra"]);
+        let cfg = CorrectionConfig::default();
+        assert_eq!(correct(&[("Ketra", 0.7)], &vocab, &cfg)[0], None);
+        assert_eq!(
+            correct(&[("Done.", 0.9), ("Ketra", 0.7)], &vocab, &cfg)[1],
+            None
+        );
+        // below the normal limit it still applies at a sentence start
+        assert_eq!(
+            correct(&[("Ketra", 0.5)], &vocab, &cfg)[0].as_deref(),
+            Some("Kethra")
+        );
+    }
+
+    #[test]
+    fn proper_noun_exception_skips_common_words() {
+        assert!(is_common_word("Time"));
+        assert!(!is_common_word("Kethra"));
+        let vocab = Vocabulary::new(&["Thyme"]);
+        let cfg = CorrectionConfig::default();
+        // "Time" sounds like the term but is a common word: no exception
+        assert_eq!(
+            correct(&[("Well,", 0.9), ("Time", 0.7)], &vocab, &cfg)[1],
+            None
+        );
+        // the normal limit still applies
+        assert_eq!(
+            correct(&[("Well,", 0.9), ("Time", 0.5)], &vocab, &cfg)[1].as_deref(),
+            Some("Thyme")
+        );
     }
 
     #[test]
