@@ -213,7 +213,7 @@ impl Stage for CanvasCropStage {
         "canvas_crop"
     }
     fn version(&self) -> u32 {
-        1
+        2
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {

@@ -124,7 +124,7 @@ impl Stage for OcrHarvestStage {
         "ocr_harvest"
     }
     fn version(&self) -> u32 {
-        1
+        2
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {

@@ -122,8 +122,9 @@ pub struct Layout {
     pub share_area: Option<BBox>,
     /// Right edge of the whiteboard sidebar plus toolbar.
     pub panel_left: Option<f64>,
-    /// Bottom of the whiteboard top bar.
-    pub panel_top: Option<f64>,
+    /// The whiteboard top bar (logo line). It floats over the canvas, so it is
+    /// masked as chrome rather than cut off: board content can sit beside it.
+    pub top_bar: Option<BBox>,
     /// Canvas from layout alone (share area minus panels), when any evidence was found.
     pub canvas: Option<BBox>,
     /// Top of the whiteboard zoom control, which marks the canvas bottom.
@@ -662,22 +663,25 @@ fn compute_share_and_canvas(layout: &mut Layout, spans: &[Span], cfg: &LayoutCon
                 && center(&s.bbox).1 < area.y1 + area.height() * 0.2
         })
         .collect();
-    layout.panel_top = if logo.is_empty() {
-        None
-    } else {
-        let line_bottom = spans
-            .iter()
-            .filter(|s| {
-                logo.iter()
-                    .any(|l| same_line(&l.bbox, &s.bbox) && s.bbox.x1 <= l.bbox.x2 + width * 0.3)
-            })
-            .map(|s| s.bbox.y2)
-            .fold(f64::MIN, f64::max);
-        Some(line_bottom + height * 0.012)
-    };
+    layout.top_bar = spans
+        .iter()
+        .filter(|s| {
+            logo.iter()
+                .any(|l| same_line(&l.bbox, &s.bbox) && s.bbox.x1 <= l.bbox.x2 + width * 0.3)
+        })
+        .map(|s| s.bbox)
+        .reduce(union)
+        .map(|b| {
+            BBox::new(
+                b.x1 - width * 0.005,
+                b.y1 - height * 0.012,
+                b.x2 + width * 0.005,
+                b.y2 + height * 0.012,
+            )
+        });
 
     let evidence =
-        layout.share_area.is_some() || layout.panel_left.is_some() || layout.panel_top.is_some();
+        layout.share_area.is_some() || layout.panel_left.is_some() || layout.top_bar.is_some();
     let bottom = match layout.zoom_top {
         Some(z) if z > area.y1 + area.height() * 0.5 => area.y2.min(z - height * 0.005),
         _ => area.y2,
@@ -687,7 +691,7 @@ fn compute_share_and_canvas(layout: &mut Layout, spans: &[Span], cfg: &LayoutCon
         .then(|| {
             BBox::new(
                 layout.panel_left.map_or(area.x1, |p| p.max(area.x1)),
-                layout.panel_top.map_or(area.y1, |p| p.max(area.y1)),
+                area.y1,
                 area.x2,
                 bottom,
             )
@@ -708,7 +712,7 @@ fn compute_share_and_canvas(layout: &mut Layout, spans: &[Span], cfg: &LayoutCon
         } else if layout.share_area.is_some_and(|a| !contains_point(&a, c)) {
             Some(ChromeReason::OutsideShare)
         } else if layout.panel_left.is_some_and(|p| c.0 < p)
-            || layout.panel_top.is_some_and(|p| c.1 < p)
+            || layout.top_bar.is_some_and(|t| contains_point(&t, c))
         {
             Some(ChromeReason::AppPanel)
         } else {
@@ -784,7 +788,9 @@ mod tests {
         assert!((share.x1 - 90.0).abs() < 1.0);
         let canvas = l.canvas.unwrap();
         assert!(canvas.x1 > 170.0, "{canvas:?}");
-        assert!(canvas.y1 > 88.0);
+        // The top bar floats over the canvas: masked, not cut off.
+        assert!(canvas.y1 < 70.0, "{canvas:?}");
+        assert!(l.top_bar.is_some_and(|t| t.x2 < 300.0));
         assert!(l.names.iter().any(|n| n == "Ada Quill"));
         assert_eq!(l.reasons[0], Some(ChromeReason::Banner));
         assert_eq!(l.reasons[3], Some(ChromeReason::AppPanel));
