@@ -28,6 +28,7 @@ fn golden() -> MeetingGolden {
     serde_json::from_value(json!({
         "golden_version": 1,
         "meeting": "fictional weekly sync",
+        "frame_clock": {"kind": "pts"},
         "participants": [
             {"person_id": "avery", "display_name": "Avery Stone", "aliases": []},
             {"person_id": "jordan", "display_name": "Jordan Vale", "aliases": []}
@@ -368,4 +369,45 @@ fn owners_and_events_use_every_state_once() {
     assert_eq!(m["owners.attribution"], 1.0);
     assert_eq!(m["owners.move_error_max_s"], 0.0);
     assert_eq!(m["events.false_change"], 1.0);
+}
+
+#[test]
+fn nominal_grid_labels_join_where_their_frame_was_taken() {
+    use glassrip_eval::golden::FrameClock;
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        schema::KEYFRAMES,
+        vec![
+            ("k1", ra::keyframe("k1", 0.0, 10.0, 5.0)),
+            ("k2", ra::keyframe("k2", 10.0, 20.0, 15.0)),
+        ],
+    );
+    write(
+        d,
+        schema::SCREEN_CLASS,
+        vec![
+            ("k1", ra::screen_class("k1", "whiteboard")),
+            ("k2", ra::screen_class("k2", "cms")),
+        ],
+    );
+    // A prototype frame named 9 s shows the screen just before 11 s.
+    let mut g = golden();
+    g.screen_types =
+        serde_json::from_value(json!([{"t_rep_s": 9.0, "screen_type": "cms"}])).unwrap();
+    let score = |g: &MeetingGolden| {
+        run_meeting(g, &RunArtifacts::scan(d).unwrap(), 2.0)
+            .unwrap()
+            .metrics["screen.accuracy"]
+    };
+    g.frame_clock = FrameClock::default();
+    assert_eq!(score(&g), 1.0);
+    g.frame_clock = FrameClock::Pts;
+    assert_eq!(score(&g), 0.0);
+    // A golden without the field is on the prototype grid (spec 9.2).
+    let mut v = serde_json::to_value(&g).unwrap();
+    v.as_object_mut().unwrap().remove("frame_clock");
+    let g: MeetingGolden = serde_json::from_value(v).unwrap();
+    assert_eq!(g.frame_clock, FrameClock::default());
 }

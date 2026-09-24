@@ -712,7 +712,8 @@ pub fn run_meeting(
                     unconfirmed += 1;
                     continue;
                 }
-                let pred = join_time(label.t_rep_s, ks, tolerance_s)
+                let t = golden.frame_clock.content_time(label.t_rep_s);
+                let pred = join_time(t, ks, tolerance_s)
                     .and_then(|i| by_kf.get(ks[i].keyframe_id.as_str()).copied().flatten());
                 score.record(label.screen_type, pred);
             }
@@ -733,6 +734,7 @@ pub fn run_meeting(
                 _ => vec![],
             };
             for tt in times {
+                let tt = golden.frame_clock.content_time(tt);
                 t.record(join_time(tt, ks, tolerance_s).is_some());
             }
         }

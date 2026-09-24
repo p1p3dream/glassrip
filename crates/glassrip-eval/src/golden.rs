@@ -116,6 +116,46 @@ pub struct Trap {
     pub note: String,
 }
 
+/// Clock of the golden's frame-derived times (screen labels and traps).
+///
+/// Spec 9.2: golden `t_rep` values sit on the prototype's nominal frame grid. The
+/// prototype sampled with ffmpeg `fps=1/INTERVAL` and named each frame by its grid
+/// time, but the frame it keeps for grid time `t` is the last video frame before
+/// `t + INTERVAL` (checked on the reference recording: every frame compared matched
+/// the native frame 1.97 to 1.99 s after its name on the 2 s grid). A label at
+/// nominal `t` therefore describes what was on screen just before `t + INTERVAL`,
+/// and the pipeline's keyframes carry true PTS times, so the join maps the label
+/// there. Transcript-derived times (hotword windows, notes, owner assignments) are
+/// not frame names and are never shifted.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FrameClock {
+    /// Frame times are nominal grid names (the default for the meeting golden).
+    PrototypeGrid {
+        /// Grid interval, seconds.
+        interval_s: f64,
+    },
+    /// Frame times are presentation times (synthetic goldens).
+    Pts,
+}
+
+impl Default for FrameClock {
+    fn default() -> Self {
+        Self::PrototypeGrid { interval_s: 2.0 }
+    }
+}
+
+impl FrameClock {
+    /// Content time of a frame-derived golden time. On the prototype grid that is a
+    /// hair (50 ms, under one frame at 20 fps or more) before the next grid point.
+    pub fn content_time(&self, t: f64) -> f64 {
+        match self {
+            Self::PrototypeGrid { interval_s } => t + interval_s - 0.05,
+            Self::Pts => t,
+        }
+    }
+}
+
 /// Transcript and notes truth.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -150,6 +190,9 @@ pub struct MeetingGolden {
     /// Media duration, seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_s: Option<f64>,
+    /// Clock of the frame-derived times ([`FrameClock`]).
+    #[serde(default)]
+    pub frame_clock: FrameClock,
     /// Participants.
     pub participants: Vec<Participant>,
     /// Per-keyframe screen types.
@@ -387,12 +430,26 @@ mod tests {
     use super::*;
     use crate::metrics::board::GoldNode;
 
+    #[test]
+    fn frame_clock_maps_nominal_grid_names_to_content_time() {
+        let g: FrameClock = serde_json::from_value(serde_json::json!({"kind": "pts"})).unwrap();
+        assert_eq!(g.content_time(24.0), 24.0);
+        let d = FrameClock::default();
+        assert!((d.content_time(24.0) - 25.95).abs() < 1e-9);
+        let five: FrameClock = serde_json::from_value(
+            serde_json::json!({"kind": "prototype_grid", "interval_s": 5.0}),
+        )
+        .unwrap();
+        assert!((five.content_time(10.0) - 14.95).abs() < 1e-9);
+    }
+
     fn minimal() -> MeetingGolden {
         MeetingGolden {
             golden_version: GOLDEN_VERSION,
             meeting: "synthetic".into(),
             sources: vec![],
             duration_s: None,
+            frame_clock: FrameClock::Pts,
             participants: vec![
                 Participant {
                     person_id: "avery".into(),
