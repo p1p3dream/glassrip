@@ -40,7 +40,7 @@ use crate::register::{
 };
 use crate::text::{clean_label, is_unreliable, normalize, AliasTable};
 
-use anchor::{anchor_tag, AnchorParams, Anchored, EdgeGeom};
+use anchor::{anchor_tag, box_distance, AnchorParams, Anchored, EdgeGeom};
 use cleanup::{derive_groups, fold_fragments, Titles};
 use events::{BoardEvent, EventGate, EventKind, SuppressedEvent};
 use owners::{
@@ -131,6 +131,10 @@ pub struct ConsolidationParams {
     /// node reading joins its track after the view moved.
     #[serde(default = "default_off_position_share")]
     pub off_position_share: f64,
+    /// Minimum share of an element's sightings that were also read as an edge's
+    /// label before the element may be lifted out as that label.
+    #[serde(default = "default_label_box_min_share")]
+    pub label_box_min_share: f64,
     /// Minimum keyframes supporting an interval.
     pub min_support_keyframes: usize,
     /// Minimum share of board keyframes inside an interval that saw the element.
@@ -181,6 +185,7 @@ impl Default for ConsolidationParams {
             position_tolerance_share: 0.04,
             label_change_min_iou: 0.5,
             off_position_share: default_off_position_share(),
+            label_box_min_share: default_label_box_min_share(),
             min_support_keyframes: 2,
             min_support_density: 0.10,
             removal_absent_keyframes: 2,
@@ -209,6 +214,10 @@ fn default_min_group_cards() -> usize {
 
 fn default_off_position_share() -> f64 {
     0.1
+}
+
+fn default_label_box_min_share() -> f64 {
+    0.3
 }
 
 /// A lifetime interval in seconds.
@@ -369,14 +378,31 @@ pub struct StickyGroup {
     pub bbox: BBox,
 }
 
-/// An element read as a piece of a longer element at the same place.
+/// Why an element left the node and sticky lists.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FoldReason {
+    /// A piece of a longer element at the same place.
+    #[default]
+    Fragment,
+    /// The heading of a derived sticky group.
+    GroupHeading,
+    /// An edge's label also read as a box on that edge.
+    EdgeLabel,
+}
+
+/// An element taken out of the node and sticky lists, with where it went.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FoldedElement {
-    /// Text of the fragment.
+    /// Text of the element.
     pub text: String,
-    /// Text of the element it was folded into.
+    /// What it was folded into: the longer element's text, `heading of <group>`,
+    /// or `label of <edge>`.
     pub into: String,
+    /// Why it left the lists.
+    #[serde(default)]
+    pub reason: FoldReason,
 }
 
 /// A consolidated edge between nodes `a` and `b`.
@@ -660,6 +686,9 @@ pub fn consolidate(
     // 2. Element tracks.
     let mut tracks: Vec<Track> = Vec::new();
     let mut node_track: HashMap<(usize, String), usize> = HashMap::new();
+    // Readings whose text matched an edge's label in the same keyframe: (track,
+    // keyframe, edge index in that keyframe, the reading's own box).
+    let mut label_merges: Vec<(usize, usize, usize, BBox)> = Vec::new();
     for (fi, f) in frames.iter().enumerate() {
         let to_ref = |b: &BBox| positioned(fi).then(|| map_bbox(&regs[fi].to_reference, b));
         let cluster = regs[fi].cluster;
@@ -730,17 +759,22 @@ pub fn consolidate(
                 single_ok: false,
             });
         }
-        for e in &f.board.edges {
+        let mut merged: Vec<(usize, usize, BBox)> = Vec::new();
+        for (ei, e) in f.board.edges.iter().enumerate() {
             let cleaned = clean_label(&e.label);
             let l = cleaned.as_str();
             if l.is_empty() || is_unreliable(l) {
                 continue;
             }
             let nl = normalize(l);
-            match obs.iter_mut().find(|o| normalize(&o.text) == nl) {
-                Some(o) => {
+            match obs.iter().position(|o| normalize(&o.text) == nl) {
+                Some(oi) => {
+                    let o = &mut obs[oi];
                     if !o.lists.contains(&ObsList::EdgeLabel) {
                         o.lists.push(ObsList::EdgeLabel);
+                    }
+                    if let Some(b) = o.raw_bbox {
+                        merged.push((oi, ei, b));
                     }
                 }
                 None => obs.push(Obs {
@@ -758,6 +792,9 @@ pub fn consolidate(
         }
         let locals: Vec<Option<String>> = obs.iter().map(|o| o.local_id.clone()).collect();
         let assigned = assign_frame(&mut tracks, obs, &match_params, &view_moved);
+        for (oi, ei, b) in merged {
+            label_merges.push((assigned[oi], fi, ei, b));
+        }
         for (ti, local) in assigned.into_iter().zip(locals) {
             if let Some(l) = local {
                 node_track.insert((fi, l), ti);
@@ -788,6 +825,7 @@ pub fn consolidate(
         .map(|(&t, &u)| FoldedElement {
             text: tracks[t].text(),
             into: tracks[resolve(u)].text(),
+            reason: FoldReason::Fragment,
         })
         .collect();
 
@@ -1095,9 +1133,11 @@ pub fn consolidate(
             .iter()
             .filter(|o| o.frame >= last_iv.first && o.frame <= last_iv.last)
             .collect();
-        // The direction vote uses every sighting since the edge's last reversal (all
-        // of them when it never reversed): more keyframes outvote a bad one, and the
-        // final direction always agrees with the last EdgeReversed event.
+        // The direction vote uses every sighting since the edge's last detected
+        // reversal (all of them when none was detected): more keyframes outvote a bad
+        // one, and the final direction agrees with the last detected reversal. A flip
+        // seen in a single keyframe is not a reversal, so it neither emits an
+        // EdgeReversed event nor restarts the vote window.
         let since = reversals(list, a, params.vote_min_share).last().copied();
         let mut votes = DirectionVotes::default();
         for o in list.iter().filter(|o| since.is_none_or(|f| o.frame >= f)) {
@@ -1395,30 +1435,78 @@ pub fn consolidate(
             folded.push(FoldedElement {
                 text: tracks[*t].text(),
                 into: format!("heading of {gid}"),
+                reason: FoldReason::GroupHeading,
             });
         }
     }
-    // A box that was itself read as an edge's label in the same keyframe and ends no
-    // edge (and carries no owner) is that label read twice, not an element.
-    let mut label_boxes: Vec<(usize, &String)> = node_id
-        .iter()
-        .filter(|(&ti, id)| !bound.contains(*id) && tracks[ti].votes().edge_label > 0)
-        .map(|(&ti, id)| (ti, id))
-        .collect();
-    label_boxes.sort_unstable();
-    for (ti, _) in label_boxes {
-        let text = tracks[ti].text();
-        let nt = normalize(&text);
-        let Some(e) = edges
+    // A box or sticky whose text is also an edge's label is that label read twice
+    // only on positive evidence: a meaningful share of its sightings coincided with
+    // the label, and in one of those keyframes the edge whose label merged into it
+    // is a consolidated edge and the reading sits on that edge (within about one
+    // text height of its label box, or beside the link between its two ends).
+    // Endpoints and owner targets are never lifted. Anything else stays an element.
+    let mut label_lifts: BTreeMap<usize, String> = BTreeMap::new();
+    for &(t, fi, ei, b) in &label_merges {
+        let ti = resolve(t);
+        let Some(id) = node_id.get(&ti).or_else(|| sticky_id.get(&ti)) else {
+            continue;
+        };
+        if bound.contains(id) || lifted.contains(&ti) || label_lifts.contains_key(&ti) {
+            continue;
+        }
+        let tr = &tracks[ti];
+        let hits = tr
+            .obs
             .iter()
-            .find(|e| !e.label.is_empty() && normalize(&e.label) == nt)
+            .filter(|o| o.lists.contains(&ObsList::EdgeLabel))
+            .count();
+        if (hits as f64) < params.label_box_min_share * tr.obs.len() as f64 {
+            continue;
+        }
+        let f = &frames[fi];
+        let Some(e) = f.board.edges.get(ei) else {
+            continue;
+        };
+        let (Some(s), Some(d)) = (
+            node_track.get(&(fi, e.src.clone())),
+            node_track.get(&(fi, e.dst.clone())),
+        ) else {
+            continue;
+        };
+        let (Some(sa), Some(sb)) = (node_id.get(s), node_id.get(d)) else {
+            continue;
+        };
+        let Some(edge) = edges
+            .iter()
+            .find(|x| (x.a == *sa && x.b == *sb) || (x.a == *sb && x.b == *sa))
         else {
             continue;
         };
+        let text_h = b.height();
+        let near_label = e
+            .label_bbox
+            .is_some_and(|lb| box_distance(&b, &lb) <= text_h);
+        let end_box = |l: &str| {
+            f.board
+                .nodes
+                .iter()
+                .find(|n| n.local_id == l)
+                .map(|n| n.bbox)
+        };
+        let on_path = match (end_box(&e.src), end_box(&e.dst)) {
+            (Some(p), Some(q)) => beside_link(&b, &p, &q),
+            _ => false,
+        };
+        if near_label || on_path {
+            label_lifts.insert(ti, edge.id.clone());
+        }
+    }
+    for (ti, eid) in label_lifts {
         if lifted.insert(ti) {
             folded.push(FoldedElement {
-                text,
-                into: format!("label of {}", e.id),
+                text: tracks[ti].text(),
+                into: format!("label of {eid}"),
+                reason: FoldReason::EdgeLabel,
             });
         }
     }
@@ -1550,6 +1638,29 @@ pub fn consolidate(
 /// VLM when pixels are inconclusive), a flip being a new direction that holds for two
 /// consecutive decided keyframes. `a` is the node track the `(a, b)` orientation
 /// starts from.
+/// Whether box `b` sits beside the straight link between boxes `p` and `q`: clear
+/// of both ends, projecting inside the link, and within about one text height
+/// (its own height) of the line between their centers.
+fn beside_link(b: &BBox, p: &BBox, q: &BBox) -> bool {
+    if box_distance(b, p) <= 0.0 || box_distance(b, q) <= 0.0 {
+        return false;
+    }
+    let c = ((b.x1 + b.x2) / 2.0, (b.y1 + b.y2) / 2.0);
+    let a = ((p.x1 + p.x2) / 2.0, (p.y1 + p.y2) / 2.0);
+    let z = ((q.x1 + q.x2) / 2.0, (q.y1 + q.y2) / 2.0);
+    let (dx, dy) = (z.0 - a.0, z.1 - a.1);
+    let len2 = dx * dx + dy * dy;
+    if len2 <= 0.0 {
+        return false;
+    }
+    let t = ((c.0 - a.0) * dx + (c.1 - a.1) * dy) / len2;
+    if !(0.0..=1.0).contains(&t) {
+        return false;
+    }
+    let dist = ((c.0 - a.0) * dy - (c.1 - a.1) * dx).abs() / len2.sqrt();
+    dist <= 1.5 * b.height()
+}
+
 fn reversals(list: &[EdgeObs], a: usize, min_share: f64) -> Vec<usize> {
     let mut per_frame: Vec<(usize, EdgeDirection)> = Vec::new();
     for o in list {

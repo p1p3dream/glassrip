@@ -9,7 +9,7 @@ use glassrip_meeting::consolidate::owners::{
 };
 use glassrip_meeting::consolidate::{
     consolidate, split_boards, BoardFrame, BoardStateItem, CanvasSource, ConsolidationParams,
-    EdgeOrientation, Hooks, StickyKind, TextAnchor,
+    EdgeOrientation, FoldReason, Hooks, StickyKind, TextAnchor,
 };
 use glassrip_meeting::direction::{DirectionBasis, EdgeDirection, EndVerdict};
 use glassrip_meeting::pixel_direction::{EndEvidence, PixelEvidence, PixelStatus};
@@ -1055,19 +1055,22 @@ fn grid_stickies_carry_boxes_and_form_a_group_with_its_heading() {
 }
 
 #[test]
-fn a_later_partial_view_of_a_grid_is_not_a_second_group() {
-    // Frames 0-2 read the whole grid with a tenth card just off the bottom row;
-    // frames 3-5 read the top row slightly off its column and the tenth card in
-    // line, so the later seven-card view is not a subset of the first.
+fn a_later_view_adds_only_its_new_cards_as_a_group() {
+    // Frames 0-2 read the 3x3 grid. Frames 3-5 read the top two rows slightly off
+    // their columns (detached from the bottom row) and a new row of four cards under
+    // the bottom row. The late seven-card view shares three cards with the grid:
+    // a majority-overlap rule keeps it whole (duplicating those three cards); the
+    // new cards alone must form the second group.
+    let new_row = ["Lambda card", "Mu card", "Nu card", "Xi card"];
     let specs: Vec<Spec> = (0..6)
         .map(|f| {
             let mut s = grid_spec();
-            let late = f >= 3;
-            s.stickies
-                .push(("Kappa card", (1290.0, if late { 670.0 } else { 715.0 })));
-            if late {
-                for c in s.stickies.iter_mut().take(3) {
+            if f >= 3 {
+                for c in s.stickies.iter_mut().take(6) {
                     c.1 .0 += 50.0;
+                }
+                for (i, t) in new_row.iter().enumerate() {
+                    s.stickies.push((t, (900.0 + i as f64 * 130.0, 780.0)));
                 }
             }
             s
@@ -1075,29 +1078,107 @@ fn a_later_partial_view_of_a_grid_is_not_a_second_group() {
         .collect();
     let s = run(frames(&specs), &params());
     let sizes: Vec<usize> = s.groups.iter().map(|g| g.sticky_ids.len()).collect();
-    assert_eq!(sizes, vec![9], "{:#?}", s.groups);
+    assert_eq!(sizes, vec![9, 4], "{:#?}", s.groups);
+    let text_of = |id: &String| {
+        s.stickies
+            .iter()
+            .find(|x| &x.id == id)
+            .map(|x| x.text.clone())
+            .unwrap_or_default()
+    };
+    let second: Vec<String> = s.groups[1].sticky_ids.iter().map(text_of).collect();
+    assert_eq!(second, new_row.map(String::from).to_vec());
+}
+
+/// Base board with a "gRPC" box at `at` in every keyframe; the Queue to Ledger
+/// Store link is labeled "gRPC" in the keyframes `labeled` says.
+fn label_box_frames(at: (f64, f64), n: usize, labeled: impl Fn(usize) -> bool) -> Vec<BoardFrame> {
+    let specs: Vec<Spec> = (0..n)
+        .map(|f| {
+            let mut s = base();
+            s.nodes.push(("n5", "gRPC".to_string(), at));
+            if !labeled(f) {
+                s.edges[1].2 = "";
+            }
+            s
+        })
+        .collect();
+    frames(&specs)
+}
+
+fn lifted_as_label(s: &BoardStateItem, text: &str) -> bool {
+    s.folded.iter().any(|f| {
+        f.text == text && f.reason == FoldReason::EdgeLabel && f.into.starts_with("label of ")
+    })
 }
 
 #[test]
-fn an_edge_label_read_as_a_box_is_not_a_node() {
+fn an_edge_label_read_as_a_box_on_its_link_is_not_a_node() {
+    let s = run(label_box_frames((950.0, 215.0), 4, |_| true), &params());
+    assert!(!s.nodes.iter().any(|n| n.text == "gRPC"), "{:?}", s.nodes);
+    assert!(lifted_as_label(&s, "gRPC"), "{:?}", s.folded);
+    assert!(!s.events.iter().any(|e| e.detail == "gRPC"));
+    assert_eq!(s.edges.len(), 3);
+}
+
+#[test]
+fn an_edge_label_read_as_a_box_at_its_label_box_is_not_a_node() {
+    // Off the straight link (a curved connector), but touching the label box.
+    let mut fr = label_box_frames((950.0, 380.0), 4, |_| true);
+    for f in &mut fr {
+        for e in &mut f.board.edges {
+            if e.label == "gRPC" {
+                e.label_bbox = Some(BBox::new(900.0, 425.0, 1000.0, 445.0));
+            }
+        }
+    }
+    let s = run(fr, &params());
+    assert!(!s.nodes.iter().any(|n| n.text == "gRPC"), "{:?}", s.nodes);
+    assert!(lifted_as_label(&s, "gRPC"), "{:?}", s.folded);
+}
+
+#[test]
+fn an_isolated_caption_named_like_a_far_edge_label_stays_a_node() {
+    // Nothing touches the caption and nobody owns it; the same-label edge runs
+    // across the other side of the board.
+    let s = run(label_box_frames((250.0, 800.0), 4, |_| true), &params());
+    assert!(
+        s.nodes.iter().any(|n| n.text == "gRPC" && n.in_final),
+        "{:?} {:?}",
+        s.nodes,
+        s.folded
+    );
+    assert!(!lifted_as_label(&s, "gRPC"));
+}
+
+#[test]
+fn a_box_that_rarely_coincides_with_the_label_stays_a_node() {
+    // On the link, but the label was read in only one of six keyframes.
+    let s = run(label_box_frames((950.0, 215.0), 6, |f| f == 0), &params());
+    assert!(
+        s.nodes.iter().any(|n| n.text == "gRPC" && n.in_final),
+        "{:?} {:?}",
+        s.nodes,
+        s.folded
+    );
+}
+
+#[test]
+fn an_edge_label_read_as_a_sticky_on_its_link_is_not_a_sticky() {
     let specs: Vec<Spec> = (0..4)
         .map(|_| {
             let mut s = base();
-            s.nodes.push(("n5", "gRPC".to_string(), (950.0, 215.0)));
+            s.stickies.push(("gRPC", (950.0, 215.0)));
             s
         })
         .collect();
     let s = run(frames(&specs), &params());
-    assert!(!s.nodes.iter().any(|n| n.text == "gRPC"), "{:?}", s.nodes);
     assert!(
-        s.folded
-            .iter()
-            .any(|f| f.text == "gRPC" && f.into.starts_with("label of ")),
+        !s.stickies.iter().any(|x| x.text == "gRPC"),
         "{:?}",
-        s.folded
+        s.stickies
     );
-    assert!(!s.events.iter().any(|e| e.detail == "gRPC"));
-    assert_eq!(s.edges.len(), 3);
+    assert!(lifted_as_label(&s, "gRPC"), "{:?}", s.folded);
 }
 
 #[test]
