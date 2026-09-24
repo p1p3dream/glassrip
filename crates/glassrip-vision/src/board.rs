@@ -34,7 +34,8 @@ the full text inside the box as its text (join wrapped lines with a space).
 - edges: lines or arrows connecting two nodes. \"src\" and \"dst\" must be local_id values from your \
 nodes list. \"src\" is the tail, \"dst\" is the end with the arrowhead. \"label\" is the small text \
 written on the line itself (for example a protocol name), or an empty string if the line has no text. \
-Never use a node's text as an edge label. \"style\" is \"dashed\" for dotted/dashed lines, otherwise \
+Never use a node's text as an edge label. \"label_bbox_2d\" is the box around the label text as \
+[x1, y1, x2, y2], or [0, 0, 0, 0] if the line has no text. \"style\" is \"dashed\" for dotted/dashed lines, otherwise \
 \"solid\". A dashed line may be long and curved and carry a text label; follow it to the box at each \
 end and put its text in \"label\".
 - stickies: colored sticky notes and cards (yellow, blue, pink, etc.) containing words, sentences, \
@@ -45,7 +46,8 @@ it once. Transcribe the full text.
 \"near\" is that box's local_id, or an empty string if it is not next to a box.
 - other_visible_text: any other readable text on the canvas itself (not UI chrome) that is not \
 already listed above.
-- bbox_2d: for every node, sticky, owner tag, and other text, the box around it as \
+- bbox_2d (and label_bbox_2d): for every node, sticky, owner tag, other text, and edge label, the box \
+around it as \
 [x1, y1, x2, y2] in absolute pixel coordinates of this image, in exactly that order: x1, y1 is the \
 top-left corner and x2, y2 the bottom-right corner, so x1 < x2 and y1 < y2.
 
@@ -98,6 +100,10 @@ pub struct BoardEdge {
     pub dst: String,
     /// Empty string when the line carries no text.
     pub label: String,
+    /// Box around the label text; `None` (written `[0, 0, 0, 0]`) without a label.
+    #[serde(rename = "label_bbox_2d", with = "crate::geometry::opt_bbox2d")]
+    #[schemars(with = "[f64; 4]")]
+    pub label_bbox: Option<BBox>,
     pub style: EdgeStyle,
     #[schemars(range(min = 0.0, max = 1.0))]
     pub conf: f64,
@@ -166,6 +172,9 @@ impl BoardReadOutput {
         }
         for t in &mut self.other_visible_text {
             t.bbox = t.bbox.to_source(prepared);
+        }
+        for e in &mut self.edges {
+            e.label_bbox = e.label_bbox.map(|b| b.to_source(prepared));
         }
         self
     }
@@ -259,7 +268,7 @@ impl Default for BoardValidationConfig {
         Self {
             denylist: ChromeDenylist::miro_meet_defaults(),
             participant_names: Vec::new(),
-            max_edge_label_words: 6,
+            max_edge_label_words: 8,
             bbox_tolerance_px: 2.0,
         }
     }
@@ -428,6 +437,15 @@ impl Ctx<'_> {
     fn is_participant(&self, text: &str) -> bool {
         self.participants.contains(&normalize(text))
     }
+}
+
+/// Words in an edge label: whitespace-separated tokens with at least one
+/// letter or digit ("A + B" is two words).
+pub fn label_words(label: &str) -> usize {
+    label
+        .split_whitespace()
+        .filter(|t| t.chars().any(char::is_alphanumeric))
+        .count()
 }
 
 /// Repair an inverted box when exactly one reading of its four numbers gives a
@@ -671,7 +689,7 @@ pub fn validate_board(
         }
         let label = e.label.trim().to_string();
         if !label.is_empty() {
-            let kind = if label.split_whitespace().count() > cfg.max_edge_label_words {
+            let kind = if label_words(&label) > cfg.max_edge_label_words {
                 Some(IssueKind::LabelTooLong)
             } else if node_texts.contains(&normalize(&label)) {
                 Some(IssueKind::LabelIsNodeText)
@@ -691,6 +709,43 @@ pub fn validate_board(
                 e.label = label;
             }
         }
+        e.label_bbox = if e.label.is_empty() {
+            None
+        } else {
+            e.label_bbox.and_then(|b| {
+                let fixed = if b.is_well_formed() {
+                    Some(b)
+                } else {
+                    repair_inverted(&b, ctx.canvas, cfg.bbox_tolerance_px)
+                };
+                match fixed {
+                    Some(f)
+                        if f.is_inside(
+                            ctx.canvas.width,
+                            ctx.canvas.height,
+                            cfg.bbox_tolerance_px,
+                        ) =>
+                    {
+                        if f != b {
+                            ctx.issue(
+                                ElementList::Edges,
+                                IssueKind::BBoxRepaired,
+                                format!("label {:?}: bbox {b:?} repaired to {f:?}", e.label),
+                            );
+                        }
+                        Some(f)
+                    }
+                    _ => {
+                        ctx.issue(
+                            ElementList::Edges,
+                            IssueKind::MalformedBBox,
+                            format!("label {:?}: bbox {b:?} dropped", e.label),
+                        );
+                        None
+                    }
+                }
+            })
+        };
         kept_edges.push(e);
     }
 
@@ -749,6 +804,7 @@ mod tests {
             src: src.into(),
             dst: dst.into(),
             label: label.into(),
+            label_bbox: None,
             style: EdgeStyle::Solid,
             conf: 0.8,
         }
@@ -816,6 +872,57 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(node_keys, ["local_id", "text", "bbox_2d", "conf"]);
         Ok(())
+    }
+
+    #[test]
+    fn edge_label_words_and_label_boxes() {
+        assert_eq!(
+            label_words("Links between Quarry content + Frontend component"),
+            6
+        );
+        assert_eq!(label_words("a - b"), 2);
+        let mut out = empty_output();
+        out.nodes = vec![
+            node("n1", "Widget Service", 100.0, 100.0),
+            node("n2", "Queue", 900.0, 100.0),
+            node("n3", "Store", 100.0, 600.0),
+        ];
+        let mut long = edge(
+            "n1",
+            "n2",
+            "Links between Quarry content + Frontend component, v2 draft notes",
+        );
+        long.label_bbox = Some(BBox::new(300.0, 90.0, 700.0, 110.0));
+        let mut kept = edge(
+            "n1",
+            "n3",
+            "Links between Quarry content + Frontend component",
+        );
+        // Inverted label box, repairable (axis-order swap).
+        kept.label_bbox = Some(BBox::new(300.0, 1000.0, 400.0, 420.0));
+        let mut none = edge("n2", "n3", "");
+        none.label_bbox = Some(BBox::new(1.0, 1.0, 5.0, 5.0));
+        out.edges = vec![long, kept, none];
+        let v = validate_board(out, CANVAS, &cfg());
+        assert_eq!(v.edges.len(), 3);
+        assert!(v.edges[0].label.is_empty() && v.edges[0].label_bbox.is_none());
+        assert_eq!(
+            v.edges[1].label,
+            "Links between Quarry content + Frontend component"
+        );
+        assert_eq!(
+            v.edges[1].label_bbox,
+            Some(BBox::new(300.0, 400.0, 1000.0, 420.0))
+        );
+        assert!(v.edges[2].label_bbox.is_none());
+        // Wire format: [0, 0, 0, 0] means no label box.
+        let e: BoardEdge = serde_json::from_value(serde_json::json!({
+            "src": "n1", "dst": "n2", "label": "", "label_bbox_2d": [0, 0, 0, 0],
+            "style": "solid", "conf": 0.5
+        }))
+        .map_err(|e| e.to_string())
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert!(e.label_bbox.is_none());
     }
 
     #[test]
@@ -1031,7 +1138,7 @@ mod tests {
             node("n3", "Store", 700.0, 100.0),
         ];
         out.edges = vec![
-            edge("n1", "n2", "one two three four five six seven"),
+            edge("n1", "n2", "one two three four five six seven eight nine"),
             edge("n2", "n3", "Widget Service"),
             edge("n1", "n3", " one two three four five six "),
         ];
