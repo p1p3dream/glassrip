@@ -167,7 +167,7 @@ fn strip_fences(text: &str) -> String {
         return text.to_string();
     }
     let start = 1;
-    let end = if lines.last().map_or(false, |l| l.trim() == "```") {
+    let end = if lines.last().is_some_and(|l| l.trim() == "```") {
         lines.len() - 1
     } else {
         lines.len()

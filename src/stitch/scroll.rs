@@ -13,8 +13,8 @@ pub fn stitch_scroll_sequence(code_blocks: &[String]) -> String {
 
     let mut full_lines: Vec<&str> = code_blocks[0].split('\n').collect();
 
-    for i in 1..code_blocks.len() {
-        let curr_lines: Vec<&str> = code_blocks[i].split('\n').collect();
+    for block in code_blocks.iter().skip(1) {
+        let curr_lines: Vec<&str> = block.split('\n').collect();
         let tail_start = full_lines.len().saturating_sub(curr_lines.len());
         let tail = &full_lines[tail_start..];
         let overlap = find_overlap(tail, &curr_lines, 3);

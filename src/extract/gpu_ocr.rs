@@ -153,8 +153,8 @@ mod engine {
             let scale = scale.min(1.0);
             let new_w = ((orig_w as f32 * scale) as u32).max(32);
             let new_h = ((orig_h as f32 * scale) as u32).max(32);
-            let new_w = (new_w + 31) / 32 * 32;
-            let new_h = (new_h + 31) / 32 * 32;
+            let new_w = new_w.div_ceil(32) * 32;
+            let new_h = new_h.div_ceil(32) * 32;
 
             let resized = image::imageops::resize(
                 img, new_w, new_h, image::imageops::FilterType::Triangle,
@@ -192,8 +192,8 @@ mod engine {
             let mut in_text = false;
             let mut line_start = 0usize;
 
-            for y in 0..out_h {
-                if row_density[y] > min_density {
+            for (y, &density) in row_density.iter().enumerate().take(out_h) {
+                if density > min_density {
                     if !in_text {
                         line_start = y;
                         in_text = true;

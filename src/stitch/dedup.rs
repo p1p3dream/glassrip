@@ -117,8 +117,8 @@ pub fn dedup_passages(text: &str) -> String {
                 {
                     end += 1;
                 }
-                for k in i..end {
-                    remove[k] = true;
+                for r in remove.iter_mut().take(end).skip(i) {
+                    *r = true;
                 }
                 i = end;
                 found = true;
@@ -199,7 +199,7 @@ fn heading_level(line: &str) -> usize {
     }
 }
 
-fn split_into_sections<'a>(lines: &[&'a str]) -> Vec<Section> {
+fn split_into_sections(lines: &[&str]) -> Vec<Section> {
     use super::normalize_line;
 
     let mut sections = Vec::new();

@@ -245,10 +245,10 @@ fn collect_frame_files(dir: &Path, prefix: &str) -> Vec<PathBuf> {
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| {
-            p.extension().map_or(false, |ext| ext == "png")
+            p.extension().is_some_and(|ext| ext == "png")
                 && p.file_name()
                     .and_then(|n| n.to_str())
-                    .map_or(false, |n| n.starts_with(prefix))
+                    .is_some_and(|n| n.starts_with(prefix))
         })
         .collect();
     files.sort();
