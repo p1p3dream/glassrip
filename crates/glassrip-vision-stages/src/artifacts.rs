@@ -139,6 +139,9 @@ pub struct OcrSpan {
     pub region: TextRegion,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chrome_reason: Option<ChromeReason>,
+    /// Median luma (0 to 255) inside the span box: conferencing name labels are
+    /// light text on a dark overlay, board text is dark on light.
+    pub bg_luma: f64,
 }
 
 /// `glassrip.ocr` item.
@@ -335,6 +338,8 @@ pub struct BoardReadingItem {
     /// Crop box in source pixels; element boxes in `result` are relative to it.
     pub crop_box: BBox,
     pub masks: Vec<ChromeMask>,
+    /// Participant tiles in source pixels (from `canvas_crop`).
+    pub tiles: Vec<TileBox>,
     pub model: ModelRef,
     /// Wall time for all requests of this keyframe.
     pub latency_s: f64,

@@ -91,6 +91,7 @@ fn spans_of(ocr: &OcrKeyframe) -> Vec<Span> {
             text: s.text.clone(),
             bbox: s.bbox,
             confidence: s.confidence,
+            bg_luma: Some(s.bg_luma),
         })
         .collect()
 }

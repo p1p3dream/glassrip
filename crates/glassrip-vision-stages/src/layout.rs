@@ -39,12 +39,43 @@ pub struct LayoutConfig {
     pub min_label_confidence: f64,
     /// Tile aspect ratio (width / height) when only one grid direction is seen.
     pub tile_aspect: f64,
+    /// Tile labels sit on a dark overlay: median luma inside the label box must be below this.
+    pub max_label_bg_luma: f64,
+}
+
+/// The spec's Miro and Meet denylist plus Miro's shape menu and text toolbar
+/// strings, which float over the canvas while someone edits.
+pub fn meeting_denylist() -> ChromeDenylist {
+    let mut d = ChromeDenylist::miro_meet_defaults();
+    d.exact.extend(
+        [
+            "Line",
+            "Arrow",
+            "Elbow arrow",
+            "Block arrow",
+            "Rectangle",
+            "Oval",
+            "Rhombus",
+            "Triangle",
+            "Divider",
+            "More shapes",
+            "Diagram",
+            "Noto Sans",
+            "Auto",
+            "Aa",
+            "Privacy Policy",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
+    d.contains.push("Tidy up your Space".into());
+    d
 }
 
 impl Default for LayoutConfig {
     fn default() -> Self {
         Self {
-            denylist: ChromeDenylist::miro_meet_defaults(),
+            denylist: meeting_denylist(),
             banner_patterns: vec!["(Presenting".into(), "is presenting".into()],
             participants: Vec::new(),
             sidebar_terms: ["Overview", "Browse", "Create section", "Starred boards"]
@@ -57,6 +88,7 @@ impl Default for LayoutConfig {
             min_tile_pitch: 0.08,
             min_label_confidence: 0.7,
             tile_aspect: 16.0 / 9.0,
+            max_label_bg_luma: 140.0,
         }
     }
 }
@@ -67,6 +99,8 @@ pub struct Span {
     pub text: String,
     pub bbox: BBox,
     pub confidence: f64,
+    /// Median luma inside the box, when measured.
+    pub bg_luma: Option<f64>,
 }
 
 /// Result of layout analysis on one image.
@@ -152,19 +186,77 @@ pub fn name_shaped(text: &str) -> Option<String> {
     (letters >= 5 && first_ok && last_ok).then(|| s.to_string())
 }
 
+/// A looser name shape for labels cut by the image edge: 2 to 4 alphabetic
+/// words, the first capitalized ("Jane van", "Jane S").
+pub fn loose_name(text: &str) -> bool {
+    let s = strip_ellipsis(text);
+    let tokens: Vec<&str> = s.split_whitespace().collect();
+    let letters: usize = tokens
+        .iter()
+        .map(|t| t.chars().filter(|c| c.is_alphabetic()).count())
+        .sum();
+    (2..=4).contains(&tokens.len())
+        && tokens.iter().all(|t| is_name_token(t))
+        && tokens.first().is_some_and(|t| capitalized(t))
+        && letters >= 5
+}
+
+/// One capitalized alphabetic word of at least four letters ("Jane").
+pub fn single_name_word(text: &str) -> bool {
+    let s = strip_ellipsis(text);
+    !s.contains(char::is_whitespace)
+        && s.chars().count() >= 4
+        && s.chars().all(char::is_alphabetic)
+        && capitalized(s)
+}
+
 /// Fuzzy name match that tolerates truncated labels ("Jane Smi" vs "Jane Smith").
 pub fn names_match(a: &str, b: &str) -> bool {
     let (a, b) = (normalize(strip_ellipsis(a)), normalize(strip_ellipsis(b)));
     if a.is_empty() || b.is_empty() {
         return false;
     }
-    let (short, long) = if a.len() <= b.len() {
-        (&a, &b)
-    } else {
-        (&b, &a)
+    if strsim::normalized_levenshtein(&a, &b) >= 0.8 {
+        return true;
+    }
+    // A label cut by the image edge: compare against the same-length prefix,
+    // ignoring spaces ("Janevan Smi" vs "Jane van Smith").
+    let squash = |s: &str| -> Vec<char> { s.chars().filter(|c| !c.is_whitespace()).collect() };
+    let (a, b) = (squash(&a), squash(&b));
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    if short.len() < 5 {
+        return false;
+    }
+    let prefix: String = long[..short.len()].iter().collect();
+    let short: String = short.iter().collect();
+    strsim::normalized_levenshtein(&short, &prefix) >= 0.8
+}
+
+/// Fuzzy match of a UI string, tolerant of OCR misreads and leading icons
+/// ("+ Create secton", "8 Browse", "Overveiw").
+pub fn ui_term_match(text: &str, term: &str) -> bool {
+    let clean = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+            .collect::<String>()
+            .split_whitespace()
+            .filter(|w| w.chars().any(char::is_alphabetic))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
     };
-    (short.len() >= 5 && long.starts_with(short.as_str()))
-        || strsim::normalized_levenshtein(&a, &b) >= 0.8
+    let (t, u) = (clean(text), clean(term));
+    !t.is_empty() && !u.is_empty() && strsim::normalized_levenshtein(&t, &u) >= 0.7
+}
+
+/// A whiteboard zoom control, for example "53%", "-53% +", or "100 %".
+fn is_zoom_control(text: &str) -> bool {
+    let t: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let t = t.trim_matches(|c| c == '-' || c == '+' || c == '−');
+    match t.strip_suffix('%') {
+        Some(num) => !num.is_empty() && num.len() <= 3 && num.chars().all(|c| c.is_ascii_digit()),
+        None => false,
+    }
 }
 
 /// Name before a banner pattern, for example "Jane Smith (Presenting)".
@@ -298,7 +390,10 @@ pub fn analyze(spans: &[Span], width: f64, height: f64, cfg: &LayoutConfig) -> L
                 && s.confidence >= cfg.min_label_confidence
                 && s.bbox.height() <= height * cfg.max_label_height
                 && !cfg.denylist.matches(&s.text)
-                && (name_shaped(&s.text).is_some() || known.iter().any(|k| names_match(k, &s.text)))
+                && s.bg_luma.is_none_or(|l| l < cfg.max_label_bg_luma)
+                && (loose_name(&s.text)
+                    || single_name_word(&s.text)
+                    || known.iter().any(|k| names_match(k, &s.text)))
         })
         .map(|(i, _)| i)
         .collect();
@@ -335,26 +430,48 @@ pub fn analyze(spans: &[Span], width: f64, height: f64, cfg: &LayoutConfig) -> L
             }
         })
     };
-    for g in col_groups.iter().filter(|g| g.len() >= 2) {
-        let p = pitch(g, &|i| spans[i].bbox.y2);
-        let spaced = p.is_some_and(|p| p >= height * cfg.min_tile_pitch);
-        let right = g.iter().all(|&i| spans[i].bbox.x1 >= width * 0.55);
-        if spaced && right && (g.iter().any(|&i| is_known(i)) || edge_hugging(g, true)) {
-            labels.extend(g);
-            pitch_y = p;
+    // Geometric candidates: columns in the right part, rows low or right.
+    let cols: Vec<(&Vec<usize>, Option<f64>)> = col_groups
+        .iter()
+        .filter(|g| g.len() >= 2)
+        .map(|g| (g, pitch(g, &|i| spans[i].bbox.y2)))
+        .filter(|(g, p)| {
+            p.is_some_and(|p| p >= height * cfg.min_tile_pitch)
+                && g.iter().all(|&i| spans[i].bbox.x1 >= width * 0.55)
+        })
+        .collect();
+    let rows: Vec<(&Vec<usize>, Option<f64>)> = row_groups
+        .iter()
+        .filter(|g| g.len() >= 2)
+        .map(|g| (g, pitch(g, &|i| spans[i].bbox.x1)))
+        .filter(|(g, p)| {
+            p.is_some_and(|p| p >= width * cfg.min_tile_pitch)
+                && g.iter()
+                    .all(|&i| spans[i].bbox.y1 >= height * 0.65 || spans[i].bbox.x1 >= width * 0.55)
+        })
+        .collect();
+    // A column and a row sharing a label form a grid: strong evidence even
+    // when no name is known.
+    let strict = |g: &[usize]| g.iter().all(|&i| name_shaped(&spans[i].text).is_some());
+    let in_grid = |g: &[usize], others: &[(&Vec<usize>, Option<f64>)]| {
+        strict(g)
+            && others
+                .iter()
+                .any(|(o, _)| strict(o) && o.iter().any(|i| g.contains(i)))
+    };
+    for (g, p) in &cols {
+        if g.iter().any(|&i| is_known(i)) || edge_hugging(g, true) || in_grid(g, &rows) {
+            labels.extend(g.iter());
+            pitch_y = *p;
         }
     }
-    for g in row_groups.iter().filter(|g| g.len() >= 2) {
-        let p = pitch(g, &|i| spans[i].bbox.x1);
-        let spaced = p.is_some_and(|p| p >= width * cfg.min_tile_pitch);
-        let low_or_right = g
-            .iter()
-            .all(|&i| spans[i].bbox.y1 >= height * 0.65 || spans[i].bbox.x1 >= width * 0.55);
-        let supported =
-            g.iter().any(|&i| is_known(i) || labels.contains(&i)) || edge_hugging(g, false);
-        if spaced && low_or_right && supported {
-            labels.extend(g);
-            pitch_x = p;
+    for (g, p) in &rows {
+        let supported = g.iter().any(|&i| is_known(i) || labels.contains(&i))
+            || edge_hugging(g, false)
+            || in_grid(g, &cols);
+        if supported {
+            labels.extend(g.iter());
+            pitch_x = *p;
         }
     }
     labels.sort_unstable();
@@ -448,6 +565,28 @@ fn compute_share_and_canvas(layout: &mut Layout, spans: &[Span], cfg: &LayoutCon
             .map_or(0.0, |l| (l - width * 0.01).max(0.0));
         share = Some(BBox::new(left, b + height * 0.01, width, height));
     }
+    // Share bottom: the whiteboard zoom control sits at the canvas bottom; else
+    // a tall tile column ends with the share area; else the image bottom.
+    let zoom_bottom = spans
+        .iter()
+        .filter(|s| is_zoom_control(&s.text) && center(&s.bbox).1 > height * 0.3)
+        .filter(|s| {
+            share.is_none_or(|a| {
+                center(&s.bbox).0 >= a.x1 && center(&s.bbox).0 <= a.x2 + width * 0.02
+            })
+        })
+        .map(|s| s.bbox.y2)
+        .fold(None, |a: Option<f64>, v| Some(a.map_or(v, |a| a.max(v))));
+    if let Some(a) = share.as_mut() {
+        let tall = layout
+            .tile_region
+            .is_some_and(|t| t.height() >= height * 0.4 && t.x1 >= width * 0.45);
+        a.y2 = match zoom_bottom {
+            Some(z) => (z + height * 0.012).min(height),
+            None if tall => a.y2,
+            None => height,
+        };
+    }
     layout.share_area = share.filter(BBox::is_well_formed);
     let area = layout
         .share_area
@@ -459,10 +598,7 @@ fn compute_share_and_canvas(layout: &mut Layout, spans: &[Span], cfg: &LayoutCon
         .iter()
         .filter(|s| {
             in_area(s)
-                && cfg
-                    .sidebar_terms
-                    .iter()
-                    .any(|t| normalize(&s.text) == normalize(t))
+                && cfg.sidebar_terms.iter().any(|t| ui_term_match(&s.text, t))
                 && center(&s.bbox).0 < area.x1 + area.width() * 0.35
         })
         .collect();
@@ -471,7 +607,21 @@ fn compute_share_and_canvas(layout: &mut Layout, spans: &[Span], cfg: &LayoutCon
     } else {
         let right = sidebar.iter().map(|s| s.bbox.x2).fold(f64::MIN, f64::max);
         let h = median(sidebar.iter().map(|s| s.bbox.height()).collect()).unwrap_or(0.0);
-        Some(right + (width * 0.035).max(3.0 * h))
+        // Toolbar icons read as one or two characters in a column right of the sidebar.
+        let reach = right + (width * 0.08).max(6.0 * h);
+        let icons: Vec<f64> = spans
+            .iter()
+            .filter(|s| {
+                let c = center(&s.bbox);
+                s.text.trim().chars().count() <= 2 && c.0 > right && c.0 < reach && in_area(s)
+            })
+            .map(|s| s.bbox.x2)
+            .collect();
+        Some(if icons.len() >= 2 {
+            icons.iter().copied().fold(f64::MIN, f64::max) + width * 0.01
+        } else {
+            right + (width * 0.035).max(4.0 * h)
+        })
     };
     let logo: Vec<&Span> = spans
         .iter()
@@ -489,7 +639,10 @@ fn compute_share_and_canvas(layout: &mut Layout, spans: &[Span], cfg: &LayoutCon
     } else {
         let line_bottom = spans
             .iter()
-            .filter(|s| logo.iter().any(|l| same_line(&l.bbox, &s.bbox)))
+            .filter(|s| {
+                logo.iter()
+                    .any(|l| same_line(&l.bbox, &s.bbox) && s.bbox.x1 <= l.bbox.x2 + width * 0.3)
+            })
             .map(|s| s.bbox.y2)
             .fold(f64::MIN, f64::max);
         Some(line_bottom + height * 0.012)
@@ -564,6 +717,7 @@ mod tests {
             text: text.into(),
             bbox: BBox::new(x1, y1, x2, y2),
             confidence: 0.95,
+            bg_luma: None,
         }
     }
 
@@ -638,6 +792,37 @@ mod tests {
     }
 
     #[test]
+    fn cut_labels_at_the_edge_form_a_column() {
+        let spans = vec![
+            span("Rexa", 960.0, 60.0, 1000.0, 72.0),
+            span("Ivy Mo", 962.0, 200.0, 1000.0, 212.0),
+            span("Ivy", 400.0, 200.0, 430.0, 212.0),
+            span("Rexa", 400.0, 300.0, 440.0, 312.0),
+        ];
+        let l = analyze(&spans, 1000.0, 600.0, &LayoutConfig::default());
+        assert_eq!(l.tiles.len(), 2, "{:?}", l.tiles);
+        assert!(l.share_area.unwrap().x2 < 960.0);
+        // Board words in the middle stay content.
+        assert_eq!(l.reasons[2], None);
+        assert_eq!(l.reasons[3], None);
+    }
+
+    #[test]
+    fn labels_on_light_background_are_not_tiles() {
+        let mut spans = vec![
+            span("Rexa Holt", 910.0, 120.0, 980.0, 132.0),
+            span("Ivy Moss Park", 905.0, 250.0, 990.0, 262.0),
+        ];
+        let l = analyze(&spans, 1000.0, 600.0, &LayoutConfig::default());
+        assert_eq!(l.tiles.len(), 2);
+        for s in &mut spans {
+            s.bg_luma = Some(235.0);
+        }
+        let l = analyze(&spans, 1000.0, 600.0, &LayoutConfig::default());
+        assert!(l.tiles.is_empty());
+    }
+
+    #[test]
     fn single_known_label_is_ambiguous_until_accepted() {
         let spans = vec![
             span("Ada Quill (Presenting)", 300.0, 20.0, 460.0, 34.0),
@@ -654,6 +839,11 @@ mod tests {
 
     #[test]
     fn name_shape_rules() {
+        assert!(loose_name("Jane van"));
+        assert!(!loose_name("Jane"));
+        assert!(single_name_word("Janet"));
+        assert!(!single_name_word("Jo"));
+        assert!(!single_name_word("12 members"));
         assert!(name_shaped("Jane Smith").is_some());
         assert!(name_shaped("Jane van Smi...").is_some());
         assert!(name_shaped("Unread chats").is_none());
@@ -661,7 +851,17 @@ mod tests {
         assert!(name_shaped("Jane").is_none());
         assert!(name_shaped("Order 66 Service").is_none());
         assert!(names_match("Jane van Smi...", "Jane van Smith"));
+        assert!(names_match("Janevan Smi", "Jane van Smith"));
+        assert!(!names_match("Jonc", "Jonas Berg"));
+        assert!(names_match("Jonas Bery", "Jonas Berg"));
         assert!(!names_match("Jane Smith", "John Doe"));
+        assert!(ui_term_match("Overveiw", "Overview"));
+        assert!(ui_term_match("+ Create secton", "Create section"));
+        assert!(ui_term_match("8 Browse", "Browse"));
+        assert!(!ui_term_match("Order Service", "Overview"));
+        assert!(is_zoom_control("-53% +"));
+        assert!(is_zoom_control("100 %"));
+        assert!(!is_zoom_control("50% done"));
         assert!(is_clock("12:58 PM | Title"));
         assert!(!is_clock("Q3: plan"));
     }

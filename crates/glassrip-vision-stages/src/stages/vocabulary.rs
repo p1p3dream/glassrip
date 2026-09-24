@@ -234,6 +234,7 @@ mod tests {
                     confidence: 0.95,
                     region: TextRegion::Unassigned,
                     chrome_reason: None,
+                    bg_luma: 240.0,
                 })
                 .collect(),
             tile_names: names.iter().map(|s| s.to_string()).collect(),

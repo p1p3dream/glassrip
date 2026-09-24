@@ -22,8 +22,9 @@ use glassrip_core::runner::{
 };
 use glassrip_vision::board::{
     normalize, validate_board, BoardNode, BoardReadOutput, BoardValidationConfig, CanvasSize,
-    OwnerTag, Sticky, StickyColor,
+    ElementList, OwnerTag, RejectReason, RejectedItem, Sticky, StickyColor,
 };
+use glassrip_vision::BBox;
 use image::RgbImage;
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -32,6 +33,7 @@ use crate::artifacts::{
     self, BoardReadingItem, BoardValidateItem, CanvasCropItem, CanvasMethod, ExtraIssue,
     MemberList, MembershipDecision, OcrKeyframe, ShapeClass,
 };
+use crate::layout::names_match;
 use crate::pixels::{self, ShapeThresholds};
 use crate::stages::board_read::canvas_image;
 use crate::stages::vocabulary::participants;
@@ -53,7 +55,10 @@ pub struct BoardValidateParams {
 impl Default for BoardValidateParams {
     fn default() -> Self {
         Self {
-            validation: BoardValidationConfig::default(),
+            validation: BoardValidationConfig {
+                denylist: crate::layout::meeting_denylist(),
+                ..BoardValidationConfig::default()
+            },
             shape: ShapeThresholds::default(),
             participant_min_keyframes: 2,
             participant_similarity: 0.8,
@@ -248,6 +253,58 @@ pub fn apply_membership(
     )
 }
 
+fn center_in(b: &BBox, boxes: &[BBox]) -> bool {
+    let (x, y) = ((b.x1 + b.x2) / 2.0, (b.y1 + b.y2) / 2.0);
+    boxes
+        .iter()
+        .any(|t| x >= t.x1 && x <= t.x2 && y >= t.y1 && y <= t.y2)
+}
+
+/// Remove elements centered inside participant tiles (canvas pixels).
+fn drop_tile_text(
+    mut out: BoardReadOutput,
+    tiles: &[BBox],
+) -> (BoardReadOutput, Vec<RejectedItem>) {
+    let mut rejected = Vec::new();
+    let mut reject = |list: ElementList, text: &str, bbox: BBox| {
+        rejected.push(RejectedItem {
+            list,
+            text: text.to_string(),
+            bbox: Some(bbox),
+            reason: RejectReason::TileRegion,
+        });
+    };
+    out.nodes.retain(|n| {
+        let inside = center_in(&n.bbox, tiles);
+        if inside {
+            reject(ElementList::Nodes, &n.text, n.bbox);
+        }
+        !inside
+    });
+    out.stickies.retain(|s| {
+        let inside = center_in(&s.bbox, tiles);
+        if inside {
+            reject(ElementList::Stickies, &s.text, s.bbox);
+        }
+        !inside
+    });
+    out.owner_tags.retain(|o| {
+        let inside = center_in(&o.bbox, tiles);
+        if inside {
+            reject(ElementList::OwnerTags, &o.name_raw, o.bbox);
+        }
+        !inside
+    });
+    out.other_visible_text.retain(|t| {
+        let inside = center_in(&t.bbox, tiles);
+        if inside {
+            reject(ElementList::OtherVisibleText, &t.text, t.bbox);
+        }
+        !inside
+    });
+    (out, rejected)
+}
+
 /// Validate one reading against its canvas image.
 pub fn validate_reading(
     reading: &BoardReadingItem,
@@ -255,7 +312,21 @@ pub fn validate_reading(
     participants: &[String],
     p: &BoardValidateParams,
 ) -> BoardValidateItem {
-    let (mut moved, membership) = apply_membership(reading.result.clone(), canvas, &p.shape);
+    let (ox, oy) = (reading.crop_box.x1, reading.crop_box.y1);
+    let tiles: Vec<BBox> = reading
+        .tiles
+        .iter()
+        .map(|t| {
+            BBox::new(
+                t.bbox.x1 - ox,
+                t.bbox.y1 - oy,
+                t.bbox.x2 - ox,
+                t.bbox.y2 - oy,
+            )
+        })
+        .collect();
+    let (result, tile_rejects) = drop_tile_text(reading.result.clone(), &tiles);
+    let (mut moved, membership) = apply_membership(result, canvas, &p.shape);
     let mut extra = Vec::new();
     // A moved element can repeat one already in its new list.
     let dup = |a: (&str, &glassrip_vision::BBox), b: (&str, &glassrip_vision::BBox)| {
@@ -313,6 +384,31 @@ pub fn validate_reading(
         height: reading.crop_box.height(),
     };
     let mut board = validate_board(moved, canvas_size, &cfg);
+    board.chrome_rejected.extend(tile_rejects);
+    // Owner tags: a participant's name (when participants are known) on a green tag.
+    let mut owners = Vec::new();
+    for o in std::mem::take(&mut board.owner_tags) {
+        let named = aliases.is_empty() || aliases.iter().any(|a| names_match(a, &o.name_raw));
+        let on_tag = pixels::measure(canvas, &o.bbox, &p.shape)
+            .is_some_and(|m| pixels::classify_shape(&m, &p.shape) == ShapeClass::GreenTag);
+        let reason = if !named {
+            Some(RejectReason::OwnerNotParticipant)
+        } else if !on_tag {
+            Some(RejectReason::OwnerNotOnTag)
+        } else {
+            None
+        };
+        match reason {
+            Some(reason) => board.chrome_rejected.push(RejectedItem {
+                list: ElementList::OwnerTags,
+                text: o.name_raw.clone(),
+                bbox: Some(o.bbox),
+                reason,
+            }),
+            None => owners.push(o),
+        }
+    }
+    board.owner_tags = owners;
     let sticky_texts: Vec<String> = board.stickies.iter().map(|s| normalize(&s.text)).collect();
     for e in &mut board.edges {
         let l = normalize(&e.label);
@@ -496,6 +592,7 @@ mod tests {
             source_image_blake3: None,
             crop_box: BBox::new(0.0, 0.0, 400.0, 300.0),
             masks: vec![],
+            tiles: vec![],
             model: crate::artifacts::ModelRef {
                 name: "m".into(),
                 digest: None,
@@ -530,7 +627,7 @@ mod tests {
                 // Owner tag read as a node with a misspelled name.
                 BoardNode {
                     local_id: "n3".into(),
-                    text: "Aida".into(),
+                    text: "Adeline".into(),
                     bbox: BBox::new(200.0, 150.0, 260.0, 190.0),
                     conf: 0.9,
                 },
@@ -561,20 +658,84 @@ mod tests {
         let v = validate_reading(
             &r,
             &board_image(),
-            &["Ada Quill".to_string()],
+            &["Adaline Quill".to_string()],
             &BoardValidateParams::default(),
         );
         let nodes: Vec<&str> = v.board.nodes.iter().map(|n| n.text.as_str()).collect();
         assert_eq!(nodes, vec!["Order Service", "Ledger"], "{:?}", v.membership);
         assert_eq!(v.board.stickies.len(), 1);
         assert_eq!(v.board.owner_tags.len(), 1);
-        assert_eq!(v.board.owner_tags[0].name_raw, "Aida");
+        assert_eq!(v.board.owner_tags[0].name_raw, "Adeline");
         assert_eq!(v.board.edges.len(), 1);
         assert!(v.board.edges[0].label.is_empty());
         assert!(v
             .extra_issues
             .iter()
             .any(|e| e.kind == "label_is_sticky_text"));
+    }
+
+    #[test]
+    fn tile_text_and_unsupported_owners_are_chrome() {
+        let out = BoardReadOutput {
+            nodes: vec![BoardNode {
+                local_id: "n1".into(),
+                text: "Order Service".into(),
+                bbox: BBox::new(20.0, 20.0, 140.0, 80.0),
+                conf: 0.9,
+            }],
+            edges: vec![],
+            stickies: vec![],
+            owner_tags: vec![
+                // On the green tag and a participant: kept.
+                OwnerTag {
+                    name_raw: "Ada".into(),
+                    near: String::new(),
+                    bbox: BBox::new(200.0, 150.0, 260.0, 190.0),
+                },
+                // On the green tag but not a participant.
+                OwnerTag {
+                    name_raw: "Kora".into(),
+                    near: String::new(),
+                    bbox: BBox::new(200.0, 150.0, 260.0, 190.0),
+                },
+                // A participant, but on plain canvas.
+                OwnerTag {
+                    name_raw: "Bo Tran".into(),
+                    near: String::new(),
+                    bbox: BBox::new(300.0, 220.0, 380.0, 260.0),
+                },
+                // Inside a video tile.
+                OwnerTag {
+                    name_raw: "Ada Quill".into(),
+                    near: String::new(),
+                    bbox: BBox::new(330.0, 30.0, 390.0, 50.0),
+                },
+            ],
+            other_visible_text: vec![],
+            confidence: 0.8,
+        };
+        let mut r = reading(out);
+        r.tiles = vec![crate::artifacts::TileBox {
+            name: "Ada Quill".into(),
+            bbox: BBox::new(320.0, 10.0, 400.0, 60.0),
+        }];
+        let v = validate_reading(
+            &r,
+            &board_image(),
+            &["Ada Quill".to_string(), "Bo Tran".to_string()],
+            &BoardValidateParams::default(),
+        );
+        let owners: Vec<&str> = v
+            .board
+            .owner_tags
+            .iter()
+            .map(|o| o.name_raw.as_str())
+            .collect();
+        assert_eq!(owners, vec!["Ada"], "{:?}", v.board.chrome_rejected);
+        let reasons: Vec<RejectReason> = v.board.chrome_rejected.iter().map(|r| r.reason).collect();
+        assert!(reasons.contains(&RejectReason::OwnerNotParticipant));
+        assert!(reasons.contains(&RejectReason::OwnerNotOnTag));
+        assert!(reasons.contains(&RejectReason::TileRegion));
     }
 
     #[test]

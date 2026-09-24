@@ -454,6 +454,7 @@ impl Stage for BoardReadStage {
             source_image_blake3: crop.source_image_blake3,
             crop_box: crop.canvas_bbox,
             masks: crop.masks,
+            tiles: crop.tiles,
             model: ModelRef {
                 name: self.model.clone(),
                 digest: self.digest.clone(),

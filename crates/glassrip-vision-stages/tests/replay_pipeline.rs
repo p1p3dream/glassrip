@@ -136,19 +136,19 @@ impl VisionBackend for ScriptedModel {
             json!({
                 "screen_type": "whiteboard",
                 "app_hint": "Miro",
-                "canvas_bbox": {"x1": 0.1 * w, "y1": 0.1 * h, "x2": 0.7 * w, "y2": 0.9 * h},
+                "bbox_2d": [0.1 * w, 0.1 * h, 0.7 * w, 0.9 * h],
                 "confidence": 0.9
             })
         } else {
             json!({
                 "nodes": [{"local_id": "n1", "text": "Order Service",
-                           "bbox": {"x1": 0.3 * w, "y1": 0.3 * h, "x2": 0.5 * w, "y2": 0.45 * h},
+                           "bbox_2d": [0.3 * w, 0.3 * h, 0.5 * w, 0.45 * h],
                            "conf": 0.9}],
                 "edges": [],
                 "stickies": [],
                 "owner_tags": [],
                 "other_visible_text": [{"text": "Overview",
-                                        "bbox": {"x1": 0.02 * w, "y1": 0.02 * h, "x2": 0.1 * w, "y2": 0.05 * h}}],
+                                        "bbox_2d": [0.02 * w, 0.02 * h, 0.1 * w, 0.05 * h]}],
                 "confidence": 0.7
             })
         };

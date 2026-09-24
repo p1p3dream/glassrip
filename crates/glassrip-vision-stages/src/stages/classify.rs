@@ -25,8 +25,8 @@ use glassrip_core::runner::{
     ArtifactSpec, InputDecl, ItemContext, KeyExtras, Stage, StageError, StageInputs, WorkItem,
 };
 use glassrip_vision::classify::{
-    classify_options, classify_request, combine, ClassifyMethod, ClassifyRules, ScreenClass,
-    ScreenClassOutput, ScreenType, SourceClassOutput, CLASSIFY_PROMPT,
+    classify_options, classify_request, combine, ClassifyMethod, ClassifyRules, KeywordPattern,
+    MatchMode, ScreenClass, ScreenClassOutput, ScreenType, SourceClassOutput, CLASSIFY_PROMPT,
 };
 use glassrip_vision::image_prep::THUMBNAIL_LONG_EDGE;
 use glassrip_vision::BBox;
@@ -56,10 +56,37 @@ impl Default for ClassifyParams {
         Self {
             thumbnail_px: THUMBNAIL_LONG_EDGE,
             seed: 0,
-            rules: ClassifyRules::spec_examples(),
+            rules: meeting_rules(),
             smoothing_max_confidence: 0.8,
         }
     }
+}
+
+/// The spec's example rules with the content-studio rule widened for phone
+/// footage: long words match fuzzily (OCR misreads), and the studio's own UI
+/// strings count as evidence. Words that also appear on boards about the
+/// studio (its product name, "content") need a second, UI-only match.
+pub fn meeting_rules() -> ClassifyRules {
+    let mut rules = ClassifyRules::spec_examples();
+    for r in &mut rules.rules {
+        if r.screen_type == ScreenType::Cms {
+            r.patterns = r
+                .patterns
+                .iter()
+                .map(|p| {
+                    if p.text.chars().count() >= 5 && p.mode == MatchMode::Word {
+                        KeywordPattern::fuzzy(&p.text)
+                    } else {
+                        p.clone()
+                    }
+                })
+                .collect();
+            for ui in ["Drafts", "Published", "Search list", "Translation metadata"] {
+                r.patterns.push(KeywordPattern::fuzzy(ui));
+            }
+        }
+    }
+    rules
 }
 
 #[derive(Debug, Clone)]
@@ -364,6 +391,16 @@ mod tests {
             canvas_bbox_issue: None,
             rule: None,
         }
+    }
+
+    #[test]
+    fn meeting_rules_catch_misread_studio_ui() {
+        let r = meeting_rules();
+        let e = r.evaluate(&["Drafts", "Stuctue", "Article"]);
+        assert_eq!(e.best().map(|h| h.screen_type), Some(ScreenType::Cms));
+        // One studio word on a board is not enough.
+        let e = r.evaluate(&["Relationships between content", "Content Manager"]);
+        assert!(e.best().is_none());
     }
 
     #[test]

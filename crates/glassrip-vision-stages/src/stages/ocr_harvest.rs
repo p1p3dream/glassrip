@@ -45,21 +45,47 @@ impl OcrHarvestStage {
     }
 }
 
+/// Median luma inside `b` (sampled on a grid of at most about 400 points).
+pub fn median_luma(img: &image::RgbImage, b: &BBox) -> f64 {
+    let x0 = b.x1.max(0.0) as u32;
+    let y0 = b.y1.max(0.0) as u32;
+    let x1 = (b.x2.max(0.0) as u32).min(img.width());
+    let y1 = (b.y2.max(0.0) as u32).min(img.height());
+    if x1 <= x0 || y1 <= y0 {
+        return 0.0;
+    }
+    let sx = ((x1 - x0) / 20).max(1) as usize;
+    let sy = ((y1 - y0) / 20).max(1) as usize;
+    let mut v: Vec<f64> = Vec::new();
+    for y in (y0..y1).step_by(sy) {
+        for x in (x0..x1).step_by(sx) {
+            let p = img.get_pixel(x, y);
+            v.push(0.299 * f64::from(p[0]) + 0.587 * f64::from(p[1]) + 0.114 * f64::from(p[2]));
+        }
+    }
+    v.sort_by(f64::total_cmp);
+    v[v.len() / 2]
+}
+
 /// Turn recognized spans plus layout into the artifact item.
 pub fn build_item(
     keyframe_id: &str,
-    width: u32,
-    height: u32,
+    img: &image::RgbImage,
     provider: String,
     raw: Vec<glassrip_ocr::RecognizedSpan>,
     cfg: &LayoutConfig,
 ) -> OcrKeyframe {
+    let (width, height) = (img.width(), img.height());
     let spans: Vec<Span> = raw
         .into_iter()
-        .map(|s| Span {
-            text: s.text,
-            bbox: BBox::new(s.bbox.x1, s.bbox.y1, s.bbox.x2, s.bbox.y2),
-            confidence: s.confidence,
+        .map(|s| {
+            let bbox = BBox::new(s.bbox.x1, s.bbox.y1, s.bbox.x2, s.bbox.y2);
+            Span {
+                text: s.text,
+                bg_luma: Some(median_luma(img, &bbox)),
+                bbox,
+                confidence: s.confidence,
+            }
         })
         .collect();
     let l = layout::analyze(&spans, f64::from(width), f64::from(height), cfg);
@@ -74,6 +100,7 @@ pub fn build_item(
                 confidence: s.confidence,
                 region,
                 chrome_reason,
+                bg_luma: s.bg_luma.unwrap_or(0.0),
             }
         })
         .collect();
@@ -154,8 +181,7 @@ impl Stage for OcrHarvestStage {
                 .map_err(|e| internal(format!("OCR failed: {e}")))?;
             Ok(build_item(
                 &id,
-                img.width(),
-                img.height(),
+                &img,
                 recognizer.execution_provider(),
                 raw,
                 &cfg,
