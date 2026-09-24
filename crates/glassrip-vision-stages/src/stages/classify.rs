@@ -168,19 +168,21 @@ impl ClassifyStage {
         let (request, prepared) = classify_request(&frame, classify_options(self.params.seed))
             .map_err(|e| vision_error_info(&e))?;
         let key = request_key(&self.model, &request);
-        self.monitor.ensure_preflight().await?;
         let reply = self
             .monitor
-            .client()
             .infer_typed::<ScreenClassOutput>(request, cancel)
             .await;
-        self.monitor.after_request().await;
         let (model, model_error): (Option<SourceClassOutput>, Option<String>) = match reply {
             Ok((out, _raw)) => (Some(out.in_source_coords(&prepared)), None),
-            Err(glassrip_vision::VisionError::Cancelled) => {
-                return Err(vision_error_info(&glassrip_vision::VisionError::Cancelled))
+            // Cancellation and aborts (digest change, lasting spill) stop the
+            // item; other model failures fall back to the OCR rules alone.
+            Err(e)
+                if e.code == glassrip_core::envelope::ErrorCode::Cancelled
+                    || self.monitor.abort_error().is_some() =>
+            {
+                return Err(e)
             }
-            Err(e) => (None, Some(e.to_string())),
+            Err(e) => (None, Some(e.message)),
         };
         let spans = rule_spans(
             input.ocr.as_ref(),

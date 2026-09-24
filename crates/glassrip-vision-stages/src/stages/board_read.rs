@@ -51,6 +51,9 @@ pub struct BoardReadParams {
     /// prompt, clamped to this range.
     pub min_num_predict: u32,
     pub max_num_predict: u32,
+    /// Tokens left unused in `num_ctx`: the prompt size is an estimate, and a
+    /// request that overflows would silently lose context.
+    pub ctx_headroom: u32,
     pub target_long_edge_px: u32,
     pub min_long_edge_px: u32,
     pub low_res_upscale: f64,
@@ -72,6 +75,7 @@ impl Default for BoardReadParams {
             // output tokens; the budget is sized per request to fill num_ctx.
             min_num_predict: 1024,
             max_num_predict: 3072,
+            ctx_headroom: 512,
             target_long_edge_px: BOARD_LONG_EDGE,
             min_long_edge_px: LOW_RES_THRESHOLD,
             low_res_upscale: LOW_RES_UPSCALE,
@@ -85,12 +89,12 @@ impl Default for BoardReadParams {
 }
 
 /// Output tokens left by `num_ctx` after the image, the prompt (estimated at
-/// 3 bytes per token), message framing, and a small margin.
+/// 3 bytes per token), message framing, and `ctx_headroom`.
 pub fn output_budget(p: &BoardReadParams, request: &glassrip_vision::VisionRequest) -> u32 {
     let used = request.image.tokens()
         + glassrip_vision::ollama::estimate_text_tokens(&request.prompt)
         + glassrip_vision::ollama::MESSAGE_OVERHEAD_TOKENS
-        + 64;
+        + p.ctx_headroom;
     p.num_ctx
         .saturating_sub(used)
         .clamp(p.min_num_predict, p.max_num_predict.max(p.min_num_predict))
@@ -333,13 +337,10 @@ impl BoardReadStage {
         request.options.num_predict = output_budget(&self.params, &request);
         let key = request_key(&self.model, &request);
         let started = Instant::now();
-        let reply = self
+        let (out, raw) = self
             .monitor
-            .client()
             .infer_typed::<BoardReadOutput>(request, cancel)
-            .await;
-        self.monitor.after_request().await;
-        let (out, raw) = reply.map_err(|e| vision_error_info(&e))?;
+            .await?;
         let out = shift_output(out.to_canvas_coords(&prepared), region.x1, region.y1);
         Ok((
             out,
@@ -542,7 +543,7 @@ mod tests {
             + glassrip_vision::ollama::estimate_text_tokens(&big.prompt)
             + glassrip_vision::ollama::MESSAGE_OVERHEAD_TOKENS
             + b;
-        assert!(total <= p.num_ctx || b == p.min_num_predict);
+        assert!(total + p.ctx_headroom <= p.num_ctx || b == p.min_num_predict);
     }
 
     #[test]

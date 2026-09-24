@@ -163,7 +163,7 @@ impl VisionBackend for ScriptedModel {
         Ok(RawResponse {
             raw_text: value.to_string(),
             json: value,
-            prompt_eval_count: Some(100),
+            prompt_eval_count: Some(request.image.tokens() + 900),
             eval_count: Some(50),
             durations: Durations::default(),
             attempts: 1,
@@ -249,6 +249,7 @@ async fn run_branch(
         },
     ));
     let branch = VisionBranch {
+        monitor: Arc::clone(&monitor),
         ocr: OcrHarvestStage::new(
             Arc::new(ScriptedOcr),
             OcrConfig::default(),
@@ -301,7 +302,13 @@ async fn record_then_replay_vision_branch() {
     .await;
     // 3 classify + 2 board requests; checks after every 2nd request.
     assert_eq!(monitor.completed(), 5);
-    assert_eq!(monitor.checks().len(), 3);
+    let checks = monitor.checks();
+    let placements = checks.iter().filter(|c| c.fully_on_gpu.is_some()).count();
+    assert_eq!(placements, 3, "{checks:?}");
+    // Digest: at preflight, before each model stage, and at each periodic check.
+    let digests = checks.iter().filter(|c| c.digest.is_some()).count();
+    assert_eq!(digests, 5, "{checks:?}");
+    assert!(monitor.abort_error().is_none());
 
     let ocr: Vec<(String, OcrKeyframe)> = read(&live, artifacts::OCR);
     assert_eq!(ocr.len(), 3);

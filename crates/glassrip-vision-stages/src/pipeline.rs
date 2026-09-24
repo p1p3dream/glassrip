@@ -1,7 +1,11 @@
 //! Run the vision-branch stages in order on a [`Runner`].
 
+use std::sync::Arc;
+
 use glassrip_core::graph::{meeting_mode_stage_decls, GraphError, StageGraph};
 use glassrip_core::runner::{Runner, RunnerError, StageReport};
+
+use crate::placement::PlacementMonitor;
 
 use crate::stages::board_read::BoardReadStage;
 use crate::stages::board_validate::BoardValidateStage;
@@ -25,8 +29,20 @@ pub fn graph() -> Result<StageGraph, GraphError> {
     StageGraph::new(meeting_mode_stage_decls())
 }
 
-/// The six vision-branch stages.
+/// Why the branch stopped.
+#[derive(Debug, thiserror::Error)]
+pub enum PipelineError {
+    #[error(transparent)]
+    Runner(#[from] RunnerError),
+    /// The model server became unusable for this run (digest change, lasting
+    /// spill, or no recovery); later stages were not run.
+    #[error("stage `{stage}` aborted: {message}")]
+    Aborted { stage: String, message: String },
+}
+
+/// The six vision-branch stages, plus the monitor their model stages share.
 pub struct VisionBranch {
+    pub monitor: Arc<PlacementMonitor>,
     pub ocr: OcrHarvestStage,
     pub vocabulary: VocabularyStage,
     pub classify: ClassifyStage,
@@ -41,17 +57,32 @@ impl VisionBranch {
         &self,
         runner: &mut Runner,
         until: Option<&str>,
-    ) -> Result<Vec<StageReport>, RunnerError> {
+    ) -> Result<Vec<StageReport>, PipelineError> {
         let mut reports = Vec::new();
         for name in STAGES {
-            let report = match name {
-                "ocr_harvest" => runner.run_stage(&self.ocr).await?,
-                "ocr_vocabulary" => runner.run_stage(&self.vocabulary).await?,
-                "classify" => runner.run_stage(&self.classify).await?,
-                "canvas_crop" => runner.run_stage(&self.canvas).await?,
-                "board_read" => runner.run_stage(&self.board_read).await?,
-                _ => runner.run_stage(&self.board_validate).await?,
+            let model_stage = matches!(name, "classify" | "board_read");
+            let abort = |message: String| PipelineError::Aborted {
+                stage: name.to_string(),
+                message,
             };
+            if model_stage {
+                self.monitor
+                    .begin_stage()
+                    .await
+                    .map_err(|e| abort(e.message))?;
+            }
+            let result = match name {
+                "ocr_harvest" => runner.run_stage(&self.ocr).await,
+                "ocr_vocabulary" => runner.run_stage(&self.vocabulary).await,
+                "classify" => runner.run_stage(&self.classify).await,
+                "canvas_crop" => runner.run_stage(&self.canvas).await,
+                "board_read" => runner.run_stage(&self.board_read).await,
+                _ => runner.run_stage(&self.board_validate).await,
+            };
+            if let Some(e) = self.monitor.abort_error().filter(|_| model_stage) {
+                return Err(abort(e.message));
+            }
+            let report = result?;
             tracing::info!(
                 stage = name,
                 status = ?report.status,

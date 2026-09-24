@@ -193,6 +193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..LayoutConfig::default()
     };
     let branch = VisionBranch {
+        monitor: Arc::clone(&monitor),
         ocr: OcrHarvestStage::new(recognizer, ocr_cfg, layout.clone()),
         vocabulary: VocabularyStage::new(VocabularyParams::default()),
         classify: ClassifyStage::new(

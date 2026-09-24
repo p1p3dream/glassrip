@@ -34,6 +34,7 @@ tracing = "0.1"
 
 [dev-dependencies]
 glassrip-meeting = { path = "../glassrip-meeting" }
+wiremock = "0.6"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
