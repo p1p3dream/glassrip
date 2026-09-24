@@ -23,6 +23,7 @@ pub mod extract;
 pub mod gapfill;
 pub mod metrics;
 pub mod models;
+pub mod pipeline;
 pub mod recluster;
 pub mod transcript;
 pub mod types;
