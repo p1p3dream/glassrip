@@ -12,20 +12,61 @@
 
 use rayon::prelude::*;
 
-use crate::gaussian::blur_f32;
+use crate::error::{MediaError, Result};
+use crate::gaussian::{blur_f32, KernelSize};
 use crate::plane::Plane;
 use crate::util::dot_prod_32f;
 use crate::warp::{affine_linear_f32, affine_nearest_u8, Affine};
 
-/// Termination criteria (`TERM_CRITERIA_COUNT | TERM_CRITERIA_EPS`).
+/// Termination criteria (`TERM_CRITERIA_COUNT | TERM_CRITERIA_EPS`) and prefilter size.
+/// Construct with [`EccParams::new`]; the default is the prototype's `(60, 1e-4, 3)`.
 #[derive(Debug, Clone, Copy)]
 pub struct EccParams {
+    max_iter: usize,
+    eps: f64,
+    gauss_size: KernelSize,
+}
+
+impl EccParams {
+    /// Validates the parameters: `max_iter >= 1`, `eps` finite and non-negative,
+    /// `gauss_size` odd and at least 3.
+    pub fn new(max_iter: usize, eps: f64, gauss_size: usize) -> Result<Self> {
+        if max_iter == 0 {
+            return Err(MediaError::Invalid(
+                "ECC max_iter must be at least 1".into(),
+            ));
+        }
+        if !eps.is_finite() || eps < 0.0 {
+            return Err(MediaError::Invalid(format!(
+                "ECC eps must be finite and >= 0, got {eps}"
+            )));
+        }
+        if gauss_size < 3 {
+            return Err(MediaError::Invalid(format!(
+                "ECC gauss_size must be odd and at least 3, got {gauss_size}"
+            )));
+        }
+        Ok(Self {
+            max_iter,
+            eps,
+            gauss_size: KernelSize::new(gauss_size)?,
+        })
+    }
+
     /// Maximum iterations.
-    pub max_iter: usize,
-    /// Stop when the correlation changes by less than this between iterations.
-    pub eps: f64,
-    /// Size of the Gaussian prefilter applied to both images (0 sigma).
-    pub gauss_size: usize,
+    pub fn max_iter(&self) -> usize {
+        self.max_iter
+    }
+
+    /// Correlation change below which iteration stops.
+    pub fn eps(&self) -> f64 {
+        self.eps
+    }
+
+    /// Prefilter size.
+    pub fn gauss_size(&self) -> usize {
+        self.gauss_size.get()
+    }
 }
 
 impl Default for EccParams {
@@ -33,7 +74,7 @@ impl Default for EccParams {
         Self {
             max_iter: 60,
             eps: 1e-4,
-            gauss_size: 3,
+            gauss_size: KernelSize::K3,
         }
     }
 }
@@ -456,6 +497,16 @@ mod tests {
         let out = find_transform_ecc_affine(&a, &b, IDENTITY, EccParams::default());
         assert!(!out.ok());
         assert!(out.warp.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn params_are_validated() {
+        assert!(EccParams::new(60, 1e-4, 3).is_ok());
+        assert!(EccParams::new(60, 1e-4, 1).is_err());
+        assert!(EccParams::new(60, 1e-4, 4).is_err());
+        assert!(EccParams::new(0, 1e-4, 3).is_err());
+        assert!(EccParams::new(60, f64::NAN, 3).is_err());
+        assert_eq!(EccParams::default().gauss_size(), 3);
     }
 
     #[test]

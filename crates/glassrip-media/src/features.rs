@@ -7,7 +7,7 @@ use rayon::prelude::*;
 use crate::decode::decode_gray_and_bgr_bytes;
 use crate::ecc::{find_transform_ecc_affine, EccOutcome, EccParams};
 use crate::error::{MediaError, Result};
-use crate::gaussian::blur_u8;
+use crate::gaussian::{blur_u8, KernelSize};
 use crate::ink::{ink_change, ink_frame, InkFrame};
 use crate::plane::Plane;
 use crate::resize::area_gray;
@@ -48,24 +48,21 @@ pub struct FrameFeatures {
 /// Builds the pair-score image from full-resolution gray (`load()` in the prototype).
 pub fn small_gray(gray: &Plane<u8>) -> Plane<f32> {
     let factor = (gray.width / SMALL_W).max(1);
-    blur_u8(&area_gray(gray, factor), 5, 1.2).map(f32::from)
+    blur_u8(&area_gray(gray, factor), KernelSize::K5, 1.2).map(f32::from)
 }
 
 /// Computes all per-frame features from JPEG bytes. `path` only labels errors.
 pub fn frame_features_from_bytes(path: &Path, bytes: &[u8]) -> Result<FrameFeatures> {
     let (gray, bgr) = decode_gray_and_bgr_bytes(path, bytes)?;
-    if gray.width % SMALL_W != 0
-        || gray.height % SMALL_H != 0
-        || gray.width / SMALL_W != gray.height / SMALL_H
-    {
+    if (gray.width, gray.height) != crate::ink::INK_INPUT {
         return Err(MediaError::Size {
             width: gray.width,
             height: gray.height,
-            reason: "prototype_compat needs an exact integer multiple of 320x180",
+            reason: "prototype_compat needs 1920x1080 frames",
         });
     }
     let (sharpness, small) = rayon::join(|| laplacian_variance(&gray), || small_gray(&gray));
-    let ink = ink_frame(&bgr);
+    let ink = ink_frame(&bgr)?;
     Ok(FrameFeatures {
         sharpness,
         small,

@@ -6,11 +6,42 @@
 //! * f32 input uses OpenCV's separable float filter, including its operation order and fused
 //!   multiply-adds, so results agree to the last bit or within a few ulps.
 
+use crate::error::{MediaError, Result};
 use crate::plane::Plane;
 use crate::util::reflect101;
 
+/// A Gaussian kernel size: odd and at least 1. Invalid sizes are unrepresentable, so the
+/// filters themselves cannot fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelSize(usize);
+
+impl KernelSize {
+    /// 3 taps.
+    pub const K3: Self = Self(3);
+    /// 5 taps.
+    pub const K5: Self = Self(5);
+    /// 7 taps.
+    pub const K7: Self = Self(7);
+
+    /// Validates an odd, positive kernel size.
+    pub fn new(n: usize) -> Result<Self> {
+        if n == 0 || n.is_multiple_of(2) {
+            return Err(MediaError::Invalid(format!(
+                "Gaussian kernel size must be odd and positive, got {n}"
+            )));
+        }
+        Ok(Self(n))
+    }
+
+    /// Number of taps.
+    pub fn get(self) -> usize {
+        self.0
+    }
+}
+
 /// `getGaussianKernelBitExact`: normalized Gaussian taps in f64.
-pub fn kernel_f64(n: usize, sigma: f64) -> Vec<f64> {
+pub fn kernel_f64(size: KernelSize, sigma: f64) -> Vec<f64> {
+    let n = size.get();
     if sigma <= 0.0 {
         match n {
             1 => return vec![1.0],
@@ -65,8 +96,9 @@ pub fn kernel_f64(n: usize, sigma: f64) -> Vec<f64> {
 }
 
 /// `getGaussianKernelFixedPoint_ED` with 8 fractional bits (`ufixedpoint16`): taps sum to 256.
-pub fn kernel_fixed8(n: usize, sigma: f64) -> Vec<u32> {
-    let k = kernel_f64(n, sigma);
+pub fn kernel_fixed8(size: KernelSize, sigma: f64) -> Vec<u32> {
+    let n = size.get();
+    let k = kernel_f64(size, sigma);
     let mut out = vec![0u32; n];
     let half = n / 2;
     let mut err = 0.0f64;
@@ -84,13 +116,17 @@ pub fn kernel_fixed8(n: usize, sigma: f64) -> Vec<u32> {
 }
 
 /// `getGaussianKernel(n, sigma, CV_32F)`.
-pub fn kernel_f32(n: usize, sigma: f64) -> Vec<f32> {
-    kernel_f64(n, sigma).iter().map(|&v| v as f32).collect()
+pub fn kernel_f32(size: KernelSize, sigma: f64) -> Vec<f32> {
+    kernel_f64(size, sigma).iter().map(|&v| v as f32).collect()
 }
 
 /// 8-bit Gaussian blur through OpenCV's fixed-point path (`GaussianBlurFixedPoint`).
-pub fn blur_u8(src: &Plane<u8>, n: usize, sigma: f64) -> Plane<u8> {
-    let k = kernel_fixed8(n, sigma);
+pub fn blur_u8(src: &Plane<u8>, size: KernelSize, sigma: f64) -> Plane<u8> {
+    if src.width == 0 || src.height == 0 {
+        return src.clone();
+    }
+    let n = size.get();
+    let k = kernel_fixed8(size, sigma);
     let (w, h) = (src.width, src.height);
     let r = (n / 2) as isize;
     // Horizontal pass: 8 fractional bits, at most 255 * 256.
@@ -184,8 +220,11 @@ fn col_pass(tmp: &[f32], w: usize, h: usize, k: &[f32]) -> Plane<f32> {
 }
 
 /// f32 Gaussian blur, `cv2.GaussianBlur(src, (n, n), sigma)` on a `CV_32F` image.
-pub fn blur_f32(src: &Plane<f32>, n: usize, sigma: f64) -> Plane<f32> {
-    let k = kernel_f32(n, sigma);
+pub fn blur_f32(src: &Plane<f32>, size: KernelSize, sigma: f64) -> Plane<f32> {
+    if src.width == 0 || src.height == 0 {
+        return src.clone();
+    }
+    let k = kernel_f32(size, sigma);
     let tmp = row_pass(src, &k);
     col_pass(&tmp, src.width, src.height, &k)
 }
@@ -197,15 +236,15 @@ mod tests {
     #[test]
     fn fixed_kernels_sum_to_256() {
         for (n, s) in [(3, 0.0), (5, 1.2), (7, 1.5), (5, 0.0)] {
-            let k = kernel_fixed8(n, s);
+            let k = kernel_fixed8(KernelSize::new(n).unwrap(), s);
             assert_eq!(k.iter().sum::<u32>(), 256, "n={n} sigma={s}");
         }
-        assert_eq!(kernel_fixed8(3, 0.0), vec![64, 128, 64]);
+        assert_eq!(kernel_fixed8(KernelSize::K3, 0.0), vec![64, 128, 64]);
     }
 
     #[test]
     fn sigma_1_2_fixed_kernel_is_symmetric_and_peaked() {
-        let k = kernel_fixed8(5, 1.2);
+        let k = kernel_fixed8(KernelSize::K5, 1.2);
         assert_eq!(k[0], k[4]);
         assert_eq!(k[1], k[3]);
         assert!(k[2] > k[1] && k[1] > k[0]);
@@ -214,9 +253,9 @@ mod tests {
     #[test]
     fn constant_image_is_unchanged() {
         let p = Plane::filled(9, 7, 77u8);
-        assert_eq!(blur_u8(&p, 5, 1.2).data, p.data);
+        assert_eq!(blur_u8(&p, KernelSize::K5, 1.2).data, p.data);
         let f = Plane::filled(9, 7, 12.5f32);
-        for v in blur_f32(&f, 7, 1.5).data {
+        for v in blur_f32(&f, KernelSize::K7, 1.5).data {
             assert!((v - 12.5).abs() < 1e-4);
         }
     }
@@ -226,7 +265,7 @@ mod tests {
         // For [1,2,1] x [1,2,1] / 16 the fixed-point result equals (sum + 8) >> 4.
         let data: Vec<u8> = (0..30u32).map(|i| ((i * 37 + 11) % 256) as u8).collect();
         let p = Plane::from_vec(6, 5, data).unwrap();
-        let got = blur_u8(&p, 3, 0.0);
+        let got = blur_u8(&p, KernelSize::K3, 0.0);
         let k = [1u32, 2, 1];
         for y in 0..5 {
             for x in 0..6 {
@@ -247,13 +286,28 @@ mod tests {
     fn impulse_response_matches_kernel_outer_product() {
         let mut f = Plane::new(11, 11);
         *f.get_mut(5, 5) = 1.0f32;
-        let out = blur_f32(&f, 5, 1.2);
-        let k = kernel_f32(5, 1.2);
+        let out = blur_f32(&f, KernelSize::K5, 1.2);
+        let k = kernel_f32(KernelSize::K5, 1.2);
         for dy in 0..5 {
             for dx in 0..5 {
                 let want = k[dx] * k[dy];
                 assert!((out.get(3 + dx, 3 + dy) - want).abs() < 1e-7);
             }
         }
+    }
+
+    #[test]
+    fn kernel_size_rejects_even_and_zero() {
+        assert!(KernelSize::new(0).is_err());
+        assert!(KernelSize::new(4).is_err());
+        assert_eq!(KernelSize::new(9).unwrap().get(), 9);
+    }
+
+    #[test]
+    fn empty_planes_pass_through() {
+        let p: Plane<u8> = Plane::new(0, 3);
+        assert_eq!(blur_u8(&p, KernelSize::K5, 1.2), p);
+        let f: Plane<f32> = Plane::new(4, 0);
+        assert_eq!(blur_f32(&f, KernelSize::K7, 1.5), f);
     }
 }

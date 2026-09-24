@@ -2,7 +2,8 @@
 //! color at 640x360, and a symmetric "ink change" score between two aligned frames.
 
 use crate::ecc::{find_transform_ecc_affine, EccOutcome, EccParams};
-use crate::gaussian::{blur_f32, blur_u8};
+use crate::error::{MediaError, Result};
+use crate::gaussian::{blur_f32, blur_u8, KernelSize};
 use crate::plane::{Bgr, Plane};
 use crate::resize::{area_bgr, half_linear_gray};
 use crate::util::replicate;
@@ -148,11 +149,22 @@ pub struct InkFrame {
     pub align: Plane<f32>,
 }
 
-/// `ink(f)` from `ink_metric.py`, from a full-resolution BGR frame (1920x1080 expected).
-pub fn ink_frame(full: &Bgr) -> InkFrame {
-    let factor = (full.width / 640).max(1);
-    let im = area_bgr(full, factor);
-    let gray = blur_u8(&bgr_to_gray(&im), 3, 0.0);
+/// Frame size the prototype's ink path was run on and that `prototype_compat` reproduces:
+/// `cv2.resize(..., (640, 360), INTER_AREA)` is then an exact 3x3 block mean.
+pub const INK_INPUT: (usize, usize) = (1920, 1080);
+
+/// `ink(f)` from `ink_metric.py`, from a full-resolution 1920x1080 BGR frame. Other sizes are
+/// rejected: OpenCV's general `INTER_AREA` path for non-integer factors is not ported.
+pub fn ink_frame(full: &Bgr) -> Result<InkFrame> {
+    if (full.width, full.height) != INK_INPUT {
+        return Err(MediaError::Size {
+            width: full.width,
+            height: full.height,
+            reason: "prototype_compat ink metric needs a 1920x1080 frame",
+        });
+    }
+    let im = area_bgr(full, 3);
+    let gray = blur_u8(&bgr_to_gray(&im), KernelSize::K3, 0.0);
     let dark = adaptive_threshold_mean_inv(&gray, BLOCK, OFFSET);
     let col = color_mask(&im);
     let mask = Plane {
@@ -165,8 +177,8 @@ pub fn ink_frame(full: &Bgr) -> InkFrame {
             .map(|(a, b)| a | b)
             .collect(),
     };
-    let align = blur_f32(&half_linear_gray(&gray).map(f32::from), 5, 1.2);
-    InkFrame { mask, align }
+    let align = blur_f32(&half_linear_gray(&gray).map(f32::from), KernelSize::K5, 1.2);
+    Ok(InkFrame { mask, align })
 }
 
 /// Result of [`ink_change`].
@@ -304,5 +316,24 @@ mod tests {
         let p = Plane::filled(50, 50, 255u8);
         let m = border_masked(&p, 20);
         assert_eq!(m.data.iter().filter(|&&v| v > 0).count(), 100);
+    }
+
+    #[test]
+    fn ink_frame_requires_prototype_size() {
+        let small = Bgr {
+            width: 640,
+            height: 360,
+            data: vec![0; 640 * 360 * 3],
+        };
+        assert!(ink_frame(&small).is_err());
+        let full = Bgr {
+            width: 1920,
+            height: 1080,
+            data: vec![200; 1920 * 1080 * 3],
+        };
+        let f = ink_frame(&full).unwrap();
+        assert_eq!((f.mask.width, f.mask.height), (640, 360));
+        assert_eq!((f.align.width, f.align.height), (320, 180));
+        assert!(f.mask.data.iter().all(|&v| v == 0));
     }
 }

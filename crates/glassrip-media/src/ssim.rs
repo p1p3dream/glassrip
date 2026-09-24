@@ -1,6 +1,6 @@
 //! SSIM and changed-pixel fraction as computed by the prototype's `score()` in numpy f32.
 
-use crate::gaussian::blur_f32;
+use crate::gaussian::{blur_f32, KernelSize};
 use crate::plane::Plane;
 
 /// SSIM stabilizers used by the prototype (for 0..255 data).
@@ -10,7 +10,7 @@ pub const C2: f32 = 58.5;
 
 /// Per-pixel SSIM map with a 7x7, sigma 1.5 Gaussian window (f32, REFLECT_101).
 pub fn ssim_map(a: &Plane<f32>, b: &Plane<f32>) -> Plane<f32> {
-    let g = |p: &Plane<f32>| blur_f32(p, 7, 1.5);
+    let g = |p: &Plane<f32>| blur_f32(p, KernelSize::K7, 1.5);
     let mul = |x: &Plane<f32>, y: &Plane<f32>| Plane {
         width: x.width,
         height: x.height,

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use glassrip_media::decode::{decode_bgr, decode_gray};
 use glassrip_media::features::{frame_features, pair_score, small_gray};
-use glassrip_media::gaussian::blur_u8;
+use glassrip_media::gaussian::{blur_u8, KernelSize};
 use glassrip_media::ink::{
     adaptive_threshold_mean_inv, bgr_to_gray, color_mask, ink_change, BLOCK, OFFSET,
 };
@@ -30,14 +30,14 @@ fn dump_frame(frame: &Path, out: &Path, tag: &str) -> Result<f64, Box<dyn std::e
     std::fs::write(out.join(format!("{tag}_small_area.u8")), &area.data)?;
     std::fs::write(
         out.join(format!("{tag}_small_blur.u8")),
-        &blur_u8(&area, 5, 1.2).data,
+        &blur_u8(&area, KernelSize::K5, 1.2).data,
     )?;
     write_f32(&out.join(format!("{tag}_small.f32")), &small_gray(&gray))?;
     let im = area_bgr(&bgr, 3);
     std::fs::write(out.join(format!("{tag}_bgr640.u8")), &im.data)?;
     let g640 = bgr_to_gray(&im);
     std::fs::write(out.join(format!("{tag}_gray640.u8")), &g640.data)?;
-    let g = blur_u8(&g640, 3, 0.0);
+    let g = blur_u8(&g640, KernelSize::K3, 0.0);
     std::fs::write(out.join(format!("{tag}_ink_g.u8")), &g.data)?;
     std::fs::write(
         out.join(format!("{tag}_dark.u8")),
@@ -74,7 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_f32(&out.join("bw.f32"), &bw)?;
     write_f32(
         &out.join("mu1.f32"),
-        &glassrip_media::gaussian::blur_f32(&a.small, 7, 1.5),
+        &glassrip_media::gaussian::blur_f32(&a.small, KernelSize::K7, 1.5),
     )?;
     write_f32(
         &out.join("ssim_map.f32"),

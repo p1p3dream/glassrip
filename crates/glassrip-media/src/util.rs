@@ -1,10 +1,13 @@
 //! Border handling and numeric helpers shared by the filters.
 
 /// OpenCV `BORDER_REFLECT_101` (`gfedcb|abcdefgh|gfedcba`) index mapping.
+///
+/// For `n == 0` there is no valid index; the function returns 0 rather than looping, and
+/// callers never index an empty axis (the filters return empty planes unchanged).
 #[inline]
 pub fn reflect101(i: isize, n: usize) -> usize {
     let n = n as isize;
-    if n == 1 {
+    if n <= 1 {
         return 0;
     }
     let mut i = i;
@@ -19,10 +22,11 @@ pub fn reflect101(i: isize, n: usize) -> usize {
     }
 }
 
-/// OpenCV `BORDER_REPLICATE` (`aaaaaa|abcdefgh|hhhhhhh`) index mapping.
+/// OpenCV `BORDER_REPLICATE` (`aaaaaa|abcdefgh|hhhhhhh`) index mapping. Returns 0 for
+/// `n == 0`.
 #[inline]
 pub fn replicate(i: isize, n: usize) -> usize {
-    i.clamp(0, n as isize - 1) as usize
+    i.clamp(0, (n as isize - 1).max(0)) as usize
 }
 
 /// `saturate_cast<uchar>(float)`: round half to even, then clamp to 0..=255.
@@ -88,6 +92,13 @@ mod tests {
     fn reflect101_matches_opencv() {
         let got: Vec<usize> = (-3..8).map(|i| reflect101(i, 5)).collect();
         assert_eq!(got, vec![3, 2, 1, 0, 1, 2, 3, 4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn zero_length_axis_does_not_hang() {
+        assert_eq!(reflect101(-3, 0), 0);
+        assert_eq!(reflect101(7, 0), 0);
+        assert_eq!(replicate(5, 0), 0);
     }
 
     #[test]
