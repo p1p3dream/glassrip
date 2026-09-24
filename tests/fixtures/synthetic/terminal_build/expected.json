@@ -1,0 +1,24 @@
+{
+  "schema": "glassrip.eval.synthetic_board",
+  "schema_version": "1.0.0",
+  "screen_type": "code",
+  "frame_width": 1920,
+  "frame_height": 1080,
+  "board": {
+    "nodes": [],
+    "edges": [],
+    "stickies": [],
+    "owners": []
+  },
+  "chrome_texts": [
+    "parcel-store - zsh - 160x48",
+    "Riley Park",
+    "Casey Moreno",
+    "Quinn Adler"
+  ],
+  "participants": [
+    "Riley Park",
+    "Casey Moreno",
+    "Quinn Adler"
+  ]
+}

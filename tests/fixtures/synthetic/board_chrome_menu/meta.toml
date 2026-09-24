@@ -1,0 +1,8 @@
+case = "board_chrome_menu"
+suite = "synthetic"
+description = "A floating shape menu on the canvas and an owner tag; menu text is chrome."
+generator = "gen_synthetic"
+generator_version = 1
+seed = 16
+screen_type = "whiteboard"
+tags = ["chrome", "shape_menu", "owner_tags"]

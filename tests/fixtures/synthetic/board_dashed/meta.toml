@@ -1,0 +1,8 @@
+case = "board_dashed"
+suite = "synthetic"
+description = "Four nodes with a long dashed labelled edge and an unlabelled edge."
+generator = "gen_synthetic"
+generator_version = 1
+seed = 12
+screen_type = "whiteboard"
+tags = ["dashed_edge", "unlabelled_edge"]

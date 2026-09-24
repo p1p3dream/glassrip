@@ -1,0 +1,8 @@
+case = "board_small_text"
+suite = "synthetic"
+description = "Six nodes with small labels and six edges."
+generator = "gen_synthetic"
+generator_version = 1
+seed = 14
+screen_type = "whiteboard"
+tags = ["small_text", "dense"]

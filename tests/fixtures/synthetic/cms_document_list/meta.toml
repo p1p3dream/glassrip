@@ -1,0 +1,8 @@
+case = "cms_document_list"
+suite = "synthetic"
+description = "Content studio document list; a trap that must not be read as a board."
+generator = "gen_synthetic"
+generator_version = 1
+seed = 21
+screen_type = "cms"
+tags = ["trap", "cms"]

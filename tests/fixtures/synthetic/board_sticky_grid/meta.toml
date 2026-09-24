@@ -1,0 +1,8 @@
+case = "board_sticky_grid"
+suite = "synthetic"
+description = "A grid of cards next to two nodes; cards are stickies, not nodes."
+generator = "gen_synthetic"
+generator_version = 1
+seed = 15
+screen_type = "whiteboard"
+tags = ["sticky_grid"]

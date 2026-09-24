@@ -1,0 +1,143 @@
+{
+  "schema": "glassrip.eval.synthetic_board",
+  "schema_version": "1.0.0",
+  "screen_type": "whiteboard",
+  "frame_width": 1920,
+  "frame_height": 1080,
+  "canvas_bbox": {
+    "x1": 220.0,
+    "y1": 110.0,
+    "x2": 1640.0,
+    "y2": 1030.0
+  },
+  "board": {
+    "nodes": [
+      {
+        "id": "relay",
+        "text": "Relay Service",
+        "bbox": {
+          "x1": 379.0,
+          "y1": 215.0,
+          "x2": 603.0,
+          "y2": 321.0
+        },
+        "core": true
+      },
+      {
+        "id": "summit",
+        "text": "Summit App",
+        "bbox": {
+          "x1": 775.0,
+          "y1": 250.0,
+          "x2": 1071.0,
+          "y2": 323.0
+        },
+        "core": true
+      },
+      {
+        "id": "ledger",
+        "text": "Ledger API",
+        "bbox": {
+          "x1": 330.0,
+          "y1": 505.0,
+          "x2": 626.0,
+          "y2": 578.0
+        },
+        "core": true
+      },
+      {
+        "id": "parcel",
+        "text": "Parcel Store",
+        "bbox": {
+          "x1": 820.0,
+          "y1": 487.0,
+          "x2": 1020.0,
+          "y2": 593.0
+        },
+        "core": true
+      }
+    ],
+    "edges": [
+      {
+        "src": "summit",
+        "dst": "relay",
+        "label": "events",
+        "style": "solid",
+        "directed": true
+      },
+      {
+        "src": "relay",
+        "dst": "ledger",
+        "label": "SQL",
+        "style": "solid",
+        "directed": true
+      },
+      {
+        "src": "summit",
+        "dst": "parcel",
+        "label": "REST",
+        "style": "solid",
+        "directed": true
+      },
+      {
+        "src": "ledger",
+        "dst": "parcel",
+        "label": "webhook",
+        "style": "solid",
+        "directed": true
+      }
+    ],
+    "stickies": [
+      {
+        "text": "Do we need a new queue?",
+        "bbox": {
+          "x1": 271.0,
+          "y1": 691.0,
+          "x2": 501.0,
+          "y2": 831.0
+        },
+        "kind": "question"
+      }
+    ],
+    "owners": [
+      {
+        "name": "Avery",
+        "near": "summit"
+      },
+      {
+        "name": "Jordan",
+        "near": "ledger"
+      },
+      {
+        "name": "Morgan",
+        "near": "relay"
+      }
+    ]
+  },
+  "chrome_texts": [
+    "Q3 roadmap - Boardly",
+    "Inbox (3)",
+    "boardly.example/app/board/q3-roadmap",
+    "Boards",
+    "Templates",
+    "Recent",
+    "Starred",
+    "Create frame",
+    "Share",
+    "Casey Moreno (Presenting)",
+    "100%",
+    "Fit",
+    "Undo",
+    "Riley Park",
+    "Casey Moreno",
+    "Quinn Adler"
+  ],
+  "participants": [
+    "Riley Park",
+    "Casey Moreno",
+    "Quinn Adler",
+    "Avery",
+    "Jordan",
+    "Morgan"
+  ]
+}

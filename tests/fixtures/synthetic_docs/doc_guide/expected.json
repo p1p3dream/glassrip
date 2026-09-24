@@ -1,0 +1,113 @@
+{
+  "schema": "glassrip.eval.synthetic_document",
+  "schema_version": "1.0.0",
+  "screen_type": "doc",
+  "document": {
+    "page_id": "queue-setup-guide",
+    "type": "doc",
+    "title": "Queue setup guide",
+    "blocks": [
+      {
+        "kind": "heading",
+        "level": 1,
+        "content": "Queue setup guide"
+      },
+      {
+        "kind": "paragraph",
+        "content": "This page explains how to run the parcel queue on a laptop and how to read its dashboard."
+      },
+      {
+        "kind": "heading",
+        "level": 2,
+        "content": "Install"
+      },
+      {
+        "kind": "list",
+        "content": "Install the queue tool\nCreate a local config file\nStart the worker"
+      },
+      {
+        "kind": "code",
+        "lang": "shell",
+        "content": "queue init --local\nqueue worker start --threads 4"
+      },
+      {
+        "kind": "heading",
+        "level": 2,
+        "content": "Settings"
+      },
+      {
+        "kind": "table",
+        "content": "Name\tDefault\tMeaning\nthreads\t4\tWorker threads\nbatch\t50\tItems per pull\nretry\t3\tAttempts per item\nbackoff\t2s\tFirst retry delay\nttl\t1h\tItem lifetime\nlog\tinfo\tLog level\nport\t7400\tDashboard port\nregion\tlocal\tStorage region",
+        "rows": [
+          [
+            "Name",
+            "Default",
+            "Meaning"
+          ],
+          [
+            "threads",
+            "4",
+            "Worker threads"
+          ],
+          [
+            "batch",
+            "50",
+            "Items per pull"
+          ],
+          [
+            "retry",
+            "3",
+            "Attempts per item"
+          ],
+          [
+            "backoff",
+            "2s",
+            "First retry delay"
+          ],
+          [
+            "ttl",
+            "1h",
+            "Item lifetime"
+          ],
+          [
+            "log",
+            "info",
+            "Log level"
+          ],
+          [
+            "port",
+            "7400",
+            "Dashboard port"
+          ],
+          [
+            "region",
+            "local",
+            "Storage region"
+          ]
+        ]
+      },
+      {
+        "kind": "quote",
+        "content": "Keep threads at or below the number of cores."
+      },
+      {
+        "kind": "paragraph",
+        "content": "Open the dashboard on the configured port to see queue depth and retry counts."
+      }
+    ]
+  },
+  "page_height_px": 938,
+  "viewport_width": 1280,
+  "viewport_height": 720,
+  "fixed_header_px": 64,
+  "frames": [
+    {
+      "file": "frames/f_000.png",
+      "scroll_y": 0
+    },
+    {
+      "file": "frames/f_001.png",
+      "scroll_y": 282
+    }
+  ]
+}

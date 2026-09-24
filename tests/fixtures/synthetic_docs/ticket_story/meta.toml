@@ -1,0 +1,8 @@
+case = "ticket_story"
+suite = "synthetic_docs"
+description = "Tracker story with fields, criteria, three comments, and links."
+generator = "gen_synthetic"
+generator_version = 1
+seed = 31
+screen_type = "ticket"
+tags = ["ticket", "comments", "links"]

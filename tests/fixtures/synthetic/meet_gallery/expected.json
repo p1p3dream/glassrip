@@ -1,0 +1,29 @@
+{
+  "schema": "glassrip.eval.synthetic_board",
+  "schema_version": "1.0.0",
+  "screen_type": "meet_gallery",
+  "frame_width": 1920,
+  "frame_height": 1080,
+  "board": {
+    "nodes": [],
+    "edges": [],
+    "stickies": [],
+    "owners": []
+  },
+  "chrome_texts": [
+    "Weekly sync - Call",
+    "Inbox (3)",
+    "call.example/abc-defg-hij",
+    "Riley Park",
+    "Casey Moreno",
+    "Quinn Adler",
+    "Avery Stone",
+    "4 people in call"
+  ],
+  "participants": [
+    "Riley Park",
+    "Casey Moreno",
+    "Quinn Adler",
+    "Avery Stone"
+  ]
+}
