@@ -409,8 +409,10 @@ impl Ctx<'_> {
 ///    participant name to owner tags.
 /// 3. Keep the first node per `local_id`.
 /// 4. Exclusive membership by normalized text: a text appears in one list only.
-///    Priority is owner tags (for participant names), then nodes, stickies,
-///    owner tags, other text.
+///    When the text is a participant name the keep order is owner tags, nodes,
+///    stickies, other visible text; otherwise it is nodes, stickies, owner tags,
+///    other visible text. Copies in lower-ranked lists are dropped with a
+///    `DuplicateAcrossLists` issue.
 /// 5. Edges must reference kept nodes (never create nodes from endpoints), may not
 ///    be self-loops, and carry labels of at most `max_edge_label_words` words that
 ///    are neither a node's text nor chrome.
