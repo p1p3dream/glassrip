@@ -23,6 +23,7 @@ pub mod cache;
 pub mod canonical;
 pub mod envelope;
 pub mod jsonl;
+pub mod manifest;
 pub mod versioning;
 
 
