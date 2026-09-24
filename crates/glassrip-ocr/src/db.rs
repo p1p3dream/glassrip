@@ -117,6 +117,39 @@ pub fn reading_order<T>(items: &mut Vec<T>, bbox: impl Fn(&T) -> PixelBox) {
     }
 }
 
+/// Join same-line fragments separated by less than `max_gap` times the text
+/// height (a word split by wide letter spacing). Input and output are in
+/// reading order; merged spans keep the lower confidence.
+pub fn merge_line_fragments(
+    spans: Vec<crate::RecognizedSpan>,
+    max_gap: f64,
+) -> Vec<crate::RecognizedSpan> {
+    let mut out: Vec<crate::RecognizedSpan> = Vec::with_capacity(spans.len());
+    for s in spans {
+        if let Some(prev) = out.last_mut() {
+            let (h1, h2) = (prev.bbox.height(), s.bbox.height());
+            let cy = |b: &PixelBox| (b.y1 + b.y2) / 2.0;
+            let same_line = (cy(&prev.bbox) - cy(&s.bbox)).abs() <= h1.min(h2) / 2.0;
+            let similar = h1.max(h2) <= 1.5 * h1.min(h2).max(1.0);
+            let gap = s.bbox.x1 - prev.bbox.x2;
+            if same_line && similar && gap >= -h1.min(h2) && gap <= max_gap * h1.max(h2) {
+                prev.text = format!("{} {}", prev.text, s.text);
+                prev.bbox = PixelBox {
+                    x1: prev.bbox.x1.min(s.bbox.x1),
+                    y1: prev.bbox.y1.min(s.bbox.y1),
+                    x2: prev.bbox.x2.max(s.bbox.x2),
+                    y2: prev.bbox.y2.max(s.bbox.y2),
+                };
+                prev.confidence = prev.confidence.min(s.confidence);
+                prev.det_score = prev.det_score.min(s.det_score);
+                continue;
+            }
+        }
+        out.push(s);
+    }
+    out
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -152,6 +185,33 @@ mod tests {
         assert!(boxes[1].bbox.x1 < boxes[2].bbox.x1);
         // Unclip grows the box beyond the raw component (10..18 rows -> 20..36 px).
         assert!(boxes[0].bbox.y1 < 20.0 && boxes[0].bbox.y2 > 36.0);
+    }
+
+    #[test]
+    fn merges_close_fragments_on_one_line_only() {
+        let s = |t: &str, x1: f64, x2: f64, y1: f64| crate::RecognizedSpan {
+            text: t.into(),
+            bbox: PixelBox {
+                x1,
+                y1,
+                x2,
+                y2: y1 + 20.0,
+            },
+            confidence: 0.9,
+            det_score: 0.9,
+        };
+        let out = merge_line_fragments(
+            vec![
+                s("Riley", 100.0, 160.0, 50.0),
+                s("Park", 168.0, 210.0, 51.0),
+                s("REST", 400.0, 450.0, 50.0),
+                s("Next", 100.0, 150.0, 90.0),
+            ],
+            0.5,
+        );
+        let texts: Vec<&str> = out.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["Riley Park", "REST", "Next"]);
+        assert_eq!(out[0].bbox.x2, 210.0);
     }
 
     #[test]

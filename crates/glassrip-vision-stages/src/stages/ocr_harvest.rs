@@ -179,6 +179,7 @@ impl Stage for OcrHarvestStage {
             let raw = recognizer
                 .recognize(&img)
                 .map_err(|e| internal(format!("OCR failed: {e}")))?;
+            let raw = glassrip_ocr::db::merge_line_fragments(raw, 0.5);
             Ok(build_item(
                 &id,
                 &img,
