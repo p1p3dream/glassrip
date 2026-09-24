@@ -637,6 +637,9 @@ async fn meeting_mode_end_to_end_on_a_synthetic_video() {
     // Vision replies were recorded for offline replay.
     assert!(out.join(meeting::RAW_RESPONSES_DIR).is_dir());
 
+    // ---- eval scores the real run: `glassrip eval --suite meeting --artifacts <run dir>`.
+    score_run_with_eval(root, &out).await;
+
     // ---- rerun: everything restores from cache except the forced render.
     let rerun = run_meeting(
         &opts,
@@ -683,4 +686,90 @@ async fn meeting_mode_end_to_end_on_a_synthetic_video() {
         .outputs
         .iter()
         .any(|p| p.ends_with("silent-board-meeting-notes.md")));
+}
+
+/// Scores the run directory with the meeting suite against a small fictional
+/// golden set in a temporary private root.
+async fn score_run_with_eval(root: &Path, run: &Path) {
+    let private = root.join("private");
+    std::fs::create_dir_all(private.join("golden")).unwrap();
+    let golden = json!({
+        "golden_version": 1,
+        "meeting": "fictional weekly sync",
+        "participants": [
+            {"person_id": "ada-quill", "display_name": "Ada Quill", "aliases": ["Ada"]},
+            {"person_id": "bo-tran", "display_name": "Bo Tran", "aliases": []}
+        ],
+        "screen_types": [
+            {"t_rep_s": 2.0, "screen_type": "whiteboard"},
+            {"t_rep_s": 14.0, "screen_type": "chat"}
+        ],
+        "final_board": {
+            "nodes": [
+                {"id": "ledger", "text": "Ledger API"},
+                {"id": "orbit", "text": "Orbit Queue"},
+                {"id": "parcel", "text": "Parcel Store"}
+            ],
+            "edges": [{"src": "ledger", "dst": "orbit", "label": "REST"}],
+            "stickies": [{"text": "Retries?"}]
+        },
+        "owners": {"probes_s": [], "assignments": [], "moves": [], "negatives": []},
+        "static_windows": [],
+        "chrome_terms": [],
+        "transcript": {
+            "decisions": [{"text": "Keep the Ledger API on REST for the pilot"}],
+            "action_items": [{"text": "Build the Orbit Queue this week", "person_id": "ada-quill"}],
+            "open_questions": [],
+            "negative_action_items": [],
+            "hotwords": [],
+            "speaker_count": 2
+        }
+    });
+    std::fs::write(
+        private.join("golden/meeting_golden.json"),
+        serde_json::to_vec_pretty(&golden).unwrap(),
+    )
+    .unwrap();
+    let cfg = root.join("eval.toml");
+    std::fs::write(
+        &cfg,
+        format!("[eval]\nprivate_fixtures = \"{}\"\n", private.display()),
+    )
+    .unwrap();
+    let report_dir = root.join("eval-report");
+    #[derive(clap::Parser)]
+    struct Wrap {
+        #[command(flatten)]
+        args: glassrip_eval::cli::EvalArgs,
+    }
+    let args = <Wrap as clap::Parser>::try_parse_from([
+        "eval",
+        "--suite",
+        "meeting",
+        "--config",
+        cfg.to_str().unwrap(),
+        "--artifacts",
+        run.to_str().unwrap(),
+        "--out",
+        report_dir.to_str().unwrap(),
+    ])
+    .unwrap()
+    .args;
+    let outcome = glassrip_eval::cli::run(args).await.unwrap();
+    assert!(outcome.passed, "{:?}", outcome.status);
+    let report: Value =
+        serde_json::from_slice(&std::fs::read(report_dir.join("eval_report.json")).unwrap())
+            .unwrap();
+    let metric = |k: &str| {
+        report["metrics"][k]["mean"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("{k}: {report}"))
+    };
+    assert_eq!(metric("screen.accuracy"), 1.0);
+    assert!(metric("board.node.recall") >= 2.0 / 3.0);
+    assert_eq!(metric("board.chrome_fp"), 0.0);
+    assert_eq!(metric("notes.decision.recall"), 1.0);
+    assert_eq!(metric("notes.action.recall"), 1.0);
+    assert_eq!(metric("audio.speaker_labels"), 2.0);
+    assert_eq!(report["not_run"], json!([]), "{}", report["not_run"]);
 }
