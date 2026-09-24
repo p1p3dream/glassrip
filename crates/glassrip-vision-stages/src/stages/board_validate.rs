@@ -22,7 +22,7 @@ use glassrip_core::runner::{
 };
 use glassrip_vision::board::{
     normalize, validate_board, BoardNode, BoardReadOutput, BoardValidationConfig, CanvasSize,
-    ElementList, OwnerTag, RejectReason, RejectedItem, Sticky, StickyColor,
+    ElementList, OwnerTag, RejectReason, RejectedItem, Sticky,
 };
 use glassrip_vision::BBox;
 use image::RgbImage;
@@ -31,7 +31,7 @@ use serde::Serialize;
 
 use crate::artifacts::{
     self, BoardReadingItem, BoardValidateItem, CanvasCropItem, CanvasMethod, ExtraIssue,
-    MemberList, MembershipDecision, OcrKeyframe, ShapeClass,
+    MemberList, MembershipDecision, OcrKeyframe, ShapeClass, TextRegion,
 };
 use crate::layout::names_match;
 use crate::pixels::{self, ShapeThresholds};
@@ -93,23 +93,97 @@ fn short_name(text: &str) -> bool {
         })
 }
 
+/// OCR text that belongs to an element: similar, or a line of it.
+fn span_matches(element: &str, span: &str) -> bool {
+    let (e, s) = (normalize(element), normalize(span));
+    s.chars().count() >= 3
+        && (strsim::normalized_levenshtein(&e, &s) >= 0.8
+            || (s.chars().count() >= 4 && e.contains(&s)))
+}
+
+/// Pixel evidence for one element.
+struct Evidence {
+    shape: ShapeClass,
+    m: pixels::ElementPixels,
+    anchored: u32,
+}
+
+/// Classify an element: by the background behind its OCR text when OCR found
+/// it (precise boxes), else by its own box. Plain text backgrounds defer to
+/// the box's outline check.
+fn evidence(
+    text: &str,
+    bbox: &BBox,
+    img: &RgbImage,
+    anchors: &[(String, BBox)],
+    t: &ShapeThresholds,
+) -> Option<Evidence> {
+    let boxed = pixels::measure(img, bbox, t);
+    let bgs: Vec<pixels::ElementPixels> = anchors
+        .iter()
+        .filter(|(s, _)| span_matches(text, s))
+        .filter_map(|(_, b)| pixels::text_background(img, b))
+        .collect();
+    if bgs.is_empty() {
+        let m = boxed?;
+        return Some(Evidence {
+            shape: pixels::classify_shape(&m, t),
+            m,
+            anchored: 0,
+        });
+    }
+    let med = |f: &dyn Fn(&pixels::ElementPixels) -> f64| {
+        let mut v: Vec<f64> = bgs.iter().map(f).collect();
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    let mut m = bgs[0];
+    m.saturation = med(&|p| p.saturation);
+    m.hue = med(&|p| p.hue);
+    m.value = med(&|p| p.value);
+    let mut shape = pixels::classify_text_background(&m, t);
+    if shape == ShapeClass::Unclear {
+        if let Some(b) = boxed {
+            m.outline_fraction = b.outline_fraction;
+            if pixels::classify_shape(&b, t) == ShapeClass::OutlinedBox {
+                shape = ShapeClass::OutlinedBox;
+            }
+        }
+    }
+    Some(Evidence {
+        shape,
+        m,
+        anchored: bgs.len() as u32,
+    })
+}
+
 fn decision(
     text: &str,
     bbox: glassrip_vision::BBox,
     from: MemberList,
     to: MemberList,
-    shape: ShapeClass,
-    m: &pixels::ElementPixels,
+    ev: &Evidence,
 ) -> MembershipDecision {
     MembershipDecision {
         text: text.to_string(),
         bbox,
         from,
         to,
-        shape,
-        fill_rgb: m.fill_rgb,
-        fill_saturation: m.saturation,
-        outline_fraction: m.outline_fraction,
+        shape: ev.shape,
+        fill_rgb: ev.m.fill_rgb,
+        fill_saturation: ev.m.saturation,
+        outline_fraction: ev.m.outline_fraction,
+        anchored_spans: ev.anchored,
+    }
+}
+
+/// A green card is an owner tag only when it names a participant (or, with no
+/// participants known, holds just a short name).
+fn owner_text(text: &str, aliases: &[String]) -> bool {
+    if aliases.is_empty() {
+        short_name(text)
+    } else {
+        aliases.iter().any(|a| names_match(a, text))
     }
 }
 
@@ -117,6 +191,8 @@ fn decision(
 pub fn apply_membership(
     out: BoardReadOutput,
     img: &RgbImage,
+    anchors: &[(String, BBox)],
+    aliases: &[String],
     t: &ShapeThresholds,
 ) -> (BoardReadOutput, Vec<MembershipDecision>) {
     let BoardReadOutput {
@@ -134,23 +210,22 @@ pub fn apply_membership(
     let mut moved_id = 0usize;
 
     for n in nodes {
-        let Some(m) = pixels::measure(img, &n.bbox, t) else {
+        let Some(ev) = evidence(&n.text, &n.bbox, img, anchors, t) else {
             new_nodes.push(n);
             continue;
         };
-        let shape = pixels::classify_shape(&m, t);
-        let to = match shape {
+        let to = match ev.shape {
             ShapeClass::FilledSticky => MemberList::Stickies,
-            ShapeClass::GreenTag if short_name(&n.text) => MemberList::OwnerTags,
+            ShapeClass::GreenTag if owner_text(&n.text, aliases) => MemberList::OwnerTags,
             ShapeClass::GreenTag => MemberList::Stickies,
             _ => MemberList::Nodes,
         };
-        decisions.push(decision(&n.text, n.bbox, MemberList::Nodes, to, shape, &m));
+        decisions.push(decision(&n.text, n.bbox, MemberList::Nodes, to, &ev));
         match to {
             MemberList::Nodes => new_nodes.push(n),
             MemberList::Stickies => new_stickies.push(Sticky {
                 text: n.text,
-                color: pixels::sticky_color(&m),
+                color: pixels::sticky_color(&ev.m),
                 bbox: n.bbox,
             }),
             MemberList::OwnerTags => new_owners.push(OwnerTag {
@@ -161,24 +236,16 @@ pub fn apply_membership(
         }
     }
     for s in stickies {
-        let Some(m) = pixels::measure(img, &s.bbox, t) else {
+        let Some(ev) = evidence(&s.text, &s.bbox, img, anchors, t) else {
             new_stickies.push(s);
             continue;
         };
-        let shape = pixels::classify_shape(&m, t);
-        let to = match shape {
+        let to = match ev.shape {
             ShapeClass::OutlinedBox => MemberList::Nodes,
-            ShapeClass::GreenTag if short_name(&s.text) => MemberList::OwnerTags,
+            ShapeClass::GreenTag if owner_text(&s.text, aliases) => MemberList::OwnerTags,
             _ => MemberList::Stickies,
         };
-        decisions.push(decision(
-            &s.text,
-            s.bbox,
-            MemberList::Stickies,
-            to,
-            shape,
-            &m,
-        ));
+        decisions.push(decision(&s.text, s.bbox, MemberList::Stickies, to, &ev));
         match to {
             MemberList::Nodes => {
                 moved_id += 1;
@@ -196,20 +263,19 @@ pub fn apply_membership(
             }),
             MemberList::Stickies => {
                 let mut s = s;
-                if s.color == StickyColor::White && shape == ShapeClass::FilledSticky {
-                    s.color = pixels::sticky_color(&m);
+                if matches!(ev.shape, ShapeClass::FilledSticky | ShapeClass::GreenTag) {
+                    s.color = pixels::sticky_color(&ev.m);
                 }
                 new_stickies.push(s);
             }
         }
     }
     for o in owner_tags {
-        let Some(m) = pixels::measure(img, &o.bbox, t) else {
+        let Some(ev) = evidence(&o.name_raw, &o.bbox, img, anchors, t) else {
             new_owners.push(o);
             continue;
         };
-        let shape = pixels::classify_shape(&m, t);
-        let to = match shape {
+        let to = match ev.shape {
             ShapeClass::FilledSticky => MemberList::Stickies,
             ShapeClass::OutlinedBox => MemberList::Nodes,
             _ => MemberList::OwnerTags,
@@ -219,14 +285,13 @@ pub fn apply_membership(
             o.bbox,
             MemberList::OwnerTags,
             to,
-            shape,
-            &m,
+            &ev,
         ));
         match to {
             MemberList::OwnerTags => new_owners.push(o),
             MemberList::Stickies => new_stickies.push(Sticky {
                 text: o.name_raw,
-                color: pixels::sticky_color(&m),
+                color: pixels::sticky_color(&ev.m),
                 bbox: o.bbox,
             }),
             MemberList::Nodes => {
@@ -306,12 +371,21 @@ fn drop_tile_text(
 }
 
 /// Validate one reading against its canvas image.
+///
+/// `anchors` are the keyframe's OCR spans inside the canvas, in canvas pixels.
 pub fn validate_reading(
     reading: &BoardReadingItem,
     canvas: &RgbImage,
     participants: &[String],
+    anchors: &[(String, BBox)],
     p: &BoardValidateParams,
 ) -> BoardValidateItem {
+    let all: Vec<String> = participants
+        .iter()
+        .chain(&p.validation.participant_names)
+        .cloned()
+        .collect();
+    let aliases = participant_aliases(&all);
     let (ox, oy) = (reading.crop_box.x1, reading.crop_box.y1);
     let tiles: Vec<BBox> = reading
         .tiles
@@ -326,11 +400,22 @@ pub fn validate_reading(
         })
         .collect();
     let (result, tile_rejects) = drop_tile_text(reading.result.clone(), &tiles);
-    let (mut moved, membership) = apply_membership(result, canvas, &p.shape);
+    let (mut moved, membership) = apply_membership(result, canvas, anchors, &aliases, &p.shape);
     let mut extra = Vec::new();
-    // A moved element can repeat one already in its new list.
+    // A moved element can repeat one already in its new list: same text and
+    // overlapping or adjacent boxes.
     let dup = |a: (&str, &glassrip_vision::BBox), b: (&str, &glassrip_vision::BBox)| {
-        normalize(a.0) == normalize(b.0) && a.1.iou(b.1) >= 0.5
+        let (ca, cb) = (
+            ((a.1.x1 + a.1.x2) / 2.0, (a.1.y1 + a.1.y2) / 2.0),
+            ((b.1.x1 + b.1.x2) / 2.0, (b.1.y1 + b.1.y2) / 2.0),
+        );
+        let reach =
+            a.1.width()
+                .max(a.1.height())
+                .max(b.1.width().max(b.1.height()));
+        normalize(a.0) == normalize(b.0)
+            && (a.1.iou(b.1) >= 0.5
+                || ((ca.0 - cb.0).powi(2) + (ca.1 - cb.1).powi(2)).sqrt() <= reach)
     };
     let mut kept: Vec<Sticky> = Vec::new();
     for s in std::mem::take(&mut moved.stickies) {
@@ -362,12 +447,6 @@ pub fn validate_reading(
         }
     }
     moved.owner_tags = kept;
-    let all: Vec<String> = participants
-        .iter()
-        .chain(&p.validation.participant_names)
-        .cloned()
-        .collect();
-    let aliases = participant_aliases(&all);
     let mut cfg = p.validation.clone();
     cfg.participant_names.extend(aliases.iter().cloned());
     for n in &moved.nodes {
@@ -394,8 +473,8 @@ pub fn validate_reading(
     let mut owners = Vec::new();
     for o in std::mem::take(&mut board.owner_tags) {
         let named = aliases.is_empty() || aliases.iter().any(|a| names_match(a, &o.name_raw));
-        let on_tag = pixels::measure(canvas, &o.bbox, &p.shape)
-            .is_some_and(|m| pixels::classify_shape(&m, &p.shape) == ShapeClass::GreenTag);
+        let on_tag = evidence(&o.name_raw, &o.bbox, canvas, anchors, &p.shape)
+            .is_some_and(|ev| ev.shape == ShapeClass::GreenTag);
         let reason = if !named {
             Some(RejectReason::OwnerNotParticipant)
         } else if !on_tag {
@@ -463,6 +542,7 @@ impl BoardValidateStage {
 pub struct ValidateWork {
     reading: BoardReadingItem,
     participants: Vec<String>,
+    anchors: Vec<(String, BBox)>,
 }
 
 impl Stage for BoardValidateStage {
@@ -498,6 +578,10 @@ impl Stage for BoardValidateStage {
             .into_iter()
             .map(|(_, o)| o)
             .collect();
+        let spans_of: HashMap<String, Vec<crate::artifacts::OcrSpan>> = ocr
+            .iter()
+            .map(|o| (o.keyframe_id.clone(), o.spans.clone()))
+            .collect();
         let names: Vec<String> = participants(&ocr, self.params.participant_min_keyframes)
             .into_iter()
             .map(|(n, _, _)| n)
@@ -514,11 +598,40 @@ impl Stage for BoardValidateStage {
                 let reading = by_id.remove(&id)?;
                 let mut ps = names.clone();
                 ps.extend(reading.participants.iter().cloned());
+                let c = reading.crop_box;
+                let anchors = spans_of
+                    .get(&reading.keyframe_id)
+                    .map(|spans| {
+                        spans
+                            .iter()
+                            .filter(|s| {
+                                matches!(s.region, TextRegion::Unassigned | TextRegion::Canvas)
+                            })
+                            .filter(|s| {
+                                let (x, y) =
+                                    ((s.bbox.x1 + s.bbox.x2) / 2.0, (s.bbox.y1 + s.bbox.y2) / 2.0);
+                                x >= c.x1 && x <= c.x2 && y >= c.y1 && y <= c.y2
+                            })
+                            .map(|s| {
+                                (
+                                    s.text.clone(),
+                                    BBox::new(
+                                        s.bbox.x1 - c.x1,
+                                        s.bbox.y1 - c.y1,
+                                        s.bbox.x2 - c.x1,
+                                        s.bbox.y2 - c.y1,
+                                    ),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 Some(WorkItem {
                     id,
                     work: ValidateWork {
                         reading,
                         participants: ps,
+                        anchors,
                     },
                 })
             })
@@ -558,6 +671,7 @@ impl Stage for BoardValidateStage {
                 &w.reading,
                 &canvas,
                 &w.participants,
+                &w.anchors,
                 &params,
             ))
         })
@@ -570,6 +684,7 @@ impl Stage for BoardValidateStage {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use glassrip_vision::board::StickyColor;
     use glassrip_vision::board::{BoardEdge, EdgeStyle};
     use glassrip_vision::BBox;
     use image::Rgb;
@@ -670,6 +785,7 @@ mod tests {
             &r,
             &board_image(),
             &["Adaline Quill".to_string()],
+            &[],
             &BoardValidateParams::default(),
         );
         let nodes: Vec<&str> = v.board.nodes.iter().map(|n| n.text.as_str()).collect();
@@ -734,6 +850,7 @@ mod tests {
             &r,
             &board_image(),
             &["Ada Quill".to_string(), "Bo Tran".to_string()],
+            &[],
             &BoardValidateParams::default(),
         );
         let owners: Vec<&str> = v
@@ -747,6 +864,56 @@ mod tests {
         assert!(reasons.contains(&RejectReason::OwnerNotParticipant));
         assert!(reasons.contains(&RejectReason::OwnerNotOnTag));
         assert!(reasons.contains(&RejectReason::TileRegion));
+    }
+
+    #[test]
+    fn ocr_text_background_decides_when_boxes_are_off() {
+        let img = board_image();
+        // Model boxes shifted onto plain canvas; OCR boxes sit on the cards.
+        let out = BoardReadOutput {
+            nodes: vec![
+                BoardNode {
+                    local_id: "n1".into(),
+                    text: "Ship before launch?".into(),
+                    bbox: BBox::new(300.0, 200.0, 390.0, 280.0),
+                    conf: 0.9,
+                },
+                BoardNode {
+                    local_id: "n2".into(),
+                    text: "Unread notes".into(),
+                    bbox: BBox::new(300.0, 100.0, 390.0, 140.0),
+                    conf: 0.9,
+                },
+            ],
+            edges: vec![],
+            stickies: vec![],
+            owner_tags: vec![],
+            other_visible_text: vec![],
+            confidence: 0.8,
+        };
+        let anchors = vec![
+            (
+                "Ship before".to_string(),
+                BBox::new(215.0, 40.0, 285.0, 52.0),
+            ),
+            ("launch?".to_string(), BBox::new(215.0, 60.0, 270.0, 72.0)),
+            (
+                "Unread notes".to_string(),
+                BBox::new(205.0, 162.0, 255.0, 176.0),
+            ),
+        ];
+        let v = validate_reading(
+            &reading(out),
+            &img,
+            &["Ada Quill".to_string()],
+            &anchors,
+            &BoardValidateParams::default(),
+        );
+        assert!(v.board.nodes.is_empty(), "{:?}", v.membership);
+        let stickies: Vec<&str> = v.board.stickies.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(stickies, vec!["Ship before launch?", "Unread notes"]);
+        assert!(v.board.owner_tags.is_empty());
+        assert!(v.membership.iter().all(|m| m.anchored_spans > 0));
     }
 
     #[test]

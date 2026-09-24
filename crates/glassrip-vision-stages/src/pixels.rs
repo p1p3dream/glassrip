@@ -35,6 +35,8 @@ pub struct ShapeThresholds {
     pub outline_min_fraction: f64,
     /// Luma difference that counts as an outline.
     pub outline_min_contrast: f64,
+    /// Background saturation behind OCR text at or above which the text sits on a card.
+    pub text_bg_min_saturation: f64,
 }
 
 impl Default for ShapeThresholds {
@@ -46,6 +48,7 @@ impl Default for ShapeThresholds {
             light_min_value: 0.70,
             outline_min_fraction: 0.6,
             outline_min_contrast: 35.0,
+            text_bg_min_saturation: 0.08,
         }
     }
 }
@@ -170,6 +173,60 @@ pub fn measure(img: &RgbImage, bbox: &BBox, t: &ShapeThresholds) -> Option<Eleme
             hits as f64 / total as f64
         },
     })
+}
+
+/// Background behind a text box: the box padded by a third of its height,
+/// median of the brighter 65% of pixels (text strokes are dropped).
+pub fn text_background(img: &RgbImage, text_box: &BBox) -> Option<ElementPixels> {
+    let pad = text_box.height().max(1.0) * 0.35;
+    let b = BBox::new(
+        text_box.x1 - pad,
+        text_box.y1 - pad,
+        text_box.x2 + pad,
+        text_box.y2 + pad,
+    );
+    let (x0, y0, x1, y1) = clamp_box(&b, img.width(), img.height())?;
+    let mut px: Vec<Rgb<u8>> = Vec::new();
+    for y in y0..y1 {
+        for x in x0..x1 {
+            px.push(*img.get_pixel(x, y));
+        }
+    }
+    px.sort_by(|a, b| luma(a).total_cmp(&luma(b)));
+    let keep = &px[px.len() * 35 / 100..];
+    let mut ch: [Vec<u8>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for p in keep {
+        for c in 0..3 {
+            ch[c].push(p[c]);
+        }
+    }
+    let fill = [
+        median_u8(&mut ch[0]),
+        median_u8(&mut ch[1]),
+        median_u8(&mut ch[2]),
+    ];
+    let (hue, saturation, value) = hsv(fill);
+    Some(ElementPixels {
+        fill_rgb: fill,
+        hue,
+        saturation,
+        value,
+        outline_fraction: 0.0,
+    })
+}
+
+/// Card class from the background behind an element's OCR text: colored
+/// (green or other) or plain.
+pub fn classify_text_background(m: &ElementPixels, t: &ShapeThresholds) -> ShapeClass {
+    if m.saturation >= t.text_bg_min_saturation && m.value >= t.filled_min_value {
+        if (95.0..=170.0).contains(&m.hue) {
+            ShapeClass::GreenTag
+        } else {
+            ShapeClass::FilledSticky
+        }
+    } else {
+        ShapeClass::Unclear
+    }
 }
 
 /// Shape class from measured pixels.

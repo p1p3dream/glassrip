@@ -389,6 +389,8 @@ pub struct MembershipDecision {
     pub fill_saturation: f64,
     /// Share of edge samples with a visible outline.
     pub outline_fraction: f64,
+    /// OCR spans whose text background decided the class (0: the element box did).
+    pub anchored_spans: u32,
 }
 
 /// A rule applied after the shared validator.
