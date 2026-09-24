@@ -1,0 +1,10 @@
+{
+  "record_version": 1,
+  "key": "385ea1196d71db003c4dd161b99bdc4c1bce6dead78a5f56a43e3507956cec6f",
+  "kind": "classify",
+  "case": "terminal_build",
+  "model": "qwen2.5vl:7b",
+  "model_digest": "5ced39dfa4bac325dc183dd1e4febaa1c46b3ea28bce48896c8e69c1e79611cc",
+  "raw_text": "{\n  \"app_hint\": \"\",\n  \"canvas_bbox\": {\n    \"x1\": 0,\n    \"x2\": 1200,\n    \"y1\": 0,\n    \"y2\": 672\n  },\n  \"confidence\": 0.95,\n  \"screen_type\": \"code\"\n}",
+  "wall_s": 5.317
+}

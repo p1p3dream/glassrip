@@ -1,0 +1,10 @@
+{
+  "record_version": 1,
+  "key": "d16653bfb312f235f5b29f4bb34335fcd77dbc71772efa4938c5fea888292a6f",
+  "kind": "classify",
+  "case": "board_chrome_menu",
+  "model": "qwen2.5vl:7b",
+  "model_digest": "5ced39dfa4bac325dc183dd1e4febaa1c46b3ea28bce48896c8e69c1e79611cc",
+  "raw_text": "{\n  \"app_hint\": \"Boardly\",\n  \"canvas_bbox\": {\n    \"x1\": 100,\n    \"x2\": 1000,\n    \"y1\": 100,\n    \"y2\": 800\n  },\n  \"confidence\": 0.95,\n  \"screen_type\": \"whiteboard\"\n}",
+  "wall_s": 3.799
+}
