@@ -384,6 +384,11 @@ pub fn meeting_mode_stage_decls() -> Vec<StageDecl> {
             &["glassrip.rectified_keyframes"],
         ),
         d(
+            "ocr_vocabulary",
+            "glassrip.asr_vocabulary",
+            &["glassrip.ocr"],
+        ),
+        d(
             "classify",
             "glassrip.screen_class",
             &["glassrip.rectified_keyframes", "glassrip.ocr"],
@@ -397,6 +402,7 @@ pub fn meeting_mode_stage_decls() -> Vec<StageDecl> {
                 "glassrip.screen_quads",
                 "glassrip.rectified_keyframes",
                 "glassrip.keyframes",
+                "glassrip.ocr",
             ],
         ),
         d(
