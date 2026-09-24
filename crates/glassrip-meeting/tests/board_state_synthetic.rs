@@ -1583,3 +1583,113 @@ fn board_state_1_0_0_items_still_parse() {
     assert!(old.groups.is_empty() && old.board_title.is_none());
     assert_eq!(old.stickies.len(), s.stickies.len());
 }
+
+/// Final state is "observed and not later removed", not "seen in the last window".
+#[test]
+fn elements_outside_a_zoomed_final_view_stay_final() {
+    // Keyframes 0 to 5 show the whole board; 6 to 8 zoom onto its right part, so
+    // "Ingest Gateway" and its HTTP edge are never in the final window's view.
+    let zoom = Similarity {
+        scale: 1.3,
+        angle: 0.0,
+        tx: -600.0,
+        ty: 0.0,
+    };
+    let specs: Vec<Spec> = (0..9)
+        .map(|i| Spec {
+            t: if i >= 6 { zoom } else { Similarity::IDENTITY },
+            ink: Some(0.01),
+            ..base()
+        })
+        .collect();
+    let s = run(frames(&specs), &params());
+    let w = s.final_window.as_ref().unwrap();
+    assert!(w.keyframe_ids.iter().all(|k| k.as_str() >= "kf06"), "{w:?}");
+    assert!(
+        s.registration
+            .iter()
+            .all(|r| r.registration.mode != RegistrationMode::TextOnly),
+        "{:?}",
+        s.registration
+    );
+    assert_eq!(
+        node_texts(&s),
+        vec!["Ingest Gateway", "Ledger Store", "Queue", "Report Builder"]
+    );
+    let http = s.edges.iter().find(|e| e.label == "HTTP").unwrap();
+    assert!(http.in_final, "{http:?}");
+    assert!(http.lifetimes.iter().all(|l| l.removed_at_s.is_none()));
+}
+
+#[test]
+fn a_view_that_read_nothing_known_near_the_place_is_not_a_removal() {
+    // Keyframes 6 to 8 keep the whole board in view but read only its left part:
+    // "Ledger Store" and everything established near it are missing. Its place is
+    // in the view, yet nothing confirms the reader looked there.
+    let mut specs: Vec<Spec> = (0..9)
+        .map(|_| Spec {
+            ink: Some(0.01),
+            ..base()
+        })
+        .collect();
+    for s in specs.iter_mut().skip(6) {
+        s.nodes.retain(|n| n.0 != "n3");
+        s.edges.retain(|e| e.1 != "n3");
+        s.stickies
+            .retain(|x| x.0 != "Is the queue durable?" && x.0 != "Beta milestone in March");
+    }
+    let mut fr = frames(&specs);
+    for f in fr.iter_mut().skip(6) {
+        f.board.other_visible_text.clear();
+    }
+    let s = run(fr, &params());
+    let ledger = s.nodes.iter().find(|n| n.text == "Ledger Store").unwrap();
+    assert!(ledger.in_final, "{ledger:?}");
+    assert!(ledger.lifetimes.iter().all(|l| l.removed_at_s.is_none()));
+    let grpc = s.edges.iter().find(|e| e.label == "gRPC").unwrap();
+    assert!(grpc.in_final, "{grpc:?}");
+}
+
+#[test]
+fn ocr_text_at_the_place_means_the_reader_missed_it() {
+    // The reader drops "Report Builder" from keyframes 6 to 8, but OCR still reads
+    // its words at its place: that is a reading omission, not an erasure.
+    let mut specs: Vec<Spec> = (0..9)
+        .map(|_| Spec {
+            ink: Some(0.01),
+            ..base()
+        })
+        .collect();
+    for s in specs.iter_mut().skip(6) {
+        s.nodes.retain(|n| n.0 != "n4");
+        s.edges.retain(|e| e.1 != "n4");
+    }
+    let without_ocr = run(frames(&specs), &params());
+    let rb = without_ocr
+        .nodes
+        .iter()
+        .find(|n| n.text == "Report Builder")
+        .unwrap();
+    assert!(
+        !rb.in_final,
+        "absent while its neighbors are read: removed ({rb:?})"
+    );
+
+    let mut fr = frames(&specs);
+    for f in fr.iter_mut().skip(6) {
+        f.ocr_anchors = vec![
+            TextAnchor {
+                text: "Report".into(),
+                bbox: BBox::new(640.0, 635.0, 700.0, 655.0),
+            },
+            TextAnchor {
+                text: "Builder".into(),
+                bbox: BBox::new(705.0, 635.0, 765.0, 655.0),
+            },
+        ];
+    }
+    let s = run(fr, &params());
+    let rb = s.nodes.iter().find(|n| n.text == "Report Builder").unwrap();
+    assert!(rb.in_final, "{rb:?}");
+    assert!(rb.lifetimes.iter().all(|l| l.removed_at_s.is_none()));
+}

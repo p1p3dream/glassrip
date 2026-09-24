@@ -11,8 +11,15 @@
 //!    stickies, other text and edge labels share one pool, so an element read in
 //!    different lists in different keyframes is one track whose kind is the majority
 //!    list. Illegible or elided texts are not tracked.
-//! 3. Lifetimes and support ([`tracks::intervals`]); the final state is what is alive
-//!    in the last stable board window.
+//! 3. Lifetimes and support ([`tracks::intervals`]). The final state is what was
+//!    observed and not later removed: an element is final when its last supported
+//!    interval was never ended by a removal. Removal needs evidence: consecutive
+//!    later keyframes that cover the element's region and lack it. A keyframe covers
+//!    the region when the region lies inside its registered view, OCR read none of
+//!    the element's text there, and the keyframe read another established element
+//!    near that place, which confirms the registration there. Absence outside the
+//!    view, or in a view with nothing known read near the place, is not removal. An element never placed on the board (text-only registration) seen
+//!    in a single keyframe cannot be checked against later views and is not final.
 //! 4. Edges are keyed by their two node tracks; an endpoint that is not a supported
 //!    node drops the edge (nodes are never created from endpoints). Directions come
 //!    from the weighted vote over `glassrip.edge_direction` evidence.
@@ -147,8 +154,17 @@ pub struct ConsolidationParams {
     /// board states. Not a spec number; tune per corpus.
     pub final_window_s: f64,
     /// The final window holds at least this many board keyframes when that many exist
-    /// (it is extended backward otherwise).
+    /// (it is extended backward otherwise). The window only dates the final state
+    /// (`t_end_s`, "final board state at"); membership is "observed and not removed".
     pub min_final_keyframes: usize,
+    /// A keyframe that lacks an element evidences its removal only when it read
+    /// another established element (seen in at least two keyframes) within this
+    /// share of the reference diagonal of the element's center: nothing known read
+    /// near the place means the view did not really cover it, or was registered
+    /// wrongly there. A quarter of the diagonal reaches the neighbors of a box on a
+    /// sparse board.
+    #[serde(default = "default_coverage_radius_share")]
+    pub coverage_radius_share: f64,
     /// Reading confidence (element and board) a single sighting needs, together with
     /// the pixel check, to be kept.
     pub single_sighting_min_conf: f64,
@@ -191,6 +207,7 @@ impl Default for ConsolidationParams {
             removal_absent_keyframes: 2,
             final_window_s: 120.0,
             min_final_keyframes: 3,
+            coverage_radius_share: default_coverage_radius_share(),
             single_sighting_min_conf: 0.8,
             title_band_share: default_title_band_share(),
             min_group_cards: default_min_group_cards(),
@@ -202,6 +219,10 @@ impl Default for ConsolidationParams {
             backfill_untargeted_owners: false,
         }
     }
+}
+
+fn default_coverage_radius_share() -> f64 {
+    0.25
 }
 
 fn default_title_band_share() -> f64 {
@@ -856,6 +877,71 @@ pub fn consolidate(
             Visibility::Unknown
         }
     };
+    // Coverage evidence per positioned keyframe, in its cluster's reference frame:
+    // the centers of the established elements it read (tracks seen in at least two
+    // keyframes, matched there by text and position, so the keyframe's registration
+    // agrees with theirs around that place), and the OCR anchors with their
+    // normalized text. Anchors never corroborate coverage on their own: a wrongly
+    // registered view carries its anchors along with it.
+    let mut content: Vec<Vec<(f64, f64)>> = vec![Vec::new(); n];
+    for t in &tracks {
+        if t.frames().len() < 2 {
+            continue;
+        }
+        for o in &t.obs {
+            if let Some(b) = o.bbox {
+                content[o.frame].push(((b.x1 + b.x2) / 2.0, (b.y1 + b.y2) / 2.0));
+            }
+        }
+    }
+    let ocr_ref: Vec<Vec<(String, BBox)>> = (0..n)
+        .map(|f| {
+            if !positioned(f) {
+                return Vec::new();
+            }
+            frames[f]
+                .ocr_anchors
+                .iter()
+                .map(|a| (normalize(&a.text), map_bbox(&regs[f].to_reference, &a.bbox)))
+                .filter(|(t, _)| t.chars().filter(|c| c.is_alphanumeric()).count() >= 3)
+                .collect()
+        })
+        .collect();
+    let coverage_radius = params.coverage_radius_share * ref_diag;
+    // `Visible` only when keyframe `f` really covers the track's place: inside the
+    // view (`track_visible`), no OCR text of the track there, and other content near.
+    let track_covered = |t: &Track, f: usize| -> Visibility {
+        if track_visible(t, f) != Visibility::Visible {
+            return Visibility::Unknown;
+        }
+        let Some(b) = t.bbox_in(regs[f].cluster) else {
+            return Visibility::Unknown;
+        };
+        let text = normalize(&t.text());
+        let (bw, bh) = (b.width() * 0.5, b.height() * 0.5);
+        let near_box = BBox::new(b.x1 - bw, b.y1 - bh, b.x2 + bw, b.y2 + bh);
+        let ocr_saw_it = ocr_ref[f].iter().any(|(a, ab)| {
+            let c = ((ab.x1 + ab.x2) / 2.0, (ab.y1 + ab.y2) / 2.0);
+            c.0 >= near_box.x1
+                && c.0 <= near_box.x2
+                && c.1 >= near_box.y1
+                && c.1 <= near_box.y2
+                && (text.contains(a.as_str()) || a.contains(text.as_str()))
+        });
+        if ocr_saw_it {
+            return Visibility::Unknown;
+        }
+        let c = ((b.x1 + b.x2) / 2.0, (b.y1 + b.y2) / 2.0);
+        let corroborated = coverage_radius.is_finite()
+            && content[f]
+                .iter()
+                .any(|p| ((p.0 - c.0).powi(2) + (p.1 - c.1).powi(2)).sqrt() <= coverage_radius);
+        if corroborated {
+            Visibility::Visible
+        } else {
+            Visibility::Unknown
+        }
+    };
     let support = SupportParams {
         min_keyframes: params.min_support_keyframes,
         min_density: params.min_support_density,
@@ -871,7 +957,7 @@ pub fn consolidate(
                     if seen.binary_search(&f).is_ok() {
                         Visibility::Unknown
                     } else {
-                        track_visible(t, f)
+                        track_covered(t, f)
                     }
                 },
                 n,
@@ -894,7 +980,8 @@ pub fn consolidate(
         .collect();
 
     // Final window: the last contiguous run of board keyframes, trimmed to
-    // `final_window_s` before its end.
+    // `final_window_s` before its end. It dates the final state; which elements
+    // belong to it is decided by removal evidence, not by this window.
     let final_frames: Vec<usize> = if n == 0 {
         Vec::new()
     } else {
@@ -929,14 +1016,12 @@ pub fn consolidate(
         keyframes: iv.count as u32,
         removed_at_s: iv.removed_at.map(|f| frames[f].t_start_s),
     };
-    let alive_in_final = |ivs: &[Interval]| -> bool {
-        let Some(w) = &window else {
-            return false;
-        };
-        ivs.iter().any(|iv| {
-            iv.removed_at.is_none()
-                && frames[iv.first].t_start_s <= w.end_s
-                && frames[iv.last].t_end_s >= w.start_s
+    // Final: observed and not later removed (see the module docs). A single
+    // sighting that was never placed on the board cannot be checked against later
+    // views, so it is not final.
+    let alive_in_final = |ivs: &[Interval], placed: bool| -> bool {
+        ivs.last().is_some_and(|iv| {
+            iv.removed_at.is_none() && (placed || iv.count >= params.min_support_keyframes)
         })
     };
     let largest_cluster = {
@@ -984,7 +1069,7 @@ pub fn consolidate(
                     variant_counts,
                     last_seen_s: lifetimes.iter().map(|l| l.last_seen_s).reduce(f64::max),
                     lifetimes,
-                    in_final: alive_in_final(ivs),
+                    in_final: alive_in_final(ivs, t.obs.iter().any(|o| o.bbox.is_some())),
                     registration: if t.obs.iter().any(|o| o.bbox.is_some()) {
                         ElementRegistration::Position
                     } else {
@@ -1012,7 +1097,7 @@ pub fn consolidate(
                     bbox: largest_cluster.and_then(|c| t.bbox_in(c)),
                     last_seen,
                     lifetimes,
-                    in_final: alive_in_final(ivs),
+                    in_final: alive_in_final(ivs, t.obs.iter().any(|o| o.bbox.is_some())),
                 });
             }
             ObsList::Other | ObsList::EdgeLabel => {}
@@ -1111,12 +1196,16 @@ pub fn consolidate(
         let (ta, tb) = (&tracks[a], &tracks[b]);
         let ivs = intervals(
             &seen,
+            // An edge is absent from a keyframe that read both of its ends (or
+            // covers both places) without reading the edge.
             |f| {
+                let present = |t: &Track| {
+                    t.obs.iter().any(|o| o.frame == f && o.bbox.is_some())
+                        || track_covered(t, f) == Visibility::Visible
+                };
                 if seen.contains(&f) {
                     Visibility::Unknown
-                } else if track_visible(ta, f) == Visibility::Visible
-                    && track_visible(tb, f) == Visibility::Visible
-                {
+                } else if present(ta) && present(tb) {
                     Visibility::Visible
                 } else {
                     Visibility::Unknown
@@ -1205,7 +1294,7 @@ pub fn consolidate(
                 EdgeStyle::Solid
             },
             lifetimes: ivs.iter().map(lifetime).collect(),
-            in_final: alive_in_final(&ivs) && final_node(a) && final_node(b),
+            in_final: alive_in_final(&ivs, true) && final_node(a) && final_node(b),
         });
     }
 

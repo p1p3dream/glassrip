@@ -746,7 +746,8 @@ impl Stage for BoardStateStage {
         "board_state"
     }
     fn version(&self) -> u32 {
-        2
+        // 3: final state is "observed and not later removed", with coverage evidence.
+        3
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
