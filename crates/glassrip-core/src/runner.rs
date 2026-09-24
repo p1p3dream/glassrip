@@ -1020,14 +1020,20 @@ impl Runner {
             .filter(|r| ids.contains(&r.id))
             .map(|r| (r.id.clone(), r))
             .collect();
+        // A terminal failure is the item's deterministic answer (see
+        // `ErrorInfo::terminal`): resume keeps it like a result. A forced stage
+        // removed its partial output above, so it retries everything.
+        let settled = |r: &Record<S::Output>| {
+            !r.outcome.is_error() || r.outcome.error.as_ref().is_some_and(|e| e.terminal)
+        };
         let todo: Vec<WorkItem<S::Work>> = work
             .into_iter()
-            .filter(|w| done.get(&w.id).is_none_or(|r| r.outcome.is_error()))
+            .filter(|w| done.get(&w.id).is_none_or(|r| !settled(r)))
             .collect();
         info!(
             stage = name,
             planned = order.len(),
-            resumed = done.values().filter(|r| !r.outcome.is_error()).count(),
+            resumed = done.values().filter(|r| settled(r)).count(),
             to_process = todo.len(),
             "processing items"
         );
@@ -1124,9 +1130,23 @@ impl Runner {
             &items,
         )?;
         header.content_hash = Some(hash.clone());
+        let retryable = items
+            .iter()
+            .filter(|r| r.outcome.error.as_ref().is_some_and(|e| !e.terminal))
+            .count();
         jsonl::write_atomic(&out_path, &header, &items)?;
         drop(writer);
-        if counts.error == 0 {
+        if retryable == 0 {
+            // Terminal failures are cached with the results: the cache key holds
+            // everything that determines them (inputs, params, model digest), so a
+            // rerun restores them instead of asking again. `--force-stage` retries.
+            if counts.error > 0 {
+                info!(
+                    stage = name,
+                    errors = counts.error,
+                    "caching output with terminal item failures; --force-stage retries them"
+                );
+            }
             // A cache that cannot be written (read-only, full) costs a future
             // recompute, not this run.
             if let Err(e) = self.cache.put_file(name, &key, OUTPUT_EXT, &out_path) {
@@ -1137,7 +1157,8 @@ impl Runner {
             info!(
                 stage = name,
                 errors = counts.error,
-                "not caching output with failed items; rerun retries them"
+                retryable,
+                "not caching output with retryable failed items; rerun retries them"
             );
         }
         let hash_text = hash.clone();
@@ -1186,6 +1207,8 @@ mod tests {
     #[derive(Default)]
     struct Behavior {
         fail: HashSet<usize>,
+        /// Failing items whose failure is terminal (deterministic).
+        terminal: HashSet<usize>,
         slow: HashSet<usize>,
         cancel_at: Option<(usize, CancellationToken)>,
         offset: u64,
@@ -1253,14 +1276,20 @@ mod tests {
         }
         async fn process(&self, ctx: &ItemContext, i: usize) -> Result<u64, ErrorInfo> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let (fail, slow, cancel, offset) = {
+            let (fail, terminal, slow, cancel, offset) = {
                 let b = self.behavior.lock().unwrap();
                 let cancel = b
                     .cancel_at
                     .as_ref()
                     .filter(|(at, _)| *at == i)
                     .map(|(_, t)| t.clone());
-                (b.fail.contains(&i), b.slow.contains(&i), cancel, b.offset)
+                (
+                    b.fail.contains(&i),
+                    b.terminal.contains(&i),
+                    b.slow.contains(&i),
+                    cancel,
+                    b.offset,
+                )
             };
             if i == 0 {
                 ctx.record_command(
@@ -1281,10 +1310,8 @@ mod tests {
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
             if fail {
-                return Err(ErrorInfo::new(
-                    ErrorCode::Validation,
-                    format!("synthetic failure {i}"),
-                ));
+                let e = ErrorInfo::new(ErrorCode::Validation, format!("synthetic failure {i}"));
+                return Err(if terminal { e.terminal() } else { e });
             }
             Ok(i as u64 * 10 + offset)
         }
@@ -1686,6 +1713,112 @@ mod tests {
         );
         assert_eq!(source.calls(), 11);
         assert_eq!(env.cache.ls().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_failures_are_cached_and_restored_unless_forced() {
+        let env = env();
+        let source = SourceStage::new(10);
+        {
+            let mut b = source.behavior.lock().unwrap();
+            b.fail = [4].into();
+            b.terminal = [4].into();
+        }
+        let mut r = runner(&env, "run-a", &Selection::default());
+        let rep = r.run_stage(&source).await.unwrap();
+        assert_eq!((rep.status, rep.items_error), (StageStatus::Ok, 1));
+        drop(r);
+        assert_eq!(
+            env.cache.ls().unwrap().len(),
+            1,
+            "an output whose only failures are terminal is cached"
+        );
+
+        // A rerun (same or another run directory) restores the failure record
+        // instead of asking again, even though the item would now succeed.
+        source.behavior.lock().unwrap().fail.clear();
+        for run in ["run-a", "run-b"] {
+            let mut r = runner(&env, run, &Selection::default());
+            let rep = r.run_stage(&source).await.unwrap();
+            assert_eq!(
+                (rep.status, rep.items_ok, rep.items_error),
+                (StageStatus::Cached, 9, 1),
+                "{run}"
+            );
+            let items = jsonl::read::<Record<u64>>(
+                &r.run_dir().artifact_path(SOURCE),
+                &SchemaReq::new(SOURCE, 1),
+            )
+            .unwrap()
+            .items;
+            let failed = items.iter().find(|x| x.id == "item-004").unwrap();
+            assert!(failed.outcome.error.as_ref().is_some_and(|e| e.terminal));
+        }
+        assert_eq!(source.calls(), 10);
+
+        // --force-stage retries it.
+        let sel = Selection {
+            force: ["source".to_string()].into(),
+            ..Default::default()
+        };
+        let mut r = runner(&env, "run-c", &sel);
+        let rep = r.run_stage(&source).await.unwrap();
+        assert_eq!(
+            (
+                rep.status,
+                rep.items_ok,
+                rep.items_error,
+                rep.items_processed
+            ),
+            (StageStatus::Ok, 10, 0, 10)
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_keeps_terminal_failures_and_retries_the_rest() {
+        let env = env();
+        let source = SourceStage::new(20);
+        {
+            let mut b = source.behavior.lock().unwrap();
+            b.fail = [3, 4].into();
+            b.terminal = [4].into();
+        }
+        let mut r = runner(&env, "run-a", &Selection::default());
+        let rep = r.run_stage(&source).await.unwrap();
+        assert_eq!(rep.items_error, 2);
+        drop(r);
+        assert!(
+            env.cache.ls().unwrap().is_empty(),
+            "a retryable failure keeps the output out of the cache"
+        );
+
+        source.behavior.lock().unwrap().fail.clear();
+        let mut r = runner(&env, "run-a", &Selection::default());
+        let rep = r.run_stage(&source).await.unwrap();
+        assert_eq!(
+            (rep.items_ok, rep.items_error, rep.items_processed),
+            (19, 1, 1),
+            "only the retryable failure is processed again"
+        );
+        assert_eq!(source.calls(), 21);
+        assert_eq!(env.cache.ls().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cancellation_and_timeouts_are_never_terminal() {
+        assert!(
+            ErrorInfo::new(ErrorCode::ModelRequest, "x")
+                .terminal()
+                .terminal
+        );
+        assert!(!ErrorInfo::new(ErrorCode::Timeout, "x").terminal().terminal);
+        assert!(
+            !ErrorInfo::new(ErrorCode::Cancelled, "x")
+                .terminal()
+                .terminal
+        );
+        let json = serde_json::to_value(ErrorInfo::new(ErrorCode::Io, "x")).unwrap();
+        assert!(json.get("terminal").is_none(), "absent when false: {json}");
     }
 
     #[tokio::test]

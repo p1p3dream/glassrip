@@ -372,6 +372,14 @@ pub struct ErrorInfo {
     /// Raw text involved in the failure (model reply, stderr tail), if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_text: Option<String>,
+    /// The failure is a deterministic answer to the item's inputs (for example a
+    /// model reply that loops or overflows at temperature 0 with a fixed seed, after
+    /// every retry): running the item again with the same cache key would fail the
+    /// same way. The runner caches terminal failures like results and does not
+    /// retry them on resume; `--force-stage` retries them. Timeouts, cancellations,
+    /// and connection errors are never terminal.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub terminal: bool,
 }
 
 impl ErrorInfo {
@@ -381,12 +389,20 @@ impl ErrorInfo {
             code,
             message: message.into(),
             raw_text: None,
+            terminal: false,
         }
     }
 
     /// Adds raw text.
     pub fn with_raw_text(mut self, raw: impl Into<String>) -> Self {
         self.raw_text = Some(raw.into());
+        self
+    }
+
+    /// Marks the failure terminal (see [`ErrorInfo::terminal`]). Cancellation and
+    /// timeouts stay retryable whatever the caller says.
+    pub fn terminal(mut self) -> Self {
+        self.terminal = !matches!(self.code, ErrorCode::Cancelled | ErrorCode::Timeout);
         self
     }
 }
