@@ -13,7 +13,7 @@
 //! | `glassrip.keyframes` | [`KeyframeItem`] | `keyframe_id`, `t_start_s`, `t_end_s`, `t_rep_s` |
 //! | `glassrip.screen_class` | [`ScreenClassItem`] | `keyframe_id`, `screen_type` (snake_case enum of 6.7) |
 //! | `glassrip.board_reading` | [`BoardReadingItem`] | `keyframe_id`, `status`, `result.{nodes[local_id,text], edges[src,dst,label,style,direction], stickies[text], owner_tags[name_raw,person_id], other_visible_text[text]}` |
-//! | `glassrip.board_state` | [`BoardStateItem`] (one item per board id) | `nodes[{node_id,text,variants,in_final_state}]`, `edges[{src,dst,label,style,direction}]` (node ids), `stickies[{text,kind,in_final_state}]`, `owner_assignments[{person_id,name_raw,target{kind:node,node_id}|{kind:edge,src,dst},valid_from_s,valid_to_s}]`, `events[{event_id,kind,t_s}]` |
+//! | `glassrip.board_state` | [`BoardStateItem`] (one item per board id or per stable window) | `final`, `t_end_s`, `nodes[{node_id,text,variants,in_final_state,last_seen_s}]`, `edges[{src,dst,label,style,direction}]` (node ids), `stickies[{text,kind,in_final_state}]`, `owner_assignments[{person_id,name_raw,target{kind:node,node_id}|{kind:edge,src,dst},valid_from_s,valid_to_s}]`, `events[{event_id,kind,t_s}]` |
 //! | `glassrip.transcript` | [`TranscriptItem`] | `segment_id`, `start_s`, `end_s`, `speaker_label`, `text`, `words[{w,start_s}]` |
 //! | `glassrip.meeting_notes` | [`NotesItem`] (first item) | `status`, `decisions[text]`, `action_items[person_id,task]`, `open_questions[text]`, `caveats` |
 //! | `glassrip.documents` | [`crate::metrics::docs::PredDocument`] | `page_id`, `type`, `title`, `fields` (ticket), `blocks`, `provenance[{field,source,model_only}]`, `completeness.coverage` |
@@ -23,6 +23,13 @@
 //!   same item; `direction` is `forward` (src is the tail), `uncertain`, or
 //!   `bidirectional`.
 //! - A node or sticky is in the final board unless `in_final_state` is false.
+//! - The final board is the item flagged `final: true` (the last stable board
+//!   window); with several flagged items, the latest by `t_end_s`. Without any
+//!   flag, the latest item by time (`t_end_s`, else its latest node, owner, or
+//!   event time; ties go to the later item in the file). See
+//!   [`select_final_state`]. Eval never picks an item by comparing it to gold.
+//! - Owner assignments and events are timed, so owner and event metrics use
+//!   the assignments and events of every item, not only the final one.
 //! - `glassrip.meeting_notes` has one item holding the whole notes object, with
 //!   `status: degraded` when the minimum-output alarm fires (6.14).
 //! - `glassrip.documents` provenance is flattened to one entry per field path
@@ -167,6 +174,9 @@ pub struct StateNode {
     /// Alive in the final board.
     #[serde(default = "yes")]
     pub in_final_state: bool,
+    /// Last time the node was seen, seconds.
+    #[serde(default)]
+    pub last_seen_s: Option<f64>,
 }
 
 fn yes() -> bool {
@@ -240,6 +250,11 @@ pub struct StateEvent {
 pub struct BoardStateItem {
     /// Board id.
     pub board_id: String,
+    /// True for the final board state (last stable board window).
+    #[serde(rename = "final")]
+    pub is_final: Option<bool>,
+    /// End of the window this state describes, seconds.
+    pub t_end_s: Option<f64>,
     /// Nodes.
     pub nodes: Vec<StateNode>,
     /// Edges between node ids.
@@ -250,6 +265,46 @@ pub struct BoardStateItem {
     pub owner_assignments: Vec<StateOwner>,
     /// Events.
     pub events: Vec<StateEvent>,
+}
+
+impl BoardStateItem {
+    /// Time of the state: `t_end_s`, else its latest node, owner, or event time.
+    pub fn time_s(&self) -> Option<f64> {
+        self.t_end_s.or_else(|| {
+            self.nodes
+                .iter()
+                .filter_map(|n| n.last_seen_s)
+                .chain(self.owner_assignments.iter().map(|o| o.valid_from_s))
+                .chain(self.events.iter().map(|e| e.t_s))
+                .reduce(f64::max)
+        })
+    }
+}
+
+/// Index of the pipeline's final board state (see the module docs): the latest
+/// item flagged `final`, else the latest item by time; ties go to the later item.
+pub fn select_final_state(items: &[BoardStateItem]) -> Option<usize> {
+    let flagged: Vec<usize> = (0..items.len())
+        .filter(|&i| items[i].is_final == Some(true))
+        .collect();
+    let pool: Vec<usize> = if flagged.is_empty() {
+        (0..items.len()).collect()
+    } else {
+        flagged
+    };
+    pool.into_iter().reduce(|best, i| {
+        let (tb, ti) = (items[best].time_s(), items[i].time_s());
+        let later = match (tb, ti) {
+            (Some(b), Some(t)) => t >= b,
+            (None, _) => true,
+            (Some(_), None) => false,
+        };
+        if later {
+            i
+        } else {
+            best
+        }
+    })
 }
 
 /// Word with timing.
@@ -482,6 +537,30 @@ mod tests {
         let p = dir.path().join("k.json");
         fs_err::write(&p, env.to_string()).unwrap();
         assert!(load_items::<KeyframeItem>(&p, schema::KEYFRAMES).is_err());
+    }
+
+    fn state(v: Value) -> BoardStateItem {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn final_state_selection() {
+        let a = state(json!({"board_id": "a", "t_end_s": 100.0}));
+        let b = state(json!({"board_id": "b", "t_end_s": 50.0, "final": true}));
+        let c = state(json!({"board_id": "c", "t_end_s": 300.0, "final": false}));
+        // A flagged item wins over later unflagged ones.
+        assert_eq!(
+            select_final_state(&[a.clone(), b.clone(), c.clone()]),
+            Some(1)
+        );
+        // Without flags, the latest by time.
+        let a2 = state(json!({"board_id": "a", "events": [{"kind": "node_added", "t_s": 400.0}]}));
+        assert_eq!(select_final_state(&[a2.clone(), c.clone()]), Some(0));
+        // Without any time, the last item in the file.
+        let n1 = state(json!({"board_id": "x"}));
+        let n2 = state(json!({"board_id": "y"}));
+        assert_eq!(select_final_state(&[n1, n2]), Some(1));
+        assert_eq!(select_final_state(&[]), None);
     }
 
     #[test]

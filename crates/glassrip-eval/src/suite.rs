@@ -383,17 +383,21 @@ pub fn summarize_board_results(results: &[BoardCaseResult], run: &mut SuiteRun) 
 pub fn load_prediction(path: &Path, page_id: &str) -> Result<PredDocument> {
     let text = crate::error::read_to_string(path)?;
     let v: Value = serde_json::from_str(&text).map_err(|e| EvalError::json(path, e))?;
-    let raw = if v.get("schema").is_some() {
-        let items: Vec<Value> = views::load_items(path, views::schema::DOCUMENTS)?;
-        items
-            .iter()
-            .find(|i| i.get("page_id").and_then(Value::as_str) == Some(page_id))
-            .or_else(|| items.first())
-            .cloned()
-            .ok_or_else(|| EvalError::json(path, "no documents in artifact"))?
+    let items: Vec<Value> = if v.get("schema").is_some() {
+        views::load_items(path, views::schema::DOCUMENTS)?
     } else {
-        v
+        vec![v]
     };
+    let raw = items
+        .into_iter()
+        .find(|i| i.get("page_id").and_then(Value::as_str) == Some(page_id))
+        .ok_or_else(|| EvalError::Fixture {
+            case: page_id.to_string(),
+            message: format!(
+                "{} has no document with page_id `{page_id}`",
+                path.display()
+            ),
+        })?;
     serde_json::from_value(normalize_document(raw)).map_err(|e| EvalError::json(path, e))
 }
 
@@ -674,18 +678,25 @@ pub fn run_meeting(
     let mut chrome = golden.chrome_terms.clone();
     chrome.extend(golden.owners.negatives.iter().cloned());
     if let Some(states) = &state_items {
-        let best = states.iter().max_by_key(|b| {
-            crate::metrics::board::match_nodes(&gold_board.nodes, &state_to_pred(b).nodes).len()
-        });
-        if let Some(state) = best {
+        // The final board is the pipeline's own final state, never a gold-selected one.
+        if let Some(state) = views::select_final_state(states).map(|i| &states[i]) {
             let pred = state_to_pred(state);
             let score = score_board(&gold_board, &pred, &golden.chrome_terms);
             put_board(m, &score);
             m.remove("board.owner.accuracy");
             m.remove("board.owner.fp");
             details.insert("board_chrome_hits".into(), json!(score.chrome_hits));
+            details.insert("final_board_id".into(), json!(state.board_id));
+        }
 
-            let resolver = NodeResolver::text_only(&golden.final_board.nodes);
+        // Owners and events are timed: use every state item, each resolved
+        // through its own node ids.
+        let resolver = NodeResolver::text_only(&golden.final_board.nodes);
+        let mut pred_assign = Vec::new();
+        let mut unresolved = 0usize;
+        let mut negatives = 0usize;
+        let mut events: Vec<PredEvent> = Vec::new();
+        for state in states {
             let text_of: BTreeMap<&str, &str> = state
                 .nodes
                 .iter()
@@ -693,9 +704,6 @@ pub fn run_meeting(
                 .collect();
             let gold_id =
                 |node_id: &str| resolver.resolve(text_of.get(node_id).copied().unwrap_or(node_id));
-            let mut pred_assign = Vec::new();
-            let mut unresolved = 0usize;
-            let mut negatives = 0usize;
             for o in &state.owner_assignments {
                 let raw = o.person_id.clone().unwrap_or_else(|| o.name_raw.clone());
                 if golden.owners.negatives.iter().any(|n| {
@@ -727,43 +735,55 @@ pub fn run_meeting(
                     _ => unresolved += 1,
                 }
             }
-            let joined = |t: f64| {
-                kspans
-                    .as_ref()
-                    .is_none_or(|ks| join_time(t, ks, tolerance_s).is_some())
-            };
-            let attr = owner_attribution(
-                &golden.owners.assignments,
-                &pred_assign,
-                &golden.owners.probes_s,
-                joined,
-            );
-            put_tally(m, "owners.attribution", attr.tally);
-            m.insert("owners.extra".into(), attr.extra as f64);
-            m.insert("owners.unresolved".into(), unresolved as f64);
-            m.insert("owners.negative_hits".into(), negatives as f64);
-            let moves = owner_move_errors(&golden.owners.moves, &pred_assign, tolerance_s);
-            let missed = moves.iter().filter(|r| r.error_s.is_none()).count();
-            m.insert("owners.moves_missed".into(), missed as f64);
-            if let Some(max) = moves.iter().filter_map(|r| r.error_s).reduce(f64::max) {
-                m.insert("owners.move_error_max_s".into(), max);
-            }
-            details.insert("owner_probes".into(), json!(attr.probes));
-            details.insert("owner_moves".into(), json!(moves));
-
-            let events: Vec<PredEvent> = state
-                .events
-                .iter()
-                .map(|e| PredEvent {
-                    kind: e.kind.clone(),
-                    t_s: e.t_s,
-                })
-                .collect();
-            let (n, offenders) =
-                false_change_events(&golden.static_windows, &events, EVENT_TOLERANCE_S);
-            m.insert("events.false_change".into(), n as f64);
-            details.insert("false_change_events".into(), json!(offenders));
+            events.extend(state.events.iter().map(|e| PredEvent {
+                kind: e.kind.clone(),
+                t_s: e.t_s,
+            }));
         }
+        // The same timed assignment or event repeated in several state items counts once.
+        let mut seen = std::collections::BTreeSet::new();
+        pred_assign.retain(|a| {
+            seen.insert(format!(
+                "{}|{:?}|{}|{:?}",
+                a.person_id, a.target, a.valid_from_s, a.valid_to_s
+            ))
+        });
+        let mut seen = std::collections::BTreeSet::new();
+        events.retain(|e| {
+            seen.insert(format!(
+                "{}|{}",
+                crate::metrics::events::kind_key(&e.kind),
+                e.t_s
+            ))
+        });
+        let joined = |t: f64| {
+            kspans
+                .as_ref()
+                .is_none_or(|ks| join_time(t, ks, tolerance_s).is_some())
+        };
+        let attr = owner_attribution(
+            &golden.owners.assignments,
+            &pred_assign,
+            &golden.owners.probes_s,
+            joined,
+        );
+        put_tally(m, "owners.attribution", attr.tally);
+        m.insert("owners.extra".into(), attr.extra as f64);
+        m.insert("owners.unresolved".into(), unresolved as f64);
+        m.insert("owners.negative_hits".into(), negatives as f64);
+        let moves = owner_move_errors(&golden.owners.moves, &pred_assign, tolerance_s);
+        let missed = moves.iter().filter(|r| r.error_s.is_none()).count();
+        m.insert("owners.moves_missed".into(), missed as f64);
+        if let Some(max) = moves.iter().filter_map(|r| r.error_s).reduce(f64::max) {
+            m.insert("owners.move_error_max_s".into(), max);
+        }
+        details.insert("owner_probes".into(), json!(attr.probes));
+        details.insert("owner_moves".into(), json!(moves));
+
+        let (n, offenders) =
+            false_change_events(&golden.static_windows, &events, EVENT_TOLERANCE_S);
+        m.insert("events.false_change".into(), n as f64);
+        details.insert("false_change_events".into(), json!(offenders));
     } else {
         run.not_run
             .push("board, owner, and event metrics: glassrip.board_state missing".into());
@@ -931,6 +951,33 @@ mod tests {
         let s = score_board(&gold, &p, &[]);
         assert_eq!(s.edges.tp, 1);
         assert_eq!(s.edge_direction.correct, 1);
+    }
+
+    #[test]
+    fn prediction_page_id_must_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = dir.path().join("bare.json");
+        fs_err::write(
+            &bare,
+            json!({"page_id": "other", "type": "doc"}).to_string(),
+        )
+        .unwrap();
+        assert!(load_prediction(&bare, "wanted").is_err());
+        assert!(load_prediction(&bare, "other").is_ok());
+        let env = dir.path().join("env.json");
+        let doc = json!({
+            "schema": "glassrip.documents", "schema_version": "1.0.0", "run_id": "r",
+            "producer": {"tool": "glassrip", "version": "0", "git_sha": null},
+            "inputs": [], "params": {},
+            "items": [{"page_id": "first", "type": "doc"}, {"page_id": "second", "type": "doc"}]
+        });
+        fs_err::write(&env, doc.to_string()).unwrap();
+        assert_eq!(
+            load_prediction(&env, "second").unwrap().doc.page_id,
+            "second"
+        );
+        // No fallback to the first document.
+        assert!(load_prediction(&env, "third").is_err());
     }
 
     #[test]

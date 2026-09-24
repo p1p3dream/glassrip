@@ -212,3 +212,81 @@ fn degraded_notes_fail_the_gate_and_missing_artifacts_are_reported() {
     assert_eq!(run.gate_failures.len(), 1);
     assert_eq!(run.not_run.len(), 3);
 }
+
+fn board_state(items: Value) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "board_state.json",
+        envelope("glassrip.board_state", items),
+    );
+    dir
+}
+
+fn board_metrics(items: Value) -> glassrip_eval::suite::Metrics {
+    let dir = board_state(items);
+    run_meeting(&golden(), &RunArtifacts::scan(dir.path()).unwrap(), 2.0)
+        .unwrap()
+        .metrics
+}
+
+#[test]
+fn noisy_extra_state_cannot_improve_the_score() {
+    // The pipeline's final state reads only one of the two gold nodes.
+    let final_state = json!({
+        "board_id": "b1", "final": true, "t_end_s": 50.0,
+        "nodes": [{"node_id": "n1", "text": "Ledger API"}, {"node_id": "n9", "text": "Noise"}]
+    });
+    // A non-final state that happens to match gold perfectly.
+    let perfect = json!({
+        "board_id": "b2", "final": false, "t_end_s": 60.0,
+        "nodes": [{"node_id": "n1", "text": "Ledger API"}, {"node_id": "n2", "text": "Orbit Queue"}],
+        "edges": [{"src": "n1", "dst": "n2", "label": "REST"}],
+        "stickies": [{"text": "Who owns retries?"}]
+    });
+    let alone = board_metrics(json!([final_state.clone()]));
+    let with_noise = board_metrics(json!([perfect.clone(), final_state.clone()]));
+    for k in [
+        "board.node.f1",
+        "board.node.recall",
+        "board.node.precision",
+        "board.edge.f1",
+        "board.sticky.f1",
+    ] {
+        assert_eq!(alone[k], with_noise[k], "{k}");
+    }
+    assert_eq!(with_noise["board.node.recall"], 0.5);
+
+    // Without flags, the latest state by time is final: the earlier perfect state is ignored.
+    let early_perfect = json!({
+        "board_id": "b2", "t_end_s": 10.0,
+        "nodes": [{"node_id": "n1", "text": "Ledger API"}, {"node_id": "n2", "text": "Orbit Queue"}]
+    });
+    let late_partial = json!({
+        "board_id": "b1", "t_end_s": 50.0,
+        "nodes": [{"node_id": "n1", "text": "Ledger API"}]
+    });
+    let m = board_metrics(json!([late_partial, early_perfect]));
+    assert_eq!(m["board.node.recall"], 0.5);
+}
+
+#[test]
+fn owners_and_events_use_every_state_once() {
+    // Owner timing lives in a non-final state; the same event appears in both.
+    let early = json!({
+        "board_id": "w1", "t_end_s": 30.0,
+        "nodes": [{"node_id": "a", "text": "Ledger API"}],
+        "owner_assignments": [{"name_raw": "Avery", "target": {"kind": "node", "node_id": "a"}, "valid_from_s": 20.0, "valid_to_s": 30.0}],
+        "events": [{"kind": "NodeAdded", "t_s": 24.0}]
+    });
+    let last = json!({
+        "board_id": "w2", "final": true, "t_end_s": 60.0,
+        "nodes": [{"node_id": "q", "text": "Orbit Queue"}],
+        "owner_assignments": [{"name_raw": "Avery", "target": {"kind": "node", "node_id": "q"}, "valid_from_s": 30.0}],
+        "events": [{"kind": "node_added", "t_s": 24.0}]
+    });
+    let m = board_metrics(json!([early, last]));
+    assert_eq!(m["owners.attribution"], 1.0);
+    assert_eq!(m["owners.move_error_max_s"], 0.0);
+    assert_eq!(m["events.false_change"], 1.0);
+}
