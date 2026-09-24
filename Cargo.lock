@@ -1356,10 +1356,10 @@ dependencies = [
  "sha2",
  "strsim",
  "tempfile",
- "thiserror",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-util",
- "toml",
+ "toml 1.1.6+spec-1.1.0",
  "unicode-normalization",
 ]
 
