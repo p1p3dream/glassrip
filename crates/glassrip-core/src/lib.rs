@@ -19,6 +19,7 @@
 #![warn(missing_docs)]
 
 pub mod atomic;
+pub mod cache;
 pub mod canonical;
 pub mod envelope;
 pub mod versioning;
