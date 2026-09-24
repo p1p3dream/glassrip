@@ -1,7 +1,7 @@
 //! End-to-end media stages on generated videos (synthetic content only).
 //!
-//! Needs `ffmpeg` and `ffprobe` on PATH; the tests print a note and pass when they are
-//! missing.
+//! Needs `ffmpeg` and `ffprobe` on PATH: the tests fail without them unless
+//! `GLASSRIP_SKIP_FFMPEG_TESTS=1` is set.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -21,6 +21,8 @@ use glassrip_media_stages::schema::{
 use image::{Rgb, RgbImage};
 use tokio_util::sync::CancellationToken;
 
+/// True when ffmpeg and ffprobe are available. Missing tools fail the test unless
+/// `GLASSRIP_SKIP_FFMPEG_TESTS=1` is set, so CI without ffmpeg cannot pass silently.
 fn have_ffmpeg() -> bool {
     let ok = |t: &str| {
         Command::new(t)
@@ -28,11 +30,14 @@ fn have_ffmpeg() -> bool {
             .output()
             .is_ok_and(|o| o.status.success())
     };
-    let found = ok("ffmpeg") && ok("ffprobe");
-    if !found {
-        eprintln!("ffmpeg/ffprobe not found; skipping media pipeline test");
+    if ok("ffmpeg") && ok("ffprobe") {
+        return true;
     }
-    found
+    if std::env::var("GLASSRIP_SKIP_FFMPEG_TESTS").as_deref() == Ok("1") {
+        eprintln!("ffmpeg/ffprobe not found; skipped because GLASSRIP_SKIP_FFMPEG_TESTS=1");
+        return false;
+    }
+    panic!("ffmpeg and ffprobe are required (set GLASSRIP_SKIP_FFMPEG_TESTS=1 to skip)");
 }
 
 /// A "phone photo of a monitor": dark surround, bright tilted screen with a slide pattern.
