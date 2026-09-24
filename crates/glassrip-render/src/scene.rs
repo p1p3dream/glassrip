@@ -561,7 +561,9 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
         let role = role_of(&n.text);
         roles_used.insert(role);
         // a snake_case or path token becomes a mono body line
-        let words: Vec<&str> = n.text.split_whitespace().collect();
+        // board text is read from the video: sanitize like model text
+        let text = sanitize_dashes(&n.text);
+        let words: Vec<&str> = text.split_whitespace().collect();
         let (head_words, mono): (Vec<&str>, Vec<&str>) = words
             .iter()
             .partition(|w| !(w.contains('_') && words.len() > 1));
@@ -857,7 +859,7 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
     let mut unplaced: Vec<String> = Vec::new();
     for (target, owners) in per_target {
         for o in owners {
-            let name = short_name(notes, &o.person_id, &o.display_name);
+            let name = sanitize_dashes(&short_name(notes, &o.person_id, &o.display_name));
             let proto = pill(0.0, 0.0, &name, "#16a34a", "pill-text", 11.0, true);
             let (w, h) = (proto.r.w, proto.r.h);
             let cands: Vec<R> = match &o.target {
@@ -901,7 +903,7 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
             if let Some(from) = &o.moved_from {
                 let txt = format!(
                     "moved from {} ({})",
-                    target_text(from),
+                    sanitize_dashes(&target_text(from)),
                     mmss(o.valid_from_s)
                 );
                 let tw = text_width(&txt, 10.0, false);

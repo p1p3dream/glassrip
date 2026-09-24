@@ -233,3 +233,16 @@ fn board_text_with_css_like_words_passes_the_style_check() {
     );
     assert!(svg.ok, "{svg:?}");
 }
+
+#[test]
+fn em_dashes_in_board_text_are_sanitized() {
+    let (notes, mut board) = inputs();
+    // real boards carry titles like "Name \u{2014} Subtitle"
+    board.nodes[0].text = "Relay API \u{2014} Hackathon".into();
+    let dir = tempfile::tempdir().unwrap();
+    let r = render_all(&notes, &[board], &params(dir.path().to_path_buf())).unwrap();
+    let (_, svg) = &r.svg[0];
+    assert!(svg.ok, "{svg:?}");
+    assert!(!r.svg_text[0].1.contains('\u{2014}'));
+    assert!(!r.markdown_text.contains('\u{2014}'));
+}

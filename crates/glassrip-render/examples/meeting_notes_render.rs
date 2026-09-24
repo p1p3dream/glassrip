@@ -43,8 +43,16 @@ use tokio_util::sync::CancellationToken;
 struct Args {
     #[arg(long)]
     transcript: PathBuf,
+    /// Board state JSON (a stand-in; ignored when --vision-run is given).
     #[arg(long)]
-    board: PathBuf,
+    board: Option<PathBuf>,
+    /// Artifacts directory of a vision run (board_validate, canvas_crop,
+    /// keyframes, ocr): runs edge_direction and board_state from it.
+    #[arg(long)]
+    vision_run: Option<PathBuf>,
+    /// Concurrent frame decodes for name_speakers.
+    #[arg(long, default_value_t = 4)]
+    decode_concurrency: usize,
     #[arg(long)]
     keyframes: Option<PathBuf>,
     #[arg(long)]
@@ -124,31 +132,44 @@ async fn main() {
     let t: TranscriptArtifact =
         serde_json::from_slice(&std::fs::read(&a.transcript).unwrap()).unwrap();
     import::import_transcript(&run, &t).unwrap();
-    let board_json: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&a.board).unwrap()).unwrap();
-    let boards: Vec<BoardStateItem> = match board_json {
-        serde_json::Value::Array(_) => serde_json::from_value(board_json).unwrap(),
-        v => vec![serde_json::from_value(v).unwrap()],
-    };
-    import::import_boards(&run, &boards).unwrap();
-    match &a.keyframes {
-        Some(p) => import::copy_artifact(&run, schemas::KEYFRAMES, p)
-            .map(|_| ())
-            .unwrap(),
-        None => import::write_empty(&run, schemas::KEYFRAMES)
-            .map(|_| ())
-            .unwrap(),
-    }
-    match &a.ocr {
-        Some(p) => import::copy_artifact(&run, schemas::OCR, p)
-            .map(|_| ())
-            .unwrap(),
-        None => import::write_empty(&run, schemas::OCR).map(|_| ()).unwrap(),
+    if let Some(vr) = &a.vision_run {
+        for schema in [
+            "glassrip.board_validate",
+            "glassrip.canvas_crop",
+            schemas::KEYFRAMES,
+            schemas::OCR,
+        ] {
+            import::copy_artifact(&run, schema, &vr.join(format!("{schema}.jsonl"))).unwrap();
+        }
+    } else {
+        let path = a.board.as_ref().expect("--board or --vision-run");
+        let board_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let boards: Vec<BoardStateItem> = match board_json {
+            serde_json::Value::Array(_) => serde_json::from_value(board_json).unwrap(),
+            v => vec![serde_json::from_value(v).unwrap()],
+        };
+        import::import_boards(&run, &boards).unwrap();
+        match &a.keyframes {
+            Some(p) => import::copy_artifact(&run, schemas::KEYFRAMES, p)
+                .map(|_| ())
+                .unwrap(),
+            None => import::write_empty(&run, schemas::KEYFRAMES)
+                .map(|_| ())
+                .unwrap(),
+        }
+        match &a.ocr {
+            Some(p) => import::copy_artifact(&run, schemas::OCR, p)
+                .map(|_| ())
+                .unwrap(),
+            None => import::write_empty(&run, schemas::OCR).map(|_| ()).unwrap(),
+        }
     }
 
     let graph = StageGraph::new(meeting_mode_stage_decls()).unwrap();
+    // every stage may run; each is run explicitly below when its inputs exist
     let sel = Selection {
-        from: Some("name_speakers".into()),
+        from: None,
         until: Some(a.until.clone()),
         force: a
             .force
@@ -174,10 +195,58 @@ async fn main() {
     .unwrap();
     let mut summary = serde_json::Map::new();
 
+    // edge_direction and board_state from the vision run (phase B: the vision
+    // model answers only edges whose pixel vote is inconclusive)
+    if a.vision_run.is_some() {
+        use glassrip_meeting::consolidate::ConsolidationParams;
+        use glassrip_meeting::pixel_direction::PixelCheckParams;
+        use glassrip_meeting::stages::{BoardStateStage, EdgeDirectionStage};
+        use glassrip_meeting::text::{AliasTable as MeetingAliases, Participant};
+        use glassrip_meeting::vlm_direction::VlmCheckParams;
+        let backend = glassrip_vision::ollama::OllamaBackend::new(
+            glassrip_vision::ollama::OllamaConfig::new(
+                a.host.clone(),
+                a.vision_model.clone(),
+                8192,
+            ),
+        )
+        .unwrap();
+        let client = glassrip_vision::VisionClient::new(Arc::new(backend), 2).unwrap();
+        let t0 = Instant::now();
+        let edge = EdgeDirectionStage::new(
+            PixelCheckParams::default(),
+            VlmCheckParams::default(),
+            Some(client),
+        );
+        let rep = runner.run_stage(&edge).await.unwrap();
+        summary.insert("edge_direction".into(), json!({"wall_s": t0.elapsed().as_secs_f64(), "status": format!("{:?}", rep.status), "items_error": rep.items_error}));
+        let people: Vec<Participant> = participants
+            .iter()
+            .map(|n| Participant {
+                person_id: glassrip_notes::people::slug(n),
+                display_name: n.clone(),
+                aliases: n
+                    .split_whitespace()
+                    .next()
+                    .map(str::to_string)
+                    .into_iter()
+                    .collect(),
+            })
+            .collect();
+        let t0 = Instant::now();
+        let bs = BoardStateStage::new(ConsolidationParams {
+            participants: MeetingAliases::new(people),
+            ..ConsolidationParams::default()
+        });
+        let rep = runner.run_stage(&bs).await.unwrap();
+        summary.insert("board_state".into(), json!({"wall_s": t0.elapsed().as_secs_f64(), "status": format!("{:?}", rep.status), "items_error": rep.items_error}));
+    }
+
     // name_speakers
     let params = NameSpeakersParams {
         participants,
         video: a.video.clone(),
+        decode_concurrency: a.decode_concurrency,
         ..Default::default()
     };
     #[cfg_attr(not(feature = "ocr"), allow(unused_mut))]
@@ -192,6 +261,8 @@ async fn main() {
     }
     let t0 = Instant::now();
     let rep = runner.run_stage(&stage).await.unwrap();
+    // release the OCR sessions' GPU memory before phase C loads the text model
+    drop(stage);
     summary.insert("name_speakers".into(), json!({"wall_s": t0.elapsed().as_secs_f64(), "status": format!("{:?}", rep.status), "items_error": rep.items_error}));
     let dir = runner.run_dir();
     let recs = jsonl::read::<Record<SpeakersRecord>>(
@@ -286,19 +357,22 @@ async fn main() {
             },
             ..RenderParams::default()
         });
-        let rep = runner.run_stage(&stage).await.unwrap();
+        // a failed strict validation fails the stage; report it instead of panicking
+        let rep = runner.run_stage(&stage).await;
         let dir = runner.run_dir();
-        let r = jsonl::read::<Record<RenderResult>>(
-            &dir.artifact_path(RENDER_SCHEMA),
-            &SchemaReq::new(RENDER_SCHEMA, 1),
-        )
-        .unwrap()
-        .items
-        .into_iter()
-        .find_map(|r| r.outcome.result);
+        let path = dir.artifact_path(RENDER_SCHEMA);
+        let r = if path.is_file() {
+            jsonl::read::<Record<RenderResult>>(&path, &SchemaReq::new(RENDER_SCHEMA, 1))
+                .unwrap()
+                .items
+                .into_iter()
+                .find_map(|r| r.outcome.result)
+        } else {
+            None
+        };
         summary.insert(
             "render".into(),
-            json!({"wall_s": t0.elapsed().as_secs_f64(), "status": format!("{:?}", rep.status), "ok": r.as_ref().map(|x| x.ok), "markdown": r.as_ref().map(|x| &x.markdown), "svg": r.as_ref().map(|x| &x.svg), "files": r.as_ref().map(|x| &x.files)}),
+            json!({"wall_s": t0.elapsed().as_secs_f64(), "status": rep.as_ref().map(|x| format!("{:?}", x.status)).unwrap_or_else(|e| format!("error: {e}")), "ok": r.as_ref().map(|x| x.ok), "markdown": r.as_ref().map(|x| &x.markdown), "svg": r.as_ref().map(|x| &x.svg), "files": r.as_ref().map(|x| &x.files)}),
         );
     }
     println!("{}", serde_json::to_string_pretty(&summary).unwrap());
