@@ -137,18 +137,19 @@ fn materialize<T, F>(
 where
     T: serde::de::DeserializeOwned,
     F: Fn(&T) -> (String, String),
+    T: Send,
 {
     let path = run.join(RunDir::artifact_rel_path(schema));
     let items = jsonl::read::<Record<T>>(&path, &SchemaReq::new(schema, 1))?.items;
-    let mut n = 0;
-    for r in items {
-        if let Some(v) = r.outcome.result {
-            let (rel, hash) = refs(&v);
-            blobs.materialize(run, &rel, &hash, stage, true)?;
-            n += 1;
-        }
-    }
-    Ok(n)
+    use rayon::prelude::*;
+    let refs: Vec<(String, String)> = items
+        .into_iter()
+        .filter_map(|r| r.outcome.result)
+        .map(|v| refs(&v))
+        .collect();
+    refs.par_iter()
+        .try_for_each(|(rel, hash)| blobs.materialize(run, rel, hash, stage).map(|_| ()))?;
+    Ok(refs.len())
 }
 
 async fn step<S: Stage>(

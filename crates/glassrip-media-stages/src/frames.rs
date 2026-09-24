@@ -45,12 +45,12 @@ use crate::util::{STDERR_TAIL, on_rayon, parse_rational, run_command, tail};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SamplingMode {
-    /// Sync frames when every bucket of a chunk has one, else grid.
+    /// Sync frames when every bucket of a chunk has one, else grid (per chunk).
     #[default]
     Auto,
-    /// Always the first frame of each bucket (full decode).
+    /// The frame nearest each bucket's center (full decode).
     Grid,
-    /// Always the first sync frame; a bucket without one is an error.
+    /// The sync frame nearest each bucket's center; a bucket without one is an error.
     Sync,
 }
 
@@ -592,7 +592,7 @@ impl FramesStage {
                     let frame_id = format!("f{k:06}");
                     let rel = format!("{FRAMES_DIR}/{frame_id}.jpg");
                     blobs
-                        .materialize(&run_root, &rel, &hash, "frames", false)
+                        .materialize(&run_root, &rel, &hash, "frames")
                         .map_err(|e| ErrorInfo::new(ErrorCode::Io, e.to_string()))?;
                     Ok((
                         *k,

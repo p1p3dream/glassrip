@@ -278,7 +278,7 @@ impl RectifyStage {
         };
         let materialize = |hash: &str| {
             self.blobs
-                .materialize(&self.run_root, &rel, hash, "rectify", false)
+                .materialize(&self.run_root, &rel, hash, "rectify")
                 .map_err(|e| ErrorInfo::new(ErrorCode::Io, e.to_string()))
         };
         let rep_frame = &w.frames[rep];
