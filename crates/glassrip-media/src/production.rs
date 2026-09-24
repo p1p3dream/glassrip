@@ -4,8 +4,12 @@
 //! 2. When ECC fails (or converges to an implausible warp), the phase-correlation translation
 //!    is used on its own; when that is not trustworthy either, alignment has failed and the
 //!    caller treats the pair as changed (`align_failed`), never as aligned by identity.
-//! 3. SSIM and `changed_frac` are averaged over the warp's valid-pixel mask instead of a fixed
-//!    inset.
+//! 3. SSIM is averaged over the warp's valid-pixel mask instead of a fixed inset;
+//!    `changed_frac` counts the pixels the warp cannot cover as changed (so two different
+//!    screens aligned over a small overlap do not score as "same"), and the ink change
+//!    counts reference ink in the uncovered region as gone.
+//! 4. Frames of any size are accepted: [`frame_features_any`] area-resamples to a 1920 px
+//!    long edge instead of requiring exactly 1920x1080.
 //!
 //! These change the numbers, so nothing here is covered by the parity gate.
 
@@ -190,7 +194,7 @@ impl Default for AlignParams {
             ecc: EccParams::default(),
             min_phase_response: 0.05,
             max_shift_frac: 0.5,
-            max_linear_dev: 0.35,
+            max_linear_dev: 0.15,
         }
     }
 }
@@ -324,7 +328,7 @@ impl Default for ScoreParams {
         Self {
             align: AlignParams::default(),
             changed_delta: 25.0,
-            min_valid_frac: 0.25,
+            min_valid_frac: 0.5,
         }
     }
 }
@@ -399,9 +403,11 @@ pub fn pair_score(a: &Plane<f32>, b: &Plane<f32>, p: &ScoreParams) -> PairScore 
         .filter(|(_, &m)| m > 0)
         .filter(|((&x, &y), _)| (x - y).abs() > p.changed_delta)
         .count();
+    // Pixels the warp cannot cover count as changed.
+    let total = (w * h).max(1);
     PairScore {
         ssim,
-        changed_frac: changed as f64 / n_valid as f64,
+        changed_frac: (changed + (total - n_valid)) as f64 / total as f64,
         shift: f64::from(wm[2].hypot(wm[5])),
         valid_frac,
         alignment,
@@ -418,8 +424,8 @@ pub struct InkChange {
 }
 
 /// `ink_change(A, B)` with production alignment: phase-initialized ECC on the ink alignment
-/// images, translation doubled for the 640x360 masks, and pixels B's warp cannot cover
-/// excluded from both masks. Failure counts as a full change.
+/// images, translation doubled for the ink masks. A's ink where B's warp cannot cover counts
+/// as gone (B's warped mask is empty there). Failure counts as a full change.
 pub fn ink_change(a: &InkFrame, b: &InkFrame, p: &AlignParams) -> InkChange {
     let alignment = align(&a.align, &b.align, p);
     if !alignment.ok() {
@@ -433,7 +439,6 @@ pub fn ink_change(a: &InkFrame, b: &InkFrame, p: &AlignParams) -> InkChange {
     wm[5] *= 2.0;
     let (w, h) = (a.mask.width, a.mask.height);
     let ib = affine_nearest_u8(&b.mask, &wm, w, h);
-    let valid = valid_mask(&wm, w, h, b.mask.width, b.mask.height);
     let keep = |m: &Plane<u8>| -> Plane<u8> {
         let mut out = m.clone();
         for y in 0..h {
@@ -443,7 +448,7 @@ pub fn ink_change(a: &InkFrame, b: &InkFrame, p: &AlignParams) -> InkChange {
                     || y >= h.saturating_sub(BORDER)
                     || x < BORDER
                     || x >= w.saturating_sub(BORDER);
-                if border || valid.data[i] == 0 {
+                if border {
                     out.data[i] = 0;
                 }
             }
@@ -464,6 +469,127 @@ pub fn ink_change(a: &InkFrame, b: &InkFrame, p: &AlignParams) -> InkChange {
         value: (new + gone) as f64 / (na + nb).max(1) as f64,
         alignment,
     }
+}
+
+/// Long edge frames are resampled to before production features.
+pub const PRODUCTION_LONG_EDGE: usize = 1920;
+
+/// Fractional area (box) resampling of interleaved 8-bit data, like `INTER_AREA` for
+/// downscaling (and bilinear-like box sampling when enlarging).
+fn area_resize(src: &[u8], w: usize, h: usize, cn: usize, dw: usize, dh: usize) -> Vec<u8> {
+    let weights = |n: usize, dn: usize| -> Vec<Vec<(usize, f64)>> {
+        let scale = n as f64 / dn as f64;
+        (0..dn)
+            .map(|d| {
+                let (lo, hi) = (d as f64 * scale, (d + 1) as f64 * scale);
+                let mut v = Vec::new();
+                let mut s = lo.floor() as usize;
+                while (s as f64) < hi && s < n {
+                    let a = (s as f64).max(lo);
+                    let b = ((s + 1) as f64).min(hi);
+                    if b > a {
+                        v.push((s, (b - a) / (hi - lo)));
+                    }
+                    s += 1;
+                }
+                v
+            })
+            .collect()
+    };
+    let (wx, wy) = (weights(w, dw), weights(h, dh));
+    let mut tmp = vec![0f64; dw * h * cn];
+    for y in 0..h {
+        for (dx, ws) in wx.iter().enumerate() {
+            for c in 0..cn {
+                tmp[(y * dw + dx) * cn + c] = ws
+                    .iter()
+                    .map(|&(x, k)| k * f64::from(src[(y * w + x) * cn + c]))
+                    .sum();
+            }
+        }
+    }
+    let mut out = vec![0u8; dw * dh * cn];
+    for (dy, ws) in wy.iter().enumerate() {
+        for dx in 0..dw {
+            for c in 0..cn {
+                let v: f64 = ws
+                    .iter()
+                    .map(|&(y, k)| k * tmp[(y * dw + dx) * cn + c])
+                    .sum();
+                out[(dy * dw + dx) * cn + c] = v.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// Target size for a frame: long edge [`PRODUCTION_LONG_EDGE`], aspect kept, both sides
+/// rounded down to multiples of 6 (the pair-score and ink grids are 6x and 3x downsamples).
+pub fn production_size(w: usize, h: usize) -> (usize, usize) {
+    let long = w.max(h).max(1) as f64;
+    let s = PRODUCTION_LONG_EDGE as f64 / long;
+    let r6 = |v: f64| ((v.round() as usize) / 6 * 6).max(6);
+    (r6(w as f64 * s), r6(h as f64 * s))
+}
+
+/// Per-frame features for any frame size (`production` mode): area-resample to a 1920 px
+/// long edge when needed, then the same sharpness, 6x small gray, and ink computations as
+/// `prototype_compat`. A 1920x1080 frame gives exactly the compat features.
+pub fn frame_features_any(
+    gray: &Plane<u8>,
+    bgr: &crate::plane::Bgr,
+) -> crate::error::Result<crate::features::FrameFeatures> {
+    use crate::gaussian::{blur_f32, blur_u8, KernelSize};
+    use crate::ink::{adaptive_threshold_mean_inv, bgr_to_gray, color_mask, BLOCK, OFFSET};
+    use crate::resize::{area_bgr, area_gray, half_linear_gray};
+    if gray.width < 12 || gray.height < 12 || (gray.width, gray.height) != (bgr.width, bgr.height) {
+        return Err(crate::error::MediaError::Size {
+            width: gray.width,
+            height: gray.height,
+            reason: "frame too small, or gray and color sizes differ",
+        });
+    }
+    let (tw, th) = production_size(gray.width, gray.height);
+    let (gray, bgr) = if (tw, th) == (gray.width, gray.height) {
+        (gray.clone(), bgr.clone())
+    } else {
+        (
+            Plane {
+                width: tw,
+                height: th,
+                data: area_resize(&gray.data, gray.width, gray.height, 1, tw, th),
+            },
+            crate::plane::Bgr {
+                width: tw,
+                height: th,
+                data: area_resize(&bgr.data, bgr.width, bgr.height, 3, tw, th),
+            },
+        )
+    };
+    let (sharpness, small) = rayon::join(
+        || crate::sharpness::laplacian_variance(&gray),
+        || blur_u8(&area_gray(&gray, 6), KernelSize::K5, 1.2).map(f32::from),
+    );
+    let im = area_bgr(&bgr, 3);
+    let g3 = blur_u8(&bgr_to_gray(&im), KernelSize::K3, 0.0);
+    let dark = adaptive_threshold_mean_inv(&g3, BLOCK, OFFSET);
+    let col = color_mask(&im);
+    let mask = Plane {
+        width: dark.width,
+        height: dark.height,
+        data: dark
+            .data
+            .iter()
+            .zip(&col.data)
+            .map(|(a, b)| a | b)
+            .collect(),
+    };
+    let align = blur_f32(&half_linear_gray(&g3).map(f32::from), KernelSize::K5, 1.2);
+    Ok(crate::features::FrameFeatures {
+        sharpness,
+        small,
+        ink: InkFrame { mask, align },
+    })
 }
 
 #[cfg(test)]
@@ -515,12 +641,113 @@ mod tests {
             s.alignment
         );
         assert!(s.ssim > 0.95, "{}", s.ssim);
-        assert!(s.changed_frac < 0.01, "{}", s.changed_frac);
+        // Only the uncovered border counts as changed.
+        assert!(
+            (s.changed_frac - (1.0 - s.valid_frac)).abs() < 0.01,
+            "{} {}",
+            s.changed_frac,
+            s.valid_frac
+        );
         assert!(
             s.valid_frac < 0.95 && s.valid_frac > 0.8,
             "{}",
             s.valid_frac
         );
+    }
+
+    #[test]
+    fn uncovered_pixels_count_as_changed() {
+        let a = texture(160, 96, 0.0, 0.0);
+        let b = texture(160, 96, 30.0, 0.0);
+        let s = pair_score(&a, &b, &ScoreParams::default());
+        assert!(s.align_ok(), "{:?}", s.alignment);
+        // About 30 of 160 columns are uncovered: they count as changed.
+        assert!(
+            (s.changed_frac - (1.0 - s.valid_frac)).abs() < 0.01,
+            "{} vs {}",
+            s.changed_frac,
+            s.valid_frac
+        );
+        assert!(s.changed_frac > 0.15);
+    }
+
+    #[test]
+    fn scaled_warps_are_rejected() {
+        // A 1.3x zoom exceeds the 0.15 linear-deviation limit.
+        let a = texture(160, 96, 0.0, 0.0);
+        let mut b = Plane::new(160, 96);
+        for y in 0..96 {
+            for x in 0..160 {
+                *b.get_mut(x, y) = a.get(
+                    ((x as f64 / 1.3) as usize).min(159),
+                    ((y as f64 / 1.3) as usize).min(95),
+                );
+            }
+        }
+        let p = AlignParams::default();
+        let al = align(&a, &b, &p);
+        if al.method == AlignMethod::Ecc {
+            assert!(plausible(&al.warp, 160, 96, &p));
+        }
+        assert!(!plausible(&[1.3, 0.0, 0.0, 0.0, 1.3, 0.0], 160, 96, &p));
+        assert!(plausible(&[1.1, 0.0, 0.0, 0.0, 1.1, 0.0], 160, 96, &p));
+    }
+
+    fn frame(w: usize, h: usize) -> (Plane<u8>, crate::plane::Bgr) {
+        let g = Plane::from_vec(
+            w,
+            h,
+            (0..w * h)
+                .map(|i| ((i % w) * 7 + (i / w) * 3) as u8)
+                .collect(),
+        )
+        .unwrap();
+        let bgr = crate::plane::Bgr {
+            width: w,
+            height: h,
+            data: g.data.iter().flat_map(|&v| [v, v, v]).collect(),
+        };
+        (g, bgr)
+    }
+
+    #[test]
+    fn any_size_frames_are_resampled() {
+        for (w, h, sw, sh) in [
+            (1920, 1080, 320, 180),
+            (1920, 1440, 320, 240),
+            (1080, 1920, 180, 320),
+            (3840, 2160, 320, 180),
+            (640, 480, 320, 240),
+        ] {
+            let (g, c) = frame(w, h);
+            let f = frame_features_any(&g, &c).unwrap();
+            assert_eq!((f.small.width, f.small.height), (sw, sh), "{w}x{h}");
+            assert_eq!(
+                (f.ink.mask.width, f.ink.mask.height),
+                (2 * sw, 2 * sh),
+                "{w}x{h}"
+            );
+            assert_eq!((f.ink.align.width, f.ink.align.height), (sw, sh), "{w}x{h}");
+        }
+    }
+
+    #[test]
+    fn full_hd_matches_compat_features() {
+        let (g, c) = frame(1920, 1080);
+        let a = frame_features_any(&g, &c).unwrap();
+        let s = crate::features::small_gray(&g);
+        let i = crate::ink::ink_frame(&c).unwrap();
+        assert_eq!(a.small, s);
+        assert_eq!(a.ink.mask, i.mask);
+        assert_eq!(a.ink.align, i.align);
+        assert_eq!(a.sharpness, crate::sharpness::laplacian_variance(&g));
+    }
+
+    #[test]
+    fn area_resize_averages() {
+        let src = vec![0u8, 100, 200, 100];
+        assert_eq!(area_resize(&src, 4, 1, 1, 2, 1), vec![50, 150]);
+        assert_eq!(area_resize(&src, 4, 1, 1, 4, 1), src);
     }
 
     #[test]

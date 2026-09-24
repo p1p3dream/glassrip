@@ -58,7 +58,8 @@ pub fn frame_features_from_bytes(path: &Path, bytes: &[u8]) -> Result<FrameFeatu
         return Err(MediaError::Size {
             width: gray.width,
             height: gray.height,
-            reason: "prototype_compat needs 1920x1080 frames",
+            reason: "prototype_compat reproduces the prototype's 1920x1080 geometry only; \
+                     use production mode for other frame sizes",
         });
     }
     let (sharpness, small) = rayon::join(|| laplacian_variance(&gray), || small_gray(&gray));

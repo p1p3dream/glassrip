@@ -5,6 +5,7 @@ use std::path::Path;
 
 use glassrip_core::config::{FeaturesConfig, FeaturesMode};
 use glassrip_core::envelope::{ErrorCode, ErrorInfo};
+use glassrip_media::decode::decode_gray_and_bgr_bytes;
 use glassrip_media::ecc::EccParams;
 use glassrip_media::features::{FrameFeatures as MediaFeatures, frame_features_from_bytes};
 use glassrip_media::production::{self, AlignParams, ScoreParams};
@@ -39,17 +40,16 @@ pub struct ScoringParams {
 impl ScoringParams {
     /// From the `[features]` config section.
     pub fn from_config(c: &FeaturesConfig) -> Self {
-        let d = AlignParams::default();
         Self {
             mode: c.mode,
             ecc_iterations: c.ecc_iterations,
             ecc_eps: c.ecc_eps,
             ecc_gauss_filt_size: c.ecc_gauss_filt_size,
             changed_pixel_delta: c.changed_pixel_delta,
-            min_phase_response: d.min_phase_response,
-            min_valid_frac: ScoreParams::default().min_valid_frac,
-            max_shift_frac: d.max_shift_frac,
-            max_linear_dev: d.max_linear_dev,
+            min_phase_response: c.production_min_phase_response,
+            min_valid_frac: c.production_min_valid_frac,
+            max_shift_frac: c.production_max_shift_frac,
+            max_linear_dev: c.production_max_linear_dev,
         }
     }
 
@@ -114,7 +114,8 @@ impl Scorer {
         })
     }
 
-    /// Per-frame features from a JPEG, verifying its blake3 when given.
+    /// Per-frame features from a JPEG, verifying its blake3 when given. `production` accepts
+    /// any frame size; `prototype_compat` requires 1920x1080.
     pub fn features(&self, path: &Path, blake3: Option<&str>) -> Result<MediaFeatures, ErrorInfo> {
         let bytes =
             fs_err::read(path).map_err(|e| crate::util::io_error("cannot read", path, e))?;
@@ -130,7 +131,16 @@ impl Scorer {
                 ));
             }
         }
-        frame_features_from_bytes(path, &bytes).map_err(crate::util::media_error)
+        match self.mode {
+            FeaturesMode::PrototypeCompat => {
+                frame_features_from_bytes(path, &bytes).map_err(crate::util::media_error)
+            }
+            FeaturesMode::Production => {
+                let (gray, bgr) =
+                    decode_gray_and_bgr_bytes(path, &bytes).map_err(crate::util::media_error)?;
+                production::frame_features_any(&gray, &bgr).map_err(crate::util::media_error)
+            }
+        }
     }
 
     /// Scores `b` against template `a`, including ink.
