@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! parity --frames DIR --reference DIR --keyframes FILE
-//!        [--checksums FILE] [--duration SECS] [--report FILE]
+//!        [--checksums FILE] [--duration SECS] [--report FILE] [--segment-batch N]
 //! ```
 //!
 //! `--reference` holds `pair_scores.json` and `ink_pairs.json`; `--keyframes` is the
@@ -15,7 +15,9 @@
 //! is a `sha256sum`-style file with one `<hex digest>  <name>` line for each of
 //! `pair_scores.json`, `ink_pairs.json` and `frames` (all frames concatenated in filename
 //! order). Exits 0 when every criterion passes, 1 on a parity failure and 2 on a usage or
-//! input error, including any checksum mismatch.
+//! input error, including any checksum mismatch. `--segment-batch` sets how many upcoming
+//! anchor comparisons are evaluated speculatively in parallel (default: threads, at most 8);
+//! it changes speed only, never results.
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
@@ -48,6 +50,7 @@ struct Args {
     checksums: Option<PathBuf>,
     duration: Option<f64>,
     report: Option<PathBuf>,
+    segment_batch: Option<usize>,
 }
 
 fn parse_args() -> Result<Args, BoxError> {
@@ -57,6 +60,7 @@ fn parse_args() -> Result<Args, BoxError> {
     let mut checksums = None;
     let mut duration = None;
     let mut report = None;
+    let mut segment_batch = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         let mut val = || it.next().ok_or_else(|| format!("missing value for {a}"));
@@ -67,10 +71,12 @@ fn parse_args() -> Result<Args, BoxError> {
             "--checksums" => checksums = Some(PathBuf::from(val()?)),
             "--duration" => duration = Some(val()?.parse::<f64>()?),
             "--report" => report = Some(PathBuf::from(val()?)),
+            "--segment-batch" => segment_batch = Some(val()?.parse::<usize>()?),
             "-h" | "--help" => {
                 return Err(
                     "usage: parity --frames DIR --reference DIR --keyframes FILE \
-                            [--checksums FILE] [--duration SECS] [--report FILE]"
+                            [--checksums FILE] [--duration SECS] [--report FILE] \
+                            [--segment-batch N]"
                         .into(),
                 )
             }
@@ -84,6 +90,7 @@ fn parse_args() -> Result<Args, BoxError> {
         checksums,
         duration,
         report,
+        segment_batch,
     })
 }
 
@@ -323,13 +330,17 @@ fn run() -> Result<bool, BoxError> {
         );
     }
     let sharp: Vec<f64> = feats.iter().map(|f| f.sharpness).collect();
-    let (mut runs, bounds) = segment(n, &cache, rayon::current_num_threads());
+    let batch = args
+        .segment_batch
+        .unwrap_or_else(|| rayon::current_num_threads().min(8));
+    let (mut runs, bounds) = segment(n, &cache, batch);
     let n_segment_runs = runs.len();
     let merges = merge_singletons(&mut runs, &sharp, MergeParams::default(), &cache);
     let kfs = keyframes(&runs, &times, &sharp, duration, &bounds);
     let t_seg = t0.elapsed().as_secs_f64();
     println!(
-        "  segmentation         {n_segment_runs} runs, {} merges, {} keyframes in {t_seg:.1} s",
+        "  segmentation         {n_segment_runs} runs, {} merges, {} keyframes in {t_seg:.1} s \
+         (speculative batch {batch})",
         merges.len(),
         kfs.len()
     );
