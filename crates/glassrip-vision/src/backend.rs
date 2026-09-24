@@ -75,7 +75,11 @@ pub struct VisionRequest {
 
 impl VisionRequest {
     /// Build a request whose output must decode as `T`. The schema text is appended to `prompt`.
-    pub fn for_output<T>(prompt: &str, image: EncodedImage, options: GenerationOptions) -> Result<Self>
+    pub fn for_output<T>(
+        prompt: &str,
+        image: EncodedImage,
+        options: GenerationOptions,
+    ) -> Result<Self>
     where
         T: schemars::JsonSchema + DeserializeOwned + 'static,
     {
@@ -135,5 +139,6 @@ pub trait VisionBackend: Send + Sync {
     async fn preflight(&self) -> Result<Placement>;
 
     /// Run one request. Retries, timeouts, and the schema repair retry are handled inside.
-    async fn infer(&self, request: VisionRequest, cancel: CancellationToken) -> Result<RawResponse>;
+    async fn infer(&self, request: VisionRequest, cancel: CancellationToken)
+        -> Result<RawResponse>;
 }

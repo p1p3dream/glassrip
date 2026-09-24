@@ -105,8 +105,14 @@ async fn success_sends_expected_request_shape() {
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0]["images"].as_array().unwrap().len(), 1);
     let prompt = messages[0]["content"].as_str().unwrap();
-    assert!(prompt.contains("\"dominant_color\""), "schema text must be in the prompt");
-    assert_eq!(body["format"]["properties"]["contains_text"]["enum"], json!(["yes", "no"]));
+    assert!(
+        prompt.contains("\"dominant_color\""),
+        "schema text must be in the prompt"
+    );
+    assert_eq!(
+        body["format"]["properties"]["contains_text"]["enum"],
+        json!(["yes", "no"])
+    );
     assert!(body["format"].get("$schema").is_none());
 }
 
@@ -179,7 +185,11 @@ async fn too_many_requests_honors_retry_after() {
         .await
         .unwrap();
     // Backoff alone is at most 20 ms here, so a wait near 1 s proves Retry-After was used.
-    assert!(start.elapsed() >= Duration::from_millis(950), "{:?}", start.elapsed());
+    assert!(
+        start.elapsed() >= Duration::from_millis(950),
+        "{:?}",
+        start.elapsed()
+    );
     assert_eq!(raw.attempts, 2);
 }
 
@@ -196,7 +206,10 @@ async fn client_error_is_not_retried() {
         .infer(request(), CancellationToken::new())
         .await
         .unwrap_err();
-    assert!(matches!(err, VisionError::Http { status: 400, .. }), "{err:?}");
+    assert!(
+        matches!(err, VisionError::Http { status: 400, .. }),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -216,7 +229,10 @@ async fn timeout_is_retried_then_reported() {
         .infer(request(), CancellationToken::new())
         .await
         .unwrap_err();
-    assert!(matches!(err, VisionError::Timeout { attempts: 2, .. }), "{err:?}");
+    assert!(
+        matches!(err, VisionError::Timeout { attempts: 2, .. }),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -250,7 +266,10 @@ async fn schema_invalid_then_repaired() {
     assert_eq!(repair.as_array().unwrap().len(), 3);
     assert_eq!(repair[1]["content"], BAD_ENUM);
     let hint = repair[2]["content"].as_str().unwrap();
-    assert!(hint.contains("/dominant_color"), "repair hint must name the path: {hint}");
+    assert!(
+        hint.contains("/dominant_color"),
+        "repair hint must name the path: {hint}"
+    );
     // The single image stays attached to the original user turn only.
     assert!(repair[2].get("images").is_none());
 }
@@ -295,7 +314,10 @@ async fn non_json_output_is_schema_invalid() {
         .infer(request(), CancellationToken::new())
         .await
         .unwrap_err();
-    assert!(matches!(err, VisionError::SchemaInvalid { attempts: 2, .. }), "{err:?}");
+    assert!(
+        matches!(err, VisionError::SchemaInvalid { attempts: 2, .. }),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -393,7 +415,8 @@ async fn missing_model_reports_pull_command() {
     Mock::given(method("POST"))
         .and(path("/api/show"))
         .respond_with(
-            ResponseTemplate::new(404).set_body_string(r#"{"error":"model 'qwen2.5vl:7b' not found"}"#),
+            ResponseTemplate::new(404)
+                .set_body_string(r#"{"error":"model 'qwen2.5vl:7b' not found"}"#),
         )
         .mount(&server)
         .await;
@@ -421,7 +444,9 @@ async fn preflight_detects_spill() {
     mount_metadata(&server, json!([ps_entry(9_000_000_000, 7_000_000_000)])).await;
     let err = backend(&server).preflight().await.unwrap_err();
     match err {
-        VisionError::Spill { size, size_vram, .. } => {
+        VisionError::Spill {
+            size, size_vram, ..
+        } => {
             assert_eq!(size, 9_000_000_000);
             assert_eq!(size_vram, 7_000_000_000);
         }
@@ -453,7 +478,9 @@ async fn preflight_loads_model_when_not_resident() {
     mount_metadata(&server, json!([ps_entry(6_000, 6_000)])).await;
     Mock::given(method("POST"))
         .and(path("/api/chat"))
-        .and(body_partial_json(json!({"messages": [], "keep_alive": "30m", "options": {"num_ctx": 8192}})))
+        .and(body_partial_json(
+            json!({"messages": [], "keep_alive": "30m", "options": {"num_ctx": 8192}}),
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"done": true})))
         .expect(1)
         .mount(&server)
@@ -483,7 +510,10 @@ async fn self_test_passes_and_fails_without_repair() {
         .respond_with(chat_reply(GOOD))
         .mount(&server)
         .await;
-    let report = backend(&server).self_test(CancellationToken::new()).await.unwrap();
+    let report = backend(&server)
+        .self_test(CancellationToken::new())
+        .await
+        .unwrap();
     assert_eq!(report.answer.dominant_color, SelfTestColor::Red);
 
     let bad = MockServer::start().await;
@@ -493,6 +523,9 @@ async fn self_test_passes_and_fails_without_repair() {
         .expect(1)
         .mount(&bad)
         .await;
-    let err = backend(&bad).self_test(CancellationToken::new()).await.unwrap_err();
+    let err = backend(&bad)
+        .self_test(CancellationToken::new())
+        .await
+        .unwrap_err();
     assert!(matches!(err, VisionError::SelfTestFailed(_)), "{err:?}");
 }

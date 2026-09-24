@@ -77,10 +77,16 @@ For a whiteboard, exclude toolbars, side panels, zoom controls, and participant 
 confidence: a number from 0 to 1.";
 
 /// Build the classification request on a 768 px thumbnail of `frame`.
-pub fn classify_request(frame: &DynamicImage, options: GenerationOptions) -> Result<(VisionRequest, PreparedImage)> {
+pub fn classify_request(
+    frame: &DynamicImage,
+    options: GenerationOptions,
+) -> Result<(VisionRequest, PreparedImage)> {
     let prepared = prepare_thumbnail(frame)?;
-    let request =
-        VisionRequest::for_output::<ScreenClassOutput>(CLASSIFY_PROMPT, prepared.image.clone(), options)?;
+    let request = VisionRequest::for_output::<ScreenClassOutput>(
+        CLASSIFY_PROMPT,
+        prepared.image.clone(),
+        options,
+    )?;
     Ok((request, prepared))
 }
 
@@ -263,7 +269,11 @@ impl ClassifyRules {
     /// Evaluate every rule against the OCR spans of one keyframe.
     pub fn evaluate<S: AsRef<str>>(&self, ocr_spans: &[S]) -> RuleEvaluation {
         let spans: Vec<&str> = ocr_spans.iter().map(AsRef::as_ref).collect();
-        let mut hits: Vec<RuleHit> = self.rules.iter().filter_map(|r| r.evaluate(&spans)).collect();
+        let mut hits: Vec<RuleHit> = self
+            .rules
+            .iter()
+            .filter_map(|r| r.evaluate(&spans))
+            .collect();
         hits.sort_by(|a, b| {
             b.confidence
                 .total_cmp(&a.confidence)
@@ -347,17 +357,22 @@ fn non_empty(s: &str) -> Option<String> {
 }
 
 /// Combine the model answer (if the request succeeded) with the rule evaluation.
-pub fn combine(model: Option<&ScreenClassOutput>, rules: &RuleEvaluation, policy: &ClassifyRules) -> ScreenClass {
+pub fn combine(
+    model: Option<&ScreenClassOutput>,
+    rules: &RuleEvaluation,
+    policy: &ClassifyRules,
+) -> ScreenClass {
     let best = rules.best();
     let strong = best.filter(|h| !rules.conflicting && h.confidence >= policy.high_confidence);
-    let from_model = |m: &ScreenClassOutput, method, confidence, rule: Option<&RuleHit>| ScreenClass {
-        screen_type: m.screen_type,
-        app_hint: non_empty(&m.app_hint).or_else(|| rule.and_then(|r| r.app_hint.clone())),
-        confidence,
-        method,
-        canvas_bbox: Some(m.canvas_bbox),
-        rule: rule.map(|r| r.rule.clone()),
-    };
+    let from_model =
+        |m: &ScreenClassOutput, method, confidence, rule: Option<&RuleHit>| ScreenClass {
+            screen_type: m.screen_type,
+            app_hint: non_empty(&m.app_hint).or_else(|| rule.and_then(|r| r.app_hint.clone())),
+            confidence,
+            method,
+            canvas_bbox: Some(m.canvas_bbox),
+            rule: rule.map(|r| r.rule.clone()),
+        };
     let unknown = |method, rule: Option<&RuleHit>| ScreenClass {
         screen_type: ScreenType::Unknown,
         app_hint: None,

@@ -14,7 +14,11 @@ pub struct FieldError {
 
 impl fmt::Display for FieldError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let path = if self.path.is_empty() { "/" } else { &self.path };
+        let path = if self.path.is_empty() {
+            "/"
+        } else {
+            &self.path
+        };
         write!(f, "{path}: {}", self.message)
     }
 }

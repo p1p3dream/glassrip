@@ -38,7 +38,9 @@ impl VisionClient {
     /// `max_in_flight` must be at least 1; use the server slot count (4 for qwen2.5vl:7b).
     pub fn new(backend: Arc<dyn VisionBackend>, max_in_flight: usize) -> Result<Self> {
         if max_in_flight == 0 {
-            return Err(VisionError::Config("max_in_flight must be at least 1".into()));
+            return Err(VisionError::Config(
+                "max_in_flight must be at least 1".into(),
+            ));
         }
         let (gate, _) = watch::channel(true);
         Ok(Self {
@@ -89,7 +91,11 @@ impl VisionClient {
     }
 
     /// Wait for the gate and a slot, then run the request.
-    pub async fn infer(&self, request: VisionRequest, cancel: CancellationToken) -> Result<RawResponse> {
+    pub async fn infer(
+        &self,
+        request: VisionRequest,
+        cancel: CancellationToken,
+    ) -> Result<RawResponse> {
         let permit = loop {
             self.wait_open(&cancel).await?;
             let permit = tokio::select! {

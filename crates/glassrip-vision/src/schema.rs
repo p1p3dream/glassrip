@@ -201,7 +201,10 @@ mod tests {
         assert!(!text.contains("$ref"), "{text}");
         assert!(!text.contains("$schema"));
         assert_eq!(s.json()["additionalProperties"], json!(false));
-        assert_eq!(s.json()["properties"]["kind"]["enum"], json!(["alpha", "beta"]));
+        assert_eq!(
+            s.json()["properties"]["kind"]["enum"],
+            json!(["alpha", "beta"])
+        );
     }
 
     #[test]
@@ -210,7 +213,13 @@ mod tests {
         let v = json!({"kind": "beta", "items": [{"score": 0.5}]});
         assert!(s.validate(&v).is_ok());
         let decoded: std::result::Result<Outer, _> = decode_value(&v);
-        assert!(matches!(decoded, Ok(Outer { kind: Kind::Beta, .. })));
+        assert!(matches!(
+            decoded,
+            Ok(Outer {
+                kind: Kind::Beta,
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -257,7 +257,9 @@ impl OllamaBackend {
             return Err(VisionError::Config("slots must be at least 1".into()));
         }
         if config.max_attempts == 0 {
-            return Err(VisionError::Config("max_attempts must be at least 1".into()));
+            return Err(VisionError::Config(
+                "max_attempts must be at least 1".into(),
+            ));
         }
         if config.model.trim().is_empty() {
             return Err(VisionError::Config("model must not be empty".into()));
@@ -297,7 +299,12 @@ impl OllamaBackend {
     }
 
     /// One POST, classified into success, retryable failure, or fatal failure.
-    async fn post_once(&self, path: &str, body: &Value, timeout: Duration) -> Result<Value, AttemptError> {
+    async fn post_once(
+        &self,
+        path: &str,
+        body: &Value,
+        timeout: Duration,
+    ) -> Result<Value, AttemptError> {
         let resp = self
             .http
             .post(self.url(path))
@@ -357,7 +364,12 @@ impl OllamaBackend {
         }
     }
 
-    fn classify_status(&self, status: StatusCode, body: String, retry_after: Option<Duration>) -> AttemptError {
+    fn classify_status(
+        &self,
+        status: StatusCode,
+        body: String,
+        retry_after: Option<Duration>,
+    ) -> AttemptError {
         if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
             return AttemptError::Retryable {
                 message: format!("HTTP {}: {}", status.as_u16(), body.trim()),
@@ -474,10 +486,16 @@ impl OllamaBackend {
         Ok(())
     }
 
-    async fn generate(&self, body: &Value, cancel: &CancellationToken) -> Result<(ChatResponse, u32, Duration)> {
+    async fn generate(
+        &self,
+        body: &Value,
+        cancel: &CancellationToken,
+    ) -> Result<(ChatResponse, u32, Duration)> {
         let start = Instant::now();
         let (value, attempts) = self
-            .with_retries(cancel, || self.post_once("/api/chat", body, self.config.request_timeout))
+            .with_retries(cancel, || {
+                self.post_once("/api/chat", body, self.config.request_timeout)
+            })
             .await?;
         let wall = start.elapsed();
         let resp: ChatResponse = serde_json::from_value(value)
@@ -485,7 +503,14 @@ impl OllamaBackend {
         Ok((resp, attempts, wall))
     }
 
-    fn to_raw(resp: ChatResponse, json: Value, text: String, attempts: u32, wall: Duration, repaired: bool) -> RawResponse {
+    fn to_raw(
+        resp: ChatResponse,
+        json: Value,
+        text: String,
+        attempts: u32,
+        wall: Duration,
+        repaired: bool,
+    ) -> RawResponse {
         RawResponse {
             raw_text: text,
             json,
@@ -513,7 +538,11 @@ impl OllamaBackend {
         self.check_context(request)?;
         let body = self.chat_body(request, None);
         let (resp, attempts, wall) = self.generate(&body, cancel).await?;
-        let text = resp.message.as_ref().map(|m| m.content.clone()).unwrap_or_default();
+        let text = resp
+            .message
+            .as_ref()
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
         let first_errors = match validate_text(request, &text) {
             Ok(json) => return Ok(Self::to_raw(resp, json, text, attempts, wall, false)),
             Err(errors) => errors,
@@ -532,7 +561,11 @@ impl OllamaBackend {
         );
         let body = self.chat_body(request, Some((&text, &first_errors)));
         let (resp, attempts, wall) = self.generate(&body, cancel).await?;
-        let text = resp.message.as_ref().map(|m| m.content.clone()).unwrap_or_default();
+        let text = resp
+            .message
+            .as_ref()
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
         match validate_text(request, &text) {
             Ok(json) => Ok(Self::to_raw(resp, json, text, attempts, wall, true)),
             Err(errors) => Err(VisionError::SchemaInvalid {
@@ -546,7 +579,9 @@ impl OllamaBackend {
     /// Server version from `/api/version`.
     pub async fn server_version(&self) -> Result<String> {
         let cancel = CancellationToken::new();
-        let (v, _) = self.with_retries(&cancel, || self.get_once("/api/version")).await?;
+        let (v, _) = self
+            .with_retries(&cancel, || self.get_once("/api/version"))
+            .await?;
         let version = v
             .get("version")
             .and_then(Value::as_str)
@@ -563,12 +598,16 @@ impl OllamaBackend {
         let cancel = CancellationToken::new();
         let body = json!({"model": self.config.model});
         let (show, _) = self
-            .with_retries(&cancel, || self.post_once("/api/show", &body, self.config.metadata_timeout))
+            .with_retries(&cancel, || {
+                self.post_once("/api/show", &body, self.config.metadata_timeout)
+            })
             .await?;
         let digest = match show.get("digest").and_then(Value::as_str) {
             Some(d) if !d.is_empty() => d.to_string(),
             _ => {
-                let (tags, _) = self.with_retries(&cancel, || self.get_once("/api/tags")).await?;
+                let (tags, _) = self
+                    .with_retries(&cancel, || self.get_once("/api/tags"))
+                    .await?;
                 let tags: TagsResponse = serde_json::from_value(tags)
                     .map_err(|e| VisionError::Protocol(format!("/api/tags response: {e}")))?;
                 tags.models
@@ -597,7 +636,9 @@ impl OllamaBackend {
 
     async fn loaded_model(&self) -> Result<Option<PsModel>> {
         let cancel = CancellationToken::new();
-        let (ps, _) = self.with_retries(&cancel, || self.get_once("/api/ps")).await?;
+        let (ps, _) = self
+            .with_retries(&cancel, || self.get_once("/api/ps"))
+            .await?;
         let ps: PsResponse = serde_json::from_value(ps)
             .map_err(|e| VisionError::Protocol(format!("/api/ps response: {e}")))?;
         Ok(ps
@@ -633,8 +674,10 @@ impl OllamaBackend {
             "keep_alive": self.config.keep_alive,
             "options": {"num_ctx": self.config.num_ctx},
         });
-        self.with_retries(&cancel, || self.post_once("/api/chat", &body, self.config.request_timeout))
-            .await?;
+        self.with_retries(&cancel, || {
+            self.post_once("/api/chat", &body, self.config.request_timeout)
+        })
+        .await?;
         Ok(())
     }
 
@@ -642,8 +685,10 @@ impl OllamaBackend {
     pub async fn unload(&self) -> Result<()> {
         let cancel = CancellationToken::new();
         let body = json!({"model": self.config.model, "messages": [], "keep_alive": 0});
-        self.with_retries(&cancel, || self.post_once("/api/chat", &body, self.config.metadata_timeout))
-            .await?;
+        self.with_retries(&cancel, || {
+            self.post_once("/api/chat", &body, self.config.metadata_timeout)
+        })
+        .await?;
         Ok(())
     }
 
@@ -676,7 +721,10 @@ impl OllamaBackend {
     }
 }
 
-fn validate_text(request: &VisionRequest, text: &str) -> std::result::Result<Value, Vec<FieldError>> {
+fn validate_text(
+    request: &VisionRequest,
+    text: &str,
+) -> std::result::Result<Value, Vec<FieldError>> {
     let json = parse_output_text(text).map_err(|e| vec![e])?;
     request.schema.validate(&json)?;
     Ok(json)
@@ -710,7 +758,9 @@ impl VisionBackend for OllamaBackend {
                     })?
             }
         };
-        if let (Some(loaded_digest), Some(known)) = (loaded.digest.as_deref(), lock(&self.digest).as_deref()) {
+        if let (Some(loaded_digest), Some(known)) =
+            (loaded.digest.as_deref(), lock(&self.digest).as_deref())
+        {
             if !loaded_digest.is_empty() && loaded_digest != known {
                 return Err(VisionError::DigestChanged {
                     model: self.config.model.clone(),
@@ -739,7 +789,11 @@ impl VisionBackend for OllamaBackend {
         Ok(placement)
     }
 
-    async fn infer(&self, request: VisionRequest, cancel: CancellationToken) -> Result<RawResponse> {
+    async fn infer(
+        &self,
+        request: VisionRequest,
+        cancel: CancellationToken,
+    ) -> Result<RawResponse> {
         self.infer_inner(&request, &cancel, true).await
     }
 }
@@ -753,7 +807,10 @@ mod tests {
     fn retry_after_seconds_and_date() {
         let mut h = HeaderMap::new();
         h.insert(RETRY_AFTER, HeaderValue::from_static("7"));
-        assert_eq!(parse_retry_after(&h, SystemTime::now()), Some(Duration::from_secs(7)));
+        assert_eq!(
+            parse_retry_after(&h, SystemTime::now()),
+            Some(Duration::from_secs(7))
+        );
 
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let later = httpdate::fmt_http_date(now + Duration::from_secs(30));
@@ -769,17 +826,30 @@ mod tests {
     fn model_names_match_with_implicit_latest() {
         assert!(same_model("qwen2.5vl:7b", "", "qwen2.5vl:7b"));
         assert!(same_model("llava", "", "llava:latest"));
-        assert!(!same_model("qwen2.5vl:32b", "qwen2.5vl:32b", "qwen2.5vl:7b"));
+        assert!(!same_model(
+            "qwen2.5vl:32b",
+            "qwen2.5vl:32b",
+            "qwen2.5vl:7b"
+        ));
     }
 
     #[test]
     fn constructor_rejects_bad_config() {
         let bad_ctx = OllamaConfig::new("http://localhost:11434", "m", 512);
-        assert!(matches!(OllamaBackend::new(bad_ctx), Err(VisionError::Config(_))));
+        assert!(matches!(
+            OllamaBackend::new(bad_ctx),
+            Err(VisionError::Config(_))
+        ));
         let mut no_slots = OllamaConfig::new("http://localhost:11434", "m", 8192);
         no_slots.slots = 0;
-        assert!(matches!(OllamaBackend::new(no_slots), Err(VisionError::Config(_))));
+        assert!(matches!(
+            OllamaBackend::new(no_slots),
+            Err(VisionError::Config(_))
+        ));
         let bad_url = OllamaConfig::new("localhost:11434", "m", 8192);
-        assert!(matches!(OllamaBackend::new(bad_url), Err(VisionError::Config(_))));
+        assert!(matches!(
+            OllamaBackend::new(bad_url),
+            Err(VisionError::Config(_))
+        ));
     }
 }
