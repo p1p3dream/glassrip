@@ -3,6 +3,7 @@
 
 pub mod extract;
 pub mod frames;
+pub mod meeting;
 pub mod output;
 pub mod pipeline;
 pub mod retry;

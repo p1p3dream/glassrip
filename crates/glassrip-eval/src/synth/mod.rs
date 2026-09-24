@@ -8,6 +8,7 @@
 
 pub mod boards;
 pub mod docs;
+pub mod run_artifacts;
 
 use std::path::{Path, PathBuf};
 

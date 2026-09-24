@@ -37,7 +37,9 @@ pub fn is_common_word(word: &str) -> bool {
 }
 
 /// Correction thresholds.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 pub struct CorrectionConfig {
     /// Words with probability at or above this are never changed.
     pub max_p: f32,

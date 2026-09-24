@@ -14,12 +14,47 @@ gpu = ["dep:ort", "dep:ndarray"]
 # GPU OCR on NVIDIA GPUs: registers the CUDA execution provider and fails
 # loudly if it cannot be initialized. Plain `gpu` runs ONNX Runtime on CPU.
 gpu-cuda = ["gpu", "ort/cuda"]
+# Meeting mode. Without these, `glassrip meeting` still builds and runs the
+# media stages (and ASR through whisper.cpp); stages that need a missing
+# feature fail preflight with a message naming it.
+# PP-OCRv5 (ocr_harvest) on ONNX Runtime, CPU.
+onnx = ["glassrip-vision-stages/onnx", "glassrip-eval/onnx"]
+# speakrs diarization (CPU unless `cuda`).
+diarize = ["glassrip-audio/diarize"]
+# Visual speaker cues in name_speakers (PP-OCR through ONNX Runtime from ORT_DYLIB_PATH).
+ocr = ["glassrip-notes/ocr"]
+# whisper.cpp on Metal (always on for macOS builds; explicit for clarity).
+metal = ["glassrip-audio/metal"]
+# NVIDIA: OCR, orientation, diarization, and whisper.cpp on CUDA; ONNX Runtime
+# loaded from ORT_DYLIB_PATH.
+cuda = [
+    "onnx",
+    "glassrip-vision-stages/cuda",
+    "glassrip-media-stages/cuda",
+    "glassrip-audio/cuda",
+    "glassrip-notes/ocr-cuda",
+]
 
 [dependencies]
 anyhow = "1"
+async-trait = "0.1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+fs-err = "3"
+glassrip-audio = { path = "crates/glassrip-audio" }
+glassrip-core = { path = "crates/glassrip-core" }
 glassrip-eval = { path = "crates/glassrip-eval" }
+glassrip-media-stages = { path = "crates/glassrip-media-stages" }
+glassrip-meeting = { path = "crates/glassrip-meeting" }
+glassrip-notes = { path = "crates/glassrip-notes" }
+glassrip-ocr = { path = "crates/glassrip-ocr" }
+glassrip-render = { path = "crates/glassrip-render" }
+glassrip-vision = { path = "crates/glassrip-vision" }
+glassrip-vision-stages = { path = "crates/glassrip-vision-stages" }
+thiserror = "2"
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "json", "env-filter"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 imageproc = "0.25"
 md-5 = "0.10"
@@ -31,3 +66,5 @@ serde_json = "1"
 similar = "2"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]

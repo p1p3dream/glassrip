@@ -76,6 +76,8 @@ enum Commands {
         #[arg(long, default_value_t = 4)]
         refine_agents: usize,
     },
+    /// Turn a meeting recording into board state, transcript, notes, and an SVG
+    Meeting(glassrip::meeting::MeetingArgs),
     /// Evaluate against golden fixtures and gate regressions (spec section 9)
     Eval(glassrip_eval::cli::EvalArgs),
 }
@@ -130,6 +132,7 @@ async fn main() -> Result<()> {
             };
             glassrip::pipeline::run_pipeline(&args).await
         }
+        Commands::Meeting(args) => glassrip::meeting::cli::run(args).await,
         Commands::Eval(args) => {
             if !glassrip_eval::cli::run(args).await?.passed {
                 std::process::exit(1);

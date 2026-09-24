@@ -223,11 +223,18 @@ pub struct OrientConfig {
     /// Frames sampled across the video for the rotation vote.
     #[garde(range(min = 1, max = 1000))]
     pub sample_frames: u32,
+    /// Skip orientation detection and apply this clockwise rotation (0, 90, 180,
+    /// or 270), for example for screen recordings; absent means detect.
+    #[garde(skip)]
+    pub override_rotation_deg: Option<u32>,
 }
 
 impl Default for OrientConfig {
     fn default() -> Self {
-        Self { sample_frames: 12 }
+        Self {
+            sample_frames: 12,
+            override_rotation_deg: None,
+        }
     }
 }
 

@@ -118,7 +118,7 @@ pub struct GapFillParams {
 }
 
 /// One word of a transcript segment.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TranscriptWord {
     /// Word text after the vocabulary correction pass.
     pub w: String,
@@ -147,7 +147,7 @@ pub struct TranscriptWord {
 }
 
 /// One transcript segment (a run of words by one speaker).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TranscriptSegment {
     /// Stable segment id.
     pub segment_id: String,

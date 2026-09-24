@@ -71,6 +71,20 @@ pub enum VisionError {
         raw_text: String,
     },
 
+    /// Generation stopped at the output limit (`done_reason: length`), so the reply
+    /// is incomplete. A schema repair would echo the cut-off text back, so the
+    /// caller decides instead (for example a retry with a smaller list budget).
+    #[error(
+        "generation stopped at the output limit of {num_predict} tokens (done_reason length) \
+         after {} bytes of output",
+        .raw_text.len()
+    )]
+    Truncated {
+        num_predict: u32,
+        eval_count: Option<u32>,
+        raw_text: String,
+    },
+
     /// Decoding an already-validated value into the caller's type failed.
     #[error("could not decode model output:\n{}", format_field_errors(.errors))]
     Decode { errors: Vec<FieldError> },
@@ -135,6 +149,11 @@ impl VisionError {
             self,
             VisionError::Timeout { .. } | VisionError::RetriesExhausted { .. }
         )
+    }
+
+    /// True when the reply was cut off at the output limit.
+    pub fn is_truncated(&self) -> bool {
+        matches!(self, VisionError::Truncated { .. })
     }
 }
 

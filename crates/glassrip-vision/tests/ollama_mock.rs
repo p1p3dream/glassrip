@@ -679,3 +679,113 @@ async fn self_test_passes_and_fails_without_repair() {
         .unwrap_err();
     assert!(matches!(err, VisionError::SelfTestFailed(_)), "{err:?}");
 }
+
+fn length_reply(content: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "model": MODEL,
+        "created_at": "2026-01-01T00:00:00Z",
+        "message": {"role": "assistant", "content": content},
+        "done": true,
+        "done_reason": "length",
+        "prompt_eval_count": 612,
+        "eval_count": 64
+    }))
+}
+
+#[tokio::test]
+async fn length_stop_is_truncated_without_a_repair_request() {
+    let server = MockServer::start().await;
+    // Indented output that ran out of tokens mid-document (synthetic).
+    let cut = "{\n  \"dominant_color\": \"red\",\n  \"contains_";
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(length_reply(cut))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let err = backend(&server)
+        .infer(request(), CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(err.is_truncated(), "{err:?}");
+    match err {
+        VisionError::Truncated {
+            num_predict,
+            eval_count,
+            raw_text,
+        } => {
+            assert_eq!(num_predict, 64);
+            assert_eq!(eval_count, Some(64));
+            assert_eq!(raw_text, cut);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    // One request only: echoing a cut-off reply back cannot fix it.
+    assert_eq!(chat_requests(&server).await.len(), 1);
+}
+
+#[tokio::test]
+async fn length_stop_with_valid_json_is_still_truncated() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(length_reply(GOOD))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let err = backend(&server)
+        .infer(request(), CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(err.is_truncated(), "{err:?}");
+}
+
+#[tokio::test]
+async fn format_is_the_structural_schema() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(chat_reply(GOOD))
+        .mount(&server)
+        .await;
+    let req = request();
+    let expected = req.schema.grammar_value();
+    backend(&server)
+        .infer(req, CancellationToken::new())
+        .await
+        .unwrap();
+    let body = &chat_requests(&server).await[0];
+    assert_eq!(body["format"], expected);
+    let text = body["format"].to_string();
+    assert!(
+        !text.contains("\"description\"") && !text.contains("\"title\""),
+        "{text}"
+    );
+    assert_eq!(body["format"]["additionalProperties"], json!(false));
+}
+
+#[tokio::test]
+async fn model_size_comes_from_tags_and_show() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "models": [
+                {"name": "other:1b", "model": "other:1b", "digest": "x", "size": 1},
+                {"name": MODEL, "model": MODEL, "digest": DIGEST, "size": 21_000_000_000u64}
+            ]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/show"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "digest": DIGEST,
+            "details": {"parameter_size": "32.8B", "quantization_level": "Q4_K_M"}
+        })))
+        .mount(&server)
+        .await;
+    let size = backend(&server).model_size().await.unwrap();
+    assert_eq!(size.file_bytes, Some(21_000_000_000));
+    assert_eq!(size.parameter_size_b, Some(32.8));
+}

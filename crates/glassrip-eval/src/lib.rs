@@ -9,6 +9,7 @@ pub mod fixture;
 pub mod gate;
 pub mod golden;
 pub mod metrics;
+pub mod pipeline;
 pub mod privacy;
 pub mod replay;
 pub mod report;

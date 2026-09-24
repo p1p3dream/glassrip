@@ -295,6 +295,36 @@ pub fn board_read_request(
     VisionRequest::for_output::<BoardReadOutput>(BOARD_READ_PROMPT, prepared.image.clone(), options)
 }
 
+/// Added to the board prompt for the one retry after a reply stopped at the
+/// output limit.
+pub const COMPACT_RETRY_NOTE: &str = "\
+Your previous answer was cut off at the output limit. Answer again, shorter: write compact JSON \
+on one single line with no spaces, indentation, or line breaks between tokens, and list at most \
+as many items as the schema below allows, keeping the most legible ones.";
+
+/// Default list budget of the compact retry, as a share of the normal `maxItems`.
+pub const COMPACT_RETRY_SCALE: f64 = 0.5;
+
+/// The retry after a truncated board read: the same image and options, the
+/// board prompt plus [`COMPACT_RETRY_NOTE`], and the output schema with every
+/// list budget scaled by `max_items_scale` (see
+/// [`crate::schema::OutputSchema::with_scaled_max_items`]).
+pub fn board_read_request_compact(
+    prepared: &PreparedImage,
+    options: GenerationOptions,
+    max_items_scale: f64,
+) -> Result<VisionRequest> {
+    let schema = crate::schema::OutputSchema::for_type::<BoardReadOutput>()?
+        .with_scaled_max_items(max_items_scale)?;
+    let prompt = format!("{}\n\n{COMPACT_RETRY_NOTE}", BOARD_READ_PROMPT.trim_end());
+    Ok(VisionRequest {
+        prompt: crate::schema::prompt_with_schema(&prompt, &schema),
+        image: prepared.image.clone(),
+        schema,
+        options,
+    })
+}
+
 /// UI strings and patterns that are never board content.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1317,6 +1347,39 @@ mod tests {
             schema.json()["properties"]["edges"]["items"]["additionalProperties"],
             serde_json::json!(false)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_asks_for_single_line_json() {
+        assert!(BOARD_READ_PROMPT.contains("single line, without indentation or line breaks"));
+        assert!(COMPACT_RETRY_NOTE.contains("one single line"));
+    }
+
+    #[test]
+    fn compact_retry_request_halves_list_budgets() -> Result<()> {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::new(64, 48));
+        let prepared = crate::image_prep::prepare_board_image(&img)?;
+        let options = GenerationOptions {
+            seed: 3,
+            num_predict: 1500,
+        };
+        let normal = board_read_request(&prepared, options)?;
+        let compact = board_read_request_compact(&prepared, options, COMPACT_RETRY_SCALE)?;
+        let props = &compact.schema.json()["properties"];
+        assert_eq!(props["nodes"]["maxItems"], 30);
+        assert_eq!(props["edges"]["maxItems"], 40);
+        assert_eq!(props["owner_tags"]["maxItems"], 10);
+        // Box tuples keep their fixed length.
+        assert_eq!(
+            props["nodes"]["items"]["properties"]["bbox_2d"]["maxItems"],
+            4
+        );
+        assert!(compact.prompt.starts_with(BOARD_READ_PROMPT.trim_end()));
+        assert!(compact.prompt.contains(COMPACT_RETRY_NOTE));
+        assert!(compact.prompt.contains("\"maxItems\":30"));
+        assert_ne!(compact.prompt, normal.prompt);
+        assert_eq!(compact.options, normal.options);
         Ok(())
     }
 

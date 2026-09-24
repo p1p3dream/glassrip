@@ -347,7 +347,7 @@ impl Plan {
 ///
 /// Artifact names follow the data contracts; stages whose artifact is not named there
 /// use `glassrip.<stage>`. `diarize` reads the audio only, so ASR and diarization can
-/// run concurrently.
+/// run concurrently; `gap_fill` joins them before word assignment.
 pub fn meeting_mode_stage_decls() -> Vec<StageDecl> {
     let d = StageDecl::new;
     vec![
@@ -434,10 +434,17 @@ pub fn meeting_mode_stage_decls() -> Vec<StageDecl> {
             &["glassrip.audio", "glassrip.asr_vocabulary"],
         ),
         d("diarize", "glassrip.diarization", &["glassrip.audio"]),
+        // Labels speech the diarizer left uncovered (embedding match); a cached
+        // intermediate so assign_words stays cheap and resumes skip inference.
+        d(
+            "gap_fill",
+            "glassrip.gap_fill",
+            &["glassrip.asr", "glassrip.diarization"],
+        ),
         d(
             "assign_words",
             "glassrip.transcript",
-            &["glassrip.asr", "glassrip.diarization"],
+            &["glassrip.asr", "glassrip.gap_fill"],
         ),
         d(
             "name_speakers",
@@ -496,6 +503,7 @@ mod tests {
         );
         assert!(g.descendants("ocr_vocabulary").unwrap().contains("asr"));
         assert!(pos("board_state") < pos("notes"));
+        assert!(pos("diarize") < pos("gap_fill") && pos("gap_fill") < pos("assign_words"));
         assert_eq!(order.last(), Some(&"render"));
         // board_read takes no transcript input in v1.
         let upstream = g.ancestors("board_read").unwrap();

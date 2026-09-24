@@ -415,3 +415,78 @@ async fn board_validate_feeds_board_state() {
         .iter()
         .any(|(_, s)| s.nodes.iter().any(|n| n.text == "Order Service")));
 }
+
+/// Scripted model whose full-budget board reads stop at the output limit; the
+/// compact retry (halved list budgets) gets the normal answer.
+struct TruncatingModel;
+
+#[async_trait]
+impl VisionBackend for TruncatingModel {
+    fn id(&self) -> BackendId {
+        ScriptedModel.id()
+    }
+    async fn preflight(&self) -> glassrip_vision::Result<Placement> {
+        Err(VisionError::Config("unused".into()))
+    }
+    async fn infer(
+        &self,
+        request: VisionRequest,
+        cancel: CancellationToken,
+    ) -> glassrip_vision::Result<RawResponse> {
+        let nodes_budget = request.schema.json()["properties"]["nodes"]["maxItems"].as_u64();
+        if nodes_budget == Some(60) {
+            return Err(VisionError::Truncated {
+                num_predict: request.options.num_predict,
+                eval_count: Some(request.options.num_predict),
+                raw_text: "{\n  \"nodes\": [\n    {\"local_id\": \"n1\",".into(),
+            });
+        }
+        ScriptedModel.infer(request, cancel).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn truncated_board_reads_retry_compact_and_replay() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_inputs(root);
+    let store = RawStore::new(root.join("raw"));
+    let live = root.join("live");
+    let (monitor, _) = run_branch(
+        root,
+        &live,
+        Arc::new(RecordingBackend::new(
+            Arc::new(TruncatingModel),
+            store.clone(),
+        )),
+    )
+    .await;
+    // 3 classify + 2 truncated board reads + 2 compact retries.
+    assert_eq!(monitor.completed(), 7);
+    let readings: Vec<(String, BoardReadingItem)> = read(&live, artifacts::BOARD_READING);
+    assert_eq!(readings.len(), 2);
+    for (_, r) in &readings {
+        assert_eq!(r.requests.len(), 1);
+        assert!(r.requests[0].compact_retry, "{:?}", r.requests[0]);
+        assert_eq!(r.result.nodes[0].text, "Order Service");
+    }
+
+    // Replay reproduces the truncation and the retry without a model.
+    let replay = root.join("replay");
+    let (_, _) = run_branch(
+        root,
+        &replay,
+        Arc::new(ReplayBackend::new("scripted-vl", store.clone())),
+    )
+    .await;
+    let again: Vec<(String, BoardReadingItem)> = read(&replay, artifacts::BOARD_READING);
+    assert_eq!(
+        again.iter().map(|(_, r)| &r.result).collect::<Vec<_>>(),
+        readings.iter().map(|(_, r)| &r.result).collect::<Vec<_>>()
+    );
+    assert!(again.iter().all(|(_, r)| r.requests[0].compact_retry));
+    assert_eq!(
+        again[0].1.requests[0].request_key,
+        readings[0].1.requests[0].request_key
+    );
+}

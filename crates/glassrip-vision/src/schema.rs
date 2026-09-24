@@ -91,6 +91,40 @@ impl OutputSchema {
         self.format_value().to_string()
     }
 
+    /// Schema as sent to the server's grammar constraint: [`Self::format_value`]
+    /// without annotation keywords (`title`, `description`, `format`, `examples`,
+    /// `default`). Annotations never constrain output, and dropping them keeps the
+    /// grammar the server builds to the structural keywords (types, enums,
+    /// required properties, bounded arrays). Property names are never touched.
+    /// The prompt keeps [`Self::text`], so prompts and replay keys do not change.
+    pub fn grammar_value(&self) -> Value {
+        let mut v = self.format_value();
+        strip_annotations(&mut v);
+        v
+    }
+
+    /// A copy whose list budgets are reduced by `scale`: every array whose
+    /// `maxItems` exceeds its `minItems` (fixed-length tuples such as boxes are
+    /// left alone) gets `maxItems = max(minItems, 1, floor(maxItems * scale))`.
+    /// Validation still runs against the Rust type as before.
+    pub fn with_scaled_max_items(&self, scale: f64) -> Result<Self> {
+        if !(scale.is_finite() && scale > 0.0) {
+            return Err(VisionError::Config(format!(
+                "list budget scale must be positive, got {scale}"
+            )));
+        }
+        let mut schema = self.schema.clone();
+        scale_max_items(&mut schema, scale);
+        let validator = jsonschema::validator_for(&schema)
+            .map_err(|e| VisionError::Config(format!("scaled schema is invalid: {e}")))?;
+        Ok(Self {
+            name: self.name.clone(),
+            schema,
+            validator: Arc::new(validator),
+            typed_check: Arc::clone(&self.typed_check),
+        })
+    }
+
     /// Validate `value` against the schema, then against the Rust type.
     pub fn validate(&self, value: &Value) -> std::result::Result<(), Vec<FieldError>> {
         let errors: Vec<FieldError> = self
@@ -106,6 +140,72 @@ impl OutputSchema {
         }
         (self.typed_check)(value)
     }
+}
+
+/// Annotation keywords that never constrain an instance.
+const ANNOTATION_KEYWORDS: [&str; 5] = ["title", "description", "format", "examples", "default"];
+
+/// Keywords whose value is one subschema.
+const SUBSCHEMA_KEYWORDS: [&str; 5] = [
+    "items",
+    "additionalProperties",
+    "not",
+    "contains",
+    "additionalItems",
+];
+
+/// Keywords whose value is a list of subschemas.
+const SUBSCHEMA_LIST_KEYWORDS: [&str; 4] = ["anyOf", "oneOf", "allOf", "prefixItems"];
+
+/// Keywords whose value maps names to subschemas.
+const SUBSCHEMA_MAP_KEYWORDS: [&str; 4] =
+    ["properties", "$defs", "definitions", "patternProperties"];
+
+/// Visits `schema` and every nested subschema (never property names).
+fn visit_schemas(schema: &mut Value, f: &mut dyn FnMut(&mut serde_json::Map<String, Value>)) {
+    let Value::Object(map) = schema else { return };
+    f(map);
+    for k in SUBSCHEMA_KEYWORDS {
+        if let Some(sub) = map.get_mut(k) {
+            match sub {
+                Value::Array(list) => list.iter_mut().for_each(|s| visit_schemas(s, f)),
+                other => visit_schemas(other, f),
+            }
+        }
+    }
+    for k in SUBSCHEMA_LIST_KEYWORDS {
+        if let Some(Value::Array(list)) = map.get_mut(k) {
+            list.iter_mut().for_each(|s| visit_schemas(s, f));
+        }
+    }
+    for k in SUBSCHEMA_MAP_KEYWORDS {
+        if let Some(Value::Object(m)) = map.get_mut(k) {
+            m.values_mut().for_each(|s| visit_schemas(s, f));
+        }
+    }
+}
+
+fn strip_annotations(schema: &mut Value) {
+    visit_schemas(schema, &mut |m| {
+        for k in ANNOTATION_KEYWORDS {
+            m.remove(k);
+        }
+    });
+}
+
+fn scale_max_items(schema: &mut Value, scale: f64) {
+    visit_schemas(schema, &mut |m| {
+        let Some(max) = m.get("maxItems").and_then(Value::as_u64) else {
+            return;
+        };
+        let min = m.get("minItems").and_then(Value::as_u64).unwrap_or(0);
+        if max <= min {
+            return;
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let scaled = (max as f64 * scale).floor() as u64;
+        m.insert("maxItems".into(), Value::from(scaled.max(min).max(1)));
+    });
 }
 
 /// Append the schema instructions to a prompt.
@@ -241,6 +341,70 @@ mod tests {
         // The typed decoder alone also names the path.
         let typed = decode_value::<Outer>(&v).err().unwrap_or_default();
         assert_eq!(typed[0].path, "/items/0/extra");
+    }
+
+    /// Documented output with a property literally named `format` and a box tuple.
+    #[derive(Debug, Deserialize, JsonSchema, PartialEq)]
+    #[serde(deny_unknown_fields)]
+    struct Annotated {
+        /// The output format name.
+        format: String,
+        /// A bounded list.
+        #[schemars(length(max = 10))]
+        rows: Vec<Row>,
+    }
+
+    /// One row.
+    #[derive(Debug, Deserialize, JsonSchema, PartialEq)]
+    #[serde(deny_unknown_fields)]
+    struct Row {
+        /// Box corners.
+        bbox: [f64; 4],
+        /// Score as a double.
+        value: f64,
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn grammar_value_drops_annotations_but_keeps_properties() {
+        let s = OutputSchema::for_type::<Annotated>().unwrap();
+        assert!(
+            s.text().contains("description"),
+            "prompt schema is unchanged"
+        );
+        let g = s.grammar_value();
+        let text = g.to_string();
+        assert!(!text.contains("\"description\""), "{text}");
+        assert!(!text.contains("\"title\""), "{text}");
+        assert!(!text.contains("\"$schema\""), "{text}");
+        // The property named `format` survives; only the keyword is removed.
+        assert!(g["properties"]["format"].is_object(), "{text}");
+        assert!(g["properties"]["rows"]["items"]["properties"]["value"]
+            .get("format")
+            .is_none());
+        assert_eq!(g["properties"]["rows"]["maxItems"], json!(10));
+        assert_eq!(g["required"], s.format_value()["required"]);
+        assert_eq!(g["additionalProperties"], json!(false));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn scaled_max_items_leaves_tuples_alone() {
+        let s = OutputSchema::for_type::<Annotated>().unwrap();
+        let half = s.with_scaled_max_items(0.5).unwrap();
+        let rows = &half.json()["properties"]["rows"];
+        assert_eq!(rows["maxItems"], json!(5));
+        assert_eq!(rows["items"]["properties"]["bbox"]["maxItems"], json!(4));
+        assert_eq!(rows["items"]["properties"]["bbox"]["minItems"], json!(4));
+        let tiny = s.with_scaled_max_items(0.01).unwrap();
+        assert_eq!(tiny.json()["properties"]["rows"]["maxItems"], json!(1));
+        // The scaled validator enforces the smaller budget.
+        let row = json!({"bbox": [0, 0, 1, 1], "value": 0.5});
+        let six = json!({"format": "x", "rows": [row, row, row, row, row, row]});
+        assert!(s.validate(&six).is_ok());
+        assert!(half.validate(&six).is_err());
+        assert!(s.with_scaled_max_items(0.0).is_err());
+        assert!(s.with_scaled_max_items(f64::NAN).is_err());
     }
 
     #[test]
