@@ -69,7 +69,10 @@ mod tests {
 
     #[test]
     fn normalizes_punctuation_and_case() {
-        assert_eq!(normalize_words("Hello, World! It's 'fine'."), vec!["hello", "world", "it's", "fine"]);
+        assert_eq!(
+            normalize_words("Hello, World! It's 'fine'."),
+            vec!["hello", "world", "it's", "fine"]
+        );
     }
 
     #[test]

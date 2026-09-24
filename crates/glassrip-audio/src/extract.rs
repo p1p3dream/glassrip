@@ -189,7 +189,10 @@ pub async fn extract_audio(opts: &ExtractOptions, input: &Path) -> Result<Extrac
     if out.stdout.len() % 4 != 0 {
         return Err(AudioError::Parse {
             what: "ffmpeg f32le output".into(),
-            message: format!("{} bytes is not a whole number of samples", out.stdout.len()),
+            message: format!(
+                "{} bytes is not a whole number of samples",
+                out.stdout.len()
+            ),
         });
     }
     let samples = f32le_to_samples(&out.stdout);

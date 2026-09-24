@@ -185,7 +185,10 @@ mod tests {
 
     #[test]
     fn falls_back_to_t0_without_dtw_and_clamps() {
-        let toks = vec![tok(" a", 0.9, -1.0, 0.3, None), tok(" b", 0.9, 0.3, 5.0, None)];
+        let toks = vec![
+            tok(" a", 0.9, -1.0, 0.3, None),
+            tok(" b", 0.9, 0.3, 5.0, None),
+        ];
         let w = tokens_to_words(&toks, 0.0, 1.0);
         assert!((w[0].start_s - 0.0).abs() < 1e-9);
         assert!(w[1].end_s <= 1.0);
