@@ -13,12 +13,15 @@ use schemars::JsonSchema;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
+use super::candidates::{board_facts, cue_lines, windows_by_time};
 use super::llm::{same_model, ChatRequest, LoadedModel, OllamaTextConfig, TextBackend};
+use super::prompt::PromptExtras;
 use super::prompt::{
     board_digest, map_request, reduce_request, repair_context, repair_request, windows, RepairCase,
 };
 use super::validate::{
-    assemble, check, dropped, merge_board_questions, Checked, Corpus, Draft, Section,
+    assemble, check_with, dropped, merge_board_questions, CheckOptions, Checked, Corpus, Draft,
+    Section,
 };
 use super::{
     CallRecord, Caveat, Evidence, MeetingNotes, NotesReport, NotesStatus, SpeakerLine,
@@ -64,6 +67,45 @@ pub struct NotesParams {
     pub paragraph_gap_s: f64,
     /// Transcript lines sent with a repair request, at most.
     pub repair_context_lines: usize,
+    /// Ask for short items in the speakers' own words and strip narrative
+    /// prefixes from decisions and tasks.
+    #[serde(default)]
+    pub concise_items: bool,
+    /// Give the model owner-tag facts from the board as candidate decisions and
+    /// action items, citable by event or keyframe id.
+    #[serde(default)]
+    pub board_candidates: bool,
+    /// List each window's decision and question cue sentences for the model to
+    /// accept or reject.
+    #[serde(default)]
+    pub cue_candidates: bool,
+    /// Most cue sentences listed per window.
+    #[serde(default = "default_max_cues")]
+    pub max_cue_lines: usize,
+    /// Tell the reduce call which open questions the board already has.
+    #[serde(default)]
+    pub board_questions_in_reduce: bool,
+    /// Decisions need a speaker commitment or an owner-tag change.
+    #[serde(default)]
+    pub precision_guard: bool,
+    /// Owner tags valid at the end become "Own <target>" action items unless
+    /// the owner already has an action naming the target.
+    #[serde(default)]
+    pub owner_actions: bool,
+    /// Time windows of this length instead of token windows, seconds.
+    #[serde(default)]
+    pub window_s: Option<f64>,
+    /// Overlap between time windows, seconds.
+    #[serde(default = "default_window_overlap_s")]
+    pub window_overlap_s: f64,
+}
+
+fn default_max_cues() -> usize {
+    60
+}
+
+fn default_window_overlap_s() -> f64 {
+    60.0
 }
 
 impl Default for NotesParams {
@@ -83,6 +125,17 @@ impl Default for NotesParams {
             alarm_min_transcript_s: 300.0,
             paragraph_gap_s: 2.0,
             repair_context_lines: 160,
+            // measured on the reference meeting (see candidates.rs); each can be
+            // switched off
+            concise_items: true,
+            board_candidates: true,
+            cue_candidates: true,
+            max_cue_lines: default_max_cues(),
+            board_questions_in_reduce: true,
+            precision_guard: true,
+            owner_actions: true,
+            window_s: None,
+            window_overlap_s: default_window_overlap_s(),
         }
     }
 }
@@ -231,7 +284,41 @@ impl NotesStage {
         let model_digest = self.backend.digest(&p.text_model).await.ok().flatten();
 
         let mut calls = Vec::new();
-        let wins = windows(&lines, p.window_tokens, p.window_overlap_lines);
+        let wins = match p.window_s {
+            Some(ws) => windows_by_time(&lines, ws, p.window_overlap_s, p.window_tokens),
+            None => windows(&lines, p.window_tokens, p.window_overlap_lines),
+        };
+        let extras = PromptExtras {
+            board_facts: if p.board_candidates {
+                board_facts(&input.boards)
+            } else {
+                String::new()
+            },
+            cues: if p.cue_candidates {
+                wins.iter()
+                    .map(|w| cue_lines(w, &lines, p.max_cue_lines))
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            board_questions: if p.board_questions_in_reduce {
+                input
+                    .boards
+                    .iter()
+                    .flat_map(|b| b.stickies.iter())
+                    .filter(|s| s.kind == crate::board::StickyKind::Question)
+                    .map(|s| s.text.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            concise: p.concise_items,
+        };
+        let opts = CheckOptions {
+            board_support: p.board_candidates,
+            precision_guard: p.precision_guard,
+            strip_prefix: p.concise_items,
+        };
         let mut drafts = Vec::new();
         for (i, w) in wins.iter().enumerate() {
             if ctx.cancel_token().is_cancelled() {
@@ -240,13 +327,21 @@ impl NotesStage {
                     "cancelled during notes",
                 ));
             }
-            let req = map_request(i, wins.len(), w, &lines, &digest, &people, p.num_predict);
+            let req = map_request(
+                (i, wins.len()),
+                w,
+                &lines,
+                &digest,
+                &people,
+                p.num_predict,
+                &extras,
+            );
             if let Some(d) = self.call(req, &mut calls).await? {
                 drafts.push(d);
             }
         }
         let draft = if drafts.len() > 1 {
-            let req = reduce_request(&drafts, &digest, &people, p.num_predict);
+            let req = reduce_request(&drafts, &digest, &people, p.num_predict, &extras);
             match self.call(req, &mut calls).await? {
                 Some(d) => d,
                 None => {
@@ -269,7 +364,7 @@ impl NotesStage {
         let mut cases = Vec::new();
         for s in Section::ALL {
             for item in draft.section(s) {
-                match check(s, item, &corpus) {
+                match check_with(s, item, &corpus, &opts) {
                     Ok(c) => checked.push(c),
                     Err(f) if f.fatal => dropped_items.push(dropped(s, item, f.reasons)),
                     Err(f) => cases.push(RepairCase {
@@ -297,7 +392,7 @@ impl NotesStage {
                     if *left == 0 {
                         break;
                     }
-                    match check(s, item, &corpus) {
+                    match check_with(s, item, &corpus, &opts) {
                         Ok(c) => {
                             *left -= 1;
                             repaired += 1;
@@ -326,6 +421,18 @@ impl NotesStage {
         }
         let mut sections = assemble(checked);
         let board_added = merge_board_questions(&mut sections.open_questions, &input.boards);
+        let owner_added = if p.owner_actions {
+            let add =
+                super::candidates::owner_actions(&input.boards, &sections.action_items, &people);
+            let n = add.len();
+            sections.action_items.extend(add);
+            for (i, a) in sections.action_items.iter_mut().enumerate() {
+                a.id = format!("a{}", i + 1);
+            }
+            n
+        } else {
+            0
+        };
 
         let duration_s = input
             .segments
@@ -426,7 +533,7 @@ impl NotesStage {
                 model_digest,
                 windows: wins.len(),
                 calls,
-                items_drafted: drafted + board_added,
+                items_drafted: drafted + board_added + owner_added,
                 items_kept,
                 items_failed_first_pass: failed_first,
                 items_repaired: repaired,

@@ -9,7 +9,7 @@ use super::{
     ActionItem, Decision, DroppedItem, Evidence, OpenQuestion, QuestionSource, Quote, QuoteMatch,
     SummaryPoint, TimelineEntry,
 };
-use crate::board::{first_seen, BoardExt, BoardStateItem, KeyframeTimes, StickyKind};
+use crate::board::{first_seen, BoardExt, BoardStateItem, EventKind, KeyframeTimes, StickyKind};
 use crate::named::NamedLine;
 use crate::people::AliasTable;
 use crate::text::{content_tokens, is_stopword, jaccard, normalize, sanitize_dashes, tokens};
@@ -203,6 +203,22 @@ pub struct Corpus {
     segs: BTreeMap<String, SegText>,
     times: BTreeMap<String, f64>,
     table: AliasTable,
+    /// Ids that show an owner tag appearing or moving (owner events, and the
+    /// keyframes that opened owner assignments).
+    owner_keys: BTreeSet<String>,
+}
+
+/// Validation switches (see [`super::candidates`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CheckOptions {
+    /// Decisions and action items may be supported by an owner-tag change on
+    /// the board instead of a transcript segment.
+    pub board_support: bool,
+    /// Decisions need a speaker commitment in a cited segment, or an owner-tag
+    /// change on the board.
+    pub precision_guard: bool,
+    /// Remove narrative prefixes ("The team decided to") from decisions and tasks.
+    pub strip_prefix: bool,
 }
 
 impl Corpus {
@@ -252,7 +268,30 @@ impl Corpus {
                 }
             }
         }
-        Self { segs, times, table }
+        let mut owner_keys = BTreeSet::new();
+        for b in boards {
+            for e in &b.events {
+                if matches!(e.kind, EventKind::OwnerAssigned | EventKind::OwnerMoved) {
+                    owner_keys.insert(e.event_id.clone());
+                }
+            }
+            for o in &b.owner_assignments {
+                if !o.opened_at_keyframe.is_empty() {
+                    owner_keys.insert(o.opened_at_keyframe.clone());
+                    times.entry(o.opened_at_keyframe.clone()).or_insert(
+                        keyframes
+                            .get(&o.opened_at_keyframe)
+                            .unwrap_or(o.valid_from_s),
+                    );
+                }
+            }
+        }
+        Self {
+            segs,
+            times,
+            table,
+            owner_keys,
+        }
     }
 
     /// The alias table.
@@ -655,12 +694,28 @@ fn resolve_owners(raw: &str, table: &AliasTable) -> Result<Vec<Owner>, String> {
 
 /// Validates one drafted item.
 pub fn check(section: Section, item: &DraftItem, corpus: &Corpus) -> Result<Checked, Failure> {
+    check_with(section, item, corpus, &CheckOptions::default())
+}
+
+/// Validates one drafted item with options.
+pub fn check_with(
+    section: Section,
+    item: &DraftItem,
+    corpus: &Corpus,
+    opts: &CheckOptions,
+) -> Result<Checked, Failure> {
     let mut reasons = Vec::new();
-    let text = sanitize_dashes(if section == Section::ActionItems {
+    let raw_text = if section == Section::ActionItems {
         &item.task
     } else {
         &item.text
-    });
+    };
+    let text = if opts.strip_prefix && matches!(section, Section::Decisions | Section::ActionItems)
+    {
+        sanitize_dashes(&super::candidates::strip_item_prefix(raw_text))
+    } else {
+        sanitize_dashes(raw_text)
+    };
     if tokens(&text).len() < 3 {
         reasons.push("text too short".to_string());
     }
@@ -694,8 +749,30 @@ pub fn check(section: Section, item: &DraftItem, corpus: &Corpus) -> Result<Chec
         section,
         Section::Decisions | Section::ActionItems | Section::OpenQuestions
     );
-    if needs_segment && evidence.segment_ids.is_empty() {
+    let board_backed = evidence
+        .event_ids
+        .iter()
+        .chain(&evidence.keyframe_ids)
+        .any(|id| corpus.owner_keys.contains(id));
+    let board_ok = opts.board_support
+        && board_backed
+        && matches!(section, Section::Decisions | Section::ActionItems);
+    if needs_segment && evidence.segment_ids.is_empty() && !board_ok {
         reasons.push("must cite at least one transcript segment".into());
+    }
+    if opts.precision_guard && section == Section::Decisions && !board_backed {
+        let committed = evidence.segment_ids.iter().any(|id| {
+            corpus.segs.get(id).is_some_and(|s| {
+                super::candidates::has_commitment(&s.text)
+                    || super::candidates::has_commitment(&s.text_raw)
+            })
+        });
+        if !committed {
+            reasons.push(
+                "a decision must cite a line where someone commits to it (or an owner-tag change on the board)"
+                    .into(),
+            );
+        }
     }
     for id in &evidence.segment_ids {
         if !corpus.segs.contains_key(id) {
@@ -1099,6 +1176,71 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ok.quote.unwrap().segment_id, "s9");
+    }
+
+    #[test]
+    fn board_support_precision_guard_and_prefixes() {
+        use crate::board::build;
+        let mut b = build::board("b", 100.0);
+        b.nodes = vec![build::node("n1", "Kiosk App", 0.0, 100.0, None)];
+        let mut o = build::owner(
+            "avery-quinn",
+            "Avery Quinn",
+            build::node_target(&b, "n1"),
+            40.0,
+            100.0,
+            None,
+        );
+        o.opened_at_keyframe = "kf_000040".into();
+        b.owner_assignments = vec![o];
+        let lines = vec![
+            line(
+                "s1",
+                10.0,
+                "The importer reads the ledger nightly.",
+                "The importer reads the ledger nightly.",
+            ),
+            line(
+                "s2",
+                20.0,
+                "Let's skip the importer for now.",
+                "Let's skip the importer for now.",
+            ),
+        ];
+        let c = Corpus::new(
+            &lines,
+            &[b],
+            &KeyframeTimes::default(),
+            AliasTable::from_names(&["Avery Quinn"]),
+        );
+        let all = CheckOptions {
+            board_support: true,
+            precision_guard: true,
+            strip_prefix: true,
+        };
+        // an owner-tag action with only the board citation
+        let mut a = DraftItem {
+            owner: "Avery".into(),
+            task: "Own the Kiosk App work".into(),
+            keyframe_ids: vec!["kf_000040".into()],
+            ..Default::default()
+        };
+        assert!(check_with(Section::ActionItems, &a, &c, &all).is_ok());
+        assert!(
+            check(Section::ActionItems, &a, &c).is_err(),
+            "off by default"
+        );
+        // a keyframe that did not open an owner tag is not board support
+        a.keyframe_ids = vec!["kf_999999".into()];
+        assert!(check_with(Section::ActionItems, &a, &c, &all).is_err());
+        // the guard: a decision citing only a descriptive line fails
+        let d = item("The team decided to skip the importer", &["s1"], "");
+        let e = check_with(Section::Decisions, &d, &c, &all).unwrap_err();
+        assert!(e.reasons.iter().any(|r| r.contains("commits")), "{e:?}");
+        // citing the committing line passes, with the prefix removed
+        let d = item("The team decided to skip the importer", &["s2"], "");
+        let ok = check_with(Section::Decisions, &d, &c, &all).unwrap();
+        assert_eq!(ok.text, "Skip the importer");
     }
 
     #[test]
