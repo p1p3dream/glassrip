@@ -166,6 +166,48 @@ pub fn stabilize(raws: &[Option<BBox>], min_iou: f64) -> Vec<Option<(u32, BBox, 
     out
 }
 
+/// Per-corner median of screen quads.
+pub fn median_quad(quads: &[[Point; 4]]) -> Option<[Point; 4]> {
+    if quads.is_empty() {
+        return None;
+    }
+    let mut out = [[0.0; 2]; 4];
+    for (c, corner) in out.iter_mut().enumerate() {
+        for (a, v) in corner.iter_mut().enumerate() {
+            let mut xs: Vec<f64> = quads.iter().map(|q| q[c][a]).collect();
+            xs.sort_by(f64::total_cmp);
+            let n = xs.len();
+            *v = if n % 2 == 1 {
+                xs[n / 2]
+            } else {
+                (xs[n / 2 - 1] + xs[n / 2]) / 2.0
+            };
+        }
+    }
+    Some(out)
+}
+
+/// Frames for the variance tiebreak and the one warp they share: the run's
+/// median quad (as `rectify` computes it) over the frames that have a quad;
+/// frames without a quad are left out. With no quads (screen recordings), all
+/// frames are used unwarped.
+pub fn tiebreak_frames(
+    frames: &[(PathBuf, Option<[Point; 4]>)],
+) -> (Vec<PathBuf>, Option<[Point; 4]>) {
+    let quads: Vec<[Point; 4]> = frames.iter().filter_map(|(_, q)| *q).collect();
+    match median_quad(&quads) {
+        Some(m) => (
+            frames
+                .iter()
+                .filter(|(_, q)| q.is_some())
+                .map(|(p, _)| p.clone())
+                .collect(),
+            Some(m),
+        ),
+        None => (frames.iter().map(|(p, _)| p.clone()).collect(), None),
+    }
+}
+
 /// Temporal-variance tiebreak for an ambiguous tile.
 fn variance_accepts(
     tile: &BBox,
@@ -174,17 +216,18 @@ fn variance_accepts(
     image_h: u32,
     p: &CanvasCropParams,
 ) -> Option<bool> {
-    let step = (frames.len() / p.variance_max_frames.max(1)).max(1);
+    let (paths, quad) = tiebreak_frames(frames);
+    let step = (paths.len() / p.variance_max_frames.max(1)).max(1);
     let out_w = p.variance_width.max(16);
     let out_h =
         ((f64::from(out_w) * f64::from(image_h) / f64::from(image_w.max(1))).round() as u32).max(8);
     let mut grays = Vec::new();
-    for (path, quad) in frames.iter().step_by(step).take(p.variance_max_frames) {
+    for path in paths.iter().step_by(step).take(p.variance_max_frames) {
         let Ok(img) = image::open(path) else {
             continue;
         };
         let gray = img.to_luma8();
-        let warped = match quad {
+        let warped = match &quad {
             Some(q) => pixels::warp_quad(&gray, q, out_w, out_h),
             None => Some(image::imageops::resize(
                 &gray,
@@ -417,6 +460,27 @@ impl Stage for CanvasCropStage {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tiebreak_uses_the_median_quad_and_drops_frames_without_one() {
+        let q = |dx: f64| [[dx, 0.0], [100.0 + dx, 0.0], [100.0 + dx, 50.0], [dx, 50.0]];
+        let frames = vec![
+            (PathBuf::from("a"), Some(q(0.0))),
+            (PathBuf::from("b"), None),
+            (PathBuf::from("c"), Some(q(4.0))),
+            (PathBuf::from("d"), Some(q(2.0))),
+        ];
+        let (paths, quad) = tiebreak_frames(&frames);
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("a"), PathBuf::from("c"), PathBuf::from("d")]
+        );
+        assert_eq!(quad, Some(q(2.0)));
+        let plain = vec![(PathBuf::from("a"), None), (PathBuf::from("b"), None)];
+        let (paths, quad) = tiebreak_frames(&plain);
+        assert_eq!(paths.len(), 2);
+        assert!(quad.is_none());
+    }
 
     #[test]
     fn stabilization_segments_and_medians() {

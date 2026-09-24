@@ -25,8 +25,9 @@ use glassrip_core::runner::{
     ArtifactSpec, InputDecl, ItemContext, KeyExtras, Stage, StageError, StageInputs, WorkItem,
 };
 use glassrip_vision::classify::{
-    classify_options, classify_request, combine, ClassifyMethod, ClassifyRules, KeywordPattern,
-    MatchMode, ScreenClass, ScreenClassOutput, ScreenType, SourceClassOutput, CLASSIFY_PROMPT,
+    classify_options, classify_request_with, combine, ClassifyMethod, ClassifyRules,
+    KeywordPattern, MatchMode, ScreenClass, ScreenClassOutput, ScreenType, SourceClassOutput,
+    CLASSIFY_PROMPT,
 };
 use glassrip_vision::image_prep::THUMBNAIL_LONG_EDGE;
 use glassrip_vision::BBox;
@@ -165,8 +166,12 @@ impl ClassifyStage {
             .ok_or_else(|| invalid(format!("no keyframe at index {idx}")))?;
         let rgb = load_rgb(input.image.clone()).await?;
         let frame = image::DynamicImage::ImageRgb8(rgb);
-        let (request, prepared) = classify_request(&frame, classify_options(self.params.seed))
-            .map_err(|e| vision_error_info(&e))?;
+        let (request, prepared) = classify_request_with(
+            &frame,
+            self.params.thumbnail_px,
+            classify_options(self.params.seed),
+        )
+        .map_err(|e| vision_error_info(&e))?;
         let key = request_key(&self.model, &request);
         let reply = self
             .monitor

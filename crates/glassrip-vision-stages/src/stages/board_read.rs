@@ -28,7 +28,8 @@ use glassrip_vision::board::{
     TextItem, BOARD_READ_PROMPT,
 };
 use glassrip_vision::image_prep::{
-    prepare_board_image, prepare_long_edge, BOARD_LONG_EDGE, LOW_RES_THRESHOLD, LOW_RES_UPSCALE,
+    prepare_board_image_with, prepare_long_edge, BoardSizing, BOARD_LONG_EDGE, LOW_RES_THRESHOLD,
+    LOW_RES_UPSCALE,
 };
 use glassrip_vision::{BBox, GenerationOptions, PreparedImage};
 use image::{DynamicImage, RgbImage};
@@ -430,7 +431,13 @@ impl Stage for BoardReadStage {
             .ok_or_else(|| crate::stages::invalid("canvas box is empty"))?;
         let (cw, ch) = (f64::from(canvas.width()), f64::from(canvas.height()));
         let overview_img = DynamicImage::ImageRgb8(canvas);
-        let overview = prepare_board_image(&overview_img).map_err(|e| vision_error_info(&e))?;
+        let sizing = BoardSizing {
+            target_long_edge: self.params.target_long_edge_px,
+            min_long_edge: self.params.min_long_edge_px,
+            low_res_upscale: self.params.low_res_upscale,
+        };
+        let overview =
+            prepare_board_image_with(&overview_img, &sizing).map_err(|e| vision_error_info(&e))?;
         let low_res = overview.plan.low_res;
         let token_capped = overview.plan.token_capped;
         let tiled = !low_res
@@ -504,6 +511,7 @@ impl Stage for BoardReadStage {
 mod tests {
     use super::*;
     use glassrip_vision::board::{BoardEdge, EdgeStyle, StickyColor};
+    use glassrip_vision::image_prep::prepare_board_image;
 
     fn node(id: &str, text: &str, b: BBox) -> BoardNode {
         BoardNode {
