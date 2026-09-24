@@ -105,6 +105,9 @@ pub fn mask_padding(
     input_w: usize,
     input_h: usize,
 ) {
+    if map_w == 0 || prob.len() < map_w * map_h {
+        return;
+    }
     let keep_w = (content_w * map_w).div_ceil(input_w.max(1)).min(map_w);
     let keep_h = (content_h * map_h).div_ceil(input_h.max(1)).min(map_h);
     for (y, row) in prob.chunks_mut(map_w.max(1)).take(map_h).enumerate() {
