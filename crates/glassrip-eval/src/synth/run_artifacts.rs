@@ -40,6 +40,36 @@ pub fn write_artifact(run: &Path, schema: &str, items: Vec<(String, Value)>) -> 
     Ok(path)
 }
 
+/// Writes an artifact whose `errored` ids failed (error records) and whose
+/// `ok` items succeeded.
+pub fn write_with_errors(
+    run: &Path,
+    schema: &str,
+    ok: Vec<(String, Value)>,
+    errored: &[&str],
+) -> Result<PathBuf> {
+    let path = write_artifact(run, schema, ok)?;
+    let mut text = fs_err::read_to_string(&path).map_err(|e| EvalError::io(&path, e))?;
+    for id in errored {
+        let r: Record<Value> = Record {
+            id: (*id).to_string(),
+            outcome: Outcome::error(glassrip_core::envelope::ErrorInfo::new(
+                glassrip_core::envelope::ErrorCode::Internal,
+                "synthetic failure",
+            )),
+        };
+        let mut v = serde_json::to_value(&r).map_err(|e| EvalError::Other(e.to_string()))?;
+        v["record"] = json!("item");
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&v.to_string());
+        text.push('\n');
+    }
+    fs_err::write(&path, text).map_err(|e| EvalError::io(&path, e))?;
+    Ok(path)
+}
+
 /// `glassrip.keyframes` item.
 pub fn keyframe(id: &str, t_start_s: f64, t_end_s: f64, t_rep_s: f64) -> Value {
     json!({
