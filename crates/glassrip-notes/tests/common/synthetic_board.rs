@@ -102,6 +102,7 @@ fn frame(i: usize) -> BoardFrame {
             src: (*a).into(),
             dst: (*b).into(),
             label: (*l).into(),
+            label_bbox: None,
             style: *st,
             conf: 0.8,
         })

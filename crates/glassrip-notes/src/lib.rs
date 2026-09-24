@@ -12,8 +12,10 @@
 //!   transcript windows; every item must cite evidence ids, and a Rust validator
 //!   decides what is kept.
 //!
-//! The board state is consumed through the local [`board`] shape until the
-//! board-state crate lands (see the `UNIFY` notes there).
+//! The board state is `glassrip-meeting`'s `glassrip.board_state`, read through
+//! the re-exports and helpers in [`board`]; keyframe times for board citations
+//! come from `glassrip.keyframes`. Speaker records reuse `glassrip-audio`'s
+//! `glassrip.speakers` types.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
