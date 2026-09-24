@@ -132,7 +132,7 @@ async fn main() -> Result<()> {
             };
             glassrip::pipeline::run_pipeline(&args).await
         }
-        Commands::Meeting(args) => meeting(args).await,
+        Commands::Meeting(args) => glassrip::meeting::cli::run(args).await,
         Commands::Eval(args) => {
             if !glassrip_eval::cli::run(args).await?.passed {
                 std::process::exit(1);
@@ -140,53 +140,6 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
-}
-
-async fn meeting(args: glassrip::meeting::MeetingArgs) -> Result<()> {
-    use glassrip::meeting::{self, preflight::Needs, Backends};
-    use glassrip_core::graph::{meeting_mode_stage_decls, StageGraph};
-
-    let opts = args.resolve()?;
-    let log = meeting::logging::init(&opts.out_dir)?;
-    let plan = StageGraph::new(meeting_mode_stage_decls())?.plan(&opts.selection)?;
-    let needs = Needs::from_plan(&plan);
-    let backends = Backends::connect(
-        &opts.config,
-        &needs,
-        &opts.out_dir.join(meeting::RAW_RESPONSES_DIR),
-    )
-    .await;
-
-    let cancel = tokio_util::sync::CancellationToken::new();
-    let on_signal = cancel.clone();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            eprintln!("interrupt: stopping after in-flight items; rerun to resume");
-            on_signal.cancel();
-        }
-    });
-
-    let outcome = meeting::run_meeting(&opts, backends, cancel)
-        .await
-        .with_context(|| format!("details in {}", log.display()))?;
-    for r in &outcome.reports {
-        eprintln!(
-            "{:<15} {:<8} items {:>5} ok {:>5} err {:>3} {:>8.2} s",
-            r.stage,
-            format!("{:?}", r.status).to_lowercase(),
-            r.items_total,
-            r.items_ok,
-            r.items_error,
-            r.wall_s
-        );
-    }
-    for (phase, wall) in &outcome.phase_wall_s {
-        eprintln!("phase {phase:<8} {wall:>8.2} s");
-    }
-    for p in &outcome.outputs {
-        println!("{}", p.display());
-    }
-    Ok(())
 }
 
 fn parse_rate(s: &str) -> Result<f64, String> {

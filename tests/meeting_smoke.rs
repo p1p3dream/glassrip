@@ -30,7 +30,7 @@ use glassrip_ocr::{OcrError, PixelBox, RecognizedSpan, TextRecognizer};
 use glassrip_vision::{
     BackendId, Durations, Placement, RawResponse, VisionBackend, VisionError, VisionRequest,
 };
-use glassrip_vision_stages::placement::StaticProbe;
+use glassrip_vision_stages::placement::{PlacementProbe, StaticProbe};
 use glassrip_vision_stages::raw_store::{RawStore, RecordingBackend};
 use image::RgbImage;
 use serde_json::{json, Value};
@@ -53,6 +53,20 @@ fn ffmpeg_ok() -> bool {
         .arg("-version")
         .output()
         .is_ok_and(|o| o.status.success())
+}
+
+/// ffmpeg is required (CI installs it); `GLASSRIP_SKIP_FFMPEG_TESTS=1` opts out.
+fn require_ffmpeg() -> bool {
+    if ffmpeg_ok() {
+        return true;
+    }
+    let opted_out = std::env::var("GLASSRIP_SKIP_FFMPEG_TESTS").is_ok_and(|v| v == "1");
+    assert!(
+        opted_out,
+        "ffmpeg is not installed; install it or set GLASSRIP_SKIP_FFMPEG_TESTS=1"
+    );
+    eprintln!("SKIPPED: ffmpeg is not installed (GLASSRIP_SKIP_FFMPEG_TESTS=1)");
+    false
 }
 
 fn font() -> Option<&'static str> {
@@ -455,6 +469,47 @@ impl TextBackend for ScriptedText {
     }
 }
 
+/// Placement probe for a model that is not loaded yet (`Ok(None)`).
+struct NotLoaded;
+
+#[async_trait]
+impl PlacementProbe for NotLoaded {
+    async fn preflight(&self) -> Result<Placement, VisionError> {
+        StaticProbe.preflight().await
+    }
+    async fn placement(&self) -> Result<Option<Placement>, VisionError> {
+        Ok(None)
+    }
+    async fn digest(&self) -> Result<String, VisionError> {
+        StaticProbe.digest().await
+    }
+    async fn server_up(&self) -> bool {
+        true
+    }
+}
+
+/// A text server that is down.
+struct DownText;
+
+#[async_trait]
+impl TextBackend for DownText {
+    async fn chat(&self, _m: &str, _r: &ChatRequest) -> Result<ChatResponse, LlmError> {
+        Err(LlmError::Transport("down".into()))
+    }
+    async fn load(&self, _m: &str) -> Result<(), LlmError> {
+        Err(LlmError::Transport("down".into()))
+    }
+    async fn unload(&self, _m: &str) -> Result<(), LlmError> {
+        Err(LlmError::Transport("down".into()))
+    }
+    async fn loaded(&self) -> Result<Vec<LoadedModel>, LlmError> {
+        Err(LlmError::Transport("down".into()))
+    }
+    async fn digest(&self, _m: &str) -> Result<Option<String>, LlmError> {
+        Err(LlmError::Transport("down".into()))
+    }
+}
+
 fn backends(raw: &Path, text: Arc<ScriptedText>) -> Backends {
     let mut b = Backends::none("unused");
     b.ocr = Ok(Arc::new(ScriptedOcr));
@@ -468,6 +523,9 @@ fn backends(raw: &Path, text: Arc<ScriptedText>) -> Backends {
         digest: Some("sha256:scripted-vision".into()),
         server_version: None,
         concurrency: 2,
+        size_bytes: None,
+        parameter_size_b: None,
+        offline: None,
     });
     b.text = Ok(text);
     b.asr = Ok(Arc::new(ScriptedAsr));
@@ -506,8 +564,7 @@ fn items<T: serde::de::DeserializeOwned>(out: &Path, schema: &str) -> Vec<T> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn meeting_mode_end_to_end_on_a_synthetic_video() {
-    if !ffmpeg_ok() {
-        eprintln!("SKIPPED: ffmpeg is not installed");
+    if !require_ffmpeg() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -515,11 +572,12 @@ async fn meeting_mode_end_to_end_on_a_synthetic_video() {
     let video = root.join("weekly-sync.mp4");
     make_video(&video, true);
     let out = root.join("weekly-sync.glassrip");
-    let log = meeting::logging::init(&out).unwrap();
+    let log = out.join(meeting::logging::RUN_LOG);
 
     // ---- full run
     let text = Arc::new(ScriptedText::new());
-    let opts = options(video.clone(), out.clone(), root);
+    let mut opts = options(video.clone(), out.clone(), root);
+    opts.log = Some(meeting::logging::init());
     let outcome = run_meeting(
         &opts,
         backends(&out.join(meeting::RAW_RESPONSES_DIR), Arc::clone(&text)),
@@ -659,6 +717,99 @@ async fn meeting_mode_end_to_end_on_a_synthetic_video() {
         };
         assert_eq!(r.status, expected, "{}", r.stage);
     }
+    // Reports come in graph order, whatever order concurrent chains finished in.
+    let graph_order: Vec<String> =
+        glassrip_core::graph::StageGraph::new(meeting_mode_stage_decls())
+            .unwrap()
+            .order()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+    let reported: Vec<String> = rerun.reports.iter().map(|r| r.stage.clone()).collect();
+    assert_eq!(reported, graph_order);
+
+    // ---- offline rerun: model servers down, digests from run.lock.json.
+    let recorded = glassrip::meeting::backends::recorded_digests(&out);
+    let offline = |raw: &Path| {
+        let mut b = backends(raw, Arc::new(ScriptedText::new()));
+        b.vision = Ok(VisionBackends::offline(
+            VISION_MODEL,
+            &recorded[VISION_MODEL],
+            "server down in this test",
+        ));
+        b.text = Ok(Arc::new(DownText));
+        b.text_offline = Some("server down in this test".into());
+        b
+    };
+    let cached = run_meeting(
+        &opts,
+        offline(&out.join(meeting::RAW_RESPONSES_DIR)),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(cached
+        .reports
+        .iter()
+        .all(|r| r.stage == "render" || r.status == StageStatus::Cached));
+    // A model stage that is not cached fails clearly instead of calling the server.
+    let mut forced = opts.clone();
+    forced.selection.force.insert("board_read".into());
+    let err = run_meeting(
+        &forced,
+        offline(&out.join(meeting::RAW_RESPONSES_DIR)),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, glassrip::meeting::MeetingError::Offline { stage, .. } if stage == "board_read"),
+        "{err}"
+    );
+
+    // ---- --from-stage board_read with a large model that is not loaded yet:
+    // phase B must run board reading and audio one after the other.
+    let mut from = opts.clone();
+    from.selection.from = Some("board_read".into());
+    let mut large = backends(
+        &out.join(meeting::RAW_RESPONSES_DIR),
+        Arc::new(ScriptedText::new()),
+    );
+    if let Ok(v) = &mut large.vision {
+        v.probe = Arc::new(NotLoaded);
+        v.size_bytes = Some(21_000_000_000);
+        assert_eq!(v.slots(14.0), 1, "large models get one slot");
+    }
+    let seq = run_meeting(&from, large, CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(
+        !seq.phase_b_concurrent,
+        "large unloaded model must be sequential"
+    );
+    let ran: Vec<&str> = seq
+        .reports
+        .iter()
+        .filter(|r| r.status != StageStatus::Skipped)
+        .map(|r| r.stage.as_str())
+        .collect();
+    assert_eq!(ran.first(), Some(&"board_read"), "{ran:?}");
+    assert!(
+        !ran.contains(&"classify") && !ran.contains(&"asr"),
+        "{ran:?}"
+    );
+    // Unknown size is sequential too.
+    let mut unknown = backends(
+        &out.join(meeting::RAW_RESPONSES_DIR),
+        Arc::new(ScriptedText::new()),
+    );
+    if let Ok(v) = &mut unknown.vision {
+        v.probe = Arc::new(NotLoaded);
+    }
+    let seq = run_meeting(&from, unknown, CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(!seq.phase_b_concurrent, "unknown size must be sequential");
 
     // ---- a video without an audio stream: empty transcript, board-only notes.
     let silent = root.join("silent-board.mp4");

@@ -53,7 +53,9 @@ impl Default for GapFillConfig {
 }
 
 /// Outcome for one uncovered span.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SpanStatus {
     /// Joined a speaker.
@@ -69,7 +71,7 @@ pub enum SpanStatus {
 }
 
 /// One uncovered span and what happened to it.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct GapSpan {
     /// Span start, seconds (audio timeline).
     pub start_s: f64,
@@ -86,7 +88,9 @@ pub struct GapSpan {
 }
 
 /// Counters for a gap filling pass.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 pub struct GapFillStats {
     /// Uncovered spans found.
     pub spans: usize,

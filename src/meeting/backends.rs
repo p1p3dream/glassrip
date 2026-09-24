@@ -5,20 +5,33 @@
 //!
 //! [`Backends::connect`] builds the real backends for this build; tests build
 //! [`Backends`] from scripted implementations.
+//!
+//! Offline reruns: when the model server cannot be reached but the output
+//! directory's `run.lock.json` records the model's digest, the vision and text
+//! backends are created offline with that digest ([`VisionBackends::offline`],
+//! [`Backends::text_offline`]). The digest keys the stage caches, so a model
+//! stage whose output is cached restores without contacting the server; one that
+//! is not cached fails with the recorded reason. OCR, ASR, and diarization are
+//! local and must still be present when their stages are selected.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use glassrip_audio::asr::{AsrConfig, VadSettings};
 use glassrip_audio::stages::{AsrEngine, DiarizeEngine, SingleSpeakerEngine, WhisperEngine};
 use glassrip_core::config::Config;
 use glassrip_notes::notes::llm::{LlmError, OllamaText, OllamaTextConfig, TextBackend};
 use glassrip_ocr::TextRecognizer;
-use glassrip_vision::{OllamaBackend, OllamaConfig, VisionBackend};
+use glassrip_vision::{
+    BackendId, OllamaBackend, OllamaConfig, Placement, RawResponse, VisionBackend, VisionError,
+    VisionRequest,
+};
 use glassrip_vision_stages::placement::PlacementProbe;
 use glassrip_vision_stages::raw_store::{RawStore, RecordingBackend};
+use tokio_util::sync::CancellationToken;
 
 use super::preflight::Needs;
 
@@ -40,6 +53,136 @@ pub struct VisionBackends {
     pub server_version: Option<String>,
     /// Client concurrency (server slots).
     pub concurrency: usize,
+    /// Bytes of the model files, when the server reported them.
+    pub size_bytes: Option<u64>,
+    /// Parameters in billions, when the server reported them.
+    pub parameter_size_b: Option<f64>,
+    /// Why the server is not used (offline rerun), when it is not.
+    pub offline: Option<String>,
+}
+
+/// Loaded bytes per parameter used to estimate a quantized model's size when
+/// the server does not report the file size (Q4-class weights plus vision
+/// projector overhead).
+pub const EST_GB_PER_B_PARAMS: f64 = 0.7;
+
+impl VisionBackends {
+    /// Estimated model size in GB: the file size, else the reported parameter
+    /// count, else the parameter count in the tag (`qwen2.5vl:32b`). `None` when
+    /// nothing is known.
+    pub fn estimated_gb(&self) -> Option<f64> {
+        #[allow(clippy::cast_precision_loss)]
+        let file = self.size_bytes.map(|b| b as f64 / 1e9);
+        file.or_else(|| self.parameter_size_b.map(|b| b * EST_GB_PER_B_PARAMS))
+            .or_else(|| size_b(&self.model).map(|b| b * EST_GB_PER_B_PARAMS))
+    }
+
+    /// Client concurrency: one slot for models above the sequential threshold
+    /// (27B/32B class, spec 5.3), else the server's slot count.
+    pub fn slots(&self, sequential_threshold_gb: f64) -> usize {
+        if self
+            .estimated_gb()
+            .is_some_and(|gb| gb > sequential_threshold_gb)
+        {
+            1
+        } else {
+            self.concurrency.max(1)
+        }
+    }
+
+    /// Backends for a model whose server is unreachable, identified by the
+    /// digest recorded in a previous run's manifest. Every request fails with
+    /// `reason`; cached stages still restore.
+    pub fn offline(model: &str, digest: &str, reason: &str) -> Self {
+        let off = Arc::new(Offline {
+            model: model.to_string(),
+            digest: digest.to_string(),
+            reason: reason.to_string(),
+        });
+        Self {
+            backend: off.clone(),
+            probe: off,
+            model: model.to_string(),
+            digest: Some(digest.to_string()),
+            server_version: None,
+            concurrency: 1,
+            size_bytes: None,
+            parameter_size_b: None,
+            offline: Some(reason.to_string()),
+        }
+    }
+}
+
+/// A vision backend and probe that only carry an identity.
+struct Offline {
+    model: String,
+    digest: String,
+    reason: String,
+}
+
+impl Offline {
+    fn err(&self) -> VisionError {
+        VisionError::Transport(format!("model server not used: {}", self.reason))
+    }
+}
+
+#[async_trait]
+impl VisionBackend for Offline {
+    fn id(&self) -> BackendId {
+        BackendId {
+            backend: "offline".into(),
+            model: self.model.clone(),
+            digest: Some(self.digest.clone()),
+            server_version: None,
+        }
+    }
+    async fn preflight(&self) -> glassrip_vision::Result<Placement> {
+        Err(self.err())
+    }
+    async fn infer(
+        &self,
+        _request: VisionRequest,
+        _cancel: CancellationToken,
+    ) -> glassrip_vision::Result<RawResponse> {
+        Err(self.err())
+    }
+}
+
+#[async_trait]
+impl PlacementProbe for Offline {
+    async fn preflight(&self) -> Result<Placement, VisionError> {
+        Err(self.err())
+    }
+    async fn placement(&self) -> Result<Option<Placement>, VisionError> {
+        Err(self.err())
+    }
+    async fn digest(&self) -> Result<String, VisionError> {
+        Ok(self.digest.clone())
+    }
+    async fn server_up(&self) -> bool {
+        false
+    }
+}
+
+/// Model digests recorded in `<out_dir>/run.lock.json` (empty when absent or unreadable).
+pub fn recorded_digests(out_dir: &Path) -> BTreeMap<String, String> {
+    let path = out_dir.join(glassrip_core::manifest::MANIFEST_FILE);
+    fs_err::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<glassrip_core::manifest::RunManifest>(&b).ok())
+        .map(|m| m.model_digests)
+        .unwrap_or_default()
+}
+
+/// True for errors that mean the server could not be reached (as opposed to a
+/// missing model or a bad reply).
+fn unreachable(e: &VisionError) -> bool {
+    matches!(
+        e,
+        VisionError::RetriesExhausted { .. }
+            | VisionError::Timeout { .. }
+            | VisionError::Transport(_)
+    )
 }
 
 /// Every model backend of a run.
@@ -54,6 +197,8 @@ pub struct Backends {
     pub asr: Avail<Arc<dyn AsrEngine>>,
     /// Diarizer for `diarize` (and the gap-fill embedder).
     pub diarize: Avail<Arc<dyn DiarizeEngine>>,
+    /// Why the text model's server is not used (offline rerun), when it is not.
+    pub text_offline: Option<String>,
     /// Model name to digest, recorded in `run.lock.json`.
     pub model_digests: BTreeMap<String, String>,
 }
@@ -67,13 +212,17 @@ impl Backends {
             text: Err(reason.to_string()),
             asr: Err(reason.to_string()),
             diarize: Err(reason.to_string()),
+            text_offline: None,
             model_digests: BTreeMap::new(),
         }
     }
 
     /// Builds the real backends the selected stages need; unneeded ones are left
-    /// unavailable without contacting anything.
-    pub async fn connect(config: &Config, needs: &Needs, raw_dir: &Path) -> Self {
+    /// unavailable without contacting anything. `out_dir` is the run directory
+    /// (read only, for digests recorded by an earlier run; see the module docs).
+    pub async fn connect(config: &Config, needs: &Needs, out_dir: &Path) -> Self {
+        let raw_dir = out_dir.join(super::RAW_RESPONSES_DIR);
+        let recorded = recorded_digests(out_dir);
         let mut b = Self::none("not needed by the selected stages");
         if needs.ocr {
             b.ocr = ocr_engine();
@@ -81,7 +230,7 @@ impl Backends {
         // edge_direction uses the vision model only as an optional fallback; it
         // is still connected so the stage keys and behaves as in a full run.
         if needs.vision || needs.vision_optional {
-            b.vision = vision(config, raw_dir).await;
+            b.vision = vision(config, &raw_dir, &recorded).await;
             if let Ok(v) = &b.vision {
                 if let Some(d) = &v.digest {
                     b.model_digests.insert(v.model.clone(), d.clone());
@@ -89,12 +238,16 @@ impl Backends {
             }
         }
         if needs.text {
-            b.text = text(config).await.map(|(backend, digest)| {
-                if let Some(d) = digest {
-                    b.model_digests.insert(config.models.text.clone(), d);
+            match text(config, &recorded).await {
+                Ok((backend, digest, offline)) => {
+                    if let Some(d) = digest {
+                        b.model_digests.insert(config.models.text.clone(), d);
+                    }
+                    b.text_offline = offline;
+                    b.text = Ok(backend);
                 }
-                backend
-            });
+                Err(e) => b.text = Err(e),
+            }
         }
         if needs.asr {
             b.asr = asr(config);
@@ -146,7 +299,11 @@ pub fn request_timeout(config: &Config, model: &str) -> Duration {
     })
 }
 
-async fn vision(config: &Config, raw_dir: &Path) -> Avail<VisionBackends> {
+async fn vision(
+    config: &Config,
+    raw_dir: &Path,
+    recorded: &BTreeMap<String, String>,
+) -> Avail<VisionBackends> {
     let model = config.models.vision.clone();
     let mut oc = OllamaConfig::new(&config.ollama.host, &model, config.ollama.num_ctx);
     oc.keep_alive = config.ollama.keep_alive.clone();
@@ -154,13 +311,27 @@ async fn vision(config: &Config, raw_dir: &Path) -> Avail<VisionBackends> {
     oc.allow_spill = config.gpu.allow_spill;
     oc.request_timeout = request_timeout(config, &model);
     let ollama = Arc::new(OllamaBackend::new(oc).map_err(|e| e.to_string())?);
-    let digest = ollama.resolve_digest().await.map_err(|e| {
-        format!(
-            "vision model {model} on {}: {e}",
-            config.ollama.host.trim_end_matches('/')
-        )
-    })?;
+    let host = config.ollama.host.trim_end_matches('/').to_string();
+    let digest = match ollama.resolve_digest().await {
+        Ok(d) => d,
+        Err(e) if unreachable(&e) => {
+            let Some(d) = recorded.get(&model) else {
+                return Err(format!("vision model {model} on {host}: {e}"));
+            };
+            let reason = format!("{host} unreachable ({e})");
+            tracing::warn!(%model, digest = %d, "{reason}; model stages must restore from cache");
+            return Ok(VisionBackends::offline(&model, d, &reason));
+        }
+        Err(e) => return Err(format!("vision model {model} on {host}: {e}")),
+    };
     let server_version = ollama.server_version().await.ok();
+    let size = match ollama.model_size().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(%model, error = %e, "model size unknown");
+            glassrip_vision::ModelSize::default()
+        }
+    };
     Ok(VisionBackends {
         // Raw replies are kept next to the run for offline replay.
         backend: Arc::new(RecordingBackend::new(
@@ -172,27 +343,37 @@ async fn vision(config: &Config, raw_dir: &Path) -> Avail<VisionBackends> {
         digest: Some(digest),
         server_version,
         concurrency: config.ollama.num_parallel as usize,
+        size_bytes: size.file_bytes,
+        parameter_size_b: size.parameter_size_b,
+        offline: None,
     })
 }
 
-async fn text(config: &Config) -> Avail<(Arc<dyn TextBackend>, Option<String>)> {
+/// The text backend, its digest, and the offline reason when the server is
+/// unreachable but a digest was recorded.
+type TextSetup = (Arc<dyn TextBackend>, Option<String>, Option<String>);
+
+async fn text(config: &Config, recorded: &BTreeMap<String, String>) -> Avail<TextSetup> {
     let model = &config.models.text;
     let backend = OllamaText::new(OllamaTextConfig {
         base_url: config.ollama.host.clone(),
         ..OllamaTextConfig::default()
     })
     .map_err(|e| e.to_string())?;
+    let host = config.ollama.host.trim_end_matches('/');
     match backend.digest(model).await {
-        Ok(Some(d)) => Ok((Arc::new(backend), Some(d))),
-        Ok(None) => Ok((Arc::new(backend), None)),
+        Ok(d) => Ok((Arc::new(backend), d, None)),
+        Err(e @ LlmError::Transport(_)) if recorded.contains_key(model) => {
+            let reason = format!("{host} unreachable ({e})");
+            tracing::warn!(%model, "{reason}; notes must restore from cache");
+            let digest = recorded.get(model).cloned();
+            Ok((Arc::new(backend), digest, Some(reason)))
+        }
         Err(LlmError::Http { status: 404, .. }) => Err(format!(
             "text model {model} is not available on {}; run `ollama pull {model}`",
-            config.ollama.host.trim_end_matches('/')
+            host
         )),
-        Err(e) => Err(format!(
-            "cannot check text model {model} on {}: {e}",
-            config.ollama.host.trim_end_matches('/')
-        )),
+        Err(e) => Err(format!("cannot check text model {model} on {host}: {e}")),
     }
 }
 
@@ -301,6 +482,70 @@ mod tests {
         let p = asr_model_path("large-v3-turbo");
         assert!(p.ends_with("ggml-large-v3-turbo.bin"), "{}", p.display());
         assert!(asr_model_path("custom.bin").ends_with("custom.bin"));
+    }
+
+    fn vb(model: &str) -> VisionBackends {
+        VisionBackends::offline(model, "sha256:d", "test")
+    }
+
+    #[test]
+    fn model_size_estimates_and_slots() {
+        let mut v = vb("custom-vl");
+        assert_eq!(v.estimated_gb(), None);
+        v.concurrency = 4;
+        assert_eq!(v.slots(14.0), 4, "unknown size keeps the server slots");
+        let big = VisionBackends {
+            size_bytes: Some(21_000_000_000),
+            ..v.clone()
+        };
+        assert_eq!(big.estimated_gb(), Some(21.0));
+        assert_eq!(big.slots(14.0), 1);
+        let by_params = VisionBackends {
+            parameter_size_b: Some(32.8),
+            ..v.clone()
+        };
+        assert!(by_params.estimated_gb().is_some_and(|g| g > 14.0));
+        let by_tag = VisionBackends {
+            model: "qwen2.5vl:32b".into(),
+            ..v.clone()
+        };
+        assert_eq!(by_tag.slots(14.0), 1);
+        let small = VisionBackends {
+            model: "qwen2.5vl:7b".into(),
+            ..v
+        };
+        assert!(small.estimated_gb().is_some_and(|g| g < 14.0));
+    }
+
+    #[tokio::test]
+    async fn offline_backends_carry_the_recorded_digest_and_refuse_requests() {
+        let v = vb("m:1b");
+        assert_eq!(v.backend.id().digest.as_deref(), Some("sha256:d"));
+        assert_eq!(v.probe.digest().await.unwrap(), "sha256:d");
+        assert!(v.probe.placement().await.is_err());
+        assert!(v.offline.is_some());
+    }
+
+    #[test]
+    fn digests_are_read_from_an_earlier_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(recorded_digests(dir.path()).is_empty());
+        let mut run = glassrip_core::manifest::RunDir::open(
+            dir.path(),
+            "r",
+            glassrip_core::envelope::Producer::glassrip("0.1.0", None),
+        )
+        .unwrap();
+        run.update(|m| {
+            m.model_digests.insert("m:1b".into(), "sha256:abc".into());
+        })
+        .unwrap();
+        drop(run);
+        assert_eq!(recorded_digests(dir.path())["m:1b"], "sha256:abc");
+        assert!(unreachable(&VisionError::Transport("x".into())));
+        assert!(!unreachable(&VisionError::ModelNotFound {
+            model: "m".into()
+        }));
     }
 
     #[test]

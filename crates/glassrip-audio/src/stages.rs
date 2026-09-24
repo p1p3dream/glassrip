@@ -5,7 +5,8 @@
 //! | [`AudioExtractStage`] | `glassrip.audio` | `glassrip.media_probe`, the source video |
 //! | [`AsrStage`] | `glassrip.asr` | `glassrip.audio`, `glassrip.asr_vocabulary` |
 //! | [`DiarizeStage`] | `glassrip.diarization` | `glassrip.audio` |
-//! | [`AssignWordsStage`] | `glassrip.transcript` | `glassrip.asr`, `glassrip.diarization` |
+//! | [`GapFillStage`] | `glassrip.gap_fill` | `glassrip.asr`, `glassrip.diarization` |
+//! | [`AssignWordsStage`] | `glassrip.transcript` | `glassrip.asr`, `glassrip.gap_fill` |
 //!
 //! The recognizer and the diarizer sit behind [`AsrEngine`] and [`DiarizeEngine`],
 //! so the stages run with whisper.cpp and speakrs in a real run and with scripted
@@ -37,7 +38,6 @@ use crate::diarize::{Diarization, DiarizeConfig};
 use crate::error::AudioError;
 use crate::extract::{extract_audio, f32le_to_samples, ExtractOptions, SAMPLE_RATE};
 use crate::gapfill::{GapFillConfig, SpanEmbedder};
-use crate::pipeline::{assemble, AssembleConfig};
 use crate::recluster::Turn;
 use crate::types::{TranscriptSegment, TRANSCRIPT_SCHEMA};
 use crate::vocab::CorrectionConfig;
@@ -53,6 +53,8 @@ pub const ASR_VOCABULARY: &str = "glassrip.asr_vocabulary";
 pub const ASR: &str = "glassrip.asr";
 /// `diarize` output.
 pub const DIARIZATION: &str = "glassrip.diarization";
+/// `gap_fill` output.
+pub const GAP_FILL: &str = "glassrip.gap_fill";
 /// `assign_words` output.
 pub const TRANSCRIPT: &str = TRANSCRIPT_SCHEMA;
 
@@ -783,79 +785,271 @@ impl Stage for DiarizeStage {
     }
 }
 
+// ----------------------------------------------------------------- gap fill
+
+/// `gap_fill` parameters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GapFillStageParams {
+    /// Gap filling gates; `None` disables gap filling.
+    pub gap_fill: Option<GapFillConfig>,
+    /// [`DiarizeEngine::describe`] of the embedder source, when there is one.
+    pub embedder: Option<Value>,
+}
+
+/// `glassrip.gap_fill` item (one item, id `gap_fill`; none without audio).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GapFillRecord {
+    /// Diarization with the gap-fill turns added (audio timeline); `None`
+    /// without diarization.
+    pub diarization: Option<DiarizationRecord>,
+    /// Counters.
+    pub stats: crate::gapfill::GapFillStats,
+    /// One record per uncovered span (audio timeline).
+    pub spans: Vec<crate::gapfill::GapSpan>,
+    /// The embedder (and the audio) were loaded: at least one span was long
+    /// enough to embed.
+    pub embedder_loaded: bool,
+}
+
+/// Work of [`GapFillStage`].
+#[derive(Debug, Clone)]
+pub struct GapFillWork {
+    asr: AsrRecord,
+    diarization: Option<DiarizationRecord>,
+}
+
+/// Labels ASR words that no diarization turn covers by embedding their audio
+/// and matching the speaker centroids. Planning only reads the two input
+/// artifacts; the embedder and the audio are loaded in `process`, on a blocking
+/// thread, and only when some uncovered span is long enough to embed. The
+/// output is a cached artifact, so a resumed run does not redo the inference.
+pub struct GapFillStage {
+    params: GapFillStageParams,
+    embedder_source: Option<Arc<dyn DiarizeEngine>>,
+}
+
+impl GapFillStage {
+    /// A stage; without `embedder_source` (or with `gap_fill: None`) the
+    /// diarization passes through unchanged.
+    pub fn new(
+        gap_fill: Option<GapFillConfig>,
+        embedder_source: Option<Arc<dyn DiarizeEngine>>,
+    ) -> Self {
+        Self {
+            params: GapFillStageParams {
+                gap_fill,
+                embedder: embedder_source.as_ref().map(|e| e.describe()),
+            },
+            embedder_source,
+        }
+    }
+}
+
+/// Loads the embedder on the first embedding request.
+struct LazyEmbedder<'a> {
+    source: &'a dyn DiarizeEngine,
+    inner: Option<Box<dyn SpanEmbedder>>,
+    unavailable: bool,
+}
+
+impl SpanEmbedder for LazyEmbedder<'_> {
+    fn embed(&mut self, audio: &[f32]) -> crate::Result<Option<Vec<f32>>> {
+        if self.inner.is_none() && !self.unavailable {
+            match self.source.embedder()? {
+                Some(e) => self.inner = Some(e),
+                None => self.unavailable = true,
+            }
+        }
+        match self.inner.as_mut() {
+            Some(e) => e.embed(audio),
+            None => Ok(None),
+        }
+    }
+}
+
+/// The gap-fill computation (blocking: may load a model and the audio).
+pub fn gap_fill_blocking(
+    work: GapFillWork,
+    cfg: Option<GapFillConfig>,
+    source: Option<&dyn DiarizeEngine>,
+) -> Result<GapFillRecord, ErrorInfo> {
+    let unchanged = |diarization| GapFillRecord {
+        diarization,
+        stats: crate::gapfill::GapFillStats::default(),
+        spans: Vec::new(),
+        embedder_loaded: false,
+    };
+    let Some(record) = work.diarization else {
+        return Ok(unchanged(None));
+    };
+    let (Some(cfg), Some(source)) = (cfg, source) else {
+        return Ok(unchanged(Some(record)));
+    };
+    let mut words: Vec<(f64, f64)> = work
+        .asr
+        .segments
+        .iter()
+        .flat_map(|s| s.words.iter().map(|w| (w.start_s, w.end_s)))
+        .collect();
+    words.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut diar = record.to_diarization();
+    let spans = crate::gapfill::uncovered_spans(&words, &diar.turns, &cfg);
+    if !spans.iter().any(|(s, e)| e - s >= cfg.min_span_s) {
+        // Nothing long enough to embed: no model, no audio.
+        let stats = crate::gapfill::GapFillStats {
+            spans: spans.len(),
+            rejected_short: spans.len(),
+            ..Default::default()
+        };
+        let spans = spans
+            .into_iter()
+            .map(|(start_s, end_s)| crate::gapfill::GapSpan {
+                start_s,
+                end_s,
+                status: crate::gapfill::SpanStatus::TooShort,
+                speaker: None,
+                similarity: None,
+                margin: None,
+            })
+            .collect();
+        return Ok(GapFillRecord {
+            diarization: Some(record),
+            stats,
+            spans,
+            embedder_loaded: false,
+        });
+    }
+    let samples = load_samples(Path::new(&work.asr.audio_path), &work.asr.audio_blake3)?;
+    let mut embedder = LazyEmbedder {
+        source,
+        inner: None,
+        unavailable: false,
+    };
+    let (stats, spans) = crate::gapfill::fill_gaps_with(
+        &mut embedder,
+        &samples,
+        SAMPLE_RATE,
+        &mut diar,
+        &words,
+        &cfg,
+    )
+    .map_err(|e| audio_err(&e))?;
+    let embedder_loaded = embedder.inner.is_some();
+    Ok(GapFillRecord {
+        diarization: Some(DiarizationRecord {
+            turns: diar.turns,
+            labels: diar.labels,
+            talk_time_s: diar.talk_time_s,
+            num_clusters_raw: diar.num_clusters_raw,
+            active_s: diar.active_s,
+            centroids: diar.centroids,
+            wall_s: record.wall_s,
+        }),
+        stats,
+        spans,
+        embedder_loaded,
+    })
+}
+
+impl Stage for GapFillStage {
+    type Params = GapFillStageParams;
+    type Work = GapFillWork;
+    type Output = GapFillRecord;
+
+    fn name(&self) -> &'static str {
+        "gap_fill"
+    }
+    fn version(&self) -> u32 {
+        1
+    }
+    fn output(&self) -> ArtifactSpec {
+        ArtifactSpec {
+            schema: GAP_FILL,
+            version: v1(),
+        }
+    }
+    fn inputs(&self) -> Vec<InputDecl> {
+        vec![input(ASR), input(DIARIZATION)]
+    }
+    fn params(&self) -> &GapFillStageParams {
+        &self.params
+    }
+    fn item_timeout(&self) -> Option<Duration> {
+        Some(Duration::from_secs(4 * 3600))
+    }
+    fn plan(&self, inputs: &StageInputs) -> Result<Vec<WorkItem<GapFillWork>>, StageError> {
+        let Some((_, asr)) = inputs.read_ok::<AsrRecord>(ASR)?.into_iter().next() else {
+            return Ok(Vec::new());
+        };
+        let diarization = inputs
+            .read_ok::<DiarizationRecord>(DIARIZATION)?
+            .into_iter()
+            .next()
+            .map(|(_, d)| d);
+        Ok(vec![WorkItem {
+            id: "gap_fill".into(),
+            work: GapFillWork { asr, diarization },
+        }])
+    }
+    async fn process(
+        &self,
+        _ctx: &ItemContext,
+        work: GapFillWork,
+    ) -> Result<GapFillRecord, ErrorInfo> {
+        let cfg = self.params.gap_fill;
+        let source = self.embedder_source.clone();
+        tokio::task::spawn_blocking(move || gap_fill_blocking(work, cfg, source.as_deref()))
+            .await
+            .map_err(task_err)?
+    }
+}
+
 // ------------------------------------------------------------- assign words
 
 /// `assign_words` parameters.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AssignWordsParams {
     /// Vocabulary correction thresholds.
     pub correction: CorrectionConfig,
     /// Word assignment settings.
     pub assign: AssignConfig,
-    /// Gap filling (used when the diarizer offers an embedder).
-    pub gap_fill: Option<GapFillConfig>,
 }
 
-impl Default for AssignWordsParams {
-    fn default() -> Self {
-        Self {
-            correction: CorrectionConfig::default(),
-            assign: AssignConfig::default(),
-            gap_fill: Some(GapFillConfig::default()),
-        }
-    }
-}
-
-/// Vocabulary correction, gap filling, and word-to-speaker assignment into
-/// `glassrip.transcript`, one item per segment (id `segment_id`). Assembly runs
-/// while planning because the items are the segments it produces.
+/// Vocabulary correction and word-to-speaker assignment into
+/// `glassrip.transcript`, one item per segment (id `segment_id`). Planning reads
+/// the ASR and gap-fill artifacts and groups words into segments (text work
+/// only; no model and no audio).
 pub struct AssignWordsStage {
     params: AssignWordsParams,
-    embedder_source: Option<Arc<dyn DiarizeEngine>>,
 }
 
 impl AssignWordsStage {
-    /// A stage; `embedder_source` supplies the gap-fill embedder when present.
-    pub fn new(params: AssignWordsParams, embedder_source: Option<Arc<dyn DiarizeEngine>>) -> Self {
-        Self {
-            params,
-            embedder_source,
-        }
+    /// A stage.
+    pub fn new(params: AssignWordsParams) -> Self {
+        Self { params }
     }
 }
 
-/// Builds the transcript segments from ASR and (optional) diarization records.
+/// Builds the transcript segments from the ASR record and the (gap-filled)
+/// diarization.
 pub fn assemble_transcript(
     asr: &AsrRecord,
     diar: Option<&DiarizationRecord>,
     params: &AssignWordsParams,
-    embedder: Option<&dyn DiarizeEngine>,
-) -> Result<Vec<TranscriptSegment>, String> {
+) -> Vec<TranscriptSegment> {
     let output = asr.to_output();
     let diarization = diar.map(DiarizationRecord::to_diarization);
-    let cfg = AssembleConfig {
-        vocabulary: asr.vocabulary.clone(),
-        correction: params.correction,
-        assign: params.assign,
-        gap_fill: params.gap_fill,
-        timeline_offset_s: asr.timeline_offset_s,
-    };
-    let mut embedder = match (embedder, &diarization, params.gap_fill) {
-        (Some(src), Some(_), Some(_)) => src.embedder().map_err(|e| e.to_string())?,
-        _ => None,
-    };
-    let samples = if embedder.is_some() {
-        load_samples(Path::new(&asr.audio_path), &asr.audio_blake3).map_err(|e| e.message)?
-    } else {
-        Vec::new()
-    };
-    let e = embedder
-        .as_mut()
-        .map(|b| b.as_mut() as &mut dyn SpanEmbedder);
-    assemble(&output, diarization, e, &samples, &cfg)
-        .map(|a| a.segments)
-        .map_err(|e| e.to_string())
+    crate::transcript::build_segments(
+        &output.segments,
+        diarization.as_ref(),
+        &crate::vocab::Vocabulary::new(&asr.vocabulary),
+        &params.correction,
+        &params.assign,
+        asr.timeline_offset_s,
+    )
 }
 
 impl Stage for AssignWordsStage {
@@ -867,7 +1061,7 @@ impl Stage for AssignWordsStage {
         "assign_words"
     }
     fn version(&self) -> u32 {
-        1
+        2
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
@@ -876,19 +1070,10 @@ impl Stage for AssignWordsStage {
         }
     }
     fn inputs(&self) -> Vec<InputDecl> {
-        vec![input(ASR), input(DIARIZATION)]
+        vec![input(ASR), input(GAP_FILL)]
     }
     fn params(&self) -> &AssignWordsParams {
         &self.params
-    }
-    fn key_extras(&self) -> KeyExtras {
-        KeyExtras {
-            model_digest: self
-                .embedder_source
-                .as_ref()
-                .map(|e| e.describe().to_string()),
-            ..KeyExtras::default()
-        }
     }
     fn plan(&self, inputs: &StageInputs) -> Result<Vec<WorkItem<TranscriptSegment>>, StageError> {
         let Some((_, asr)) = inputs.read_ok::<AsrRecord>(ASR)?.into_iter().next() else {
@@ -896,18 +1081,11 @@ impl Stage for AssignWordsStage {
             return Ok(Vec::new());
         };
         let diar = inputs
-            .read_ok::<DiarizationRecord>(DIARIZATION)?
+            .read_ok::<GapFillRecord>(GAP_FILL)?
             .into_iter()
             .next()
-            .map(|(_, d)| d);
-        let segments = assemble_transcript(
-            &asr,
-            diar.as_ref(),
-            &self.params,
-            self.embedder_source.as_deref(),
-        )
-        .map_err(StageError::Invalid)?;
-        Ok(segments
+            .and_then(|(_, g)| g.diarization);
+        Ok(assemble_transcript(&asr, diar.as_ref(), &self.params)
             .into_iter()
             .map(|s| WorkItem {
                 id: s.segment_id.clone(),
@@ -974,13 +1152,7 @@ mod tests {
 
     #[test]
     fn assembly_without_diarization_labels_one_speaker() {
-        let segs = assemble_transcript(
-            &asr_record("x", "y"),
-            None,
-            &AssignWordsParams::default(),
-            None,
-        )
-        .unwrap();
+        let segs = assemble_transcript(&asr_record("x", "y"), None, &AssignWordsParams::default());
         assert_eq!(segs.len(), 1);
         let s = &segs[0];
         assert_eq!(s.speaker_label, "SPEAKER_00");
@@ -1006,10 +1178,217 @@ mod tests {
             &asr_record("x", "y"),
             Some(&diar),
             &AssignWordsParams::default(),
-            None,
-        )
-        .unwrap();
+        );
         let labels: Vec<&str> = segs.iter().map(|s| s.speaker_label.as_str()).collect();
         assert_eq!(labels, vec!["SPEAKER_00", "SPEAKER_01"]);
+    }
+
+    // ---- gap_fill and assign_words on the core runner.
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use glassrip_core::cache::Cache;
+    use glassrip_core::envelope::{EnvelopeHeader, Outcome, Producer, Record, SchemaReq};
+    use glassrip_core::graph::{Selection, StageDecl, StageGraph};
+    use glassrip_core::manifest::RunDir;
+    use glassrip_core::runner::{stage_decl, Runner, RunnerError, RunnerOptions};
+
+    /// Counts embedder loads; fails the load when `fail` is set.
+    struct CountingSource {
+        loads: Arc<AtomicUsize>,
+        fail: bool,
+    }
+
+    struct FixedEmbedder;
+
+    impl SpanEmbedder for FixedEmbedder {
+        fn embed(&mut self, _audio: &[f32]) -> crate::Result<Option<Vec<f32>>> {
+            Ok(Some(vec![1.0, 0.0]))
+        }
+    }
+
+    impl DiarizeEngine for CountingSource {
+        fn describe(&self) -> Value {
+            serde_json::json!({"engine": "counting"})
+        }
+        fn diarize(&self, _samples: &[f32]) -> crate::Result<Diarization> {
+            Err(AudioError::InvalidInput("unused".into()))
+        }
+        fn embedder(&self) -> crate::Result<Option<Box<dyn SpanEmbedder>>> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(AudioError::InvalidInput("embedder load failed".into()));
+            }
+            Ok(Some(Box::new(FixedEmbedder)))
+        }
+    }
+
+    fn write<T: Serialize>(run: &Path, schema: &str, id: &str, item: T) {
+        let header = EnvelopeHeader {
+            schema: schema.into(),
+            schema_version: v1(),
+            run_id: "t".into(),
+            producer: Producer::glassrip("0.1.0", None),
+            inputs: vec![],
+            params: serde_json::json!({}),
+            content_hash: None,
+            restored_from: None,
+        };
+        let records = vec![Record {
+            id: id.to_string(),
+            outcome: Outcome::ok(item),
+        }];
+        let path = run.join("artifacts").join(format!("{schema}.jsonl"));
+        glassrip_core::jsonl::write_atomic(&path, &header, &records).unwrap();
+    }
+
+    /// Words at 1.0 to 2.2 s (covered by speaker 0) and 6.0 to 7.2 s (uncovered).
+    fn inputs(run: &Path, audio: &Path, gap: bool) {
+        let (path, hash) = store_samples(audio, &vec![0.1f32; 16_000 * 10]).unwrap();
+        let word = |w: &str, s: f64| AsrWordRecord {
+            w: w.into(),
+            start_s: s,
+            end_s: s + 0.4,
+            p: 0.9,
+        };
+        let mut asr = asr_record(&path.display().to_string(), &hash);
+        asr.segments = vec![
+            AsrSegmentRecord {
+                start_s: 1.0,
+                end_s: 2.2,
+                words: vec![word("one", 1.0), word("two", 1.4), word("three", 1.8)],
+            },
+            AsrSegmentRecord {
+                start_s: 6.0,
+                end_s: 7.2,
+                words: vec![word("four", 6.0), word("five", 6.4), word("six", 6.8)],
+            },
+        ];
+        write(run, ASR, "asr", asr);
+        let end = if gap { 3.0 } else { 9.0 };
+        let diar = DiarizationRecord {
+            turns: vec![Turn::new(0.0, end, 0)],
+            labels: vec!["SPEAKER_00".into()],
+            talk_time_s: vec![end],
+            num_clusters_raw: 1,
+            active_s: end,
+            centroids: vec![Some(vec![1.0, 0.0])],
+            wall_s: 0.0,
+        };
+        write(run, DIARIZATION, "diarization", diar);
+    }
+
+    fn runner(root: &Path, run: &str, gap: &GapFillStage, assign: &AssignWordsStage) -> Runner {
+        let graph = StageGraph::new(vec![
+            StageDecl::new("asr", ASR, &[]),
+            StageDecl::new("diarize", DIARIZATION, &[]),
+            stage_decl(gap),
+            stage_decl(assign),
+        ])
+        .unwrap();
+        let dir = RunDir::open(&root.join(run), run, Producer::glassrip("0.1.0", None)).unwrap();
+        Runner::new(
+            dir,
+            graph,
+            &Selection::default(),
+            Cache::new(root.join("cache")),
+            RunnerOptions::default(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap()
+    }
+
+    fn read_one<T: serde::de::DeserializeOwned>(run: &Path, schema: &str) -> Vec<T> {
+        glassrip_core::jsonl::read::<Record<T>>(
+            &run.join("artifacts").join(format!("{schema}.jsonl")),
+            &SchemaReq::new(schema, 1),
+        )
+        .unwrap()
+        .items
+        .into_iter()
+        .filter_map(|r| r.outcome.result)
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn gap_fill_loads_nothing_without_long_gaps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loads = Arc::new(AtomicUsize::new(0));
+        let source = Arc::new(CountingSource {
+            loads: Arc::clone(&loads),
+            fail: true,
+        });
+        let gap = GapFillStage::new(Some(GapFillConfig::default()), Some(source));
+        let assign = AssignWordsStage::new(AssignWordsParams::default());
+        let mut r = runner(tmp.path(), "run", &gap, &assign);
+        inputs(&tmp.path().join("run"), &tmp.path().join("audio"), false);
+        r.run_stage(&gap).await.unwrap();
+        r.run_stage(&assign).await.unwrap();
+        assert_eq!(
+            loads.load(Ordering::SeqCst),
+            0,
+            "embedder must stay unloaded"
+        );
+        let rec: Vec<GapFillRecord> = read_one(&tmp.path().join("run"), GAP_FILL);
+        assert!(!rec[0].embedder_loaded);
+        let segs: Vec<TranscriptSegment> = read_one(&tmp.path().join("run"), TRANSCRIPT);
+        assert!(segs.iter().all(|s| s.speaker_label == "SPEAKER_00"));
+    }
+
+    #[tokio::test]
+    async fn a_failing_loader_is_an_item_error_not_a_plan_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loads = Arc::new(AtomicUsize::new(0));
+        let source = Arc::new(CountingSource {
+            loads: Arc::clone(&loads),
+            fail: true,
+        });
+        let gap = GapFillStage::new(Some(GapFillConfig::default()), Some(source));
+        let assign = AssignWordsStage::new(AssignWordsParams::default());
+        let mut r = runner(tmp.path(), "run", &gap, &assign);
+        inputs(&tmp.path().join("run"), &tmp.path().join("audio"), true);
+        // plan() only reads the input artifacts; the load happens in process().
+        let err = r.run_stage(&gap).await.unwrap_err();
+        assert!(
+            matches!(err, RunnerError::ErrorRateExceeded { .. }),
+            "the loader ran during plan: {err}"
+        );
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn gap_fill_labels_gaps_once_and_resumes_from_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loads = Arc::new(AtomicUsize::new(0));
+        let source: Arc<dyn DiarizeEngine> = Arc::new(CountingSource {
+            loads: Arc::clone(&loads),
+            fail: false,
+        });
+        let gap = GapFillStage::new(Some(GapFillConfig::default()), Some(Arc::clone(&source)));
+        let assign = AssignWordsStage::new(AssignWordsParams::default());
+        for run in ["first", "second"] {
+            let mut r = runner(tmp.path(), run, &gap, &assign);
+            inputs(&tmp.path().join(run), &tmp.path().join("audio"), true);
+            let rep = r.run_stage(&gap).await.unwrap();
+            r.run_stage(&assign).await.unwrap();
+            if run == "second" {
+                assert_eq!(rep.status, glassrip_core::manifest::StageStatus::Cached);
+            }
+        }
+        assert_eq!(
+            loads.load(Ordering::SeqCst),
+            1,
+            "the resume must not re-embed"
+        );
+        let rec: Vec<GapFillRecord> = read_one(&tmp.path().join("second"), GAP_FILL);
+        assert!(rec[0].embedder_loaded);
+        assert_eq!(rec[0].stats.labeled, 1);
+        let segs: Vec<TranscriptSegment> = read_one(&tmp.path().join("second"), TRANSCRIPT);
+        let late = segs.iter().find(|s| s.text.contains("four")).unwrap();
+        assert_eq!(late.speaker_label, "SPEAKER_00");
+        assert!(late
+            .words
+            .iter()
+            .all(|w| w.source == crate::recluster::Source::GapFill));
     }
 }

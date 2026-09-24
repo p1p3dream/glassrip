@@ -37,6 +37,7 @@ cuda = [
 
 [dependencies]
 anyhow = "1"
+async-trait = "0.1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 fs-err = "3"
@@ -67,4 +68,3 @@ tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 
 [dev-dependencies]
-async-trait = "0.1"

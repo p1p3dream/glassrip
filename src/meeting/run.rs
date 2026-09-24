@@ -10,10 +10,17 @@
 //! | phase C | notes | text model (the notes stage unloads the vision model first) |
 //! | output | render | |
 //!
-//! Phase B runs the vision and audio chains concurrently unless the loaded vision
-//! model is larger than `gpu.sequential_model_threshold_gb` (27B/32B class), in
-//! which case the chains run one after the other. Stages outside the selection
-//! are skipped by the runner and their existing artifacts reused.
+//! Phase B runs the vision and audio chains concurrently only when the vision
+//! model is known to be at most `gpu.sequential_model_threshold_gb` (from `/api/ps`
+//! when loaded, else the file size or parameter count the server reports, else
+//! the tag); larger or unknown models run the chains one after the other, and
+//! large models get one client slot. While ASR runs next to board reading, a
+//! placement guard pauses vision requests if the model spills (spec 5.3).
+//!
+//! A model stage whose output restores from cache skips model preflight, so a
+//! fully cached rerun works with the model server down (see
+//! [`super::backends`]). Stages outside the selection are skipped by the runner
+//! and their existing artifacts reused.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -21,8 +28,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use glassrip_audio::extract::ExtractOptions;
+use glassrip_audio::gapfill::GapFillConfig;
 use glassrip_audio::stages::{
-    AsrStage, AssignWordsParams, AssignWordsStage, AudioExtractStage, DiarizeStage,
+    AsrStage, AssignWordsParams, AssignWordsStage, AudioExtractStage, DiarizeStage, GapFillStage,
 };
 use glassrip_core::cache::{Cache, DEFAULT_CACHE_DIR};
 use glassrip_core::config::Config;
@@ -66,6 +74,7 @@ use glassrip_vision_stages::{
 use tokio_util::sync::CancellationToken;
 
 use super::backends::{Backends, VisionBackends};
+use super::logging::LogHandle;
 use super::preflight::{self, Needs, ToolVersions};
 
 /// On-screen vocabulary terms offered to ASR, at most (the prompt token budget
@@ -101,6 +110,8 @@ pub struct MeetingOptions {
     pub ffmpeg: String,
     /// `ffprobe` binary.
     pub ffprobe: String,
+    /// Deferred `run.log.jsonl`, activated once preflight passes.
+    pub log: Option<LogHandle>,
 }
 
 impl MeetingOptions {
@@ -127,8 +138,23 @@ impl MeetingOptions {
             allow_model_download: true,
             ffmpeg: "ffmpeg".into(),
             ffprobe: "ffprobe".into(),
+            log: None,
         }
     }
+}
+
+/// Phase B mode: the vision and audio chains run concurrently only when the
+/// vision model is known to fit next to ASR. `loaded_bytes` is the placement
+/// size when the model is loaded; `estimated_gb` comes from the server's file
+/// size or parameter count, or the tag. Unknown size means sequential.
+pub fn phase_b_concurrent(
+    loaded_bytes: Option<u64>,
+    estimated_gb: Option<f64>,
+    threshold_gb: f64,
+) -> bool {
+    #[allow(clippy::cast_precision_loss)]
+    let gb = loaded_bytes.map(|b| b as f64 / 1e9).or(estimated_gb);
+    gb.is_some_and(|g| g <= threshold_gb)
 }
 
 /// Meeting run failure.
@@ -153,6 +179,14 @@ pub enum MeetingError {
         stage: String,
         /// Reason.
         message: String,
+    },
+    /// A model stage is not cached and its model server is not used.
+    #[error("stage `{stage}` needs its model, which is unavailable: {reason}")]
+    Offline {
+        /// Stage.
+        stage: String,
+        /// Why the server is not used.
+        reason: String,
     },
     /// Setup problem (bad parameters, unreadable files).
     #[error("{0}")]
@@ -213,19 +247,43 @@ async fn step<S: Stage>(
     Ok(status)
 }
 
+/// Fails a selected stage that would need a model whose server is not used
+/// (offline rerun) and that will not restore from cache.
+fn require_cached<S: Stage>(
+    runner: &Runner,
+    stage: &S,
+    offline: Option<&str>,
+) -> Result<(), MeetingError> {
+    let selected = matches!(
+        runner.plan().decision(stage.name()),
+        Some(StageDecision::Run { .. })
+    );
+    match offline {
+        Some(reason) if selected && !runner.cache_hit(stage) => Err(MeetingError::Offline {
+            stage: stage.name().to_string(),
+            reason: reason.to_string(),
+        }),
+        _ => Ok(()),
+    }
+}
+
 /// A model stage: digest check before it (spec 8.1: the digest must not change
-/// mid-run) and the sticky abort after it.
+/// mid-run) and the sticky abort after it. A stage that restores from cache
+/// skips the check (its key already includes the digest), so a fully cached
+/// rerun needs no model server.
 async fn model_step<S: Stage>(
     runner: &Runner,
     stage: &S,
     monitor: &PlacementMonitor,
+    offline: Option<&str>,
     reports: &Reports,
 ) -> Result<StageStatus, MeetingError> {
     let name = stage.name();
+    require_cached(runner, stage, offline)?;
     let selected = matches!(
         runner.plan().decision(name),
         Some(StageDecision::Run { .. })
-    );
+    ) && !runner.cache_hit(stage);
     let aborted = |message: String| MeetingError::Aborted {
         stage: name.to_string(),
         message,
@@ -277,7 +335,16 @@ struct VisionStages {
 }
 
 fn vision_stages(v: VisionBackends, cfg: &Config) -> Result<VisionStages, MeetingError> {
-    let client = VisionClient::new(v.backend, v.concurrency.max(1)).map_err(setup)?;
+    let slots = v.slots(cfg.gpu.sequential_model_threshold_gb);
+    if slots < v.concurrency {
+        tracing::info!(
+            model = %v.model,
+            estimated_gb = v.estimated_gb(),
+            slots,
+            "large vision model: one request at a time"
+        );
+    }
+    let client = VisionClient::new(v.backend, slots).map_err(setup)?;
     let monitor = Arc::new(PlacementMonitor::new(
         v.probe,
         client.clone(),
@@ -344,6 +411,9 @@ pub async fn run_meeting(
     let video = std::path::absolute(&opts.video).map_err(setup)?;
     let out_dir = std::path::absolute(&opts.out_dir).map_err(setup)?;
     fs_err::create_dir_all(&out_dir).map_err(setup)?;
+    if let Some(log) = &opts.log {
+        log.activate(&out_dir).map_err(setup)?;
+    }
 
     let run = glassrip_core::manifest::RunDir::open(
         &out_dir,
@@ -389,6 +459,12 @@ pub async fn run_meeting(
         });
         m.tool_versions.extend(tool_map.clone());
         m.model_digests.extend(backends.model_digests.clone());
+        // The vision digest keys the model stages' caches; an offline rerun reads it back.
+        if let Ok(v) = &backends.vision {
+            if let Some(d) = &v.digest {
+                m.model_digests.insert(v.model.clone(), d.clone());
+            }
+        }
     })?;
 
     let reports = Reports::default();
@@ -480,6 +556,12 @@ pub async fn run_meeting(
     // The vision stages exist only with a vision backend; preflight has already
     // failed when a selected stage needs one and it is missing.
     let vision_model = backends.vision.as_ref().ok().map(|v| v.model.clone());
+    let vision_offline_reason = backends
+        .vision
+        .as_ref()
+        .ok()
+        .and_then(|v| v.offline.clone());
+    let vision_offline = vision_offline_reason.as_deref();
     let vision = match backends.vision.as_ref() {
         Ok(v) => Some(vision_stages(v.clone(), cfg)?),
         Err(_) => None,
@@ -503,30 +585,36 @@ pub async fn run_meeting(
         )
         .await?;
         if let Some(v) = &vision {
-            model_step(&runner, &v.classify, &v.monitor, &reports).await?;
+            model_step(&runner, &v.classify, &v.monitor, vision_offline, &reports).await?;
         }
     }
     lap(&mut outcome, "phase_a", t);
 
     // ---- phase B: board reading next to the audio branch.
     let t = Instant::now();
+    let threshold = cfg.gpu.sequential_model_threshold_gb;
     let concurrent = match &backends.vision {
-        Ok(v) => match v.probe.placement().await {
-            Ok(Some(p)) => {
-                #[allow(clippy::cast_precision_loss)]
-                let gb = p.size_bytes as f64 / 1e9;
-                let sequential = gb > cfg.gpu.sequential_model_threshold_gb;
-                if sequential {
-                    tracing::info!(
-                        model_gb = gb,
-                        threshold_gb = cfg.gpu.sequential_model_threshold_gb,
-                        "large vision model: phase B runs board reading and audio one after the other"
-                    );
+        Ok(v) => {
+            let loaded = match v.probe.placement().await {
+                Ok(Some(p)) => Some(p.size_bytes),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!(error = %e, "vision placement unknown before phase B");
+                    None
                 }
-                !sequential
+            };
+            let concurrent = phase_b_concurrent(loaded, v.estimated_gb(), threshold);
+            if !concurrent {
+                tracing::info!(
+                    loaded_bytes = loaded,
+                    estimated_gb = v.estimated_gb(),
+                    threshold_gb = threshold,
+                    "vision model large or of unknown size: phase B runs board reading and audio one after the other"
+                );
             }
-            _ => true,
-        },
+            concurrent
+        }
+        // No vision model: nothing on the GPU competes with ASR.
         Err(_) => true,
     };
     outcome.phase_b_concurrent = concurrent;
@@ -548,9 +636,10 @@ pub async fn run_meeting(
         let vision_chain = async {
             step(&runner, &canvas, &reports).await?;
             if let Some(v) = &vision {
-                model_step(&runner, &v.board_read, &v.monitor, &reports).await?;
+                model_step(&runner, &v.board_read, &v.monitor, vision_offline, &reports).await?;
             }
             step(&runner, &validate, &reports).await?;
+            require_cached(&runner, &edges, vision_offline)?;
             step(&runner, &edges, &reports).await?;
             Ok::<(), MeetingError>(())
         };
@@ -577,23 +666,31 @@ pub async fn run_meeting(
         );
         let asr = asr_engine.map(|e| AsrStage::new(e, MAX_VOCABULARY_TERMS));
         let diarize = diarizer.clone().map(DiarizeStage::new);
-        let assign = AssignWordsStage::new(
-            AssignWordsParams {
-                assign: glassrip_audio::assign::AssignConfig {
-                    max_gap_s: cfg.audio.nearest_turn_s,
-                    ..glassrip_audio::assign::AssignConfig::default()
-                },
-                ..AssignWordsParams::default()
+        let gap_fill = GapFillStage::new(Some(GapFillConfig::default()), diarizer);
+        let assign = AssignWordsStage::new(AssignWordsParams {
+            assign: glassrip_audio::assign::AssignConfig {
+                max_gap_s: cfg.audio.nearest_turn_s,
+                ..glassrip_audio::assign::AssignConfig::default()
             },
-            diarizer,
-        );
+            ..AssignWordsParams::default()
+        });
+        // ASR next to board reading: poll placement and hold vision requests
+        // on a spill until ASR finishes.
+        let guard = vision
+            .as_ref()
+            .filter(|_| concurrent)
+            .map(|v| Arc::clone(&v.monitor));
         let audio_chain = async {
             step(&runner, &extract, &reports).await?;
             let (a, d) = tokio::join!(
                 async {
-                    match &asr {
-                        Some(s) => step(&runner, s, &reports).await.map(|_| ()),
-                        None => Ok(()),
+                    match (&asr, &guard) {
+                        (Some(s), Some(m)) => m
+                            .guard_asr(step(&runner, s, &reports), m.config().poll_interval)
+                            .await
+                            .map(|_| ()),
+                        (Some(s), None) => step(&runner, s, &reports).await.map(|_| ()),
+                        (None, _) => Ok(()),
                     }
                 },
                 async {
@@ -605,6 +702,7 @@ pub async fn run_meeting(
             );
             a?;
             d?;
+            step(&runner, &gap_fill, &reports).await?;
             step(&runner, &assign, &reports).await?;
             Ok::<(), MeetingError>(())
         };
@@ -643,6 +741,7 @@ pub async fn run_meeting(
     let t = Instant::now();
     drop(vision);
     let text = std::mem::replace(&mut backends.text, Err("released".into()));
+    let text_offline = backends.text_offline.clone();
     if let Ok(text) = text {
         let notes = NotesStage::new(
             NotesParams {
@@ -659,6 +758,7 @@ pub async fn run_meeting(
             },
             text,
         );
+        require_cached(&runner, &notes, text_offline.as_deref())?;
         step(&runner, &notes, &reports).await?;
     }
     lap(&mut outcome, "phase_c", t);
@@ -690,7 +790,22 @@ pub async fn run_meeting(
     }
     lap(&mut outcome, "render", t);
 
-    outcome.reports = reports.take();
+    // Graph order, whatever order concurrent chains finished in.
+    let position: BTreeMap<&str, usize> = runner
+        .plan()
+        .order
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i))
+        .collect();
+    let mut all = reports.take();
+    all.sort_by_key(|r| {
+        position
+            .get(r.stage.as_str())
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+    outcome.reports = all;
     let ran: BTreeSet<&str> = outcome.reports.iter().map(|r| r.stage.as_str()).collect();
     tracing::info!(
         stages = ran.len(),
@@ -739,6 +854,22 @@ async fn name_speakers_stage(participants: &[String], _video: &Path) -> NameSpea
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phase_b_is_sequential_unless_the_model_is_known_small() {
+        let gb = |g: f64| Some((g * 1e9) as u64);
+        assert!(phase_b_concurrent(gb(9.0), None, 14.0));
+        assert!(
+            !phase_b_concurrent(gb(20.0), Some(5.0), 14.0),
+            "loaded size wins"
+        );
+        assert!(phase_b_concurrent(None, Some(6.0), 14.0));
+        assert!(!phase_b_concurrent(None, Some(21.0), 14.0));
+        assert!(
+            !phase_b_concurrent(None, None, 14.0),
+            "unknown size is sequential"
+        );
+    }
 
     #[test]
     fn participants_get_slugs_and_name_aliases() {

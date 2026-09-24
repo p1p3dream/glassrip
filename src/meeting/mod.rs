@@ -6,7 +6,8 @@
 //! - [`backends`]: OCR, vision, text, ASR, and diarization backends for this build.
 //! - [`preflight`]: tools, features, and models the selected stages need.
 //! - [`run`]: stage construction and the GPU-phase schedule on the core runner.
-//! - [`logging`]: stderr progress and `run.log.jsonl`.
+//! - [`logging`]: stderr progress and `run.log.jsonl` (deferred until preflight passes).
+//! - [`cli`]: the command entry point.
 //!
 //! Outputs in `--out`: `run.lock.json`, `run.log.jsonl`, `artifacts/`,
 //! `frames/keyframes/`, `<stem>-meeting-notes.md`, `<stem>-architecture.svg`
@@ -14,6 +15,7 @@
 
 pub mod args;
 pub mod backends;
+pub mod cli;
 pub mod logging;
 pub mod preflight;
 pub mod run;

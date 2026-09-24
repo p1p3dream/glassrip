@@ -39,5 +39,6 @@ whisper-rs = { version = "0.16", features = ["raw-api"] }
 whisper-rs = { version = "0.16", features = ["metal", "raw-api"] }
 
 [dev-dependencies]
+tokio-util = "0.7"
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
