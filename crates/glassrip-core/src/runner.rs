@@ -481,6 +481,14 @@ impl Counts {
     }
 }
 
+/// A stage's loaded inputs and cache key.
+struct KeyedInputs {
+    artifacts: BTreeMap<String, LoadedInput>,
+    input_refs: Vec<InputRef>,
+    params: serde_json::Value,
+    key: CacheKey,
+}
+
 /// A verified cache entry ready to be restored.
 struct CachedArtifact {
     header: EnvelopeHeader,
@@ -725,44 +733,10 @@ impl Runner {
         }
     }
 
-    async fn run_stage_inner<S: Stage>(
-        &self,
-        stage: &S,
-        started: Instant,
-    ) -> Result<StageReport, RunnerError> {
+    /// Loads and checks a stage's declared inputs and derives its cache key.
+    fn keyed_inputs<S: Stage>(&self, stage: &S) -> Result<KeyedInputs, RunnerError> {
         let name = stage.name();
         let version = stage.version();
-        let mut report = StageReport {
-            stage: name.to_string(),
-            status: StageStatus::Skipped,
-            cache_key: None,
-            content_hash: None,
-            items_total: 0,
-            items_ok: 0,
-            items_error: 0,
-            items_skipped: 0,
-            items_processed: 0,
-            wall_s: 0.0,
-            output: None,
-        };
-
-        let force = match self.plan.decision(name) {
-            None => return Err(RunnerError::StageNotInGraph(name.to_string())),
-            Some(StageDecision::Skip(reason)) => {
-                info!(stage = name, ?reason, "stage skipped by selection");
-                if !self.with_run(|r| r.manifest().stages.contains_key(name)) {
-                    self.set_stage(name, version, |r| r.status = StageStatus::Skipped)?;
-                }
-                return Ok(report);
-            }
-            Some(StageDecision::Run { force }) => force,
-        };
-        if self.cancel.is_cancelled() {
-            return Err(RunnerError::Cancelled {
-                stage: name.to_string(),
-            });
-        }
-
         // Inputs: existence, schema check, content hashes.
         let mut artifacts = BTreeMap::new();
         let mut input_refs = Vec::new();
@@ -845,6 +819,79 @@ impl Runner {
             tool_versions,
         }
         .key()?;
+        Ok(KeyedInputs {
+            artifacts,
+            input_refs,
+            params,
+            key,
+        })
+    }
+
+    /// True when running `stage` now would restore its output from the cache:
+    /// the stage is selected without `--force-stage`, its inputs exist, and a
+    /// valid cache entry exists for its key. Model stages use this to skip model
+    /// preflight on a fully cached rerun. Errors (missing inputs) mean "no".
+    pub fn cache_hit<S: Stage>(&self, stage: &S) -> bool {
+        match self.plan.decision(stage.name()) {
+            Some(StageDecision::Run { force: false }) => {}
+            _ => return false,
+        }
+        let Ok(k) = self.keyed_inputs(stage) else {
+            return false;
+        };
+        let output = stage.output();
+        let req = SchemaReq::new(output.schema, output.version.major);
+        match self.cache.get_path(stage.name(), &k.key, OUTPUT_EXT) {
+            Ok(Some(path)) => self.load_cached::<S>(&path, &req).is_ok(),
+            _ => false,
+        }
+    }
+
+    async fn run_stage_inner<S: Stage>(
+        &self,
+        stage: &S,
+        started: Instant,
+    ) -> Result<StageReport, RunnerError> {
+        let name = stage.name();
+        let version = stage.version();
+        let mut report = StageReport {
+            stage: name.to_string(),
+            status: StageStatus::Skipped,
+            cache_key: None,
+            content_hash: None,
+            items_total: 0,
+            items_ok: 0,
+            items_error: 0,
+            items_skipped: 0,
+            items_processed: 0,
+            wall_s: 0.0,
+            output: None,
+        };
+
+        let force = match self.plan.decision(name) {
+            None => return Err(RunnerError::StageNotInGraph(name.to_string())),
+            Some(StageDecision::Skip(reason)) => {
+                info!(stage = name, ?reason, "stage skipped by selection");
+                if !self.with_run(|r| r.manifest().stages.contains_key(name)) {
+                    self.set_stage(name, version, |r| r.status = StageStatus::Skipped)?;
+                }
+                return Ok(report);
+            }
+            Some(StageDecision::Run { force }) => force,
+        };
+        if self.cancel.is_cancelled() {
+            return Err(RunnerError::Cancelled {
+                stage: name.to_string(),
+            });
+        }
+
+        let KeyedInputs {
+            artifacts,
+            input_refs,
+            params,
+            key,
+        } = self.keyed_inputs(stage)?;
+        let output = stage.output();
         report.cache_key = Some(key.clone());
         let out_path = self.with_run(|r| r.artifact_path(output.schema));
         let (run_id, producer) =
@@ -1533,6 +1580,33 @@ mod tests {
         let mut r = runner(&env, "run-c", &Selection::default());
         assert_eq!(r.run_stage(&source).await.unwrap().status, StageStatus::Ok);
         assert_eq!(source.calls(), 2 + 2 + 3);
+    }
+
+    #[tokio::test]
+    async fn cache_hit_predicts_a_restore() {
+        let env = env();
+        let src = SourceStage::new(3);
+        let mut r1 = runner(&env, "a", &Selection::default());
+        assert!(!r1.cache_hit(&src), "nothing cached yet");
+        r1.run_stage(&src).await.unwrap();
+        drop(r1);
+        let r2 = runner(&env, "b", &Selection::default());
+        assert!(r2.cache_hit(&src));
+        let forced = runner(
+            &env,
+            "c",
+            &Selection {
+                force: std::collections::BTreeSet::from(["source".to_string()]),
+                ..Selection::default()
+            },
+        );
+        assert!(!forced.cache_hit(&src), "a forced stage is never a hit");
+        // Different params mean a different key.
+        let mut other = SourceStage::new(3);
+        other.params.scale = 2.0;
+        assert!(!r2.cache_hit(&other));
+        // Missing inputs are not a hit (no error).
+        assert!(!r2.cache_hit(&DoubleStage::new()));
     }
 
     #[tokio::test]
