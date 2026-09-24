@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::backend::{GenerationOptions, VisionRequest};
 use crate::error::Result;
 use crate::geometry::BBox;
-use crate::image_prep::{prepare_thumbnail, PreparedImage};
+use crate::image_prep::PreparedImage;
 
 /// Closed set of screen types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -137,7 +137,16 @@ pub fn classify_request(
     frame: &DynamicImage,
     options: GenerationOptions,
 ) -> Result<(VisionRequest, PreparedImage)> {
-    let prepared = prepare_thumbnail(frame)?;
+    classify_request_with(frame, crate::image_prep::THUMBNAIL_LONG_EDGE, options)
+}
+
+/// [`classify_request`] with an explicit thumbnail long edge.
+pub fn classify_request_with(
+    frame: &DynamicImage,
+    thumbnail_px: u32,
+    options: GenerationOptions,
+) -> Result<(VisionRequest, PreparedImage)> {
+    let prepared = crate::image_prep::prepare_long_edge(frame, thumbnail_px)?;
     let request = VisionRequest::for_output::<ScreenClassOutput>(
         CLASSIFY_PROMPT,
         prepared.image.clone(),
