@@ -3,9 +3,18 @@
 //! ```text
 //! glassrip eval --suite synthetic|synthetic_docs|meeting|docs
 //!     [--vision-model M] [--rerecord] [--baseline FILE] [--bench]
-//!     [--config FILE] [--host URL] [--fixtures DIR] [--responses DIR]
-//!     [--artifacts DIR] [--out DIR] [--repetitions N]
+//!     [--mode reader|pipeline] [--config FILE] [--host URL] [--fixtures DIR]
+//!     [--responses DIR] [--artifacts DIR] [--out DIR] [--repetitions N]
 //! ```
+//!
+//! The synthetic suite has two modes. `reader` (default, the CI gate) classifies
+//! each frame and reads the predicted crop directly, replaying
+//! `tests/fixtures/responses/synthetic/<model>/`. `pipeline` runs the vision
+//! stages (OCR harvest through edge direction) on each frame, replaying vision
+//! replies and OCR spans from `tests/fixtures/responses/synthetic_pipeline/<model>/`
+//! (see [`crate::pipeline`]); `--rerecord` fills that store from a live run.
+//! `--suite meeting --artifacts DIR` scores a run directory (or its
+//! `artifacts/` directory) written by `glassrip meeting`.
 //!
 //! Defaults:
 //! - Public suites read `tests/fixtures/<suite>/`, replay responses from
@@ -67,6 +76,17 @@ impl Suite {
     }
 }
 
+/// How the synthetic suite reads boards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum SyntheticMode {
+    /// Classify the whole frame, read the predicted crop (the CI gate).
+    #[default]
+    Reader,
+    /// Run the vision stages (OCR harvest through edge direction) on each frame.
+    Pipeline,
+}
+
 /// Arguments of `glassrip eval`.
 #[derive(Debug, Clone, Args)]
 pub struct EvalArgs {
@@ -106,6 +126,9 @@ pub struct EvalArgs {
     /// Live repetitions (default 3; replay always runs once).
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=20))]
     pub repetitions: Option<u32>,
+    /// Synthetic suite mode.
+    #[arg(long, value_enum, default_value_t = SyntheticMode::Reader)]
+    pub mode: SyntheticMode,
 }
 
 /// What the command did.
@@ -206,6 +229,42 @@ async fn live_client(host: &str, model: &str, config: &Config) -> Result<VisionC
     )?)
 }
 
+/// Live vision backend, placement probe, and OCR for pipeline-mode recording.
+type LivePipeline = (
+    Arc<dyn VisionBackend>,
+    Arc<dyn glassrip_vision_stages::placement::PlacementProbe>,
+    Arc<dyn glassrip_ocr::TextRecognizer>,
+);
+
+async fn live_pipeline(host: &str, model: &str, config: &Config) -> Result<LivePipeline> {
+    let mut oc = OllamaConfig::new(host, model, config.ollama.num_ctx);
+    oc.keep_alive = config.ollama.keep_alive.clone();
+    oc.slots = config.ollama.num_parallel as usize;
+    oc.allow_spill = config.gpu.allow_spill;
+    oc.request_timeout = std::time::Duration::from_secs(config.ollama.request_timeout_s);
+    let backend = Arc::new(OllamaBackend::new(oc)?);
+    backend.resolve_digest().await?;
+    Ok((backend.clone(), backend, ocr_engine()?))
+}
+
+#[cfg(feature = "onnx")]
+fn ocr_engine() -> Result<Arc<dyn glassrip_ocr::TextRecognizer>> {
+    glassrip_ocr::engine::PpOcrEngine::new(
+        &glassrip_ocr::models::default_dir(),
+        glassrip_ocr::OcrConfig::default(),
+    )
+    .map(|e| Arc::new(e) as Arc<dyn glassrip_ocr::TextRecognizer>)
+    .map_err(|e| EvalError::Config(format!("PP-OCRv5: {e}")))
+}
+
+#[cfg(not(feature = "onnx"))]
+fn ocr_engine() -> Result<Arc<dyn glassrip_ocr::TextRecognizer>> {
+    Err(EvalError::Config(
+        "recording pipeline mode needs PP-OCRv5: build with `--features onnx` or `--features cuda`"
+            .into(),
+    ))
+}
+
 fn base_report(suite: Suite, mode: &str, model: &str, runs: &[SuiteRun]) -> EvalReport {
     let metrics = aggregate(&runs.iter().map(|r| r.metrics.clone()).collect::<Vec<_>>());
     let first = runs.first().cloned().unwrap_or_default();
@@ -268,6 +327,88 @@ pub async fn run(args: EvalArgs) -> Result<EvalOutcome> {
     let cancel = CancellationToken::new();
 
     let (report, out_dir) = match suite {
+        Suite::Synthetic if args.mode == SyntheticMode::Pipeline => {
+            let root = args
+                .fixtures
+                .clone()
+                .unwrap_or_else(|| public_fixtures_root().join("synthetic"));
+            let cases = load_board_suite(&root)?;
+            let responses = args
+                .responses
+                .clone()
+                .unwrap_or_else(|| crate::pipeline::default_responses(&model_slug(&model)));
+            let out = args.out.clone().unwrap_or_else(|| {
+                PathBuf::from("target/glassrip-eval").join("synthetic_pipeline")
+            });
+            let (raw, ocr_store) = crate::pipeline::stores(&responses);
+            let reps = if args.rerecord {
+                args.repetitions.unwrap_or(3) as usize
+            } else {
+                1
+            };
+            let mut runs = Vec::new();
+            for rep in 0..reps {
+                let ctx = if args.rerecord {
+                    let host = resolve_host(args.host.as_deref(), &config);
+                    let live = live_pipeline(&host, &model, &config).await?;
+                    let record = rep == 0;
+                    crate::pipeline::PipelineContext {
+                        vision: if record {
+                            Arc::new(crate::pipeline::RecordingBackend::new(
+                                live.0.clone(),
+                                raw.clone(),
+                            ))
+                        } else {
+                            live.0.clone()
+                        },
+                        probe: live.1,
+                        recognizer: if record {
+                            Arc::new(crate::pipeline::RecordingRecognizer::new(
+                                live.2,
+                                ocr_store.clone(),
+                            ))
+                        } else {
+                            live.2
+                        },
+                        model: model.clone(),
+                        slots: config.ollama.num_parallel as usize,
+                        seed: config.ollama.seed,
+                        num_ctx: config.ollama.num_ctx,
+                        work_dir: out.join("runs"),
+                        cancel: cancel.clone(),
+                    }
+                } else {
+                    crate::pipeline::PipelineContext {
+                        vision: Arc::new(crate::pipeline::ReplayBackend::new(&model, raw.clone())),
+                        probe: Arc::new(glassrip_vision_stages::placement::StaticProbe),
+                        recognizer: Arc::new(crate::pipeline::ReplayRecognizer::new(
+                            ocr_store.clone(),
+                        )),
+                        model: model.clone(),
+                        slots: 1,
+                        seed: config.ollama.seed,
+                        num_ctx: config.ollama.num_ctx,
+                        work_dir: out.join("runs"),
+                        cancel: cancel.clone(),
+                    }
+                };
+                let run = crate::pipeline::run_pipeline_suite(&ctx, &cases).await;
+                eprintln!(
+                    "eval: pipeline repetition {} of {reps} done ({} case errors)",
+                    rep + 1,
+                    run.errors.len()
+                );
+                runs.push(run);
+            }
+            let mode = if args.rerecord {
+                "pipeline_live"
+            } else {
+                "pipeline_replay"
+            };
+            let mut report = base_report(suite, mode, &model, &runs);
+            standard_gates(&mut report, &runs);
+            (report, out)
+        }
         Suite::Synthetic => {
             let root = args
                 .fixtures

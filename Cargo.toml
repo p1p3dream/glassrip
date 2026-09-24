@@ -18,7 +18,7 @@ gpu-cuda = ["gpu", "ort/cuda"]
 # media stages (and ASR through whisper.cpp); stages that need a missing
 # feature fail preflight with a message naming it.
 # PP-OCRv5 (ocr_harvest) on ONNX Runtime, CPU.
-onnx = ["glassrip-vision-stages/onnx"]
+onnx = ["glassrip-vision-stages/onnx", "glassrip-eval/onnx"]
 # speakrs diarization (CPU unless `cuda`).
 diarize = ["glassrip-audio/diarize"]
 # Visual speaker cues in name_speakers (PP-OCR through ONNX Runtime from ORT_DYLIB_PATH).
