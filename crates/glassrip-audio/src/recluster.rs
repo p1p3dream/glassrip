@@ -20,7 +20,17 @@ pub struct EmbeddingSample {
 }
 
 /// Where a turn or a word's speaker came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Source {
     /// The diarizer's own turns (overlap, or the nearest turn within the gap limit).
@@ -33,7 +43,7 @@ pub enum Source {
 }
 
 /// An exclusive speaker turn.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct Turn {
     /// Start, seconds.
     pub start_s: f64,

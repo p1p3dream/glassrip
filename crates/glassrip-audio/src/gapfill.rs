@@ -21,7 +21,9 @@ use crate::error::Result;
 use crate::recluster::{cosine, Source, Turn};
 
 /// Gap filling settings.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 pub struct GapFillConfig {
     /// Uncovered words closer than this join one span, seconds.
     pub merge_gap_s: f64,

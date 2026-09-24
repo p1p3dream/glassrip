@@ -13,6 +13,9 @@
 //!    embedding the uncovered speech and matching it to the speaker centroids.
 //! 6. [`assign`]: each word goes to the exclusive speaker turn it overlaps most.
 //! 7. [`transcript`]: `glassrip.transcript` and `glassrip.speakers` artifacts ([`types`]).
+//!
+//! [`stages`] wraps extraction, ASR, diarization, and assignment as glassrip-core
+//! stages for `glassrip meeting`.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod asr;
@@ -25,6 +28,7 @@ pub mod metrics;
 pub mod models;
 pub mod pipeline;
 pub mod recluster;
+pub mod stages;
 pub mod transcript;
 pub mod types;
 pub mod vocab;

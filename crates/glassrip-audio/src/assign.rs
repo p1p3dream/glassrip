@@ -15,7 +15,9 @@
 use crate::recluster::{Source, Turn};
 
 /// Assignment settings.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 pub struct AssignConfig {
     /// Maximum distance to a turn for words with no overlap, seconds.
     pub max_gap_s: f64,

@@ -15,9 +15,15 @@ diarize = ["dep:speakrs"]
 # NVIDIA GPU: whisper.cpp CUDA backend plus the ONNX Runtime CUDA provider.
 # ONNX Runtime is loaded at run time from ORT_DYLIB_PATH (see README).
 cuda = ["diarize", "whisper-rs/cuda", "speakrs/cuda", "speakrs/load-dynamic"]
+# whisper.cpp on Metal (already on for every macOS build; see below).
+metal = ["whisper-rs/metal"]
 
 [dependencies]
 blake3 = "1"
+fs-err = "3"
+glassrip-core = { path = "../glassrip-core" }
+semver = "1"
+tracing = "0.1"
 schemars = "1.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
