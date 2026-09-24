@@ -100,7 +100,25 @@ pub fn compute_diff(old_code: Option<&str>, new_code: &str) -> String {
     let diff = similar::TextDiff::from_lines(old, new_code);
     let unified = diff.unified_diff().context_radius(1).to_string();
 
-    unified.lines().skip(2).collect::<Vec<_>>().join("\n")
+    strip_file_headers(&unified)
+}
+
+/// Drop the `--- a` / `+++ b` file header pair if present. `similar` only emits
+/// it when `.header()` is set, so in practice the output starts at the first
+/// `@@` hunk header. Headers are matched by content and only before the first
+/// hunk, so removed lines whose text starts with `-- ` are never dropped.
+fn strip_file_headers(unified: &str) -> String {
+    let mut lines = unified.lines().peekable();
+    let mut out: Vec<&str> = Vec::new();
+    while let Some(line) = lines.peek() {
+        if line.starts_with("--- ") || line.starts_with("+++ ") {
+            lines.next();
+        } else {
+            break;
+        }
+    }
+    out.extend(lines);
+    out.join("\n")
 }
 
 fn find_overlap<S1: AsRef<str>, S2: AsRef<str>>(
@@ -285,6 +303,26 @@ mod tests {
         let result = compute_diff(Some("a\nb\nc"), "a\nB\nc");
         assert!(result.contains("-b"));
         assert!(result.contains("+B"));
+    }
+
+    #[test]
+    fn compute_diff_keeps_change_on_first_line() {
+        let result = compute_diff(Some("a\nb\nc\nd"), "A\nb\nc\nd");
+        assert!(result.starts_with("@@ -1,2 +1,2 @@"), "got: {result}");
+        assert!(result.contains("\n-a\n"), "first removed line dropped: {result}");
+        assert!(result.contains("\n+A"), "first added line dropped: {result}");
+    }
+
+    #[test]
+    fn compute_diff_keeps_removed_line_that_looks_like_header() {
+        let result = compute_diff(Some("-- x\nb"), "b");
+        assert!(result.contains("\n--- x"), "got: {result}");
+    }
+
+    #[test]
+    fn strip_file_headers_removes_only_leading_headers() {
+        let text = "--- a\n+++ b\n@@ -1 +1 @@\n-x\n+y";
+        assert_eq!(strip_file_headers(text), "@@ -1 +1 @@\n-x\n+y");
     }
 
     #[test]
