@@ -458,7 +458,9 @@ pub fn consolidate(
         let cluster = regs[fi].cluster;
         let mut obs: Vec<Obs> = Vec::new();
         for nd in &f.board.nodes {
-            if is_unreliable(&nd.text) {
+            // A node whose text resolves to a participant (fuzzy, unlike the
+            // validator's exact check) is an owner tag read in the wrong list.
+            if is_unreliable(&nd.text) || params.participants.resolve(&nd.text).is_some() {
                 continue;
             }
             obs.push(Obs {
@@ -895,6 +897,12 @@ pub fn consolidate(
     let mut by_person: BTreeMap<String, (String, Vec<OwnerSighting>)> = BTreeMap::new();
     for (fi, f) in frames.iter().enumerate() {
         let geo = geometry_ok(&f.board);
+        let geo_nodes: Vec<&glassrip_vision::board::BoardNode> = f
+            .board
+            .nodes
+            .iter()
+            .filter(|x| params.participants.resolve(&x.text).is_none())
+            .collect();
         let mut tags: Vec<(String, String, BBox)> = f
             .board
             .owner_tags
@@ -907,6 +915,11 @@ pub fn consolidate(
                 if let Some(b) = r.bbox {
                     tags.push((r.text.clone(), String::new(), b));
                 }
+            }
+        }
+        for nd in &f.board.nodes {
+            if params.participants.resolve(&nd.text).is_some() {
+                tags.push((nd.text.clone(), String::new(), nd.bbox));
             }
         }
         let frame_edges: Vec<((usize, usize), Segment)> = edge_obs
@@ -926,7 +939,7 @@ pub fn consolidate(
             let size = tb.width().max(tb.height()).max(1.0);
             let mut target: Option<(OwnerTarget, AnchorKind)> = None;
             if geo {
-                let overlaps_node = f.board.nodes.iter().any(|x| x.bbox.iou(&tb) > 0.0);
+                let overlaps_node = geo_nodes.iter().any(|x| x.bbox.iou(&tb) > 0.0);
                 let on_edge = frame_edges
                     .iter()
                     .map(|(k, (p, q))| (*k, point_segment_distance(c, *p, *q)))
@@ -936,9 +949,7 @@ pub fn consolidate(
                     target = edge_target(k).map(|t| (t, AnchorKind::GeometryEdge));
                 }
                 if target.is_none() {
-                    let mut d: Vec<(f64, &str)> = f
-                        .board
-                        .nodes
+                    let mut d: Vec<(f64, &str)> = geo_nodes
                         .iter()
                         .map(|x| (dist_to_bbox(c, &x.bbox), x.local_id.as_str()))
                         .collect();

@@ -529,3 +529,25 @@ fn owners_are_timed_edge_anchored_and_filtered() {
     assert_eq!(yes.owner_assignments.len(), 2);
     assert_eq!(yes.owner_assignments[1].valid_from_s, 100.0);
 }
+
+#[test]
+fn misread_participant_node_becomes_an_owner_sighting() {
+    let mut specs: Vec<Spec> = (0..4).map(|_| base()).collect();
+    for s in &mut specs {
+        // "Jordann" is not an exact participant name, so validation keeps it as a node.
+        s.nodes.push(("n7", "Jordann".into(), (1000.0, 420.0)));
+        s.edges.push(("n7", "n2", ""));
+    }
+    let s = consolidate(frames(&specs), &params(), &NoCorroboration);
+    assert!(!s.nodes.iter().any(|n| n.text == "Jordann"));
+    assert!(!s
+        .edges
+        .iter()
+        .any(|e| e.a_text == "Jordann" || e.b_text == "Jordann"));
+    let jordan: Vec<_> = s
+        .owner_assignments
+        .iter()
+        .filter(|a| a.person_id == "p-jordan")
+        .collect();
+    assert_eq!(jordan.len(), 1, "{:#?}", s.owner_assignments);
+}
