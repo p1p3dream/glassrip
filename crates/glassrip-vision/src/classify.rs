@@ -42,6 +42,8 @@ pub struct ScreenClassOutput {
     /// Application name if recognizable (for example "Miro"), otherwise an empty string.
     pub app_hint: String,
     /// Main content area (the whiteboard canvas for `whiteboard`), in image pixels.
+    #[serde(rename = "bbox_2d", with = "crate::geometry::bbox2d")]
+    #[schemars(with = "[f64; 4]")]
     pub canvas_bbox: BBox,
     #[schemars(range(min = 0.0, max = 1.0))]
     pub confidence: f64,
@@ -125,7 +127,8 @@ screen_type values:
 - unknown: none of the above, or unreadable
 
 app_hint: the application name if you can recognize it, otherwise an empty string.
-canvas_bbox: the main content area in pixel coordinates of this image (x1, y1 top-left; x2, y2 bottom-right). \
+bbox_2d: the main content area as [x1, y1, x2, y2] in absolute pixel coordinates of this image, in exactly \
+that order (x1, y1 top-left; x2, y2 bottom-right; x1 < x2 and y1 < y2). \
 For a whiteboard, exclude toolbars, side panels, zoom controls, and participant video tiles.
 confidence: a number from 0 to 1.";
 
@@ -161,6 +164,9 @@ pub enum MatchMode {
     Phrase,
     /// Span (leading whitespace trimmed) starts with the pattern, case-sensitive.
     Prefix,
+    /// Like `Word`, but words of five or more letters match at a normalized
+    /// Levenshtein similarity of at least 0.75 (tolerates OCR misreads).
+    Fuzzy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -183,6 +189,12 @@ impl KeywordPattern {
             mode: MatchMode::Phrase,
         }
     }
+    pub fn fuzzy(text: &str) -> Self {
+        Self {
+            text: text.into(),
+            mode: MatchMode::Fuzzy,
+        }
+    }
     pub fn prefix(text: &str) -> Self {
         Self {
             text: text.into(),
@@ -198,6 +210,18 @@ impl KeywordPattern {
                 let pat = words(&self.text);
                 let hay = words(span);
                 !pat.is_empty() && hay.windows(pat.len()).any(|w| w == pat.as_slice())
+            }
+            MatchMode::Fuzzy => {
+                let pat = words(&self.text);
+                let hay = words(span);
+                let close = |a: &String, b: &String| {
+                    a == b
+                        || (a.chars().count() >= 5 && strsim::normalized_levenshtein(a, b) >= 0.75)
+                };
+                !pat.is_empty()
+                    && hay
+                        .windows(pat.len())
+                        .any(|w| w.iter().zip(&pat).all(|(h, p)| close(p, h)))
             }
         }
     }
@@ -475,6 +499,19 @@ pub fn combine(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fuzzy_words_tolerate_misreads() {
+        let p = KeywordPattern::fuzzy("Structure");
+        assert!(p.matches("Stuctue"));
+        assert!(p.matches("tab Structure list"));
+        assert!(!p.matches("Stack"));
+        let short = KeywordPattern::fuzzy("Tag");
+        assert!(short.matches("tag"));
+        assert!(!short.matches("tog"));
+        let two = KeywordPattern::fuzzy("Search list");
+        assert!(two.matches("Q Serch list"));
+    }
+
     use super::*;
 
     fn model(t: ScreenType, conf: f64) -> SourceClassOutput {

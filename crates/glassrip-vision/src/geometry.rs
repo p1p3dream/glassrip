@@ -85,6 +85,24 @@ impl BBox {
     }
 }
 
+/// Serde for a box as the array `[x1, y1, x2, y2]` in absolute pixels, the
+/// `bbox_2d` convention Qwen2.5-VL emits natively. Use with
+/// `#[serde(rename = "bbox_2d", with = "crate::geometry::bbox2d")]` and
+/// `#[schemars(with = "[f64; 4]")]`.
+pub mod bbox2d {
+    use super::BBox;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(b: &BBox, s: S) -> Result<S::Ok, S::Error> {
+        [b.x1, b.y1, b.x2, b.y2].serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<BBox, D::Error> {
+        let [x1, y1, x2, y2] = <[f64; 4]>::deserialize(d)?;
+        Ok(BBox::new(x1, y1, x2, y2))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

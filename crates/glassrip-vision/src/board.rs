@@ -45,8 +45,9 @@ it once. Transcribe the full text.
 \"near\" is that box's local_id, or an empty string if it is not next to a box.
 - other_visible_text: any other readable text on the canvas itself (not UI chrome) that is not \
 already listed above.
-- bbox: for every node, sticky, owner tag, and other text, the box around it in pixel coordinates of \
-this image: x1, y1 is the top-left corner and x2, y2 the bottom-right corner.
+- bbox_2d: for every node, sticky, owner tag, and other text, the box around it as \
+[x1, y1, x2, y2] in absolute pixel coordinates of this image, in exactly that order: x1, y1 is the \
+top-left corner and x2, y2 the bottom-right corner, so x1 < x2 and y1 < y2.
 
 Rules:
 - Transcribe text VERBATIM, exactly as written, including punctuation. Do not correct, summarize or \
@@ -83,6 +84,8 @@ pub enum StickyColor {
 pub struct BoardNode {
     pub local_id: String,
     pub text: String,
+    #[serde(rename = "bbox_2d", with = "crate::geometry::bbox2d")]
+    #[schemars(with = "[f64; 4]")]
     pub bbox: BBox,
     #[schemars(range(min = 0.0, max = 1.0))]
     pub conf: f64,
@@ -105,6 +108,8 @@ pub struct BoardEdge {
 pub struct Sticky {
     pub text: String,
     pub color: StickyColor,
+    #[serde(rename = "bbox_2d", with = "crate::geometry::bbox2d")]
+    #[schemars(with = "[f64; 4]")]
     pub bbox: BBox,
 }
 
@@ -115,6 +120,8 @@ pub struct OwnerTag {
     pub name_raw: String,
     /// `local_id` of the node the tag sits on or next to, or empty.
     pub near: String,
+    #[serde(rename = "bbox_2d", with = "crate::geometry::bbox2d")]
+    #[schemars(with = "[f64; 4]")]
     pub bbox: BBox,
 }
 
@@ -122,6 +129,8 @@ pub struct OwnerTag {
 #[serde(deny_unknown_fields)]
 pub struct TextItem {
     pub text: String,
+    #[serde(rename = "bbox_2d", with = "crate::geometry::bbox2d")]
+    #[schemars(with = "[f64; 4]")]
     pub bbox: BBox,
 }
 
@@ -137,7 +146,7 @@ pub struct BoardReadOutput {
     pub stickies: Vec<Sticky>,
     #[schemars(length(max = 20))]
     pub owner_tags: Vec<OwnerTag>,
-    #[schemars(length(max = 40))]
+    #[schemars(length(max = 20))]
     pub other_visible_text: Vec<TextItem>,
     #[schemars(range(min = 0.0, max = 1.0))]
     pub confidence: f64,
@@ -281,8 +290,14 @@ pub enum RejectReason {
     Denylist,
     /// Bbox lies outside the canvas, so the text is chrome by definition.
     OutsideCanvas,
-    /// A node whose text is a participant name.
+    /// A node or other text whose text is a participant name.
     ParticipantName,
+    /// Inside a detected participant video tile.
+    TileRegion,
+    /// Owner tag whose name matches no participant.
+    OwnerNotParticipant,
+    /// Owner tag not on a green tag (pixel check).
+    OwnerNotOnTag,
 }
 
 /// An element removed as UI chrome.
@@ -298,7 +313,10 @@ pub struct RejectedItem {
 #[serde(rename_all = "snake_case")]
 pub enum IssueKind {
     EmptyText,
+    /// Non-finite box, or an inverted box with no unambiguous repair; dropped.
     MalformedBBox,
+    /// Inverted box read as `[x1, x2, y1, y2]` or with swapped corners; repaired.
+    BBoxRepaired,
     DuplicateNodeId,
     /// Same text in more than one list; the lower-priority copy was dropped.
     DuplicateAcrossLists,
@@ -363,7 +381,7 @@ impl Ctx<'_> {
     }
 
     /// Shared per-element checks. Returns false if the element must be dropped.
-    fn keep(&mut self, list: ElementList, text: &str, bbox: &BBox) -> bool {
+    fn keep(&mut self, list: ElementList, text: &str, bbox: &mut BBox) -> bool {
         if text.trim().is_empty() {
             self.issue(
                 list,
@@ -373,12 +391,24 @@ impl Ctx<'_> {
             return false;
         }
         if !bbox.is_well_formed() {
-            self.issue(
-                list,
-                IssueKind::MalformedBBox,
-                format!("{text:?} has bbox {bbox:?}"),
-            );
-            return false;
+            match repair_inverted(bbox, self.canvas, self.cfg.bbox_tolerance_px) {
+                Some(fixed) => {
+                    self.issue(
+                        list,
+                        IssueKind::BBoxRepaired,
+                        format!("{text:?}: bbox {bbox:?} repaired to {fixed:?}"),
+                    );
+                    *bbox = fixed;
+                }
+                None => {
+                    self.issue(
+                        list,
+                        IssueKind::MalformedBBox,
+                        format!("{text:?} has bbox {bbox:?}"),
+                    );
+                    return false;
+                }
+            }
         }
         if self.cfg.denylist.matches(text) {
             self.reject(list, text, Some(*bbox), RejectReason::Denylist);
@@ -397,6 +427,35 @@ impl Ctx<'_> {
 
     fn is_participant(&self, text: &str) -> bool {
         self.participants.contains(&normalize(text))
+    }
+}
+
+/// Repair an inverted box when exactly one reading of its four numbers gives a
+/// well-formed box inside the canvas. Readings tried: `[x1, x2, y1, y2]`
+/// (axis-order swap), `[x2, y2, x1, y1]` (swapped corners), and either axis
+/// flipped. Returns `None` for non-finite values or zero or several candidates.
+pub fn repair_inverted(b: &BBox, canvas: CanvasSize, tolerance: f64) -> Option<BBox> {
+    if ![b.x1, b.y1, b.x2, b.y2].iter().all(|v| v.is_finite()) || b.is_well_formed() {
+        return None;
+    }
+    let (p, q, r, s) = (b.x1, b.y1, b.x2, b.y2);
+    let mut found: Vec<BBox> = Vec::new();
+    for c in [
+        BBox::new(p, r, q, s),
+        BBox::new(r, s, p, q),
+        BBox::new(r, q, p, s),
+        BBox::new(p, s, r, q),
+    ] {
+        if c.is_well_formed()
+            && c.is_inside(canvas.width, canvas.height, tolerance)
+            && !found.contains(&c)
+        {
+            found.push(c);
+        }
+    }
+    match found.as_slice() {
+        [one] => Some(*one),
+        _ => None,
     }
 }
 
@@ -434,7 +493,7 @@ pub fn validate_board(
         nodes,
         edges,
         stickies,
-        owner_tags,
+        owner_tags: owner_tags_in,
         other_visible_text,
         confidence,
     } = output;
@@ -442,8 +501,8 @@ pub fn validate_board(
     // Rules 1-3 for nodes.
     let mut seen_ids = HashSet::new();
     let mut kept_nodes = Vec::new();
-    for n in nodes {
-        if !ctx.keep(ElementList::Nodes, &n.text, &n.bbox) {
+    for mut n in nodes {
+        if !ctx.keep(ElementList::Nodes, &n.text, &mut n.bbox) {
             continue;
         }
         if ctx.is_participant(&n.text) {
@@ -467,14 +526,16 @@ pub fn validate_board(
     }
     let mut nodes = kept_nodes;
 
-    let mut owner_tags: Vec<OwnerTag> = owner_tags
-        .into_iter()
-        .filter(|o| ctx.keep(ElementList::OwnerTags, &o.name_raw, &o.bbox))
-        .collect();
+    let mut owner_tags: Vec<OwnerTag> = Vec::new();
+    for mut o in owner_tags_in {
+        if ctx.keep(ElementList::OwnerTags, &o.name_raw, &mut o.bbox) {
+            owner_tags.push(o);
+        }
+    }
 
     let mut kept_stickies = Vec::new();
-    for s in stickies {
-        if !ctx.keep(ElementList::Stickies, &s.text, &s.bbox) {
+    for mut s in stickies {
+        if !ctx.keep(ElementList::Stickies, &s.text, &mut s.bbox) {
             continue;
         }
         if ctx.is_participant(&s.text) {
@@ -497,10 +558,23 @@ pub fn validate_board(
     }
     let mut stickies = kept_stickies;
 
-    let mut other: Vec<TextItem> = other_visible_text
-        .into_iter()
-        .filter(|t| ctx.keep(ElementList::OtherVisibleText, &t.text, &t.bbox))
-        .collect();
+    let mut other: Vec<TextItem> = Vec::new();
+    for mut t in other_visible_text {
+        if !ctx.keep(ElementList::OtherVisibleText, &t.text, &mut t.bbox) {
+            continue;
+        }
+        // Participant names outside owner tags are tile or banner text.
+        if ctx.is_participant(&t.text) {
+            ctx.reject(
+                ElementList::OtherVisibleText,
+                &t.text,
+                Some(t.bbox),
+                RejectReason::ParticipantName,
+            );
+            continue;
+        }
+        other.push(t);
+    }
 
     // Rule 4: exclusive membership by normalized text.
     let mut owner_of: HashMap<String, ElementList> = HashMap::new();
@@ -699,6 +773,116 @@ mod tests {
     }
 
     #[test]
+    fn bbox_2d_wire_format() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let n = node("n1", "Widget Service", 100.0, 200.0);
+        let v = serde_json::to_value(&n)?;
+        assert_eq!(
+            v["bbox_2d"],
+            serde_json::json!([100.0, 200.0, 220.0, 260.0])
+        );
+        assert!(v.get("bbox").is_none());
+        let back: BoardNode = serde_json::from_value(v)?;
+        assert_eq!(back, n);
+        let short =
+            serde_json::json!({"local_id": "n", "text": "t", "bbox_2d": [1, 2, 3], "conf": 0.5});
+        assert!(serde_json::from_value::<BoardNode>(short).is_err());
+        let schema = crate::schema::OutputSchema::for_type::<BoardReadOutput>()?;
+        let text = schema.text();
+        assert!(
+            text.contains("bbox_2d") && !text.contains("\"x1\""),
+            "{text}"
+        );
+        assert!(BOARD_READ_PROMPT.contains("[x1, y1, x2, y2]"));
+        // Properties reach the grammar in declaration order: nodes before edges
+        // (edges reference node ids), and an element's text before its box.
+        let keys: Vec<&String> = schema.json()["properties"]
+            .as_object()
+            .map(|m| m.keys().collect())
+            .unwrap_or_default();
+        assert_eq!(
+            keys,
+            [
+                "nodes",
+                "edges",
+                "stickies",
+                "owner_tags",
+                "other_visible_text",
+                "confidence"
+            ]
+        );
+        let node_keys: Vec<&String> = schema.json()["properties"]["nodes"]["items"]["properties"]
+            .as_object()
+            .map(|m| m.keys().collect())
+            .unwrap_or_default();
+        assert_eq!(node_keys, ["local_id", "text", "bbox_2d", "conf"]);
+        Ok(())
+    }
+
+    #[test]
+    fn inverted_boxes_repaired_only_when_unambiguous() {
+        // Emitted as [x1, x2, y1, y2] for x 600..1000, y 100..300: only one reading fits.
+        let axis_swap = BBox::new(600.0, 1000.0, 100.0, 300.0);
+        assert_eq!(
+            repair_inverted(&axis_swap, CANVAS, 2.0),
+            Some(BBox::new(600.0, 100.0, 1000.0, 300.0))
+        );
+        // Only the x axis flipped.
+        assert_eq!(
+            repair_inverted(&BBox::new(50.0, 50.0, 40.0, 60.0), CANVAS, 2.0),
+            Some(BBox::new(40.0, 50.0, 50.0, 60.0))
+        );
+        // Scrambled beyond one reading (two fit): rejected.
+        let scrambled = BBox::new(337.0, 467.0, 259.0, 337.0);
+        assert_eq!(repair_inverted(&scrambled, CANVAS, 2.0), None);
+        // Well-formed and non-finite boxes are not candidates.
+        assert_eq!(repair_inverted(&bb(1.0, 1.0), CANVAS, 2.0), None);
+        assert_eq!(
+            repair_inverted(&BBox::new(f64::NAN, 0.0, 1.0, 1.0), CANVAS, 2.0),
+            None
+        );
+
+        let mut out = empty_output();
+        out.nodes = vec![
+            BoardNode {
+                bbox: axis_swap,
+                ..node("n1", "Widget Service", 0.0, 0.0)
+            },
+            BoardNode {
+                bbox: scrambled,
+                ..node("n2", "Queue", 0.0, 0.0)
+            },
+        ];
+        let v = validate_board(out, CANVAS, &cfg());
+        assert_eq!(v.nodes.len(), 1);
+        assert!(v.nodes[0].bbox.is_well_formed());
+        assert!(v.nodes.iter().all(|n| n.bbox.is_well_formed()));
+        assert!(v.issues.iter().any(|i| i.kind == IssueKind::BBoxRepaired));
+        assert!(v.issues.iter().any(|i| i.kind == IssueKind::MalformedBBox));
+    }
+
+    #[test]
+    fn participant_names_in_other_text_are_chrome() {
+        let mut out = empty_output();
+        out.nodes = vec![node("n1", "Widget Service", 100.0, 100.0)];
+        out.other_visible_text = vec![
+            TextItem {
+                text: "Jordan".into(),
+                bbox: bb(500.0, 500.0),
+            },
+            TextItem {
+                text: "v2 draft".into(),
+                bbox: bb(700.0, 500.0),
+            },
+        ];
+        let v = validate_board(out, CANVAS, &cfg());
+        assert_eq!(v.other_visible_text.len(), 1);
+        assert!(v
+            .chrome_rejected
+            .iter()
+            .any(|r| r.text == "Jordan" && r.reason == RejectReason::ParticipantName));
+    }
+
+    #[test]
     fn clean_board_passes_unchanged() {
         let mut out = empty_output();
         out.nodes = vec![
@@ -870,8 +1054,8 @@ mod tests {
             node("n1", "Widget Service", 100.0, 100.0),
             node("n1", "Other Box", 400.0, 100.0),
             BoardNode {
-                bbox: BBox::new(50.0, 50.0, 40.0, 60.0),
-                ..node("n3", "Inverted", 0.0, 0.0)
+                bbox: BBox::new(f64::NAN, 50.0, 40.0, 60.0),
+                ..node("n3", "Not a number", 0.0, 0.0)
             },
         ];
         out.owner_tags = vec![OwnerTag {
