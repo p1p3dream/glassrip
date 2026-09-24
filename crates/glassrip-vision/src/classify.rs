@@ -47,17 +47,65 @@ pub struct ScreenClassOutput {
     pub confidence: f64,
 }
 
+/// A canvas box side shorter than this fraction of the frame side is degenerate.
+pub const MIN_CANVAS_SIDE_FRACTION: f64 = 0.05;
+
+/// Why the model's canvas box was replaced by the full frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CanvasBBoxIssue {
+    /// `x2 < x1` or `y2 < y1`, or non-finite coordinates.
+    Inverted,
+    /// Zero area or a side below [`MIN_CANVAS_SIDE_FRACTION`] of the frame after clamping.
+    Degenerate,
+}
+
+/// A classification answer in source frame pixels, with its canvas box checked.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceClassOutput {
+    pub answer: ScreenClassOutput,
+    /// Set when the reported box was unusable and the full frame was substituted.
+    pub canvas_issue: Option<CanvasBBoxIssue>,
+}
+
 impl ScreenClassOutput {
-    /// Map the canvas box from thumbnail pixels to source frame pixels, clamped to the frame.
+    /// Map the canvas box from thumbnail pixels to source frame pixels and check it.
     ///
-    /// The model sometimes reports coordinates past the image edge, so the result is clamped.
-    pub fn in_source_coords(mut self, prepared: &PreparedImage) -> Self {
-        self.canvas_bbox = self.canvas_bbox.to_source(prepared).clamped(
+    /// The model sometimes reports coordinates past the image edge, so the box is
+    /// clamped to the frame. An inverted or degenerate box (after clamping) is
+    /// replaced by the full frame and the issue is recorded.
+    pub fn in_source_coords(mut self, prepared: &PreparedImage) -> SourceClassOutput {
+        let (w, h) = (
             f64::from(prepared.source_width),
             f64::from(prepared.source_height),
         );
-        self
+        let mapped = self.canvas_bbox.to_source(prepared);
+        let (bbox, canvas_issue) = check_canvas_bbox(mapped, w, h);
+        self.canvas_bbox = bbox;
+        SourceClassOutput {
+            answer: self,
+            canvas_issue,
+        }
     }
+}
+
+/// Clamp `bbox` to a `width` x `height` frame; fall back to the full frame if it is unusable.
+pub fn check_canvas_bbox(bbox: BBox, width: f64, height: f64) -> (BBox, Option<CanvasBBoxIssue>) {
+    let full = BBox::new(0.0, 0.0, width, height);
+    let finite = [bbox.x1, bbox.y1, bbox.x2, bbox.y2]
+        .iter()
+        .all(|v| v.is_finite());
+    if !finite || bbox.x2 < bbox.x1 || bbox.y2 < bbox.y1 {
+        return (full, Some(CanvasBBoxIssue::Inverted));
+    }
+    let c = bbox.clamped(width, height);
+    if !c.is_well_formed()
+        || c.width() < width * MIN_CANVAS_SIDE_FRACTION
+        || c.height() < height * MIN_CANVAS_SIDE_FRACTION
+    {
+        return (full, Some(CanvasBBoxIssue::Degenerate));
+    }
+    (c, None)
 }
 
 /// Classification prompt; the schema text is appended by [`VisionRequest::for_output`].
@@ -343,8 +391,10 @@ pub struct ScreenClass {
     pub app_hint: Option<String>,
     pub confidence: f64,
     pub method: ClassifyMethod,
-    /// Present only when the final type matches the model's answer.
+    /// Present only when the final type matches the model's answer (source frame pixels).
     pub canvas_bbox: Option<BBox>,
+    /// Set when the model's box was unusable and `canvas_bbox` is the full frame.
+    pub canvas_bbox_issue: Option<CanvasBBoxIssue>,
     /// Name of the deciding or agreeing rule.
     pub rule: Option<String>,
 }
@@ -361,14 +411,17 @@ fn non_empty(s: &str) -> Option<String> {
     (!t.is_empty()).then(|| t.to_string())
 }
 
-/// Combine the model answer (if the request succeeded) with the rule evaluation.
+/// Combine the model answer (if the request succeeded, mapped to source pixels
+/// with [`ScreenClassOutput::in_source_coords`]) with the rule evaluation.
 pub fn combine(
-    model: Option<&ScreenClassOutput>,
+    model: Option<&SourceClassOutput>,
     rules: &RuleEvaluation,
     policy: &ClassifyRules,
 ) -> ScreenClass {
     let best = rules.best();
     let strong = best.filter(|h| !rules.conflicting && h.confidence >= policy.high_confidence);
+    let issue = model.and_then(|m| m.canvas_issue);
+    let model = model.map(|m| &m.answer);
     let from_model =
         |m: &ScreenClassOutput, method, confidence, rule: Option<&RuleHit>| ScreenClass {
             screen_type: m.screen_type,
@@ -376,6 +429,7 @@ pub fn combine(
             confidence,
             method,
             canvas_bbox: Some(m.canvas_bbox),
+            canvas_bbox_issue: issue,
             rule: rule.map(|r| r.rule.clone()),
         };
     let unknown = |method, rule: Option<&RuleHit>| ScreenClass {
@@ -384,6 +438,7 @@ pub fn combine(
         confidence: 0.0,
         method,
         canvas_bbox: None,
+        canvas_bbox_issue: None,
         rule: rule.map(|r| r.rule.clone()),
     };
 
@@ -400,6 +455,7 @@ pub fn combine(
             confidence: hit.confidence,
             method: ClassifyMethod::Rule,
             canvas_bbox: None,
+            canvas_bbox_issue: None,
             rule: Some(hit.rule.clone()),
         },
         (Some(m), None, Some(weak)) => {
@@ -421,13 +477,56 @@ pub fn combine(
 mod tests {
     use super::*;
 
-    fn model(t: ScreenType, conf: f64) -> ScreenClassOutput {
-        ScreenClassOutput {
-            screen_type: t,
-            app_hint: String::new(),
-            canvas_bbox: BBox::new(10.0, 20.0, 700.0, 400.0),
-            confidence: conf,
+    fn model(t: ScreenType, conf: f64) -> SourceClassOutput {
+        SourceClassOutput {
+            answer: ScreenClassOutput {
+                screen_type: t,
+                app_hint: String::new(),
+                canvas_bbox: BBox::new(10.0, 20.0, 700.0, 400.0),
+                confidence: conf,
+            },
+            canvas_issue: None,
         }
+    }
+
+    #[test]
+    fn canvas_bbox_is_clamped_or_replaced() {
+        let (b, issue) = check_canvas_bbox(BBox::new(100.0, 50.0, 1800.0, 1200.0), 1600.0, 900.0);
+        assert_eq!(b, BBox::new(100.0, 50.0, 1600.0, 900.0));
+        assert_eq!(issue, None);
+
+        let full = BBox::new(0.0, 0.0, 1600.0, 900.0);
+        let (b, issue) = check_canvas_bbox(BBox::new(800.0, 50.0, 100.0, 600.0), 1600.0, 900.0);
+        assert_eq!((b, issue), (full, Some(CanvasBBoxIssue::Inverted)));
+        // Entirely past the right edge: zero width after clamping.
+        let (b, issue) = check_canvas_bbox(BBox::new(1700.0, 50.0, 1900.0, 600.0), 1600.0, 900.0);
+        assert_eq!((b, issue), (full, Some(CanvasBBoxIssue::Degenerate)));
+        // Tiny: 40 px wide is under 5% of 1600.
+        let (_, issue) = check_canvas_bbox(BBox::new(10.0, 10.0, 50.0, 600.0), 1600.0, 900.0);
+        assert_eq!(issue, Some(CanvasBBoxIssue::Degenerate));
+        let (_, issue) = check_canvas_bbox(BBox::new(f64::NAN, 0.0, 10.0, 10.0), 1600.0, 900.0);
+        assert_eq!(issue, Some(CanvasBBoxIssue::Inverted));
+    }
+
+    #[test]
+    fn in_source_coords_flags_bad_box_and_combine_reports_it() -> Result<()> {
+        let frame = DynamicImage::ImageRgb8(image::RgbImage::new(1536, 864));
+        let (_, prepared) = classify_request(&frame, classify_options(1))?;
+        let answer = ScreenClassOutput {
+            screen_type: ScreenType::Whiteboard,
+            app_hint: "Miro".into(),
+            canvas_bbox: BBox::new(500.0, 300.0, 100.0, 50.0),
+            confidence: 0.9,
+        };
+        let src = answer.in_source_coords(&prepared);
+        assert_eq!(src.canvas_issue, Some(CanvasBBoxIssue::Inverted));
+        assert_eq!(src.answer.canvas_bbox, BBox::new(0.0, 0.0, 1536.0, 864.0));
+        let rules = ClassifyRules::spec_examples();
+        let out = combine(Some(&src), &rules.evaluate::<&str>(&[]), &rules);
+        assert!(out.reads_board());
+        assert_eq!(out.canvas_bbox_issue, Some(CanvasBBoxIssue::Inverted));
+        assert_eq!(out.canvas_bbox, Some(BBox::new(0.0, 0.0, 1536.0, 864.0)));
+        Ok(())
     }
 
     #[test]
