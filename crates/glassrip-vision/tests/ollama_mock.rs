@@ -10,7 +10,7 @@ use glassrip_vision::{
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{body_partial_json, body_string_contains, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
 
 const MODEL: &str = "qwen2.5vl:7b";
 const DIGEST: &str = "sha256-synthetic-digest-0001";
@@ -236,6 +236,54 @@ async fn timeout_is_retried_then_reported() {
 }
 
 #[tokio::test]
+async fn timeout_then_server_errors_reports_timeout() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(chat_reply(GOOD).set_delay(Duration::from_millis(600)))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("busy"))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    let mut c = config(&server);
+    c.request_timeout = Duration::from_millis(100);
+    c.max_attempts = 3;
+    let err = OllamaBackend::new(c)
+        .unwrap()
+        .infer(request(), CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, VisionError::Timeout { attempts: 3, .. }),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn not_found_on_non_model_endpoint_is_generic() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/ps"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("404 page not found"))
+        .mount(&server)
+        .await;
+    let err = backend(&server).placement().await.unwrap_err();
+    match err {
+        VisionError::Http { path, status, .. } => {
+            assert_eq!(path, "/api/ps");
+            assert_eq!(status, 404);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn schema_invalid_then_repaired() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -272,6 +320,100 @@ async fn schema_invalid_then_repaired() {
     );
     // The single image stays attached to the original user turn only.
     assert!(repair[2].get("images").is_none());
+}
+
+/// Independent budget check on a chat request: every message's content bytes / 3,
+/// plus the image tokens and `num_predict`, must fit in `num_ctx`.
+struct WithinBudget {
+    image_tokens: u64,
+}
+
+impl Match for WithinBudget {
+    fn matches(&self, request: &Request) -> bool {
+        let Ok(body) = serde_json::from_slice::<Value>(&request.body) else {
+            return false;
+        };
+        let content_bytes: u64 = body["messages"]
+            .as_array()
+            .map(|ms| {
+                ms.iter()
+                    .map(|m| m["content"].as_str().map_or(0, |c| c.len() as u64))
+                    .sum()
+            })
+            .unwrap_or(u64::MAX / 2);
+        let num_ctx = body["options"]["num_ctx"].as_u64().unwrap_or(0);
+        let num_predict = body["options"]["num_predict"]
+            .as_u64()
+            .unwrap_or(u64::MAX / 2);
+        content_bytes.div_ceil(3) + self.image_tokens + num_predict <= num_ctx
+    }
+}
+
+#[tokio::test]
+async fn huge_invalid_output_repair_stays_within_num_ctx() {
+    let server = MockServer::start().await;
+    let image_tokens = u64::from(self_test_image().unwrap().tokens());
+    // About 10k tokens of invalid output against a 2048-token context.
+    let huge = format!("{{\"dominant_color\":\"{}\"}}", "crimson ".repeat(4000));
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .and(body_string_contains("failed validation"))
+        .and(WithinBudget { image_tokens })
+        .respond_with(chat_reply(GOOD))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(chat_reply(&huge))
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut c = OllamaConfig::new(server.uri(), MODEL, 2048);
+    c.backoff_min = Duration::from_millis(5);
+    let raw = OllamaBackend::new(c)
+        .unwrap()
+        .infer(request(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(raw.repaired);
+    let bodies = chat_requests(&server).await;
+    let echo = bodies[1]["messages"][1]["content"].as_str().unwrap();
+    assert!(echo.len() < huge.len());
+    assert!(echo.starts_with("{\"dominant_color\":\"crimson"));
+    assert!(echo.contains("bytes omitted"));
+}
+
+#[tokio::test]
+async fn normal_repair_echoes_output_verbatim() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .and(body_string_contains("failed validation"))
+        .respond_with(chat_reply(GOOD))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(chat_reply(BAD_EXTRA))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    let raw = backend(&server)
+        .infer(request(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(raw.repaired);
+    let bodies = chat_requests(&server).await;
+    assert_eq!(bodies[1]["messages"][1]["role"], "assistant");
+    assert_eq!(bodies[1]["messages"][1]["content"], BAD_EXTRA);
+    assert!(!bodies[1]["messages"][2]["content"]
+        .as_str()
+        .unwrap()
+        .contains("not repeated"));
 }
 
 #[tokio::test]
@@ -460,8 +602,16 @@ async fn preflight_spill_allowed_reduces_concurrency() {
     mount_metadata(&server, json!([ps_entry(9_000_000_000, 7_000_000_000)])).await;
     let mut c = config(&server);
     c.allow_spill = true;
-    let p = OllamaBackend::new(c).unwrap().preflight().await.unwrap();
+    let p = OllamaBackend::new(c.clone())
+        .unwrap()
+        .preflight()
+        .await
+        .unwrap();
     assert!(!p.fully_on_gpu);
+    // Spill allowed: slots halved (4 -> 2), never below 1.
+    assert_eq!(p.concurrency_hint, 2);
+    c.slots = 1;
+    let p = OllamaBackend::new(c).unwrap().preflight().await.unwrap();
     assert_eq!(p.concurrency_hint, 1);
 }
 

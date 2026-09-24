@@ -1,7 +1,7 @@
 //! Ollama backend: `/api/chat` with schema-constrained output, `/api/show` and
 //! `/api/tags` for digests, `/api/ps` for GPU placement.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -81,6 +81,162 @@ impl OllamaConfig {
     pub fn num_ctx(&self) -> u32 {
         self.num_ctx
     }
+}
+
+/// Bytes per token assumed by the context-budget estimates (conservative for English and JSON).
+pub const BYTES_PER_TOKEN: usize = 3;
+/// Token allowance for chat-template framing around each message.
+pub const MESSAGE_OVERHEAD_TOKENS: u32 = 16;
+/// Most validation errors listed in a repair hint.
+const MAX_REPAIR_ERRORS: usize = 20;
+/// Longest single validation error message in a repair hint.
+const MAX_REPAIR_ERROR_BYTES: usize = 300;
+/// Below this many tokens of room, the bad output is not echoed at all.
+const MIN_ECHO_TOKENS: u32 = 32;
+
+/// Estimated tokens for `text` (bytes / [`BYTES_PER_TOKEN`], rounded up).
+pub fn estimate_text_tokens(text: &str) -> u32 {
+    u32::try_from(text.len().div_ceil(BYTES_PER_TOKEN)).unwrap_or(u32::MAX)
+}
+
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    i = i.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
+    i = i.min(s.len());
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+/// Keep the head and tail of `text` within `max_bytes`, joined by an omission marker.
+fn head_tail(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    // Reserve room for the marker, sized for the largest possible omitted count.
+    let marker_len = format!("\n...[{} bytes omitted]...\n", text.len()).len();
+    let keep = max_bytes.saturating_sub(marker_len);
+    let head_end = floor_char_boundary(text, keep / 2);
+    let tail_start = ceil_char_boundary(text, text.len() - (keep - keep / 2));
+    let omitted = tail_start - head_end;
+    format!(
+        "{}\n...[{omitted} bytes omitted]...\n{}",
+        &text[..head_end],
+        &text[tail_start..]
+    )
+}
+
+fn repair_hint(errors: &[FieldError], max_errors: usize, echoed: bool) -> String {
+    let mut lines: Vec<String> = errors
+        .iter()
+        .take(max_errors)
+        .map(|e| {
+            let line = e.to_string();
+            let end = floor_char_boundary(&line, MAX_REPAIR_ERROR_BYTES);
+            line[..end].to_string()
+        })
+        .collect();
+    if errors.len() > max_errors {
+        lines.push(format!(
+            "({} more errors not shown)",
+            errors.len() - max_errors
+        ));
+    }
+    let subject = if echoed {
+        "Your previous reply"
+    } else {
+        "Your previous reply (not repeated here)"
+    };
+    format!(
+        "{subject} failed validation against the required JSON schema:\n{}\n\
+         Reply again with only a corrected JSON object that satisfies the schema.",
+        lines.join("\n")
+    )
+}
+
+/// What the schema repair request will contain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairPlan {
+    /// The previous (invalid) output to echo back, possibly truncated; `None` when omitted.
+    pub echo: Option<String>,
+    /// Validation-error hint sent as the final user message.
+    pub hint: String,
+    /// True when the echo was shortened or dropped to fit the budget.
+    pub echo_reduced: bool,
+    /// Estimated total tokens of the repair request including `num_predict`.
+    pub estimated_tokens: u32,
+}
+
+/// Fit a repair request into `num_ctx`.
+///
+/// Budget: image tokens, original prompt, echoed output, hint, `num_predict`, and
+/// per-message framing must sum to at most `num_ctx`. The hint is shortened first if needed (fewer listed
+/// errors); the echoed output is then truncated to its head and tail, or omitted
+/// when fewer than a few dozen tokens remain. Returns
+/// [`VisionError::ContextOverflow`] rather than planning a request that cannot fit.
+pub fn plan_repair(
+    num_ctx: u32,
+    image_tokens: u32,
+    prompt: &str,
+    num_predict: u32,
+    bad_text: &str,
+    errors: &[FieldError],
+) -> Result<RepairPlan> {
+    let base = image_tokens
+        .saturating_add(estimate_text_tokens(prompt))
+        .saturating_add(num_predict)
+        .saturating_add(3 * MESSAGE_OVERHEAD_TOKENS);
+    let mut chosen = None;
+    let mut smallest = u32::MAX;
+    for max_errors in [MAX_REPAIR_ERRORS, 5, 1] {
+        // Size the budget with the longer (echo omitted) wording so either variant fits.
+        let fixed = base.saturating_add(estimate_text_tokens(&repair_hint(
+            errors, max_errors, false,
+        )));
+        smallest = smallest.min(fixed);
+        if fixed <= num_ctx {
+            chosen = Some((max_errors, fixed));
+            break;
+        }
+    }
+    let Some((max_errors, fixed)) = chosen else {
+        return Err(VisionError::ContextOverflow {
+            estimated: smallest,
+            num_ctx,
+        });
+    };
+    let available = num_ctx - fixed;
+    let full = estimate_text_tokens(bad_text);
+    let (echo, echo_reduced) = if full <= available {
+        (Some(bad_text.to_string()), false)
+    } else if available >= MIN_ECHO_TOKENS {
+        let max_bytes = usize::try_from(available)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(BYTES_PER_TOKEN);
+        (Some(head_tail(bad_text, max_bytes)), true)
+    } else {
+        (None, true)
+    };
+    let hint = repair_hint(errors, max_errors, echo.is_some());
+    let estimated = base
+        .saturating_add(estimate_text_tokens(&hint))
+        .saturating_add(echo.as_deref().map_or(0, estimate_text_tokens));
+    if estimated > num_ctx {
+        return Err(VisionError::ContextOverflow { estimated, num_ctx });
+    }
+    Ok(RepairPlan {
+        echo,
+        hint,
+        echo_reduced,
+        estimated_tokens: estimated,
+    })
 }
 
 /// Answer schema for the startup self-test.
@@ -328,7 +484,7 @@ impl OllamaBackend {
         let retry_after = parse_retry_after(resp.headers(), SystemTime::now())
             .map(|d| d.min(self.config.max_retry_after));
         let text = resp.text().await.unwrap_or_default();
-        Err(self.classify_status(status, text, retry_after))
+        Err(self.classify_status(path, status, text, retry_after))
     }
 
     async fn get_once(&self, path: &str) -> Result<Value, AttemptError> {
@@ -350,7 +506,7 @@ impl OllamaBackend {
         let retry_after = parse_retry_after(resp.headers(), SystemTime::now())
             .map(|d| d.min(self.config.max_retry_after));
         let text = resp.text().await.unwrap_or_default();
-        Err(self.classify_status(status, text, retry_after))
+        Err(self.classify_status(path, status, text, retry_after))
     }
 
     fn classify_reqwest(&self, e: reqwest::Error) -> AttemptError {
@@ -366,6 +522,7 @@ impl OllamaBackend {
 
     fn classify_status(
         &self,
+        path: &str,
         status: StatusCode,
         body: String,
         retry_after: Option<Duration>,
@@ -377,12 +534,15 @@ impl OllamaBackend {
                 timed_out: false,
             };
         }
-        if status == StatusCode::NOT_FOUND && body.contains("not found") {
+        // Only these endpoints take a model name, so only here does 404 mean a missing model.
+        let model_endpoint = matches!(path, "/api/show" | "/api/chat");
+        if model_endpoint && status == StatusCode::NOT_FOUND && body.contains("not found") {
             return AttemptError::Fatal(VisionError::ModelNotFound {
                 model: self.config.model.clone(),
             });
         }
         AttemptError::Fatal(VisionError::Http {
+            path: path.to_string(),
             status: status.as_u16(),
             body: body.trim().to_string(),
         })
@@ -395,9 +555,17 @@ impl OllamaBackend {
         Fut: std::future::Future<Output = Result<Value, AttemptError>> + Send,
     {
         let attempts = AtomicU32::new(0);
+        let any_timeout = AtomicBool::new(false);
         let run = || async {
             attempts.fetch_add(1, Ordering::SeqCst);
-            op().await
+            let result = op().await;
+            if let Err(AttemptError::Retryable {
+                timed_out: true, ..
+            }) = &result
+            {
+                any_timeout.store(true, Ordering::SeqCst);
+            }
+            result
         };
         let retrying = run
             .retry(self.backoff())
@@ -419,12 +587,13 @@ impl OllamaBackend {
         match result {
             Ok(v) => Ok((v, n)),
             Err(AttemptError::Fatal(e)) => Err(e),
-            Err(AttemptError::Retryable {
-                timed_out: true, ..
-            }) => Err(VisionError::Timeout {
-                attempts: n,
-                timeout: self.config.request_timeout,
-            }),
+            // Any timed-out attempt makes the outcome a timeout, even if later attempts failed otherwise.
+            Err(AttemptError::Retryable { .. }) if any_timeout.load(Ordering::SeqCst) => {
+                Err(VisionError::Timeout {
+                    attempts: n,
+                    timeout: self.config.request_timeout,
+                })
+            }
             Err(AttemptError::Retryable { message, .. }) => Err(VisionError::RetriesExhausted {
                 attempts: n,
                 last: message,
@@ -432,22 +601,17 @@ impl OllamaBackend {
         }
     }
 
-    fn chat_body(&self, request: &VisionRequest, repair: Option<(&str, &[FieldError])>) -> Value {
+    fn chat_body(&self, request: &VisionRequest, repair: Option<&RepairPlan>) -> Value {
         let mut messages = vec![json!({
             "role": "user",
             "content": request.prompt,
             "images": [request.image.base64()],
         })];
-        if let Some((bad_text, errors)) = repair {
-            messages.push(json!({"role": "assistant", "content": bad_text}));
-            messages.push(json!({
-                "role": "user",
-                "content": format!(
-                    "Your previous reply failed validation against the required JSON schema:\n{}\n\
-                     Reply again with only a corrected JSON object that satisfies the schema.",
-                    format_field_errors(errors)
-                ),
-            }));
+        if let Some(plan) = repair {
+            if let Some(echo) = &plan.echo {
+                messages.push(json!({"role": "assistant", "content": echo}));
+            }
+            messages.push(json!({"role": "user", "content": plan.hint}));
         }
         let GenerationOptions { seed, num_predict } = request.options;
         let mut body = json!({
@@ -469,13 +633,13 @@ impl OllamaBackend {
         body
     }
 
-    /// Rough token estimate: image tokens + prompt (about 3 chars per token) + `num_predict`.
+    /// Estimate: image tokens + prompt + one message of framing + `num_predict`.
     fn check_context(&self, request: &VisionRequest) -> Result<()> {
-        let prompt_tokens = u32::try_from(request.prompt.len() / 3).unwrap_or(u32::MAX);
         let estimated = request
             .image
             .tokens()
-            .saturating_add(prompt_tokens)
+            .saturating_add(estimate_text_tokens(&request.prompt))
+            .saturating_add(MESSAGE_OVERHEAD_TOKENS)
             .saturating_add(request.options.num_predict);
         if estimated > self.config.num_ctx {
             return Err(VisionError::ContextOverflow {
@@ -559,7 +723,23 @@ impl OllamaBackend {
             errors = %format_field_errors(&first_errors),
             "model output failed validation; sending one repair request"
         );
-        let body = self.chat_body(request, Some((&text, &first_errors)));
+        let plan = plan_repair(
+            self.config.num_ctx,
+            request.image.tokens(),
+            &request.prompt,
+            request.options.num_predict,
+            &text,
+            &first_errors,
+        )?;
+        if plan.echo_reduced {
+            tracing::warn!(
+                model = %self.config.model,
+                output_bytes = text.len(),
+                estimated_tokens = plan.estimated_tokens,
+                "repair echo shortened to fit num_ctx"
+            );
+        }
+        let body = self.chat_body(request, Some(&plan));
         let (resp, attempts, wall) = self.generate(&body, cancel).await?;
         let text = resp
             .message
@@ -661,7 +841,12 @@ impl OllamaBackend {
             size_vram_bytes: m.size_vram,
             fully_on_gpu,
             context_length: m.context_length,
-            concurrency_hint: if fully_on_gpu { self.config.slots } else { 1 },
+            // Spilling (allowed): halve concurrency, at least 1.
+            concurrency_hint: if fully_on_gpu {
+                self.config.slots
+            } else {
+                (self.config.slots / 2).max(1)
+            },
         }
     }
 
@@ -831,6 +1016,78 @@ mod tests {
             "qwen2.5vl:32b",
             "qwen2.5vl:7b"
         ));
+    }
+
+    fn errs(n: usize) -> Vec<FieldError> {
+        (0..n)
+            .map(|i| FieldError {
+                path: format!("/nodes/{i}/text"),
+                message: "x".repeat(1000),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn repair_plan_echoes_small_output_verbatim() -> Result<()> {
+        let plan = plan_repair(8192, 2700, &"p".repeat(3000), 2048, "{\"a\":1}", &errs(1))?;
+        assert_eq!(plan.echo.as_deref(), Some("{\"a\":1}"));
+        assert!(!plan.echo_reduced);
+        assert!(plan.hint.contains("/nodes/0/text"));
+        // Long error messages are capped.
+        assert!(plan.hint.len() < 600, "{}", plan.hint.len());
+        Ok(())
+    }
+
+    #[test]
+    fn repair_plan_truncates_huge_output_to_budget() -> Result<()> {
+        let bad = format!(
+            "{{\"head\":1,{}\"tail\":2}}",
+            "\"filler\": \"é\",".repeat(5000)
+        );
+        let plan = plan_repair(8192, 2700, &"p".repeat(3000), 2048, &bad, &errs(3))?;
+        assert!(plan.echo_reduced);
+        assert!(plan.estimated_tokens <= 8192);
+        let echo = plan.echo.unwrap_or_default();
+        assert!(echo.starts_with("{\"head\":1"));
+        assert!(echo.ends_with("\"tail\":2}"));
+        assert!(echo.contains("bytes omitted"));
+        Ok(())
+    }
+
+    #[test]
+    fn repair_plan_omits_echo_when_no_room() -> Result<()> {
+        // Only a handful of tokens remain after prompt, image, hint and num_predict.
+        let plan = plan_repair(
+            4096,
+            900,
+            &"p".repeat(2800),
+            2048,
+            &"z".repeat(9000),
+            &errs(1),
+        )?;
+        assert_eq!(plan.echo, None);
+        assert!(plan.hint.contains("not repeated here"));
+        assert!(plan.estimated_tokens <= 4096);
+        Ok(())
+    }
+
+    #[test]
+    fn repair_plan_shrinks_hint_then_refuses() -> Result<()> {
+        let plan = plan_repair(4096, 1000, &"p".repeat(1500), 2048, "{}", &errs(40))?;
+        assert!(plan.hint.contains("more errors not shown"));
+        assert!(plan.estimated_tokens <= 4096);
+        let err = plan_repair(4096, 3000, &"p".repeat(3000), 2048, "{}", &errs(1));
+        assert!(matches!(err, Err(VisionError::ContextOverflow { .. })));
+        Ok(())
+    }
+
+    #[test]
+    fn head_tail_respects_budget_and_char_boundaries() {
+        let text = "é".repeat(1000);
+        let out = head_tail(&text, 200);
+        assert!(out.len() <= 200, "{}", out.len());
+        assert!(out.contains("bytes omitted"));
+        assert_eq!(head_tail("short", 200), "short");
     }
 
     #[test]

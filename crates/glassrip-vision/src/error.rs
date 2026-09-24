@@ -48,8 +48,12 @@ pub enum VisionError {
     RetriesExhausted { attempts: u32, last: String },
 
     /// The server answered with a non-retryable status.
-    #[error("server returned HTTP {status}: {body}")]
-    Http { status: u16, body: String },
+    #[error("{path} returned HTTP {status}: {body}")]
+    Http {
+        path: String,
+        status: u16,
+        body: String,
+    },
 
     /// A transport error that is not worth retrying (for example an invalid URL).
     #[error("transport error: {0}")]
