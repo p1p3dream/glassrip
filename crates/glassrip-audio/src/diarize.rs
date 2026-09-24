@@ -9,9 +9,9 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use crate::error::Result;
 #[cfg(not(feature = "diarize"))]
 use crate::error::AudioError;
+use crate::error::Result;
 use crate::recluster::{
     ahc_to_k, centroids, cosine, exclusive_turns, merge_columns, normalize, talk_time,
     EmbeddingSample, Turn,
@@ -48,6 +48,8 @@ pub struct DiarizeConfig {
     pub mode: DiarizeMode,
     /// Known number of speakers; clusters are merged down to this count.
     pub num_speakers: Option<usize>,
+    /// Check model files against `models.toml` before loading.
+    pub verify_models: bool,
 }
 
 /// Backend output before re-clustering.
@@ -192,7 +194,9 @@ pub(crate) fn execution_mode(mode: DiarizeMode) -> speakrs::ExecutionMode {
 #[cfg(feature = "diarize")]
 pub fn run_backend(samples: &[f32], cfg: &DiarizeConfig) -> Result<RawDiarization> {
     use crate::error::AudioError;
-    use speakrs::pipeline::{FRAME_DURATION_SECONDS, FRAME_STEP_SECONDS, SEGMENTATION_WINDOW_SECONDS};
+    use speakrs::pipeline::{
+        FRAME_DURATION_SECONDS, FRAME_STEP_SECONDS, SEGMENTATION_WINDOW_SECONDS,
+    };
     use speakrs::OwnedDiarizationPipeline;
 
     let err = |e: speakrs::PipelineError| AudioError::Diarization(e.to_string());
@@ -202,6 +206,9 @@ pub fn run_backend(samples: &[f32], cfg: &DiarizeConfig) -> Result<RawDiarizatio
             name: cfg.models_dir.display().to_string(),
             message: "speakrs model directory not found".into(),
         });
+    }
+    if cfg.verify_models {
+        crate::models::verify_speakrs_dir(&cfg.models_dir)?;
     }
     let mut pipeline = OwnedDiarizationPipeline::from_dir(&cfg.models_dir, mode).map_err(err)?;
     let chunk_step_s = pipeline.segmentation_step();
@@ -271,9 +278,21 @@ mod tests {
             acts.push(row);
         }
         let samples = vec![
-            EmbeddingSample { chunk: 0, cluster: 0, embedding: vec![1.0, 0.0] },
-            EmbeddingSample { chunk: 4, cluster: 1, embedding: vec![0.0, 1.0] },
-            EmbeddingSample { chunk: 8, cluster: 2, embedding: vec![0.9, 0.1] },
+            EmbeddingSample {
+                chunk: 0,
+                cluster: 0,
+                embedding: vec![1.0, 0.0],
+            },
+            EmbeddingSample {
+                chunk: 4,
+                cluster: 1,
+                embedding: vec![0.0, 1.0],
+            },
+            EmbeddingSample {
+                chunk: 8,
+                cluster: 2,
+                embedding: vec![0.9, 0.1],
+            },
         ];
         RawDiarization {
             activations: acts,
@@ -318,6 +337,7 @@ mod tests {
             models_dir: PathBuf::from("/nonexistent"),
             mode: DiarizeMode::Cpu,
             num_speakers: None,
+            verify_models: false,
         };
         assert!(matches!(
             run_backend(&[], &cfg),

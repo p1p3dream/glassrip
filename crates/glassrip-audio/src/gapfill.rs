@@ -2,17 +2,23 @@
 //!
 //! On far-field recordings the segmentation model can mark long stretches of
 //! real speech as silence, which leaves ASR words outside every turn. Those
-//! words are grouped into spans (split wherever a diarization turn intervenes),
-//! each span is embedded with the same WeSpeaker model the diarizer uses, and
-//! the span joins the speaker whose centroid is most similar. The span's turn
-//! carries a margin-weighted similarity, so the per-word confidence reflects
-//! how clearly one speaker won.
+//! words are grouped into spans (split wherever a diarization turn intervenes).
+//! Each span is embedded with a [`SpanEmbedder`] (the diarizer's own WeSpeaker
+//! model in production) and joins the most similar speaker centroid only when
+//! it passes three gates:
+//! 1. the uncovered span (before any widening) is at least `min_span_s` long;
+//! 2. the best cosine similarity is at least `min_similarity`;
+//! 3. the best similarity beats the second best by at least `min_margin`.
+//!
+//! Spans that fail a gate are recorded with their status and their words stay
+//! unassigned. Spans shorter than `min_embed_s` are widened for embedding, but
+//! only into uncovered audio, never into another turn.
 
 use serde::Serialize;
 
-use crate::diarize::{DiarizeConfig, Diarization};
+use crate::diarize::Diarization;
 use crate::error::Result;
-use crate::recluster::{cosine, Turn};
+use crate::recluster::{cosine, Source, Turn};
 
 /// Gap filling settings.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -21,10 +27,14 @@ pub struct GapFillConfig {
     pub merge_gap_s: f64,
     /// Maximum span length, seconds.
     pub max_span_s: f64,
-    /// Spans shorter than this are widened (centered) before embedding, seconds.
+    /// Minimum uncovered span length (before widening), seconds.
+    pub min_span_s: f64,
+    /// Spans shorter than this are widened into uncovered audio for embedding.
     pub min_embed_s: f64,
-    /// Similarity margin (best minus second best) that earns full confidence.
-    pub full_margin: f32,
+    /// Minimum cosine similarity to the chosen centroid.
+    pub min_similarity: f32,
+    /// Minimum similarity margin over the second-best centroid.
+    pub min_margin: f32,
 }
 
 impl Default for GapFillConfig {
@@ -32,21 +42,70 @@ impl Default for GapFillConfig {
         Self {
             merge_gap_s: 0.6,
             max_span_s: 8.0,
+            min_span_s: 0.4,
             min_embed_s: 1.5,
-            full_margin: 0.2,
+            min_similarity: 0.5,
+            min_margin: 0.05,
         }
     }
 }
 
-/// What gap filling did.
+/// Outcome for one uncovered span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpanStatus {
+    /// Joined a speaker.
+    Assigned,
+    /// Shorter than `min_span_s`.
+    TooShort,
+    /// Best similarity below `min_similarity`.
+    LowSimilarity,
+    /// Margin over the second best below `min_margin`.
+    LowMargin,
+    /// No usable embedding (too little audio, or non-finite output).
+    NoEmbedding,
+}
+
+/// One uncovered span and what happened to it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct GapSpan {
+    /// Span start, seconds (audio timeline).
+    pub start_s: f64,
+    /// Span end, seconds.
+    pub end_s: f64,
+    /// Outcome.
+    pub status: SpanStatus,
+    /// Best-matching speaker index, when an embedding was scored.
+    pub speaker: Option<usize>,
+    /// Best cosine similarity.
+    pub similarity: Option<f32>,
+    /// Best minus second-best similarity.
+    pub margin: Option<f32>,
+}
+
+/// Counters for a gap filling pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub struct GapFillStats {
     /// Uncovered spans found.
     pub spans: usize,
-    /// Spans that received a speaker.
+    /// Spans that joined a speaker.
     pub labeled: usize,
+    /// Spans rejected as too short.
+    pub rejected_short: usize,
+    /// Spans rejected for low similarity.
+    pub rejected_similarity: usize,
+    /// Spans rejected for a low margin.
+    pub rejected_margin: usize,
+    /// Spans without a usable embedding.
+    pub no_embedding: usize,
     /// Seconds of turns added.
     pub filled_s: f64,
+}
+
+/// Produces a speaker embedding for a stretch of 16 kHz audio.
+pub trait SpanEmbedder {
+    /// Embedding of `audio`, or `None` when no usable embedding exists.
+    fn embed(&mut self, audio: &[f32]) -> Result<Option<Vec<f32>>>;
 }
 
 fn overlaps_any(turns: &[Turn], s: f64, e: f64) -> bool {
@@ -60,12 +119,19 @@ fn overlaps_any(turns: &[Turn], s: f64, e: f64) -> bool {
 /// Spans of consecutive words that overlap no turn.
 ///
 /// `words` are `(start_s, end_s)` in time order; `turns` are exclusive and sorted.
-pub fn uncovered_spans(words: &[(f64, f64)], turns: &[Turn], cfg: &GapFillConfig) -> Vec<(f64, f64)> {
+/// A zero-length word lying inside a turn counts as covered.
+pub fn uncovered_spans(
+    words: &[(f64, f64)],
+    turns: &[Turn],
+    cfg: &GapFillConfig,
+) -> Vec<(f64, f64)> {
     let mut spans: Vec<(f64, f64)> = Vec::new();
     let mut open = false;
     for &(ws, we) in words {
         let we = we.max(ws);
-        if overlaps_any(turns, ws, we) {
+        let covered =
+            overlaps_any(turns, ws, we) || turns.iter().any(|t| ws >= t.start_s && we <= t.end_s);
+        if covered {
             open = false;
             continue;
         }
@@ -85,24 +151,56 @@ pub fn uncovered_spans(words: &[(f64, f64)], turns: &[Turn], cfg: &GapFillConfig
     spans
 }
 
-/// Pick the speaker for an embedding and a margin-weighted score in [0, 1].
-pub fn label_embedding(
-    emb: &[f32],
-    centroids: &[Option<Vec<f32>>],
-    full_margin: f32,
-) -> Option<(usize, f32)> {
+/// Best speaker, its similarity, and the margin over the second best.
+///
+/// With a single centroid the margin equals the similarity.
+pub fn score_embedding(emb: &[f32], centroids: &[Option<Vec<f32>>]) -> Option<(usize, f32, f32)> {
     let mut sims: Vec<(usize, f32)> = centroids
         .iter()
         .enumerate()
         .filter_map(|(i, c)| c.as_ref().and_then(|c| cosine(emb, c)).map(|s| (i, s)))
+        .filter(|(_, s)| s.is_finite())
         .collect();
     sims.sort_by(|a, b| b.1.total_cmp(&a.1));
     let (best_i, best) = *sims.first()?;
-    let margin_factor = match sims.get(1) {
-        Some((_, second)) => ((best - second) / full_margin.max(1e-6)).clamp(0.2, 1.0),
-        None => 1.0,
-    };
-    Some((best_i, (best.max(0.0) * margin_factor).clamp(0.0, 1.0)))
+    let margin = sims.get(1).map_or(best, |(_, second)| best - second);
+    Some((best_i, best, margin))
+}
+
+/// Free interval around `span`: from the end of the previous turn to the start
+/// of the next one, within `[0, total]`.
+pub fn free_bounds(span: (f64, f64), turns: &[Turn], total: f64) -> (f64, f64) {
+    let lo = turns
+        .iter()
+        .filter(|t| t.end_s <= span.0)
+        .map(|t| t.end_s)
+        .fold(0.0, f64::max);
+    let hi = turns
+        .iter()
+        .filter(|t| t.start_s >= span.1)
+        .map(|t| t.start_s)
+        .fold(total, f64::min);
+    (lo.min(span.0), hi.max(span.1))
+}
+
+/// Widen `span` to at least `min_len`, centered, staying within `[lo, hi]`.
+pub fn widen(span: (f64, f64), min_len: f64, lo: f64, hi: f64) -> (f64, f64) {
+    let (s, e) = span;
+    if e - s >= min_len {
+        return (s.max(lo), e.min(hi));
+    }
+    let mid = (s + e) / 2.0;
+    let mut a = mid - min_len / 2.0;
+    let mut b = mid + min_len / 2.0;
+    if a < lo {
+        b += lo - a;
+        a = lo;
+    }
+    if b > hi {
+        a -= b - hi;
+        b = hi;
+    }
+    (a.max(lo), b.min(hi))
 }
 
 /// Parts of `span` not covered by `turns`.
@@ -126,22 +224,24 @@ pub fn subtract_turns(span: (f64, f64), turns: &[Turn]) -> Vec<(f64, f64)> {
     out
 }
 
-/// Add labeled spans as turns and update talk time. Returns seconds added.
-pub fn apply_labels(diar: &mut Diarization, labeled: &[((f64, f64), usize, f32)]) -> f64 {
+/// Add assigned spans as gap-fill turns and update talk time. Returns seconds added.
+pub fn apply_spans(diar: &mut Diarization, spans: &[GapSpan]) -> f64 {
     let original = diar.turns.clone();
     let mut added = Vec::new();
-    for &(span, speaker, score) in labeled {
-        for (s, e) in subtract_turns(span, &original) {
+    for sp in spans.iter().filter(|s| s.status == SpanStatus::Assigned) {
+        let Some(speaker) = sp.speaker else { continue };
+        for (s, e) in subtract_turns((sp.start_s, sp.end_s), &original) {
             added.push(Turn {
                 start_s: s,
                 end_s: e,
                 speaker,
-                embedding_sim: Some(score),
+                embedding_sim: sp.similarity,
+                source: Source::GapFill,
+                gap_margin: sp.margin,
             });
         }
     }
     added.sort_by(|a, b| a.start_s.total_cmp(&b.start_s));
-    // spans come from monotonic words but may touch; keep them exclusive
     let mut prev_end = f64::MIN;
     added.retain_mut(|t| {
         if t.start_s < prev_end {
@@ -166,115 +266,120 @@ pub fn apply_labels(diar: &mut Diarization, labeled: &[((f64, f64), usize, f32)]
     filled
 }
 
-/// Widen a span to at least `min_len` seconds, centered, within `[0, total]`.
-pub fn widen(span: (f64, f64), min_len: f64, total: f64) -> (f64, f64) {
-    let (s, e) = span;
-    if e - s >= min_len {
-        return (s.max(0.0), e.min(total));
+/// Find uncovered words, embed and gate their spans, and add turns for the
+/// spans that pass. Returns counters and one record per span.
+pub fn fill_gaps_with(
+    embedder: &mut dyn SpanEmbedder,
+    samples: &[f32],
+    sample_rate: u32,
+    diar: &mut Diarization,
+    words: &[(f64, f64)],
+    cfg: &GapFillConfig,
+) -> Result<(GapFillStats, Vec<GapSpan>)> {
+    let sr = f64::from(sample_rate);
+    let total = samples.len() as f64 / sr;
+    let spans = uncovered_spans(words, &diar.turns, cfg);
+    let mut out = Vec::with_capacity(spans.len());
+    let mut stats = GapFillStats {
+        spans: spans.len(),
+        ..GapFillStats::default()
+    };
+    for &(s, e) in &spans {
+        let mut rec = GapSpan {
+            start_s: s,
+            end_s: e,
+            status: SpanStatus::TooShort,
+            speaker: None,
+            similarity: None,
+            margin: None,
+        };
+        if e - s < cfg.min_span_s {
+            stats.rejected_short += 1;
+            out.push(rec);
+            continue;
+        }
+        let (lo, hi) = free_bounds((s, e), &diar.turns, total);
+        let (a, b) = widen((s, e), cfg.min_embed_s, lo, hi);
+        let ia = ((a * sr) as usize).min(samples.len());
+        let ib = ((b * sr) as usize).min(samples.len());
+        let emb = if ib > ia {
+            embedder.embed(&samples[ia..ib])?
+        } else {
+            None
+        };
+        let scored = emb.and_then(|v| score_embedding(&v, &diar.centroids));
+        let Some((spk, sim, margin)) = scored else {
+            rec.status = SpanStatus::NoEmbedding;
+            stats.no_embedding += 1;
+            out.push(rec);
+            continue;
+        };
+        rec.speaker = Some(spk);
+        rec.similarity = Some(sim);
+        rec.margin = Some(margin);
+        rec.status = if sim < cfg.min_similarity {
+            stats.rejected_similarity += 1;
+            SpanStatus::LowSimilarity
+        } else if margin < cfg.min_margin {
+            stats.rejected_margin += 1;
+            SpanStatus::LowMargin
+        } else {
+            stats.labeled += 1;
+            SpanStatus::Assigned
+        };
+        out.push(rec);
     }
-    let mid = (s + e) / 2.0;
-    let mut a = mid - min_len / 2.0;
-    let mut b = mid + min_len / 2.0;
-    if a < 0.0 {
-        b -= a;
-        a = 0.0;
-    }
-    if b > total {
-        a -= b - total;
-        b = total;
-    }
-    (a.max(0.0), b)
+    stats.filled_s = apply_spans(diar, &out);
+    Ok((stats, out))
 }
 
-/// Embed each span with the diarizer's WeSpeaker model.
+/// WeSpeaker embedder from the speakrs model bundle.
 ///
 /// The span audio is tiled to fill the model's 10 s window so that zero padding
 /// does not dilute the pooled statistics.
 #[cfg(feature = "diarize")]
-pub fn embed_spans(
-    samples: &[f32],
-    spans: &[(f64, f64)],
-    cfg: &DiarizeConfig,
-    min_embed_s: f64,
-) -> Result<Vec<Option<Vec<f32>>>> {
-    use crate::error::AudioError;
-    use crate::extract::SAMPLE_RATE;
-    use speakrs::inference::EmbeddingModel;
-    use speakrs::pipeline::SEGMENTATION_WINDOW_SECONDS;
-
-    let sr = f64::from(SAMPLE_RATE);
-    let mut model = EmbeddingModel::with_mode(
-        cfg.models_dir.join("wespeaker-voxceleb-resnet34.onnx"),
-        crate::diarize::execution_mode(cfg.mode),
-    )
-    .map_err(|e| AudioError::Diarization(e.to_string()))?;
-    let window = (SEGMENTATION_WINDOW_SECONDS * sr) as usize;
-    let total = samples.len() as f64 / sr;
-    let mut out = Vec::with_capacity(spans.len());
-    let mut tiled = vec![0.0f32; window];
-    for &span in spans {
-        let (s, e) = widen(span, min_embed_s, total);
-        let a = ((s * sr) as usize).min(samples.len());
-        let b = ((e * sr) as usize).min(samples.len());
-        if b <= a + (sr * 0.1) as usize {
-            out.push(None);
-            continue;
-        }
-        let src = &samples[a..b];
-        for (i, x) in tiled.iter_mut().enumerate() {
-            *x = src[i % src.len()];
-        }
-        let emb = model
-            .embed(&tiled)
-            .map_err(|e| AudioError::Diarization(e.to_string()))?;
-        let v: Vec<f32> = emb.iter().copied().collect();
-        out.push(v.iter().all(|x| x.is_finite()).then_some(v));
-    }
-    Ok(out)
+pub struct SpeakrsEmbedder {
+    model: speakrs::inference::EmbeddingModel,
+    tiled: Vec<f32>,
 }
 
-/// Stub used when the crate is built without the `diarize` feature.
-#[cfg(not(feature = "diarize"))]
-pub fn embed_spans(
-    _samples: &[f32],
-    _spans: &[(f64, f64)],
-    _cfg: &DiarizeConfig,
-    _min_embed_s: f64,
-) -> Result<Vec<Option<Vec<f32>>>> {
-    Err(crate::error::AudioError::FeatureDisabled("diarize"))
-}
-
-/// Find uncovered words, embed their spans and add turns for them.
-pub fn fill_gaps(
-    samples: &[f32],
-    diar: &mut Diarization,
-    words: &[(f64, f64)],
-    dcfg: &DiarizeConfig,
-    gcfg: &GapFillConfig,
-) -> Result<GapFillStats> {
-    let spans = uncovered_spans(words, &diar.turns, gcfg);
-    if spans.is_empty() || diar.centroids.iter().all(Option::is_none) {
-        return Ok(GapFillStats {
-            spans: spans.len(),
-            ..GapFillStats::default()
-        });
-    }
-    let embs = embed_spans(samples, &spans, dcfg, gcfg.min_embed_s)?;
-    let labeled: Vec<((f64, f64), usize, f32)> = spans
-        .iter()
-        .zip(&embs)
-        .filter_map(|(&span, e)| {
-            e.as_ref()
-                .and_then(|e| label_embedding(e, &diar.centroids, gcfg.full_margin))
-                .map(|(spk, score)| (span, spk, score))
+#[cfg(feature = "diarize")]
+impl SpeakrsEmbedder {
+    /// Load the embedding model from the speakrs model directory.
+    pub fn new(cfg: &crate::diarize::DiarizeConfig) -> Result<Self> {
+        use crate::error::AudioError;
+        use speakrs::pipeline::SEGMENTATION_WINDOW_SECONDS;
+        let model = speakrs::inference::EmbeddingModel::with_mode(
+            cfg.models_dir.join("wespeaker-voxceleb-resnet34.onnx"),
+            crate::diarize::execution_mode(cfg.mode),
+        )
+        .map_err(|e| AudioError::Diarization(e.to_string()))?;
+        let window =
+            (SEGMENTATION_WINDOW_SECONDS * f64::from(crate::extract::SAMPLE_RATE)) as usize;
+        Ok(Self {
+            model,
+            tiled: vec![0.0; window],
         })
-        .collect();
-    let filled_s = apply_labels(diar, &labeled);
-    Ok(GapFillStats {
-        spans: spans.len(),
-        labeled: labeled.len(),
-        filled_s,
-    })
+    }
+}
+
+#[cfg(feature = "diarize")]
+impl SpanEmbedder for SpeakrsEmbedder {
+    fn embed(&mut self, audio: &[f32]) -> Result<Option<Vec<f32>>> {
+        // at least 0.1 s of audio
+        if audio.len() < (crate::extract::SAMPLE_RATE / 10) as usize {
+            return Ok(None);
+        }
+        for (i, x) in self.tiled.iter_mut().enumerate() {
+            *x = audio[i % audio.len()];
+        }
+        let emb = self
+            .model
+            .embed(&self.tiled)
+            .map_err(|e| crate::error::AudioError::Diarization(e.to_string()))?;
+        let v: Vec<f32> = emb.iter().copied().collect();
+        Ok(v.iter().all(|x| x.is_finite()).then_some(v))
+    }
 }
 
 #[cfg(test)]
@@ -282,11 +387,27 @@ mod tests {
     use super::*;
 
     fn turn(s: f64, e: f64, spk: usize) -> Turn {
-        Turn {
-            start_s: s,
-            end_s: e,
-            speaker: spk,
-            embedding_sim: None,
+        Turn::new(s, e, spk)
+    }
+
+    fn diar(turns: Vec<Turn>, centroids: Vec<Option<Vec<f32>>>) -> Diarization {
+        let n = centroids.len();
+        Diarization {
+            turns,
+            labels: (0..n).map(crate::diarize::speaker_label).collect(),
+            talk_time_s: vec![0.0; n],
+            num_clusters_raw: n,
+            active_s: 0.0,
+            centroids,
+        }
+    }
+
+    /// Returns a fixed embedding and records the audio length it was given.
+    struct Fixed(Option<Vec<f32>>, Vec<usize>);
+    impl SpanEmbedder for Fixed {
+        fn embed(&mut self, audio: &[f32]) -> Result<Option<Vec<f32>>> {
+            self.1.push(audio.len());
+            Ok(self.0.clone())
         }
     }
 
@@ -294,71 +415,128 @@ mod tests {
     fn spans_group_uncovered_words_and_stop_at_turns() {
         let turns = vec![turn(0.0, 2.0, 0), turn(6.0, 7.0, 1)];
         let words = vec![
-            (1.0, 1.5),  // covered
-            (2.5, 2.9),  // uncovered, starts span
-            (3.0, 3.4),  // joins
-            (5.0, 5.4),  // gap 1.6 s: new span
-            (6.2, 6.5),  // covered
-            (7.2, 7.5),  // uncovered, new span after the turn
+            (1.0, 1.5),
+            (2.5, 2.9),
+            (3.0, 3.4),
+            (5.0, 5.4),
+            (6.2, 6.5),
+            (7.2, 7.5),
         ];
         let s = uncovered_spans(&words, &turns, &GapFillConfig::default());
         assert_eq!(s, vec![(2.5, 3.4), (5.0, 5.4), (7.2, 7.5)]);
     }
 
     #[test]
-    fn span_length_is_capped() {
-        let words: Vec<(f64, f64)> = (0..20).map(|i| (i as f64 * 0.5, i as f64 * 0.5 + 0.4)).collect();
-        let cfg = GapFillConfig {
-            max_span_s: 3.0,
-            ..GapFillConfig::default()
-        };
-        let s = uncovered_spans(&words, &[], &cfg);
-        assert!(s.len() >= 3);
-        assert!(s.iter().all(|(a, b)| b - a <= 3.0 + 1e-9));
+    fn zero_length_word_inside_turn_is_covered() {
+        let turns = vec![turn(0.0, 2.0, 0)];
+        assert!(uncovered_spans(&[(1.0, 1.0)], &turns, &GapFillConfig::default()).is_empty());
     }
 
     #[test]
-    fn label_prefers_closest_centroid_and_scales_by_margin() {
+    fn score_reports_similarity_and_margin() {
         let c = vec![Some(vec![1.0, 0.0]), Some(vec![0.0, 1.0])];
-        let (spk, clear) = label_embedding(&[0.9, 0.1], &c, 0.2).unwrap();
+        let (spk, sim, margin) = score_embedding(&[1.0, 0.0], &c).unwrap();
         assert_eq!(spk, 0);
-        let (_, unclear) = label_embedding(&[0.7, 0.69], &c, 0.2).unwrap();
-        assert!(clear > unclear);
-        assert!(label_embedding(&[1.0, 0.0], &[None, None], 0.2).is_none());
+        assert!((sim - 1.0).abs() < 1e-6);
+        assert!((margin - 1.0).abs() < 1e-6);
+        assert!(score_embedding(&[1.0, 0.0], &[None, None]).is_none());
+    }
+
+    #[test]
+    fn gates_reject_short_dissimilar_and_ambiguous_spans() {
+        let cents = vec![Some(vec![1.0, 0.0]), Some(vec![0.0, 1.0])];
+        let samples = vec![0.1f32; 16_000 * 20];
+        let cfg = GapFillConfig::default();
+        // short: 0.3 s of uncovered words
+        let mut d = diar(vec![], cents.clone());
+        let mut e = Fixed(Some(vec![1.0, 0.0]), vec![]);
+        let (st, sp) =
+            fill_gaps_with(&mut e, &samples, 16_000, &mut d, &[(1.0, 1.3)], &cfg).unwrap();
+        assert_eq!(sp[0].status, SpanStatus::TooShort);
+        assert_eq!(st.rejected_short, 1);
+        assert!(e.1.is_empty(), "short spans are not embedded");
+        assert!(d.turns.is_empty());
+        // low similarity: best cosine 0.45
+        let mut d = diar(vec![], cents.clone());
+        let v = vec![0.45f32, -(1.0f32 - 0.45 * 0.45).sqrt()];
+        let mut e = Fixed(Some(v), vec![]);
+        let (_, sp) =
+            fill_gaps_with(&mut e, &samples, 16_000, &mut d, &[(1.0, 2.0)], &cfg).unwrap();
+        assert_eq!(sp[0].status, SpanStatus::LowSimilarity);
+        assert!(d.turns.is_empty());
+        // low margin: equal similarity to both
+        let mut d = diar(vec![], cents.clone());
+        let mut e = Fixed(Some(vec![0.7, 0.7]), vec![]);
+        let (_, sp) =
+            fill_gaps_with(&mut e, &samples, 16_000, &mut d, &[(1.0, 2.0)], &cfg).unwrap();
+        assert_eq!(sp[0].status, SpanStatus::LowMargin);
+        assert!(d.turns.is_empty());
+        // no embedding
+        let mut d = diar(vec![], cents.clone());
+        let mut e = Fixed(None, vec![]);
+        let (st, sp) =
+            fill_gaps_with(&mut e, &samples, 16_000, &mut d, &[(1.0, 2.0)], &cfg).unwrap();
+        assert_eq!(sp[0].status, SpanStatus::NoEmbedding);
+        assert_eq!(st.no_embedding, 1);
+        // assigned
+        let mut d = diar(vec![], cents);
+        let mut e = Fixed(Some(vec![0.1, 0.9]), vec![]);
+        let (st, sp) =
+            fill_gaps_with(&mut e, &samples, 16_000, &mut d, &[(1.0, 2.0)], &cfg).unwrap();
+        assert_eq!(sp[0].status, SpanStatus::Assigned);
+        assert_eq!(sp[0].speaker, Some(1));
+        assert_eq!(st.labeled, 1);
+        assert_eq!(d.turns.len(), 1);
+        assert_eq!(d.turns[0].source, Source::GapFill);
+        assert!(d.turns[0].gap_margin.is_some());
+        assert!((st.filled_s - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn widening_stays_inside_uncovered_audio() {
+        // 0.5 s span between turns ending at 9.8 and starting at 11.0: the
+        // 1.5 s embedding window must stay inside [9.8, 11.0]
+        let turns = vec![turn(5.0, 9.8, 0), turn(11.0, 15.0, 1)];
+        let (lo, hi) = free_bounds((10.0, 10.5), &turns, 20.0);
+        assert_eq!((lo, hi), (9.8, 11.0));
+        let (a, b) = widen((10.0, 10.5), 1.5, lo, hi);
+        assert!(a >= 9.8 - 1e-9 && b <= 11.0 + 1e-9, "{a}..{b}");
+
+        let mut d = diar(turns, vec![Some(vec![1.0, 0.0]), Some(vec![0.0, 1.0])]);
+        let samples = vec![0.1f32; 16_000 * 20];
+        let mut e = Fixed(Some(vec![1.0, 0.0]), vec![]);
+        fill_gaps_with(
+            &mut e,
+            &samples,
+            16_000,
+            &mut d,
+            &[(10.0, 10.5)],
+            &GapFillConfig::default(),
+        )
+        .unwrap();
+        // embedded audio is at most the 1.2 s free gap
+        assert!(e.1[0] <= (1.2 * 16_000.0) as usize + 1, "{}", e.1[0]);
+    }
+
+    #[test]
+    fn widen_centers_and_clamps() {
+        let close =
+            |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9;
+        assert!(close(widen((1.0, 1.2), 1.0, 0.0, 10.0), (0.6, 1.6)));
+        assert!(close(widen((0.0, 0.2), 1.0, 0.0, 10.0), (0.0, 1.0)));
+        assert!(close(widen((9.9, 10.0), 1.0, 0.0, 10.0), (9.0, 10.0)));
+        assert!(close(widen((2.0, 5.0), 1.0, 0.0, 10.0), (2.0, 5.0)));
+        assert!(close(widen((2.0, 2.2), 2.0, 1.9, 2.5), (1.9, 2.5)));
     }
 
     #[test]
     fn subtract_splits_around_turns() {
         let turns = vec![turn(1.0, 2.0, 0), turn(3.0, 4.0, 1)];
-        assert_eq!(subtract_turns((0.5, 3.5), &turns), vec![(0.5, 1.0), (2.0, 3.0)]);
+        assert_eq!(
+            subtract_turns((0.5, 3.5), &turns),
+            vec![(0.5, 1.0), (2.0, 3.0)]
+        );
         assert_eq!(subtract_turns((4.5, 5.0), &turns), vec![(4.5, 5.0)]);
         assert!(subtract_turns((1.2, 1.8), &turns).is_empty());
-    }
-
-    #[test]
-    fn apply_keeps_turns_exclusive_and_sorted() {
-        let mut d = Diarization {
-            turns: vec![turn(0.0, 1.0, 0)],
-            labels: vec!["SPEAKER_00".into(), "SPEAKER_01".into()],
-            talk_time_s: vec![1.0, 0.0],
-            num_clusters_raw: 2,
-            active_s: 1.0,
-            centroids: vec![None, None],
-        };
-        let filled = apply_labels(&mut d, &[((0.5, 2.0), 1, 0.8), ((1.8, 2.5), 1, 0.7)]);
-        assert!((filled - 1.5).abs() < 1e-9, "filled {filled}");
-        for w in d.turns.windows(2) {
-            assert!(w[0].end_s <= w[1].start_s + 1e-9);
-        }
-        assert!((d.talk_time_s[1] - 1.5).abs() < 1e-9);
-    }
-
-    #[test]
-    fn widen_centers_and_clamps() {
-        let close = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9;
-        assert!(close(widen((1.0, 1.2), 1.0, 10.0), (0.6, 1.6)));
-        assert!(close(widen((0.0, 0.2), 1.0, 10.0), (0.0, 1.0)));
-        assert!(close(widen((9.9, 10.0), 1.0, 10.0), (9.0, 10.0)));
-        assert!(close(widen((2.0, 5.0), 1.0, 10.0), (2.0, 5.0)));
     }
 }

@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::recluster::Source;
+
 /// Schema name of the transcript artifact.
 pub const TRANSCRIPT_SCHEMA: &str = "glassrip.transcript";
 /// Schema name of the speakers artifact.
@@ -30,7 +32,10 @@ impl Producer {
         Self {
             tool: env!("CARGO_PKG_NAME").to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            git_sha: option_env!("GLASSRIP_GIT_SHA").map(str::to_string),
+            // set by build.rs; empty when git was unavailable at build time
+            git_sha: Some(env!("GLASSRIP_GIT_SHA"))
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
         }
     }
 }
@@ -90,6 +95,23 @@ pub struct TranscriptParams {
     pub correction_max_p: f32,
     /// Limit used for capitalized (proper noun) substitutions.
     pub correction_max_p_proper_noun: f32,
+    /// whisper backend device actually used (for example `CUDA0`, `MTL0`, `cpu`).
+    pub asr_backend: String,
+    /// Gap filling gates, when gap filling ran.
+    pub gap_fill: Option<GapFillParams>,
+}
+
+/// Gap filling gates recorded in the transcript params.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GapFillParams {
+    /// Minimum uncovered span length before widening, seconds.
+    pub min_span_s: f64,
+    /// Minimum cosine similarity to the chosen centroid.
+    pub min_similarity: f32,
+    /// Minimum similarity margin over the second-best speaker.
+    pub min_margin: f32,
+    /// Upper bound on the confidence of a gap-filled word.
+    pub conf_cap: f32,
 }
 
 /// One word of a transcript segment.
@@ -110,6 +132,15 @@ pub struct TranscriptWord {
     pub speaker_label: String,
     /// Confidence of the speaker assignment, in [0, 1].
     pub assign_conf: f32,
+    /// Where the speaker label came from.
+    #[serde(default)]
+    pub source: Source,
+    /// Gap fill: cosine similarity of the span to the chosen speaker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap_sim: Option<f32>,
+    /// Gap fill: similarity margin over the second-best speaker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap_margin: Option<f32>,
 }
 
 /// One transcript segment (a run of words by one speaker).
@@ -129,6 +160,12 @@ pub struct TranscriptSegment {
     pub text: String,
     /// Verbatim ASR text.
     pub text_raw: String,
+    /// Words labeled by gap filling.
+    #[serde(default)]
+    pub gap_fill_words: usize,
+    /// Words with a placeholder label only.
+    #[serde(default)]
+    pub unassigned_words: usize,
     /// Words.
     pub words: Vec<TranscriptWord>,
 }
@@ -210,6 +247,18 @@ pub struct SpeakerItem {
     pub evidence: Vec<Evidence>,
     /// Total speaking time of the label, seconds.
     pub talk_time_s: f64,
+    /// Part of `talk_time_s` that comes from gap-fill turns, seconds.
+    #[serde(default)]
+    pub talk_time_gap_fill_s: f64,
+    /// Words labeled from diarizer turns.
+    #[serde(default)]
+    pub words_diarizer: usize,
+    /// Words labeled by gap filling.
+    #[serde(default)]
+    pub words_gap_fill: usize,
+    /// Words carrying this label only as a placeholder.
+    #[serde(default)]
+    pub words_unassigned: usize,
 }
 
 /// The `glassrip.speakers` artifact.
@@ -250,6 +299,10 @@ mod tests {
                     confidence: 0.0,
                     evidence: vec![],
                     talk_time_s: 1.5,
+                    talk_time_gap_fill_s: 0.0,
+                    words_diarizer: 3,
+                    words_gap_fill: 0,
+                    words_unassigned: 0,
                 }],
             },
             people: vec![],
@@ -272,8 +325,13 @@ mod tests {
             p: 0.9,
             speaker_label: "SPEAKER_00".into(),
             assign_conf: 1.0,
+            source: Source::Diarizer,
+            gap_sim: None,
+            gap_margin: None,
         };
         let v = serde_json::to_value(&w).unwrap();
         assert!(v.get("w_raw").is_none());
+        assert!(v.get("gap_sim").is_none());
+        assert_eq!(v["source"], "diarizer");
     }
 }

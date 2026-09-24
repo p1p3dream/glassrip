@@ -69,9 +69,9 @@ struct Args {
     /// Words of the previous chunk appended to the prompt.
     #[arg(long, default_value_t = 0)]
     carry_words: usize,
-    /// Verify model hashes against models.toml before running.
+    /// Skip checking model hashes against models.toml.
     #[arg(long)]
-    verify_models: bool,
+    skip_verify: bool,
     /// Baseline transcript JSON for comparison.
     #[arg(long)]
     baseline: Option<PathBuf>,
@@ -115,7 +115,11 @@ fn load_baseline(path: &Path) -> Result<Vec<BaseSeg>, Box<dyn Error>> {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
-            text: s.get("text").and_then(Value::as_str).unwrap_or("").to_string(),
+            text: s
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
         })
         .collect())
 }
@@ -145,18 +149,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let model_path = resolve(&dir, &args.model);
     let vad_path = resolve(&dir, &args.vad);
 
-    if args.verify_models {
-        for entry in models::manifest()? {
-            let used = dir.join(&entry.path) == model_path
-                || dir.join(&entry.path) == vad_path
-                || (!args.no_diarize && entry.path.starts_with("speakrs/"));
-            if used {
-                models::verify(&dir, &entry)?;
-                eprintln!("verified {}", entry.name);
-            }
-        }
-    }
-
     let vocabulary: Vec<String> = args
         .vocab
         .split(',')
@@ -168,6 +160,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     asr.beam_size = args.beam;
     asr.vocabulary = vocabulary;
     asr.carry_previous_words = args.carry_words;
+    asr.verify_models = !args.skip_verify;
 
     let mode = match args.diarize_mode.as_deref() {
         Some("cpu") => DiarizeMode::Cpu,
@@ -177,16 +170,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         None if cfg!(feature = "cuda") => DiarizeMode::Cuda,
         None => DiarizeMode::Cpu,
     };
-    if !args.no_diarize
-        && cfg!(feature = "cuda")
-        && std::env::var_os("ORT_DYLIB_PATH").is_none()
-    {
-        return Err("set ORT_DYLIB_PATH to libonnxruntime.so from an ONNX Runtime GPU build".into());
+    if !args.no_diarize && cfg!(feature = "cuda") && std::env::var_os("ORT_DYLIB_PATH").is_none() {
+        return Err(
+            "set ORT_DYLIB_PATH to libonnxruntime.so from an ONNX Runtime GPU build".into(),
+        );
     }
     let diarize = (!args.no_diarize).then(|| DiarizeConfig {
         models_dir: dir.join("speakrs"),
         mode,
         num_speakers: args.speakers,
+        verify_models: !args.skip_verify,
     });
 
     let cfg = PipelineConfig {
@@ -211,10 +204,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         serde_json::to_string_pretty(&out.speakers)?,
     )?;
 
-    std::fs::write(args.out.join("turns.json"), serde_json::to_string(&out.turns)?)?;
+    std::fs::write(
+        args.out.join("turns.json"),
+        serde_json::to_string(&out.turns)?,
+    )?;
+    std::fs::write(
+        args.out.join("gap_spans.json"),
+        serde_json::to_string(&out.gap_spans)?,
+    )?;
 
     let segs = &out.transcript.items;
-    let text: String = segs.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
+    let text: String = segs
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
     let text_raw: String = segs
         .iter()
         .map(|s| s.text_raw.as_str())
@@ -259,6 +263,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             json!({
                 "t_s": t,
                 "label": ours.map(|s| s.speaker_label.clone()),
+                "sources": ours.map(|s| s.words.iter().map(|w| w.source).collect::<Vec<_>>()),
                 "speaker_conf": ours.map(|s| s.speaker_conf),
                 "start_s": ours.map(|s| s.start_s),
                 "end_s": ours.map(|s| s.end_s),
@@ -288,7 +293,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .envelope
         .items
         .iter()
-        .map(|i| json!({"label": i.label, "talk_time_s": i.talk_time_s}))
+        .map(|i| {
+            json!({
+                "label": i.label,
+                "talk_time_s": i.talk_time_s,
+                "talk_time_gap_fill_s": i.talk_time_gap_fill_s,
+                "words_diarizer": i.words_diarizer,
+                "words_gap_fill": i.words_gap_fill,
+                "words_unassigned": i.words_unassigned,
+            })
+        })
         .collect();
     let report = json!({
         "timings": out.timings,

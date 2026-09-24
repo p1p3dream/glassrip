@@ -19,6 +19,19 @@ pub struct EmbeddingSample {
     pub embedding: Vec<f32>,
 }
 
+/// Where a turn or a word's speaker came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Source {
+    /// The diarizer's own turns (overlap, or the nearest turn within the gap limit).
+    #[default]
+    Diarizer,
+    /// Embedding match of speech the diarizer left uncovered.
+    GapFill,
+    /// No turn qualified; the label is the nearest speaker as a placeholder.
+    Unassigned,
+}
+
 /// An exclusive speaker turn.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Turn {
@@ -30,6 +43,26 @@ pub struct Turn {
     pub speaker: usize,
     /// Cosine similarity between the turn's embedding and its speaker centroid.
     pub embedding_sim: Option<f32>,
+    /// Provenance of the turn.
+    #[serde(default)]
+    pub source: Source,
+    /// For gap-fill turns: best similarity minus the second best.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap_margin: Option<f32>,
+}
+
+impl Turn {
+    /// A diarizer turn without an embedding similarity.
+    pub fn new(start_s: f64, end_s: f64, speaker: usize) -> Self {
+        Self {
+            start_s,
+            end_s,
+            speaker,
+            embedding_sim: None,
+            source: Source::Diarizer,
+            gap_margin: None,
+        }
+    }
 }
 
 /// L2-normalize a vector; `None` for zero or non-finite input.
@@ -220,12 +253,7 @@ pub fn exclusive_turns(
                 order.len() - 1
             }
         };
-        turns.push(Turn {
-            start_s: mid(a),
-            end_s: mid(b),
-            speaker,
-            embedding_sim: None,
-        });
+        turns.push(Turn::new(mid(a), mid(b), speaker));
     }
     (turns, order)
 }
@@ -294,9 +322,18 @@ mod tests {
         let (turns, order) = exclusive_turns(&acts, 1.0, 0.0);
         assert_eq!(order, vec![0, 1]);
         assert_eq!(turns.len(), 3);
-        assert_eq!((turns[0].start_s, turns[0].end_s, turns[0].speaker), (0.0, 3.0, 0));
-        assert_eq!((turns[1].start_s, turns[1].end_s, turns[1].speaker), (3.0, 4.0, 1));
-        assert_eq!((turns[2].start_s, turns[2].end_s, turns[2].speaker), (5.0, 6.0, 1));
+        assert_eq!(
+            (turns[0].start_s, turns[0].end_s, turns[0].speaker),
+            (0.0, 3.0, 0)
+        );
+        assert_eq!(
+            (turns[1].start_s, turns[1].end_s, turns[1].speaker),
+            (3.0, 4.0, 1)
+        );
+        assert_eq!(
+            (turns[2].start_s, turns[2].end_s, turns[2].speaker),
+            (5.0, 6.0, 1)
+        );
     }
 
     #[test]

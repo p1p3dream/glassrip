@@ -25,11 +25,11 @@ speakrs = { version = "0.5", optional = true, default-features = false, features
 thiserror = "2"
 tokio = { version = "1", features = ["process", "rt", "rt-multi-thread", "macros", "fs", "io-util"] }
 toml = "0.8"
-whisper-rs = "0.16"
+whisper-rs = { version = "0.16", features = ["raw-api"] }
 
 # Metal is always on for macOS builds so the default Mac build uses the GPU.
 [target.'cfg(target_os = "macos")'.dependencies]
-whisper-rs = { version = "0.16", features = ["metal"] }
+whisper-rs = { version = "0.16", features = ["metal", "raw-api"] }
 
 [dev-dependencies]
 clap = { version = "4", features = ["derive"] }
