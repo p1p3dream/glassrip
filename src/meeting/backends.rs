@@ -14,7 +14,7 @@ use std::time::Duration;
 use glassrip_audio::asr::{AsrConfig, VadSettings};
 use glassrip_audio::stages::{AsrEngine, DiarizeEngine, SingleSpeakerEngine, WhisperEngine};
 use glassrip_core::config::Config;
-use glassrip_notes::notes::llm::{OllamaText, OllamaTextConfig, TextBackend};
+use glassrip_notes::notes::llm::{LlmError, OllamaText, OllamaTextConfig, TextBackend};
 use glassrip_ocr::TextRecognizer;
 use glassrip_vision::{OllamaBackend, OllamaConfig, VisionBackend};
 use glassrip_vision_stages::placement::PlacementProbe;
@@ -183,8 +183,12 @@ async fn text(config: &Config) -> Avail<(Arc<dyn TextBackend>, Option<String>)> 
     match backend.digest(model).await {
         Ok(Some(d)) => Ok((Arc::new(backend), Some(d))),
         Ok(None) => Ok((Arc::new(backend), None)),
+        Err(LlmError::Http { status: 404, .. }) => Err(format!(
+            "text model {model} is not available on {}; run `ollama pull {model}`",
+            config.ollama.host.trim_end_matches('/')
+        )),
         Err(e) => Err(format!(
-            "text model {model} is not available on {} ({e}); run `ollama pull {model}`",
+            "cannot check text model {model} on {}: {e}",
             config.ollama.host.trim_end_matches('/')
         )),
     }

@@ -168,13 +168,7 @@ async fn meeting(args: glassrip::meeting::MeetingArgs) -> Result<()> {
 
     let outcome = meeting::run_meeting(&opts, backends, cancel)
         .await
-        .with_context(|| {
-            format!(
-                "see {} and {}",
-                log.display(),
-                opts.out_dir.join("run.lock.json").display()
-            )
-        })?;
+        .with_context(|| format!("details in {}", log.display()))?;
     for r in &outcome.reports {
         eprintln!(
             "{:<15} {:<8} items {:>5} ok {:>5} err {:>3} {:>8.2} s",
