@@ -29,6 +29,8 @@ metal = ["glassrip-audio/metal"]
 # loaded from ORT_DYLIB_PATH.
 cuda = [
     "onnx",
+    "diarize",
+    "ocr",
     "glassrip-vision-stages/cuda",
     "glassrip-media-stages/cuda",
     "glassrip-audio/cuda",
@@ -51,6 +53,7 @@ glassrip-ocr = { path = "crates/glassrip-ocr" }
 glassrip-render = { path = "crates/glassrip-render" }
 glassrip-vision = { path = "crates/glassrip-vision" }
 glassrip-vision-stages = { path = "crates/glassrip-vision-stages" }
+libc = "0.2"
 thiserror = "2"
 tokio-util = "0.7"
 tracing = "0.1"

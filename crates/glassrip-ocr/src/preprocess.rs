@@ -31,18 +31,30 @@ fn round32(v: f64) -> u32 {
     }
 }
 
-/// Resize so the long side is at most `max_side`, both sides multiples of 32.
+/// Detector inputs are padded so their short side is a multiple of this.
+pub const DET_BUCKET: u32 = 128;
+
+fn ceil_to(v: u32, step: u32) -> u32 {
+    v.div_ceil(step).saturating_mul(step)
+}
+
+/// Resize so the long side is at most `max_side` (both sides multiples of
+/// 32), then pad at the bottom and right to multiples of [`DET_BUCKET`]. Few
+/// distinct shapes keep ONNX Runtime's CUDA arena from growing with every new
+/// keyframe size; padding does not move boxes (the scales refer to the
+/// resized content, and padded pixels are the normalized zero).
 pub fn det_input(image: &RgbImage, max_side: u32) -> DetInput {
     let (w, h) = (image.width().max(1), image.height().max(1));
     let ratio = (f64::from(max_side) / f64::from(w.max(h))).min(1.0);
     let rw = round32(f64::from(w) * ratio);
     let rh = round32(f64::from(h) * ratio);
+    let (pw, ph) = (ceil_to(rw, DET_BUCKET), ceil_to(rh, DET_BUCKET));
     let resized = image::imageops::resize(image, rw, rh, FilterType::Triangle);
-    let (rw_us, rh_us) = (rw as usize, rh as usize);
-    let plane = rw_us * rh_us;
+    let (pw_us, ph_us) = (pw as usize, ph as usize);
+    let plane = pw_us * ph_us;
     let mut data = vec![0f32; 3 * plane];
     for (x, y, px) in resized.enumerate_pixels() {
-        let i = y as usize * rw_us + x as usize;
+        let i = y as usize * pw_us + x as usize;
         // BGR order: channel 0 is blue.
         for (c, src) in [2usize, 1, 0].into_iter().enumerate() {
             data[c * plane + i] = (f32::from(px[src]) / 255.0 - MEAN[c]) / STD[c];
@@ -50,8 +62,8 @@ pub fn det_input(image: &RgbImage, max_side: u32) -> DetInput {
     }
     DetInput {
         data,
-        width: rw_us,
-        height: rh_us,
+        width: pw_us,
+        height: ph_us,
         scale_x: f64::from(w) / f64::from(rw),
         scale_y: f64::from(h) / f64::from(rh),
     }
@@ -113,7 +125,35 @@ mod tests {
         let plane = d.width * d.height;
         assert!((d.data[0] - (0.0 - MEAN[0]) / STD[0]).abs() < 1e-5);
         assert!((d.data[2 * plane] - (1.0 - MEAN[2]) / STD[2]).abs() < 1e-5);
-        assert!((d.scale_x * d.width as f64 - 100.0).abs() < 1e-9);
+        // Content 96 x 64 (multiples of 32), padded to 128 x 128.
+        assert_eq!((d.width, d.height), (128, 128));
+        assert!((d.scale_x * 96.0 - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn det_inputs_fall_into_few_buckets() {
+        let shapes: std::collections::BTreeSet<(usize, usize)> = [
+            (1920, 1080),
+            (1680, 832),
+            (1676, 796),
+            (1680, 830),
+            (1594, 810),
+            (1664, 832),
+            (1642, 832),
+            (1610, 828),
+        ]
+        .iter()
+        .map(|&(w, h)| {
+            let d = det_input(&RgbImage::new(w, h), 1920);
+            assert_eq!((d.width % 128, d.height % 128), (0, 0));
+            (d.width, d.height)
+        })
+        .collect();
+        assert!(shapes.len() <= 3, "{shapes:?}");
+        // Padding keeps the content scale.
+        let d = det_input(&RgbImage::new(1680, 832), 1920);
+        assert!((d.scale_x - 1680.0 / 1696.0).abs() < 1e-12);
+        assert_eq!((d.width, d.height), (1792, 896));
     }
 
     #[test]

@@ -82,10 +82,51 @@ enum Commands {
     Eval(glassrip_eval::cli::EvalArgs),
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
+fn main() {
+    let code = match run_cli() {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            1
+        }
+    };
+    exit_now(code);
+}
 
+/// Ends the process without running exit-time destructors. ort 2.0.0-rc.13
+/// releases its ONNX Runtime environment from `.fini_array`; with the
+/// dynamically loaded runtime and CUDA that hook runs during CUDA teardown and
+/// corrupts the heap (or panics when no runtime was loaded), so every run
+/// ended with SIGABRT. Everything glassrip writes is persisted before this
+/// point (artifacts, manifest, and log are written and synced as they are
+/// produced), so only stdout and stderr need flushing.
+fn exit_now(code: i32) -> ! {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    #[cfg(unix)]
+    {
+        // SAFETY: `_exit` takes no pointers and never returns; skipping the
+        // exit handlers is the purpose (see above).
+        unsafe { libc::_exit(code) }
+    }
+    #[cfg(not(unix))]
+    std::process::exit(code)
+}
+
+fn run_cli() -> Result<i32> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("cannot start the async runtime")?;
+    let result = runtime.block_on(run(Cli::parse()));
+    // Joins the blocking pool, so no worker is mid-write when the process ends.
+    drop(runtime);
+    result
+}
+
+/// Runs a command; returns the process exit code.
+async fn run(cli: Cli) -> Result<i32> {
     match cli.command {
         Commands::Scrape {
             video,
@@ -130,15 +171,14 @@ async fn main() -> Result<()> {
                 vlm_timeout_secs: vlm_timeout,
                 max_frame_failure_rate,
             };
-            glassrip::pipeline::run_pipeline(&args).await
+            glassrip::pipeline::run_pipeline(&args).await.map(|()| 0)
         }
-        Commands::Meeting(args) => glassrip::meeting::cli::run(args).await,
-        Commands::Eval(args) => {
-            if !glassrip_eval::cli::run(args).await?.passed {
-                std::process::exit(1);
-            }
-            Ok(())
-        }
+        Commands::Meeting(args) => glassrip::meeting::cli::run(args).await.map(|()| 0),
+        Commands::Eval(args) => Ok(if glassrip_eval::cli::run(args).await?.passed {
+            0
+        } else {
+            1
+        }),
     }
 }
 
