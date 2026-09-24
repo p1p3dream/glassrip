@@ -404,6 +404,15 @@ pub struct ExtraIssue {
 #[serde(deny_unknown_fields)]
 pub struct BoardValidateItem {
     pub keyframe_id: String,
+    pub source_frame_id: String,
+    /// Rectified keyframe image; crop it with `crop_box` (and paint `masks`)
+    /// to get the canvas the element boxes refer to.
+    pub source_image_path: String,
+    /// Canvas crop in source pixels. Every box in `board` (nodes, stickies,
+    /// owner tags, other text, edge `label_bbox_2d`) is in canvas pixels,
+    /// relative to this crop's top-left corner.
+    pub crop_box: BBox,
+    pub masks: Vec<ChromeMask>,
     pub canvas_width: f64,
     pub canvas_height: f64,
     pub board: ValidatedBoard,

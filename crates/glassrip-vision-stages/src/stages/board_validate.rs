@@ -429,10 +429,15 @@ pub fn validate_reading(
                 detail: format!("label {:?} on {} -> {} cleared", e.label, e.src, e.dst),
             });
             e.label.clear();
+            e.label_bbox = None;
         }
     }
     BoardValidateItem {
         keyframe_id: reading.keyframe_id.clone(),
+        source_frame_id: reading.source_frame_id.clone(),
+        source_image_path: reading.source_image_path.clone(),
+        crop_box: reading.crop_box,
+        masks: reading.masks.clone(),
         canvas_width: canvas_size.width,
         canvas_height: canvas_size.height,
         needs_reclassification: board.needs_reclassification,
@@ -647,6 +652,7 @@ mod tests {
                 src: "n1".into(),
                 dst: "n4".into(),
                 label: "Ship before launch?".into(),
+                label_bbox: None,
                 style: EdgeStyle::Solid,
                 conf: 0.9,
             }],

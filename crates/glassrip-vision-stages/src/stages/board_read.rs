@@ -266,6 +266,9 @@ fn shift_output(mut o: BoardReadOutput, dx: f64, dy: f64) -> BoardReadOutput {
     for t in &mut o.other_visible_text {
         t.bbox = offset(&t.bbox, dx, dy);
     }
+    for e in &mut o.edges {
+        e.label_bbox = e.label_bbox.map(|b| offset(&b, dx, dy));
+    }
     o
 }
 
@@ -522,6 +525,7 @@ mod tests {
             src: "a".into(),
             dst: "b".into(),
             label: "REST".into(),
+            label_bbox: None,
             style: EdgeStyle::Solid,
             conf: 0.9,
         }];
