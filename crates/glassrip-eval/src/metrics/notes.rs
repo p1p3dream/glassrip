@@ -2,17 +2,30 @@
 //! by text similarity (spec 9.3), plus negative action items (farewells) that
 //! must not appear.
 //!
-//! A predicted item matches a gold item when the content-word Dice coefficient
-//! ([`crate::text::content_dice`], stopwords removed) against the gold text or
-//! any alias is at least the threshold (default
-//! [`crate::text::SENTENCE_MATCH_DICE`], 0.6). When the
-//! gold item names a person, the prediction must name the same person.
+//! A predicted item matches a gold item when its similarity to the gold text or any
+//! alias is at least the threshold (default [`crate::text::SENTENCE_MATCH_DICE`],
+//! 0.6). The similarity to one gold phrasing is the larger of:
+//!
+//! - the content-word Dice coefficient ([`crate::text::content_dice`], stopwords
+//!   removed), which rewards the same wording at the same length, and
+//! - token containment ([`crate::text::containment`]): the share of the gold
+//!   phrasing's stemmed content words that the prediction states, so a paraphrase
+//!   that restates the claim inside a longer sentence ("The team decided to skip
+//!   the importer step for now to focus on ...") matches a short gold phrasing
+//!   ("skip the importer for now"). A prediction that is mostly unrelated content
+//!   (under [`crate::text::CONTAINMENT_MIN_PRECISION`] of its words from the gold)
+//!   does not count.
+//!
+//! Either way, every key term of the gold phrasing (a proper noun, acronym, or
+//! identifier; [`crate::text::key_terms`]) must appear in the prediction: a decision
+//! about another person or system is another decision, however similar the wording.
+//! When the gold item names a person, the prediction must name the same person.
 //! Matching is one-to-one and greedy by score.
 
 use serde::{Deserialize, Serialize};
 
 use super::{greedy_match, Counts};
-use crate::text::content_dice;
+use crate::text::{containment, content_dice, key_terms_present};
 
 /// A gold notes item.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -41,11 +54,19 @@ pub struct PredItem {
     pub person_id: Option<String>,
 }
 
-/// Best similarity of a prediction to a gold item.
+/// Similarity of a prediction to one gold phrasing (see the module docs).
+pub fn phrasing_similarity(gold: &str, pred: &str) -> f64 {
+    if !key_terms_present(gold, pred) {
+        return 0.0;
+    }
+    content_dice(gold, pred).max(containment(gold, pred))
+}
+
+/// Best similarity of a prediction to a gold item (its text or any alias).
 pub fn item_similarity(gold: &GoldItem, pred: &str) -> f64 {
     std::iter::once(gold.text.as_str())
         .chain(gold.aliases.iter().map(String::as_str))
-        .map(|g| content_dice(g, pred))
+        .map(|g| phrasing_similarity(g, pred))
         .fold(0.0, f64::max)
 }
 
@@ -131,6 +152,82 @@ mod tests {
         assert_eq!(score_items(&gold, &right, 0.6).0.tp, 1);
     }
 
+    fn ga(text: &str, aliases: &[&str]) -> GoldItem {
+        GoldItem {
+            text: text.into(),
+            aliases: aliases.iter().map(|a| a.to_string()).collect(),
+            person_id: None,
+            t_s: None,
+        }
+    }
+
+    #[test]
+    fn paraphrases_inside_longer_sentences_match() {
+        let gold = vec![
+            ga("Skip the Ledger step for now", &["Ledger is deferred"]),
+            ga(
+                "Tamsin moves from the importer to the dashboard work",
+                &["Tamsin works on the dashboard instead"],
+            ),
+            ga("Ordering can be random for the demo", &[]),
+        ];
+        let pred = vec![
+            // Dice against the gold text is 0.5; containment is 1.0.
+            p(
+                "The team decided to skip the Ledger integration step for now to focus on the API shape.",
+                None,
+            ),
+            // Inflections differ (moves / moved); every content word is covered.
+            p(
+                "Tamsin moved off the importer and onto the dashboard work.",
+                None,
+            ),
+            p(
+                "For the demo, the ordering of cards can simply be random.",
+                None,
+            ),
+        ];
+        assert!(
+            content_dice(&gold[0].text, &pred[0].text) < 0.6,
+            "Dice alone misses this paraphrase"
+        );
+        let (c, m) = score_items(&gold, &pred, 0.6);
+        assert_eq!(
+            c,
+            Counts {
+                tp: 3,
+                fp: 0,
+                fn_: 0
+            },
+            "{m:?}"
+        );
+    }
+
+    #[test]
+    fn different_claims_do_not_match() {
+        let gold = vec![
+            ga("Skip the Ledger step for now", &[]),
+            ga("Move Tamsin to the dashboard work", &[]),
+            ga("Ship weekly builds", &[]),
+        ];
+        let pred = vec![
+            // Same topic words, other system: the key term Ledger is missing.
+            p("Skip the Orbit step for now", None),
+            // Dice is 0.75, but another person is named.
+            p("Move Quill to the dashboard work", None),
+            // One shared word out of three.
+            p("Builds are slow this week", None),
+            // Contains every gold word, but nearly all of it is unrelated content.
+            p(
+                "We reviewed hiring plans, office seating, travel budgets, lunch vendors, parking passes, badge printers, laptop refresh cycles, conference talks, onboarding checklists, ship weekly builds, holiday calendars, desk moves, printer toner, coffee orders, standup times, team photos, and retrospectives notes archives",
+                None,
+            ),
+        ];
+        let (c, _) = score_items(&gold, &pred, 0.6);
+        assert_eq!(c.tp, 0, "{c:?}");
+        assert_eq!(c.fp, 4);
+    }
+
     #[test]
     fn aliases_and_negatives() {
         let gold = [GoldItem {
@@ -139,8 +236,10 @@ mod tests {
             person_id: None,
             t_s: None,
         }];
-        // content Dice with alias {skip, importer} vs {skip, importer, step}: 4/5 = 0.8
-        assert!((item_similarity(&gold[0], "skip importer step") - 0.8).abs() < 1e-12);
+        // Content Dice with alias {skip, importer} vs {skip, importer, step} is
+        // 4/5 = 0.8; the prediction states the whole alias, so containment is 1.0.
+        assert!((content_dice("skip importer", "skip importer step") - 0.8).abs() < 1e-12);
+        assert!((item_similarity(&gold[0], "skip importer step") - 1.0).abs() < 1e-12);
         let hits = negative_hits(
             &["see you later".into()],
             &[p("I'll see you guys later", None), p("write tests", None)],
