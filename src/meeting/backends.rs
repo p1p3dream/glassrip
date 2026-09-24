@@ -78,7 +78,9 @@ impl Backends {
         if needs.ocr {
             b.ocr = ocr_engine();
         }
-        if needs.vision {
+        // edge_direction uses the vision model only as an optional fallback; it
+        // is still connected so the stage keys and behaves as in a full run.
+        if needs.vision || needs.vision_optional {
             b.vision = vision(config, raw_dir).await;
             if let Ok(v) = &b.vision {
                 if let Some(d) = &v.digest {
