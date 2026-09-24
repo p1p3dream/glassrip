@@ -21,6 +21,7 @@
 pub mod atomic;
 pub mod cache;
 pub mod canonical;
+pub mod config;
 pub mod envelope;
 pub mod graph;
 pub mod jsonl;
