@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::artifacts::{
     AxisScale, BoardItem, CanvasCropView, CanvasDims, CoordinateCheck, EdgeDirectionBatch,
-    EdgeDirectionItem, EdgeEvidence, KeyframeView, OcrView, ValidateItemView, VlmFallback,
-    BOARD_STATE, BOARD_VALIDATE, CANVAS_CROP, EDGE_DIRECTION, KEYFRAMES, OCR,
+    EdgeDirectionItem, EdgeEvidence, KeyframeView, OcrSpanView, OcrView, ValidateItemView,
+    VlmFallback, BOARD_STATE, BOARD_VALIDATE, CANVAS_CROP, EDGE_DIRECTION, KEYFRAMES, OCR,
 };
 use crate::consolidate::owners::{Corroborator, NoCorroboration};
 use crate::consolidate::{
@@ -60,6 +60,8 @@ pub struct FrameWork {
     pub image: Option<PathBuf>,
     /// Crop box in frame pixels.
     pub crop: Option<BBox>,
+    /// OCR spans of the keyframe, in frame pixels (empty when unavailable).
+    pub ocr: Vec<OcrSpanView>,
 }
 
 /// All board keyframes (one work item).
@@ -117,6 +119,22 @@ pub fn pixel_evidence(
     board: &ValidatedBoard,
     params: &PixelCheckParams,
 ) -> (Vec<EdgeEvidence>, f64, f64) {
+    let (edges, sharp, zoom, _) = pixel_evidence_with_ocr(image, board, &[], params);
+    (edges, sharp, zoom)
+}
+
+/// [`pixel_evidence`] with the keyframe's OCR spans (in the image's coordinates):
+/// node and label boxes are first moved onto their OCR text, and every OCR text box
+/// is masked ([`crate::ocr_anchor`]). Also returns `(nodes moved, labels found)`.
+pub fn pixel_evidence_with_ocr(
+    image: &RgbImage,
+    board: &ValidatedBoard,
+    ocr: &[TextAnchor],
+    params: &PixelCheckParams,
+) -> (Vec<EdgeEvidence>, f64, f64, (usize, usize)) {
+    let re = crate::ocr_anchor::reanchor(board, ocr, &params.ocr_anchor);
+    let moved = (re.nodes_moved, re.labels_found);
+    let board = &re.board;
     let bgr = bgr_from_rgb(image);
     let nodes: Vec<BBox> = board.nodes.iter().map(|n| n.bbox).collect();
     let texts: Vec<BBox> = board
@@ -127,6 +145,7 @@ pub fn pixel_evidence(
         .chain(board.other_visible_text.iter().map(|t| t.bbox))
         // Edge labels are text too: unmasked, their glyphs join the connector.
         .chain(board.edges.iter().filter_map(|e| e.label_bbox))
+        .chain(re.text_boxes.iter().copied())
         .collect();
     let prepared = PreparedCanvas::new(&bgr, &nodes, &texts, params);
     let by_id: HashMap<&str, &glassrip_vision::board::BoardNode> = board
@@ -160,7 +179,39 @@ pub fn pixel_evidence(
         });
     }
     let zoom = median(board.nodes.iter().map(|n| n.bbox.height()).collect());
-    (out, sharpness(&bgr), zoom)
+    (out, sharpness(&bgr), zoom, moved)
+}
+
+/// OCR spans of a keyframe in the loaded canvas image's pixels: canvas spans, and
+/// unassigned spans inside the crop (chrome and tile names never count), shifted by
+/// the crop origin.
+pub fn ocr_in_canvas(spans: &[OcrSpanView], crop: Option<BBox>) -> Vec<TextAnchor> {
+    let (ox, oy) = crop.filter(|c| c.is_well_formed()).map_or((0.0, 0.0), |c| {
+        (c.x1.max(0.0).floor(), c.y1.max(0.0).floor())
+    });
+    spans
+        .iter()
+        .filter(|s| {
+            let inside = crop.is_none_or(|c| {
+                s.bbox.x1 >= c.x1 && s.bbox.y1 >= c.y1 && s.bbox.x2 <= c.x2 && s.bbox.y2 <= c.y2
+            });
+            match s.region.as_deref() {
+                Some("canvas") => true,
+                Some("unassigned") | None => inside,
+                Some(_) => false,
+            }
+        })
+        .filter(|s| s.bbox.is_well_formed())
+        .map(|s| TextAnchor {
+            text: s.text.clone(),
+            bbox: BBox::new(
+                s.bbox.x1 - ox,
+                s.bbox.y1 - oy,
+                s.bbox.x2 - ox,
+                s.bbox.y2 - oy,
+            ),
+        })
+        .collect()
 }
 
 fn scale_box(b: &BBox, sx: f64, sy: f64) -> BBox {
@@ -285,7 +336,8 @@ pub fn pixel_frame(fw: &FrameWork, params: &PixelCheckParams) -> EdgeDirectionIt
         };
     }
     let board = scale_board(&fw.board, scale.x, scale.y);
-    let (mut edges, sharp, zoom) = pixel_evidence(&image, &board, params);
+    let ocr = ocr_in_canvas(&fw.ocr, fw.crop);
+    let (mut edges, sharp, zoom, _) = pixel_evidence_with_ocr(&image, &board, &ocr, params);
     for e in &mut edges {
         unscale_end(&mut e.pixel.src_end, scale);
         unscale_end(&mut e.pixel.dst_end, scale);
@@ -474,7 +526,8 @@ impl Stage for EdgeDirectionStage {
         "edge_direction"
     }
     fn version(&self) -> u32 {
-        1
+        // 2: node and label boxes re-anchored to OCR text; OCR is an input.
+        2
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
@@ -490,6 +543,10 @@ impl Stage for EdgeDirectionStage {
             },
             InputDecl {
                 schema: CANVAS_CROP,
+                major: 1,
+            },
+            InputDecl {
+                schema: OCR,
                 major: 1,
             },
         ]
@@ -519,6 +576,11 @@ impl Stage for EdgeDirectionStage {
                 )
             })
             .collect();
+        let mut ocr: HashMap<String, Vec<OcrSpanView>> = inputs
+            .read_ok::<OcrView>(OCR)?
+            .into_iter()
+            .map(|(id, o)| (o.keyframe_id.clone().unwrap_or(id), o.spans))
+            .collect();
         let frames = inputs
             .read_ok::<ValidateItemView>(BOARD_VALIDATE)?
             .into_iter()
@@ -526,6 +588,7 @@ impl Stage for EdgeDirectionStage {
                 let item = v.into_item(&id);
                 let crop = crops.get(&item.keyframe_id);
                 FrameWork {
+                    ocr: ocr.remove(&item.keyframe_id).unwrap_or_default(),
                     image: crop.map(|c| c.0.clone()),
                     crop: crop.and_then(|c| c.1),
                     keyframe_id: item.keyframe_id,

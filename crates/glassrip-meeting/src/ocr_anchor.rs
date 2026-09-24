@@ -1,0 +1,431 @@
+//! Re-anchoring reader boxes to OCR text before the pixel check.
+//!
+//! The vision reader's boxes can sit well off the drawn shapes (tens of pixels on a
+//! zoomed canvas), far beyond what snapping each side to its outline can recover.
+//! The pixel check then treats a node's real outline, outside the reader's box, as
+//! part of the connector, and attributes an arrowhead that touches one node to the
+//! other end. OCR boxes are pixel-accurate, so they locate the text of each node and
+//! label:
+//!
+//! - **Nodes.** The OCR spans of a node's words near its reader box are grouped
+//!   around the span closest to the box. When they cover enough of the node's text
+//!   and their center is displaced from the box center by more than a share of the
+//!   box size, the box is translated onto them (keeping its size, grown to contain
+//!   them). Smaller offsets are left to the outline snap.
+//! - **Edge labels.** The label box becomes the OCR box of the label text found near
+//!   the reader's label box, or between the two nodes when there is none.
+//! - **Masking.** Every OCR text box is returned for masking, so label glyphs never
+//!   join a connector wherever the reader placed its boxes.
+
+use glassrip_vision::board::ValidatedBoard;
+use glassrip_vision::BBox;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use crate::consolidate::TextAnchor;
+use crate::text::{clean_label, normalize};
+
+/// Re-anchoring settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OcrAnchorParams {
+    /// Re-anchor at all (OCR spans must be available).
+    pub enabled: bool,
+    /// Search window around a reader box, as a share of its width and height on
+    /// each side.
+    pub search_share: f64,
+    /// Share of the node's text (in characters) the grouped spans must cover.
+    pub min_text_cover: f64,
+    /// Displacements under this share of the box's smaller side are left to the
+    /// outline snap.
+    pub min_shift_share: f64,
+    /// Two words of four or more letters match when their similarity ratio
+    /// ([`crate::difflib::ratio`]) reaches this (OCR misreads a letter or two).
+    pub word_similarity: f64,
+}
+
+impl Default for OcrAnchorParams {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            search_share: 1.0,
+            min_text_cover: 0.5,
+            min_shift_share: 0.15,
+            word_similarity: 0.75,
+        }
+    }
+}
+
+/// What re-anchoring changed in one keyframe.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reanchored {
+    /// The reading with node and label boxes moved onto their OCR text.
+    pub board: ValidatedBoard,
+    /// Nodes whose box was translated.
+    pub nodes_moved: usize,
+    /// Edge labels whose box now comes from OCR.
+    pub labels_found: usize,
+    /// Every usable OCR text box (to mask).
+    pub text_boxes: Vec<BBox>,
+}
+
+fn words(text: &str) -> Vec<String> {
+    normalize(text)
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn center(b: &BBox) -> (f64, f64) {
+    ((b.x1 + b.x2) / 2.0, (b.y1 + b.y2) / 2.0)
+}
+
+fn union(boxes: &[BBox]) -> Option<BBox> {
+    boxes.iter().copied().reduce(|a, b| {
+        BBox::new(
+            a.x1.min(b.x1),
+            a.y1.min(b.y1),
+            a.x2.max(b.x2),
+            a.y2.max(b.y2),
+        )
+    })
+}
+
+fn inside(p: (f64, f64), b: &BBox) -> bool {
+    p.0 >= b.x1 && p.0 <= b.x2 && p.1 >= b.y1 && p.1 <= b.y2
+}
+
+fn grow(b: &BBox, share: f64) -> BBox {
+    let (dx, dy) = (b.width() * share, b.height() * share);
+    BBox::new(b.x1 - dx, b.y1 - dy, b.x2 + dx, b.y2 + dy)
+}
+
+/// A usable OCR span: at least two alphanumeric characters.
+struct Span {
+    words: Vec<String>,
+    bbox: BBox,
+}
+
+/// Indexes of `target` words matched by `span` words, or `None` when a span word
+/// matches none of them (the span is other text).
+fn matched_words(span: &[String], target: &[String], sim: f64) -> Option<Vec<usize>> {
+    let mut hit = Vec::new();
+    for w in span {
+        let best = target
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| {
+                *t == w || (w.chars().count() >= 4 && crate::difflib::ratio(t, w) >= sim)
+            })
+            .map(|(i, _)| i)
+            .next()?;
+        hit.push(best);
+    }
+    Some(hit)
+}
+
+/// Spans of `text` near `window`, grouped around the one closest to `anchor`
+/// (within `reach` of it on each axis), and the share of `text`'s characters they
+/// cover.
+fn locate(
+    spans: &[Span],
+    text: &str,
+    window: &BBox,
+    anchor: (f64, f64),
+    reach: (f64, f64),
+    sim: f64,
+) -> Option<(BBox, f64)> {
+    let target = words(text);
+    if target.is_empty() {
+        return None;
+    }
+    let cands: Vec<(&Span, Vec<usize>)> = spans
+        .iter()
+        .filter(|s| inside(center(&s.bbox), window))
+        .filter_map(|s| matched_words(&s.words, &target, sim).map(|m| (s, m)))
+        .collect();
+    let dist = |b: &BBox| {
+        let c = center(b);
+        (c.0 - anchor.0).powi(2) + (c.1 - anchor.1).powi(2)
+    };
+    let seed = cands
+        .iter()
+        .min_by(|a, b| dist(&a.0.bbox).total_cmp(&dist(&b.0.bbox)))?;
+    let sc = center(&seed.0.bbox);
+    let group: Vec<&(&Span, Vec<usize>)> = cands
+        .iter()
+        .filter(|(s, _)| {
+            let c = center(&s.bbox);
+            (c.0 - sc.0).abs() <= reach.0 && (c.1 - sc.1).abs() <= reach.1
+        })
+        .collect();
+    let mut covered: Vec<usize> = group.iter().flat_map(|(_, m)| m.iter().copied()).collect();
+    covered.sort_unstable();
+    covered.dedup();
+    let total: usize = target.iter().map(|w| w.chars().count()).sum();
+    let got: usize = covered.iter().map(|&i| target[i].chars().count()).sum();
+    let boxes: Vec<BBox> = group.iter().map(|(s, _)| s.bbox).collect();
+    union(&boxes).map(|u| (u, got as f64 / total.max(1) as f64))
+}
+
+/// Move node and label boxes of `board` onto their OCR text. `ocr` must share the
+/// board's coordinate space.
+pub fn reanchor(board: &ValidatedBoard, ocr: &[TextAnchor], p: &OcrAnchorParams) -> Reanchored {
+    let spans: Vec<Span> = ocr
+        .iter()
+        .filter(|a| a.bbox.is_well_formed())
+        .filter(|a| a.text.chars().filter(|c| c.is_alphanumeric()).count() >= 2)
+        .map(|a| Span {
+            words: words(&a.text),
+            bbox: a.bbox,
+        })
+        .filter(|s| !s.words.is_empty())
+        .collect();
+    let mut out = Reanchored {
+        board: board.clone(),
+        nodes_moved: 0,
+        labels_found: 0,
+        text_boxes: spans.iter().map(|s| s.bbox).collect(),
+    };
+    if !p.enabled || spans.is_empty() {
+        return out;
+    }
+    for n in &mut out.board.nodes {
+        let b = n.bbox;
+        let (w, h) = (b.width(), b.height());
+        if w <= 0.0 || h <= 0.0 {
+            continue;
+        }
+        let window = grow(&b, p.search_share);
+        let Some((u, cover)) = locate(
+            &spans,
+            &n.text,
+            &window,
+            center(&b),
+            (w, h),
+            p.word_similarity,
+        ) else {
+            continue;
+        };
+        if cover < p.min_text_cover {
+            continue;
+        }
+        let (bc, uc) = (center(&b), center(&u));
+        let (dx, dy) = (uc.0 - bc.0, uc.1 - bc.1);
+        let min_shift = p.min_shift_share * w.min(h);
+        if dx.abs() <= min_shift && dy.abs() <= min_shift {
+            continue;
+        }
+        let moved = BBox::new(b.x1 + dx, b.y1 + dy, b.x2 + dx, b.y2 + dy);
+        n.bbox = BBox::new(
+            moved.x1.min(u.x1 - 2.0),
+            moved.y1.min(u.y1 - 2.0),
+            moved.x2.max(u.x2 + 2.0),
+            moved.y2.max(u.y2 + 2.0),
+        );
+        out.nodes_moved += 1;
+    }
+    let node_box = |id: &str, nodes: &[glassrip_vision::board::BoardNode]| {
+        nodes.iter().find(|n| n.local_id == id).map(|n| n.bbox)
+    };
+    let nodes = out.board.nodes.clone();
+    for e in &mut out.board.edges {
+        let label = clean_label(&e.label);
+        if label.is_empty() {
+            continue;
+        }
+        let (Some(s), Some(d)) = (node_box(&e.src, &nodes), node_box(&e.dst, &nodes)) else {
+            continue;
+        };
+        let (sc, dc) = (center(&s), center(&d));
+        let mid = ((sc.0 + dc.0) / 2.0, (sc.1 + dc.1) / 2.0);
+        // Near the reader's label box when there is one, else anywhere around the
+        // two nodes (closest to their midpoint).
+        let (window, anchor) = match e.label_bbox {
+            Some(l) if l.is_well_formed() => {
+                let pad = l.width().max(l.height());
+                (
+                    BBox::new(l.x1 - pad, l.y1 - pad, l.x2 + pad, l.y2 + pad),
+                    center(&l),
+                )
+            }
+            _ => (
+                BBox::new(
+                    s.x1.min(d.x1) - 20.0,
+                    s.y1.min(d.y1) - 20.0,
+                    s.x2.max(d.x2) + 20.0,
+                    s.y2.max(d.y2) + 20.0,
+                ),
+                mid,
+            ),
+        };
+        // Label words on one line or two stacked lines.
+        let reach = (window.width(), window.height() / 2.0);
+        if let Some((u, cover)) = locate(&spans, &label, &window, anchor, reach, p.word_similarity)
+        {
+            if cover >= p.min_text_cover {
+                e.label_bbox = Some(u);
+                out.labels_found += 1;
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use glassrip_vision::board::{BoardEdge, BoardNode, EdgeStyle};
+
+    fn node(id: &str, text: &str, b: BBox) -> BoardNode {
+        BoardNode {
+            local_id: id.into(),
+            text: text.into(),
+            bbox: b,
+            conf: 0.9,
+        }
+    }
+
+    fn anchor(text: &str, x1: f64, y1: f64, x2: f64, y2: f64) -> TextAnchor {
+        TextAnchor {
+            text: text.into(),
+            bbox: BBox::new(x1, y1, x2, y2),
+        }
+    }
+
+    fn board(nodes: Vec<BoardNode>, edges: Vec<BoardEdge>) -> ValidatedBoard {
+        ValidatedBoard {
+            nodes,
+            edges,
+            stickies: vec![],
+            owner_tags: vec![],
+            other_visible_text: vec![],
+            confidence: 0.9,
+            chrome_rejected: vec![],
+            issues: vec![],
+            needs_reclassification: false,
+        }
+    }
+
+    #[test]
+    fn a_box_read_far_off_its_text_moves_onto_it() {
+        // Three text lines centered at y 239; the reader's box is centered 34 px
+        // higher.
+        let b = board(
+            vec![node(
+                "n1",
+                "Ledger Sync Service",
+                BBox::new(100.0, 155.0, 300.0, 255.0),
+            )],
+            vec![],
+        );
+        let ocr = vec![
+            anchor("Ledger", 170.0, 215.0, 230.0, 228.0),
+            anchor("Sync", 180.0, 232.0, 220.0, 245.0),
+            anchor("Service", 168.0, 250.0, 232.0, 263.0),
+            anchor("Other box", 600.0, 230.0, 680.0, 245.0),
+        ];
+        let r = reanchor(&b, &ocr, &OcrAnchorParams::default());
+        assert_eq!(r.nodes_moved, 1);
+        let m = r.board.nodes[0].bbox;
+        let c = center(&m);
+        assert!((c.1 - 239.0).abs() < 1.0, "{m:?}");
+        assert!((m.height() - 100.0).abs() < 1.0, "size kept: {m:?}");
+        assert_eq!(r.text_boxes.len(), 4);
+    }
+
+    #[test]
+    fn small_offsets_unrelated_text_and_other_boxes_leave_the_box() {
+        let b = board(
+            vec![
+                node(
+                    "n1",
+                    "Ledger Sync Service",
+                    BBox::new(100.0, 196.0, 300.0, 296.0),
+                ),
+                node("n2", "Queue", BBox::new(400.0, 200.0, 500.0, 260.0)),
+            ],
+            vec![],
+        );
+        let ocr = vec![
+            // n1's text, 4 px off: below the shift threshold.
+            anchor("Ledger", 170.0, 215.0, 230.0, 228.0),
+            anchor("Sync", 180.0, 232.0, 220.0, 245.0),
+            anchor("Service", 168.0, 250.0, 232.0, 263.0),
+            // Text near n2 that is not n2's.
+            anchor("Retry policy", 380.0, 300.0, 470.0, 315.0),
+            // n2's word, but outside its search window.
+            anchor("Queue", 900.0, 600.0, 950.0, 615.0),
+        ];
+        let r = reanchor(&b, &ocr, &OcrAnchorParams::default());
+        assert_eq!(r.nodes_moved, 0);
+        assert_eq!(r.board.nodes, b.nodes);
+    }
+
+    #[test]
+    fn a_single_short_word_of_a_long_title_is_not_enough() {
+        let b = board(
+            vec![node(
+                "n1",
+                "Customer Onboarding Workflow Service",
+                BBox::new(100.0, 100.0, 300.0, 200.0),
+            )],
+            vec![],
+        );
+        // Only "Service" found, far below the reader's center: 7 of 34 characters.
+        let ocr = vec![anchor("Service", 170.0, 250.0, 230.0, 262.0)];
+        let r = reanchor(&b, &ocr, &OcrAnchorParams::default());
+        assert_eq!(r.nodes_moved, 0);
+    }
+
+    #[test]
+    fn edge_labels_take_their_ocr_box() {
+        let edge = |label_bbox| BoardEdge {
+            src: "n1".into(),
+            dst: "n2".into(),
+            label: "gRPC".into(),
+            label_bbox,
+            style: EdgeStyle::Solid,
+            conf: 0.9,
+        };
+        let nodes = vec![
+            node("n1", "Alpha", BBox::new(100.0, 100.0, 200.0, 150.0)),
+            node("n2", "Beta", BBox::new(100.0, 300.0, 200.0, 350.0)),
+        ];
+        let ocr = vec![
+            anchor("Alpha", 130.0, 118.0, 170.0, 132.0),
+            anchor("Beta", 132.0, 318.0, 168.0, 332.0),
+            anchor("GRPC", 155.0, 212.0, 190.0, 224.0),
+        ];
+        // Reader label box 30 px off, and no label box at all.
+        for lb in [Some(BBox::new(150.0, 180.0, 185.0, 192.0)), None] {
+            let r = reanchor(
+                &board(nodes.clone(), vec![edge(lb)]),
+                &ocr,
+                &OcrAnchorParams::default(),
+            );
+            assert_eq!(r.labels_found, 1, "{lb:?}");
+            assert_eq!(
+                r.board.edges[0].label_bbox,
+                Some(BBox::new(155.0, 212.0, 190.0, 224.0))
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_or_without_ocr_nothing_changes() {
+        let b = board(
+            vec![node("n1", "Ledger", BBox::new(100.0, 155.0, 300.0, 255.0))],
+            vec![],
+        );
+        let ocr = vec![anchor("Ledger", 170.0, 235.0, 230.0, 248.0)];
+        let off = OcrAnchorParams {
+            enabled: false,
+            ..OcrAnchorParams::default()
+        };
+        assert_eq!(reanchor(&b, &ocr, &off).board, b);
+        assert_eq!(reanchor(&b, &[], &OcrAnchorParams::default()).board, b);
+    }
+}

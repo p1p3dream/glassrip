@@ -86,6 +86,10 @@ pub struct PixelCheckParams {
     pub min_arrow_spread_px: f64,
     /// Components larger than this share of the canvas are rejected (not a connector).
     pub max_component_share: f64,
+    /// Node and label boxes are first moved onto their OCR text when the reader's
+    /// boxes sit off the drawn shapes ([`crate::ocr_anchor`]).
+    #[serde(default)]
+    pub ocr_anchor: crate::ocr_anchor::OcrAnchorParams,
 }
 
 impl Default for PixelCheckParams {
@@ -110,6 +114,7 @@ impl Default for PixelCheckParams {
             min_arrow_overhang_px: 1.5,
             min_arrow_spread_px: 2.0,
             max_component_share: 0.05,
+            ocr_anchor: crate::ocr_anchor::OcrAnchorParams::default(),
         }
     }
 }

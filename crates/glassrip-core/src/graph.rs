@@ -415,7 +415,11 @@ pub fn meeting_mode_stage_decls() -> Vec<StageDecl> {
         d(
             "edge_direction",
             "glassrip.edge_direction",
-            &["glassrip.board_validate", "glassrip.canvas_crop"],
+            &[
+                "glassrip.board_validate",
+                "glassrip.canvas_crop",
+                "glassrip.ocr",
+            ],
         ),
         d(
             "board_state",

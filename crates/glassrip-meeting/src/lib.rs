@@ -10,6 +10,7 @@ pub mod artifacts;
 pub mod consolidate;
 pub mod difflib;
 pub mod direction;
+pub mod ocr_anchor;
 pub mod pixel_direction;
 pub mod register;
 pub mod similarity;
