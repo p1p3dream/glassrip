@@ -388,6 +388,10 @@ fn chunk_argv(
     if let Some(h) = hw {
         a.extend(["-hwaccel".into(), h.into()]);
     }
+    // Several chunks decode at once: split the CPUs between them instead of letting each
+    // ffmpeg start a thread per core.
+    let threads = (crate::util::cpus() / params.chunk_concurrency.max(1) as usize).max(1);
+    a.extend(["-threads".into(), threads.to_string()]);
     a.push("-noautorotate".into());
     if chunk.sampling == Sampling::Sync {
         a.extend(["-skip_frame".into(), "nokey".into()]);
@@ -954,6 +958,9 @@ mod tests {
             "{s}"
         );
         assert!(s.contains("transpose=clock,scale=1920:-2"), "{s}");
+        let t = a.iter().position(|x| x == "-threads").unwrap();
+        let n: usize = a[t + 1].parse().unwrap();
+        assert!(n >= 1 && n <= crate::util::cpus().max(1), "{s}");
         assert!(
             s.contains("select='eq(pts\\,990000)+eq(pts\\,1170000)'"),
             "{s}"
