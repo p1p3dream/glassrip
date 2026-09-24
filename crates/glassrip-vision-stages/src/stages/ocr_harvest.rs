@@ -124,7 +124,8 @@ impl Stage for OcrHarvestStage {
         "ocr_harvest"
     }
     fn version(&self) -> u32 {
-        2
+        // 3: bucketed detector input (padding changes spans slightly).
+        3
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {

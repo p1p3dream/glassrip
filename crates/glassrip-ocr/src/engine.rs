@@ -55,6 +55,10 @@ fn session_builder(limit_mib: u32) -> Result<SessionBuilder, OcrError> {
     let builder = Session::builder()
         .map_err(rt)?
         .with_optimization_level(GraphOptimizationLevel::Level3)
+        .map_err(rt)?
+        // Inputs vary in shape (keyframes, text crops); the memory pattern is
+        // planned per shape and made the CUDA arena grow until it ran out.
+        .with_memory_pattern(false)
         .map_err(rt)?;
     // Without an explicit provider ONNX Runtime silently runs on CPU;
     // error_on_failure turns a broken CUDA install into an error.
