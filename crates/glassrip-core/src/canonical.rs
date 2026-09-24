@@ -5,6 +5,9 @@
 //! - No insignificant whitespace.
 //! - Strings use `serde_json` escaping; numbers use `serde_json` formatting
 //!   (integers as integers, floats via the shortest round-trip representation).
+//! - `-0.0` is written as `0.0`.
+//! - Non-finite floats (NaN, infinities) are rejected with
+//!   [`CanonicalJsonError::NonFinite`] instead of silently becoming `null`.
 //!
 //! Key ordering never depends on how the input map was built, so the result is the
 //! same whether or not any crate in the build enables `serde_json/preserve_order`.
@@ -12,15 +15,33 @@
 use serde::Serialize;
 use serde_json::Value;
 
-/// Error produced when a value cannot be converted to JSON.
-#[derive(Debug, thiserror::Error)]
-#[error("value is not representable as JSON: {0}")]
-pub struct CanonicalJsonError(#[from] serde_json::Error);
+mod finite;
 
-/// Serializes `value` to canonical JSON text.
+/// Error produced when a value has no canonical JSON form.
+#[derive(Debug, thiserror::Error)]
+pub enum CanonicalJsonError {
+    /// The value could not be converted to JSON.
+    #[error("value is not representable as JSON: {0}")]
+    Json(#[from] serde_json::Error),
+    /// A float was NaN or infinite.
+    #[error("non-finite float at `{path}`")]
+    NonFinite {
+        /// Location of the float (`$` is the root).
+        path: String,
+    },
+}
+
+/// Serializes `value` to canonical JSON text, rejecting non-finite floats.
 pub fn to_canonical_string<T: Serialize + ?Sized>(value: &T) -> Result<String, CanonicalJsonError> {
-    let value = serde_json::to_value(value)?;
+    let value = to_checked_value(value)?;
     Ok(canonical_value_string(&value))
+}
+
+/// Converts `value` to a [`Value`], rejecting non-finite floats (which
+/// `serde_json::to_value` would silently turn into `null`).
+pub fn to_checked_value<T: Serialize + ?Sized>(value: &T) -> Result<Value, CanonicalJsonError> {
+    finite::check(value)?;
+    Ok(serde_json::to_value(value)?)
 }
 
 /// Writes an already-built [`Value`] as canonical JSON text.
@@ -39,7 +60,14 @@ fn write_value(value: &Value, out: &mut String) {
     match value {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::Number(n) => out.push_str(&n.to_string()),
+        Value::Number(n) => {
+            if n.is_f64() && n.as_f64() == Some(0.0) {
+                // Covers -0.0, which compares equal to 0.0.
+                out.push_str("0.0");
+            } else {
+                out.push_str(&n.to_string());
+            }
+        }
         Value::String(s) => write_string(s, out),
         Value::Array(items) => {
             out.push('[');
@@ -186,7 +214,69 @@ mod tests {
         }
     }
 
+    #[derive(Serialize)]
+    struct Params {
+        name: String,
+        values: Vec<f64>,
+        nested: Option<Box<Params>>,
+    }
+
+    #[test]
+    fn non_finite_floats_rejected_with_path() {
+        let p = Params {
+            name: "a".into(),
+            values: vec![1.0],
+            nested: Some(Box::new(Params {
+                name: "b".into(),
+                values: vec![0.5, f64::NAN],
+                nested: None,
+            })),
+        };
+        match to_canonical_string(&p) {
+            Err(CanonicalJsonError::NonFinite { path }) => assert_eq!(path, "$.nested.values[1]"),
+            other => panic!("expected NonFinite, got {other:?}"),
+        }
+        assert!(to_canonical_string(&f64::INFINITY).is_err());
+        assert!(
+            to_canonical_string(&std::collections::BTreeMap::from([(
+                "k",
+                f32::NEG_INFINITY
+            )]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn negative_zero_normalized() {
+        assert_eq!(to_canonical_string(&-0.0f64).unwrap(), "0.0");
+        assert_eq!(
+            canonical_value_string(&json!({"x": -0.0})),
+            canonical_value_string(&json!({"x": 0.0}))
+        );
+    }
+
     proptest! {
+        #[test]
+        fn non_finite_always_rejected(
+            finite in any::<f64>().prop_filter("finite", |f| f.is_finite()),
+            bad in prop_oneof![Just(f64::NAN), Just(f64::INFINITY), Just(f64::NEG_INFINITY)],
+            pos in 0usize..4,
+        ) {
+            let mut values = vec![finite; 4];
+            values[pos] = bad;
+            let p = Params { name: "x".into(), values, nested: None };
+            let rejected = matches!(to_canonical_string(&p), Err(CanonicalJsonError::NonFinite { .. }));
+            prop_assert!(rejected);
+        }
+
+        #[test]
+        fn finite_floats_accepted_and_sign_of_zero_ignored(f in any::<f64>().prop_filter("finite", |f| f.is_finite())) {
+            let text = to_canonical_string(&f).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let back: f64 = serde_json::from_str(&text).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            prop_assert_eq!(back, f);
+            prop_assert_eq!(to_canonical_string(&(f * 0.0)).ok(), to_canonical_string(&0.0f64).ok());
+        }
+
         #[test]
         fn round_trip_is_invariant(v in arb_json()) {
             let text = canonical_value_string(&v);
