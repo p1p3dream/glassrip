@@ -227,7 +227,7 @@ async fn run_branch(
     root: &Path,
     run: &Path,
     backend: Arc<dyn VisionBackend>,
-) -> Arc<PlacementMonitor> {
+) -> (Arc<PlacementMonitor>, Runner) {
     adapter::build_inputs(run, &root.join("index.json"), None, "test-run").unwrap();
     let rd = RunDir::open(run, "test-run", Producer::glassrip("0.1.0", None)).unwrap();
     let mut runner = Runner::new(
@@ -278,7 +278,7 @@ async fn run_branch(
     let reports = branch.run(&mut runner, None).await.unwrap();
     assert_eq!(reports.len(), 6);
     assert!(reports.iter().all(|r| r.items_error == 0), "{reports:?}");
-    monitor
+    (monitor, runner)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -290,7 +290,7 @@ async fn record_then_replay_vision_branch() {
 
     // Live run against the scripted model, recording every answer.
     let live = root.join("live");
-    let monitor = run_branch(
+    let (monitor, _) = run_branch(
         root,
         &live,
         Arc::new(RecordingBackend::new(
@@ -358,4 +358,53 @@ async fn record_then_replay_vision_branch() {
     assert_eq!(again, validated);
     let classes_again: Vec<(String, ScreenClassItem)> = read(&replay, artifacts::SCREEN_CLASS);
     assert_eq!(classes_again, classes);
+}
+
+/// board_validate output feeds glassrip-meeting's edge_direction and
+/// board_state stages unchanged: the canvas crop is found from the source
+/// frame and crop box, and the validated node reaches the board state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn board_validate_feeds_board_state() {
+    use glassrip_meeting::artifacts::EdgeDirectionBatch;
+    use glassrip_meeting::consolidate::{BoardStateItem, ConsolidationParams};
+    use glassrip_meeting::pixel_direction::PixelCheckParams;
+    use glassrip_meeting::stages::{BoardStateStage, EdgeDirectionStage};
+    use glassrip_meeting::vlm_direction::VlmCheckParams;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_inputs(root);
+    let store = RawStore::new(root.join("raw"));
+    let run = root.join("run");
+    let (_, mut runner) = run_branch(
+        root,
+        &run,
+        Arc::new(RecordingBackend::new(Arc::new(ScriptedModel), store)),
+    )
+    .await;
+    let edge =
+        EdgeDirectionStage::new(PixelCheckParams::default(), VlmCheckParams::default(), None);
+    let r = runner.run_stage(&edge).await.unwrap();
+    assert_eq!(r.items_error, 0, "{r:?}");
+    let state = BoardStateStage::new(ConsolidationParams::default());
+    let r = runner.run_stage(&state).await.unwrap();
+    assert_eq!(r.items_error, 0, "{r:?}");
+
+    let batches: Vec<(String, EdgeDirectionBatch)> = read(&run, "glassrip.edge_direction");
+    let frames: Vec<_> = batches.iter().flat_map(|(_, b)| &b.keyframes).collect();
+    assert_eq!(frames.len(), 2);
+    for f in &frames {
+        assert!(f.error.is_none(), "{:?}", f.error);
+        // The canvas was cut from the full keyframe: its size is the crop's.
+        assert!(
+            f.canvas.width < 900.0 && f.canvas.width > 600.0,
+            "{:?}",
+            f.canvas
+        );
+    }
+    let states: Vec<(String, BoardStateItem)> = read(&run, "glassrip.board_state");
+    assert!(!states.is_empty());
+    assert!(states
+        .iter()
+        .any(|(_, s)| s.nodes.iter().any(|n| n.text == "Order Service")));
 }

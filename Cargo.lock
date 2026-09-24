@@ -1444,6 +1444,7 @@ dependencies = [
  "fs-err",
  "futures-util",
  "glassrip-core",
+ "glassrip-meeting",
  "glassrip-ocr",
  "glassrip-vision",
  "image",

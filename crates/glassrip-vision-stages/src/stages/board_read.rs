@@ -24,8 +24,8 @@ use glassrip_core::runner::{
     ArtifactSpec, InputDecl, ItemContext, KeyExtras, Stage, StageError, StageInputs, WorkItem,
 };
 use glassrip_vision::board::{
-    board_read_request, normalize, BoardNode, BoardReadOutput, OwnerTag, Sticky, TextItem,
-    BOARD_READ_PROMPT,
+    board_read_request, normalize, BoardNode, BoardReadOutput, BoardReading, OwnerTag, Sticky,
+    TextItem, BOARD_READ_PROMPT,
 };
 use glassrip_vision::image_prep::{
     prepare_board_image, prepare_long_edge, BOARD_LONG_EDGE, LOW_RES_THRESHOLD, LOW_RES_UPSCALE,
@@ -194,11 +194,11 @@ fn merge_list<T: Clone>(
 
 /// Merge tile readings (already in canvas pixels) with the overview.
 pub fn merge_tiles(
-    overview: BoardReadOutput,
-    tiles: Vec<BoardReadOutput>,
+    overview: BoardReading,
+    tiles: Vec<BoardReading>,
     iou: f64,
     ratio: f64,
-) -> BoardReadOutput {
+) -> BoardReading {
     // Nodes: tiles first, then overview nodes not seen in any tile.
     let mut all_nodes: Vec<(Option<usize>, BoardNode)> = Vec::new();
     for (t, r) in tiles.iter().enumerate() {
@@ -260,7 +260,7 @@ pub fn merge_tiles(
         .collect();
     other_in.extend(overview.other_visible_text.clone());
     let (other_visible_text, _) = merge_list(other_in, |t| (t.text.as_str(), &t.bbox), iou, ratio);
-    BoardReadOutput {
+    BoardReading {
         nodes,
         edges,
         stickies,
@@ -270,7 +270,7 @@ pub fn merge_tiles(
     }
 }
 
-fn shift_output(mut o: BoardReadOutput, dx: f64, dy: f64) -> BoardReadOutput {
+fn shift_output(mut o: BoardReading, dx: f64, dy: f64) -> BoardReading {
     for n in &mut o.nodes {
         n.bbox = offset(&n.bbox, dx, dy);
     }
@@ -321,7 +321,7 @@ impl BoardReadStage {
         region: BBox,
         prepared: PreparedImage,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<(BoardReadOutput, RequestLog), ErrorInfo> {
+    ) -> Result<(BoardReading, RequestLog), ErrorInfo> {
         let mut request = board_read_request(
             &prepared,
             GenerationOptions {
@@ -513,8 +513,8 @@ mod tests {
         }
     }
 
-    fn empty() -> BoardReadOutput {
-        BoardReadOutput {
+    fn empty() -> BoardReading {
+        BoardReading {
             nodes: vec![],
             edges: vec![],
             stickies: vec![],

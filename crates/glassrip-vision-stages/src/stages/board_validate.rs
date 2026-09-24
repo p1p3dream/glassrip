@@ -21,7 +21,7 @@ use glassrip_core::runner::{
     ArtifactSpec, InputDecl, ItemContext, Stage, StageError, StageInputs, WorkItem,
 };
 use glassrip_vision::board::{
-    normalize, validate_board, BoardNode, BoardReadOutput, BoardValidationConfig, CanvasSize,
+    normalize, validate_board, BoardNode, BoardReading, BoardValidationConfig, CanvasSize,
     ElementList, OwnerTag, RejectReason, RejectedItem, Sticky,
 };
 use glassrip_vision::BBox;
@@ -189,13 +189,13 @@ fn owner_text(text: &str, aliases: &[String]) -> bool {
 
 /// Move elements between lists by measured shape and color.
 pub fn apply_membership(
-    out: BoardReadOutput,
+    out: BoardReading,
     img: &RgbImage,
     anchors: &[(String, BBox)],
     aliases: &[String],
     t: &ShapeThresholds,
-) -> (BoardReadOutput, Vec<MembershipDecision>) {
-    let BoardReadOutput {
+) -> (BoardReading, Vec<MembershipDecision>) {
+    let BoardReading {
         nodes,
         edges,
         stickies,
@@ -306,7 +306,7 @@ pub fn apply_membership(
         }
     }
     (
-        BoardReadOutput {
+        BoardReading {
             nodes: new_nodes,
             edges,
             stickies: new_stickies,
@@ -326,10 +326,7 @@ fn center_in(b: &BBox, boxes: &[BBox]) -> bool {
 }
 
 /// Remove elements centered inside participant tiles (canvas pixels).
-fn drop_tile_text(
-    mut out: BoardReadOutput,
-    tiles: &[BBox],
-) -> (BoardReadOutput, Vec<RejectedItem>) {
+fn drop_tile_text(mut out: BoardReading, tiles: &[BBox]) -> (BoardReading, Vec<RejectedItem>) {
     let mut rejected = Vec::new();
     let mut reject = |list: ElementList, text: &str, bbox: BBox| {
         rejected.push(RejectedItem {
@@ -517,8 +514,7 @@ pub fn validate_reading(
         source_image_path: reading.source_image_path.clone(),
         crop_box: reading.crop_box,
         masks: reading.masks.clone(),
-        canvas_width: canvas_size.width,
-        canvas_height: canvas_size.height,
+        canvas: canvas_size,
         needs_reclassification: board.needs_reclassification,
         board,
         membership,
@@ -709,7 +705,7 @@ mod tests {
         img
     }
 
-    fn reading(result: BoardReadOutput) -> BoardReadingItem {
+    fn reading(result: BoardReading) -> BoardReadingItem {
         BoardReadingItem {
             keyframe_id: "k".into(),
             source_frame_id: "f".into(),
@@ -734,7 +730,7 @@ mod tests {
 
     #[test]
     fn misfiled_elements_move_by_shape_and_color() {
-        let out = BoardReadOutput {
+        let out = BoardReading {
             nodes: vec![
                 BoardNode {
                     local_id: "n1".into(),
@@ -803,7 +799,7 @@ mod tests {
 
     #[test]
     fn tile_text_and_unsupported_owners_are_chrome() {
-        let out = BoardReadOutput {
+        let out = BoardReading {
             nodes: vec![BoardNode {
                 local_id: "n1".into(),
                 text: "Order Service".into(),
@@ -870,7 +866,7 @@ mod tests {
     fn ocr_text_background_decides_when_boxes_are_off() {
         let img = board_image();
         // Model boxes shifted onto plain canvas; OCR boxes sit on the cards.
-        let out = BoardReadOutput {
+        let out = BoardReading {
             nodes: vec![
                 BoardNode {
                     local_id: "n1".into(),

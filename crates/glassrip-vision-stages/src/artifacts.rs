@@ -4,7 +4,7 @@
 //! They accept unknown fields so upstream producers can add fields in minor
 //! versions; outputs are strict (`deny_unknown_fields`).
 
-use glassrip_vision::board::{BoardReadOutput, ValidatedBoard};
+use glassrip_vision::board::{BoardReading, CanvasSize, ValidatedBoard};
 use glassrip_vision::classify::{ClassifyMethod, RuleHit, ScreenType};
 use glassrip_vision::BBox;
 use schemars::JsonSchema;
@@ -349,7 +349,7 @@ pub struct BoardReadingItem {
     pub requests: Vec<RequestLog>,
     pub participants: Vec<String>,
     /// Reading in canvas pixels (merged over tiles when tiled).
-    pub result: BoardReadOutput,
+    pub result: BoardReading,
 }
 
 /// Shape and color measured inside an element's box.
@@ -415,8 +415,8 @@ pub struct BoardValidateItem {
     /// relative to this crop's top-left corner.
     pub crop_box: BBox,
     pub masks: Vec<ChromeMask>,
-    pub canvas_width: f64,
-    pub canvas_height: f64,
+    /// Canvas size in pixels (equals the crop box size).
+    pub canvas: CanvasSize,
     pub board: ValidatedBoard,
     pub membership: Vec<MembershipDecision>,
     pub extra_issues: Vec<ExtraIssue>,
