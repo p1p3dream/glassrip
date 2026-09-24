@@ -1,163 +1,163 @@
 {
   "report_version": 1,
   "suite": "synthetic",
-  "mode": "replay",
+  "mode": "live",
   "vision_model": "qwen2.5vl:7b",
-  "repetitions": 1,
+  "repetitions": 3,
   "metrics": {
     "board.chrome_fp": {
-      "mean": 17.0,
-      "spread": 0.0,
-      "min": 17.0,
-      "max": 17.0,
-      "runs": 1
+      "mean": 35.333333333333336,
+      "spread": 9.018499505645789,
+      "min": 26.0,
+      "max": 44.0,
+      "runs": 3
     },
     "board.edge.direction_accuracy": {
       "mean": 1.0,
       "spread": 0.0,
       "min": 1.0,
       "max": 1.0,
-      "runs": 1
+      "runs": 3
     },
     "board.edge.f1": {
-      "mean": 0.43243243243243246,
-      "spread": 0.0,
-      "min": 0.43243243243243246,
-      "max": 0.43243243243243246,
-      "runs": 1
+      "mean": 0.8988988988988988,
+      "spread": 0.017337845921610442,
+      "min": 0.8888888888888888,
+      "max": 0.918918918918919,
+      "runs": 3
     },
     "board.edge.label_accuracy": {
-      "mean": 0.75,
-      "spread": 0.0,
-      "min": 0.75,
-      "max": 0.75,
-      "runs": 1
+      "mean": 0.9387254901960785,
+      "spread": 0.0021226112837853814,
+      "min": 0.9375,
+      "max": 0.9411764705882353,
+      "runs": 3
     },
     "board.edge.precision": {
-      "mean": 0.4444444444444444,
-      "spread": 0.0,
-      "min": 0.4444444444444444,
-      "max": 0.4444444444444444,
-      "runs": 1
+      "mean": 0.9422657952069716,
+      "spread": 0.0018867655855870056,
+      "min": 0.9411764705882353,
+      "max": 0.9444444444444444,
+      "runs": 3
     },
     "board.edge.recall": {
-      "mean": 0.42105263157894735,
-      "spread": 0.0,
-      "min": 0.42105263157894735,
-      "max": 0.42105263157894735,
-      "runs": 1
+      "mean": 0.8596491228070176,
+      "spread": 0.030386856273138228,
+      "min": 0.8421052631578947,
+      "max": 0.8947368421052632,
+      "runs": 3
     },
     "board.edge.style_accuracy": {
-      "mean": 1.0,
-      "spread": 0.0,
-      "min": 1.0,
-      "max": 1.0,
-      "runs": 1
+      "mean": 0.9387254901960785,
+      "spread": 0.0021226112837853814,
+      "min": 0.9375,
+      "max": 0.9411764705882353,
+      "runs": 3
     },
     "board.edge.uncertain": {
       "mean": 0.0,
       "spread": 0.0,
       "min": 0.0,
       "max": 0.0,
-      "runs": 1
+      "runs": 3
     },
     "board.node.core_recall": {
-      "mean": 0.18181818181818182,
+      "mean": 0.8636363636363636,
       "spread": 0.0,
-      "min": 0.18181818181818182,
-      "max": 0.18181818181818182,
-      "runs": 1
+      "min": 0.8636363636363636,
+      "max": 0.8636363636363636,
+      "runs": 3
     },
     "board.node.f1": {
-      "mean": 0.14545454545454545,
-      "spread": 0.0,
-      "min": 0.14545454545454545,
-      "max": 0.14545454545454545,
-      "runs": 1
+      "mean": 0.7125553226182156,
+      "spread": 0.0076657268445861895,
+      "min": 0.7037037037037037,
+      "max": 0.7169811320754716,
+      "runs": 3
     },
     "board.node.precision": {
-      "mean": 0.12121212121212122,
-      "spread": 0.0,
-      "min": 0.12121212121212122,
-      "max": 0.12121212121212122,
-      "runs": 1
+      "mean": 0.606518817204301,
+      "spread": 0.011058120075204533,
+      "min": 0.59375,
+      "max": 0.6129032258064516,
+      "runs": 3
     },
     "board.node.recall": {
-      "mean": 0.18181818181818182,
+      "mean": 0.8636363636363636,
       "spread": 0.0,
-      "min": 0.18181818181818182,
-      "max": 0.18181818181818182,
-      "runs": 1
+      "min": 0.8636363636363636,
+      "max": 0.8636363636363636,
+      "runs": 3
     },
     "board.owner.accuracy": {
-      "mean": 0.5,
+      "mean": 1.0,
       "spread": 0.0,
-      "min": 0.5,
-      "max": 0.5,
-      "runs": 1
+      "min": 1.0,
+      "max": 1.0,
+      "runs": 3
     },
     "board.owner.fp": {
-      "mean": 9.0,
-      "spread": 0.0,
-      "min": 9.0,
-      "max": 9.0,
-      "runs": 1
+      "mean": 11.666666666666666,
+      "spread": 0.5773502691896257,
+      "min": 11.0,
+      "max": 12.0,
+      "runs": 3
     },
     "board.sticky.cer": {
       "mean": 0.0,
       "spread": 0.0,
       "min": 0.0,
       "max": 0.0,
-      "runs": 1
+      "runs": 3
     },
     "board.sticky.f1": {
-      "mean": 0.33333333333333337,
-      "spread": 0.0,
-      "min": 0.33333333333333337,
-      "max": 0.33333333333333337,
-      "runs": 1
+      "mean": 0.44357864357864357,
+      "spread": 0.03926130885005238,
+      "min": 0.4,
+      "max": 0.47619047619047616,
+      "runs": 3
     },
     "board.sticky.precision": {
-      "mean": 1.0,
-      "spread": 0.0,
-      "min": 1.0,
-      "max": 1.0,
-      "runs": 1
+      "mean": 0.7825396825396825,
+      "spread": 0.06141441943540669,
+      "min": 0.7142857142857143,
+      "max": 0.8333333333333334,
+      "runs": 3
     },
     "board.sticky.recall": {
-      "mean": 0.2,
-      "spread": 0.0,
-      "min": 0.2,
-      "max": 0.2,
-      "runs": 1
+      "mean": 0.3111111111111111,
+      "spread": 0.03849001794597504,
+      "min": 0.26666666666666666,
+      "max": 0.3333333333333333,
+      "runs": 3
     },
     "cases": {
       "mean": 11.0,
       "spread": 0.0,
       "min": 11.0,
       "max": 11.0,
-      "runs": 1
+      "runs": 3
     },
     "screen.accuracy": {
       "mean": 1.0,
       "spread": 0.0,
       "min": 1.0,
       "max": 1.0,
-      "runs": 1
+      "runs": 3
     },
     "screen.cms_as_whiteboard": {
       "mean": 0.0,
       "spread": 0.0,
       "min": 0.0,
       "max": 0.0,
-      "runs": 1
+      "runs": 3
     },
     "screen.missed": {
       "mean": 0.0,
       "spread": 0.0,
       "min": 0.0,
       "max": 0.0,
-      "runs": 1
+      "runs": 3
     }
   },
   "targets": [
@@ -181,7 +181,7 @@
       "metric": "board.node.precision",
       "op": ">=",
       "threshold": 0.9,
-      "value": 0.12121212121212122,
+      "value": 0.606518817204301,
       "pass": false,
       "spec": "9.3 node precision"
     },
@@ -189,7 +189,7 @@
       "metric": "board.node.core_recall",
       "op": ">=",
       "threshold": 1.0,
-      "value": 0.18181818181818182,
+      "value": 0.8636363636363636,
       "pass": false,
       "spec": "9.3 node recall (core)"
     },
@@ -205,15 +205,15 @@
       "metric": "board.edge.label_accuracy",
       "op": ">=",
       "threshold": 0.9,
-      "value": 0.75,
-      "pass": false,
+      "value": 0.9387254901960785,
+      "pass": true,
       "spec": "9.3 edge label accuracy"
     },
     {
       "metric": "board.sticky.recall",
       "op": ">=",
       "threshold": 0.9,
-      "value": 0.2,
+      "value": 0.3111111111111111,
       "pass": false,
       "spec": "9.3 sticky recall"
     },
@@ -229,7 +229,7 @@
       "metric": "board.chrome_fp",
       "op": "<=",
       "threshold": 0.0,
-      "value": 17.0,
+      "value": 35.333333333333336,
       "pass": false,
       "spec": "9.3 UI-chrome false positives"
     }
@@ -249,1195 +249,6 @@
   "not_run": [],
   "errors": [],
   "details": {
-    "cases": [
-      {
-        "board": {
-          "edges": [
-            {
-              "direction": "forward",
-              "dst": "Queue",
-              "label": "REST",
-              "src": "Ledger API",
-              "style": "solid"
-            },
-            {
-              "direction": "forward",
-              "dst": "Parcel Store",
-              "label": "gRPC",
-              "src": "Queue",
-              "style": "solid"
-            }
-          ],
-          "nodes": [
-            {
-              "bbox": {
-                "x1": 336.9791666666667,
-                "x2": 467.4479166666667,
-                "y1": 258.7002096436059,
-                "y2": 337.0020964360587
-              },
-              "text": "Ledger API"
-            },
-            {
-              "bbox": {
-                "x1": 815.3645833333334,
-                "x2": 945.8333333333334,
-                "y1": 258.7002096436059,
-                "y2": 337.0020964360587
-              },
-              "text": "Queue"
-            },
-            {
-              "bbox": {
-                "x1": 1163.28125,
-                "x2": 1293.75,
-                "y1": 258.7002096436059,
-                "y2": 337.0020964360587
-              },
-              "text": "Parcel Store"
-            }
-          ],
-          "other_text": [
-            "Who owns retries?"
-          ],
-          "owner_tags": [
-            {
-              "name": "Casey",
-              "near": "Parcel Store"
-            },
-            {
-              "name": "Quinn",
-              "near": "Parcel Store"
-            }
-          ],
-          "stickies": []
-        },
-        "case": "board_basic",
-        "classify_method": "model",
-        "error": null,
-        "gold_screen": "whiteboard",
-        "latency_s": 13.870000000000001,
-        "pred_screen": "whiteboard",
-        "score": {
-          "chrome_fp": 0,
-          "chrome_hits": [],
-          "core_nodes": {
-            "correct": 0,
-            "total": 3
-          },
-          "edge_direction": {
-            "correct": 0,
-            "total": 0
-          },
-          "edge_label": {
-            "correct": 0,
-            "total": 0
-          },
-          "edge_style": {
-            "correct": 0,
-            "total": 0
-          },
-          "edge_uncertain": 0,
-          "edges": {
-            "fn_": 2,
-            "fp": 2,
-            "tp": 0
-          },
-          "nodes": {
-            "fn_": 3,
-            "fp": 3,
-            "tp": 0
-          },
-          "owner_fp": 2,
-          "owners": {
-            "correct": 0,
-            "total": 0
-          },
-          "stickies": {
-            "fn_": 1,
-            "fp": 0,
-            "tp": 0
-          },
-          "sticky_cer": {
-            "errors": 0,
-            "reference_len": 0
-          }
-        }
-      },
-      {
-        "board": {
-          "edges": [
-            {
-              "direction": "forward",
-              "dst": "Signal Hub",
-              "label": "MILS",
-              "src": "Vault Proxy",
-              "style": "solid"
-            },
-            {
-              "direction": "forward",
-              "dst": "Cache TTL still open",
-              "label": "purge",
-              "src": "Signal Hub",
-              "style": "solid"
-            }
-          ],
-          "nodes": [
-            {
-              "bbox": {
-                "x1": 336.9791666666667,
-                "x2": 423.95833333333337,
-                "y1": 258.7002096436059,
-                "y2": 337.0020964360587
-              },
-              "text": "Vault Proxy"
-            },
-            {
-              "bbox": {
-                "x1": 684.8958333333334,
-                "x2": 771.875,
-                "y1": 258.7002096436059,
-                "y2": 337.0020964360587
-              },
-              "text": "Signal Hub"
-            },
-            {
-              "bbox": {
-                "x1": 771.875,
-                "x2": 858.8541666666667,
-                "y1": 467.5052410901468,
-                "y2": 554.5073375262054
-              },
-              "text": "Pixel CDN"
-            },
-            {
-              "bbox": {
-                "x1": 336.9791666666667,
-                "x2": 423.95833333333337,
-                "y1": 685.0104821802936,
-                "y2": 772.0125786163522
-              },
-              "text": "Cache TTL still open"
-            }
-          ],
-          "other_text": [
-            "Riley Park",
-            "Casey Moreno",
-            "Quinn Adler",
-            "100% Fit Undo"
-          ],
-          "owner_tags": [
-            {
-              "name": "Casey",
-              "near": "Signal Hub"
-            },
-            {
-              "name": "Quinn",
-              "near": "Signal Hub"
-            }
-          ],
-          "stickies": []
-        },
-        "case": "board_chrome_menu",
-        "classify_method": "model",
-        "error": null,
-        "gold_screen": "whiteboard",
-        "latency_s": 17.164,
-        "pred_screen": "whiteboard",
-        "score": {
-          "chrome_fp": 4,
-          "chrome_hits": [
-            "Riley Park",
-            "Casey Moreno",
-            "Quinn Adler",
-            "100% Fit Undo"
-          ],
-          "core_nodes": {
-            "correct": 0,
-            "total": 3
-          },
-          "edge_direction": {
-            "correct": 1,
-            "total": 1
-          },
-          "edge_label": {
-            "correct": 0,
-            "total": 1
-          },
-          "edge_style": {
-            "correct": 1,
-            "total": 1
-          },
-          "edge_uncertain": 0,
-          "edges": {
-            "fn_": 1,
-            "fp": 1,
-            "tp": 1
-          },
-          "nodes": {
-            "fn_": 3,
-            "fp": 4,
-            "tp": 0
-          },
-          "owner_fp": 1,
-          "owners": {
-            "correct": 1,
-            "total": 1
-          },
-          "stickies": {
-            "fn_": 1,
-            "fp": 0,
-            "tp": 0
-          },
-          "sticky_cer": {
-            "errors": 0,
-            "reference_len": 0
-          }
-        }
-      },
-      {
-        "board": {
-          "edges": [
-            {
-              "direction": "forward",
-              "dst": "Harbor Gateway",
-              "label": "GraphQL",
-              "src": "Beacon Web",
-              "style": "solid"
-            },
-            {
-              "direction": "forward",
-              "dst": "Nimbus Auth",
-              "label": "OAuth",
-              "src": "Harbor Gateway",
-              "style": "solid"
-            },
-            {
-              "direction": "forward",
-              "dst": "Design Kit",
-              "label": "Relates copy to layout blocks",
-              "src": "Harbor Gateway",
-              "style": "dashed"
-            },
-            {
-              "direction": "forward",
-              "dst": "Idea: batch uploads",
-              "label": "",
-              "src": "Beacon Web",
-              "style": "solid"
-            }
-          ],
-          "nodes": [
-            {
-              "bbox": {
-                "x1": 336.9791666666667,
-                "x2": 510.9375,
-                "y1": 258.7002096436059,
-                "y2": 337.0020964360587
-              },
-              "text": "Beacon Web"
-            },
-            {
-              "bbox": {
-                "x1": 684.8958333333334,
-                "x2": 858.8541666666667,
-                "y1": 258.7002096436059,
-                "y2": 337.0020964360587
-              },
-              "text": "Harbor Gateway"
-            },
-            {
-              "bbox": {
-                "x1": 945.8333333333334,
-                "x2": 1119.7916666666667,
-                "y1": 258.7002096436059,
-                "y2": 337.0020964360587
-              },
-              "text": "Nimbus Auth"
-            },
-            {
-              "bbox": {
-                "x1": 336.9791666666667,
-                "x2": 510.9375,
-                "y1": 424.0041928721174,
-                "y2": 511.0062893081761
-              },
-              "text": "Design Kit"
-            },
-            {
-              "bbox": {
-                "x1": 336.9791666666667,
-                "x2": 510.9375,
-                "y1": 685.0104821802936,
-                "y2": 772.0125786163522
-              },
-              "text": "Idea: batch uploads"
-            },
-            {
-              "bbox": {
-                "x1": 510.9375,
-                "x2": 684.8958333333334,
-                "y1": 685.0104821802936,
-                "y2": 772.0125786163522
-              },
-              "text": "Milestone 1: reorder feed"
-            }
-          ],
-          "other_text": [
-            "Riley Park",
-            "Casey Moreno",
-            "Quinn Adler",
-            "100% Fit Undo"
-          ],
-          "owner_tags": [
-            {
-              "name": "Casey",
-              "near": "Nimbus Auth"
-            },
-            {
-              "name": "Quinn",
-              "near": "Nimbus Auth"
-            }
-          ],
-          "stickies": []
-        },
-        "case": "board_dashed",
-        "classify_method": "model",
-        "error": null,
-        "gold_screen": "whiteboard",
-        "latency_s": 21.418,
-        "pred_screen": "whiteboard",
-        "score": {
-          "chrome_fp": 4,
-          "chrome_hits": [
-            "Riley Park",
-            "Casey Moreno",
-            "Quinn Adler",
-            "100% Fit Undo"
-          ],
-          "core_nodes": {
-            "correct": 0,
-            "total": 4
-          },
-          "edge_direction": {
-            "correct": 2,
-            "total": 2
-          },
-          "edge_label": {
-            "correct": 2,
-            "total": 2
-          },
-          "edge_style": {
-            "correct": 2,
-            "total": 2
-          },
-          "edge_uncertain": 0,
-          "edges": {
-            "fn_": 2,
-            "fp": 2,
-            "tp": 2
-          },
-          "nodes": {
-            "fn_": 4,
-            "fp": 6,
-            "tp": 0
-          },
-          "owner_fp": 2,
-          "owners": {
-            "correct": 0,
-            "total": 0
-          },
-          "stickies": {
-            "fn_": 2,
-            "fp": 0,
-            "tp": 0
-          },
-          "sticky_cer": {
-            "errors": 0,
-            "reference_len": 0
-          }
-        }
-      },
-      {
-        "board": {
-          "edges": [
-            {
-              "direction": "forward",
-              "dst": "Summit App",
-              "label": "events",
-              "src": "Ledger Service",
-              "style": "solid"
-            },
-            {
-              "direction": "forward",
-              "dst": "Parcel Store",
-              "label": "REST",
-              "src": "Ledger API",
-              "style": "solid"
-            },
-            {
-              "direction": "forward",
-              "dst": "Do we need a new queue?",
-              "label": "webhook",
-              "src": "Parcel Store",
-              "style": "solid"
-            }
-          ],
-          "nodes": [
-            {
-              "bbox": {
-                "x1": 380.46875,
-                "x2": 484.84375,
-                "y1": 258.7002096436059,
-                "y2": 337.0020964360587
-              },
-              "text": "Ledger Service"
-            },
-            {
-              "bbox": {
-                "x1": 728.3854166666667,
-                "x2": 919.7395833333334,
-                "y1": 258.7002096436059,
-                "y2": 337.0020964360587
-              },
-              "text": "Summit App"
-            },
-            {
-              "bbox": {
-                "x1": 380.46875,
-                "x2": 484.84375,
-                "y1": 493.6058700209644,
-                "y2": 589.308176100629
-              },
-              "text": "Ledger API"
-            },
-            {
-              "bbox": {
-                "x1": 728.3854166666667,
-                "x2": 919.7395833333334,
-                "y1": 493.6058700209644,
-                "y2": 589.308176100629
-              },
-              "text": "Parcel Store"
-            },
-            {
-              "bbox": {
-                "x1": 380.46875,
-                "x2": 484.84375,
-                "y1": 728.5115303983229,
-                "y2": 824.2138364779875
-              },
-              "text": "Do we need a new queue?"
-            }
-          ],
-          "other_text": [
-            "Riley Park",
-            "Casey Moreno",
-            "Quinn Adler"
-          ],
-          "owner_tags": [
-            {
-              "name": "Jordan",
-              "near": "Ledger API"
-            }
-          ],
-          "stickies": []
-        },
-        "case": "board_owners",
-        "classify_method": "model",
-        "error": null,
-        "gold_screen": "whiteboard",
-        "latency_s": 18.714,
-        "pred_screen": "whiteboard",
-        "score": {
-          "chrome_fp": 3,
-          "chrome_hits": [
-            "Riley Park",
-            "Casey Moreno",
-            "Quinn Adler"
-          ],
-          "core_nodes": {
-            "correct": 3,
-            "total": 4
-          },
-          "edge_direction": {
-            "correct": 1,
-            "total": 1
-          },
-          "edge_label": {
-            "correct": 0,
-            "total": 1
-          },
-          "edge_style": {
-            "correct": 1,
-            "total": 1
-          },
-          "edge_uncertain": 0,
-          "edges": {
-            "fn_": 3,
-            "fp": 2,
-            "tp": 1
-          },
-          "nodes": {
-            "fn_": 1,
-            "fp": 2,
-            "tp": 3
-          },
-          "owner_fp": 0,
-          "owners": {
-            "correct": 1,
-            "total": 3
-          },
-          "stickies": {
-            "fn_": 1,
-            "fp": 0,
-            "tp": 0
-          },
-          "sticky_cer": {
-            "errors": 0,
-            "reference_len": 0
-          }
-        }
-      },
-      {
-        "board": {
-          "edges": [
-            {
-              "direction": "forward",
-              "dst": "Rules Engine",
-              "label": "validate",
-              "src": "Intake Form",
-              "style": "solid"
-            },
-            {
-              "direction": "forward",
-              "dst": "Audit Log",
-              "label": "append",
-              "src": "Rules Engine",
-              "style": "solid"
-            },
-            {
-              "direction": "forward",
-              "dst": "Metrics Store",
-              "label": "trigger",
-              "src": "Rules Engine",
-              "style": "solid"
-            },
-            {
-              "direction": "forward",
-              "dst": "Review Queue",
-              "label": "manual",
-              "src": "Intake Form",
-              "style": "solid"
-            },
-            {
-              "direction": "forward",
-              "dst": "Notifier",
-              "label": "email",
-              "src": "Review Queue",
-              "style": "solid"
-            }
-          ],
-          "nodes": [
-            {
-              "bbox": {
-                "x1": 336.9791666666667,
-                "x2": 423.95833333333337,
-                "y1": 258.7002096436059,
-                "y2": 337.0020964360587
-              },
-              "text": "Intake Form"
-            },
-            {
-              "bbox": {
-                "x1": 684.8958333333334,
-                "x2": 771.875,
-                "y1": 258.7002096436059,
-                "y2": 337.0020964360587
-              },
-              "text": "Rules Engine"
-            },
-            {
-              "bbox": {
-                "x1": 1032.8125,
-                "x2": 1119.7916666666667,
-                "y1": 258.7002096436059,
-                "y2": 337.0020964360587
-              },
-              "text": "Review Queue"
-            },
-            {
-              "bbox": {
-                "x1": 858.8541666666667,
-                "x2": 945.8333333333334,
-                "y1": 511.0062893081761,
-                "y2": 598.0083857442348
-              },
-              "text": "Audit Log"
-            },
-            {
-              "bbox": {
-                "x1": 684.8958333333334,
-                "x2": 771.875,
-                "y1": 511.0062893081761,
-                "y2": 598.0083857442348
-              },
-              "text": "Notifier"
-            },
-            {
-              "bbox": {
-                "x1": 1032.8125,
-                "x2": 1119.7916666666667,
-                "y1": 511.0062893081761,
-                "y2": 598.0083857442348
-              },
-              "text": "Metrics Store"
-            }
-          ],
-          "other_text": [
-            "Riley Park",
-            "Casey Moreno",
-            "Quinn Adler"
-          ],
-          "owner_tags": [
-            {
-              "name": "Casey",
-              "near": "Rules Engine"
-            },
-            {
-              "name": "Quinn",
-              "near": "Metrics Store"
-            }
-          ],
-          "stickies": [
-            {
-              "bbox": {
-                "x1": 293.4895833333333,
-                "x2": 423.95833333333337,
-                "y1": 685.0104821802936,
-                "y2": 772.0125786163522
-              },
-              "text": "Rename audit fields?"
-            },
-            {
-              "bbox": {
-                "x1": 510.9375,
-                "x2": 684.8958333333334,
-                "y1": 685.0104821802936,
-                "y2": 772.0125786163522
-              },
-              "text": "Idea: weekly digest"
-            },
-            {
-              "bbox": {
-                "x1": 771.875,
-                "x2": 945.8333333333334,
-                "y1": 685.0104821802936,
-                "y2": 772.0125786163522
-              },
-              "text": "Out of scope: exports"
-            }
-          ]
-        },
-        "case": "board_small_text",
-        "classify_method": "model",
-        "error": null,
-        "gold_screen": "whiteboard",
-        "latency_s": 30.608,
-        "pred_screen": "whiteboard",
-        "score": {
-          "chrome_fp": 3,
-          "chrome_hits": [
-            "Riley Park",
-            "Casey Moreno",
-            "Quinn Adler"
-          ],
-          "core_nodes": {
-            "correct": 0,
-            "total": 6
-          },
-          "edge_direction": {
-            "correct": 4,
-            "total": 4
-          },
-          "edge_label": {
-            "correct": 4,
-            "total": 4
-          },
-          "edge_style": {
-            "correct": 4,
-            "total": 4
-          },
-          "edge_uncertain": 0,
-          "edges": {
-            "fn_": 2,
-            "fp": 1,
-            "tp": 4
-          },
-          "nodes": {
-            "fn_": 6,
-            "fp": 6,
-            "tp": 0
-          },
-          "owner_fp": 2,
-          "owners": {
-            "correct": 0,
-            "total": 0
-          },
-          "stickies": {
-            "fn_": 0,
-            "fp": 0,
-            "tp": 3
-          },
-          "sticky_cer": {
-            "errors": 0,
-            "reference_len": 60
-          }
-        }
-      },
-      {
-        "board": {
-          "edges": [
-            {
-              "direction": "forward",
-              "dst": "Tab Picker",
-              "label": "",
-              "src": "Home Feed",
-              "style": "solid"
-            },
-            {
-              "direction": "forward",
-              "dst": "Step log",
-              "label": "",
-              "src": "Tab Picker",
-              "style": "solid"
-            }
-          ],
-          "nodes": [
-            {
-              "bbox": {
-                "x1": 336.9791666666667,
-                "x2": 510.9375,
-                "y1": 258.7002096436059,
-                "y2": 337.0020964360587
-              },
-              "text": "Home Feed"
-            },
-            {
-              "bbox": {
-                "x1": 771.875,
-                "x2": 945.8333333333334,
-                "y1": 258.7002096436059,
-                "y2": 337.0020964360587
-              },
-              "text": "Tab Picker"
-            },
-            {
-              "bbox": {
-                "x1": 336.9791666666667,
-                "x2": 423.95833333333337,
-                "y1": 685.0104821802936,
-                "y2": 772.0125786163522
-              },
-              "text": "Step log"
-            },
-            {
-              "bbox": {
-                "x1": 510.9375,
-                "x2": 597.9166666666667,
-                "y1": 685.0104821802936,
-                "y2": 772.0125786163522
-              },
-              "text": "Past entries"
-            },
-            {
-              "bbox": {
-                "x1": 684.8958333333334,
-                "x2": 771.875,
-                "y1": 685.0104821802936,
-                "y2": 772.0125786163522
-              },
-              "text": "Tips for you"
-            },
-            {
-              "bbox": {
-                "x1": 858.8541666666667,
-                "x2": 945.8333333333334,
-                "y1": 685.0104821802936,
-                "y2": 772.0125786163522
-              },
-              "text": "Group posts"
-            },
-            {
-              "bbox": {
-                "x1": 1032.8125,
-                "x2": 1119.7916666666667,
-                "y1": 685.0104821802936,
-                "y2": 772.0125786163522
-              },
-              "text": "Unread notes"
-            },
-            {
-              "bbox": {
-                "x1": 336.9791666666667,
-                "x2": 423.95833333333337,
-                "y1": 772.0125786163522,
-                "y2": 859.0146750524109
-              },
-              "text": "Reminders"
-            },
-            {
-              "bbox": {
-                "x1": 510.9375,
-                "x2": 684.8958333333334,
-                "y1": 772.0125786163522,
-                "y2": 859.0146750524109
-              },
-              "text": "Two columns or one?"
-            }
-          ],
-          "other_text": [
-            "100% Fit Undo"
-          ],
-          "owner_tags": [
-            {
-              "name": "Casey Moreno",
-              "near": ""
-            },
-            {
-              "name": "Quinn Adler",
-              "near": ""
-            }
-          ],
-          "stickies": []
-        },
-        "case": "board_sticky_grid",
-        "classify_method": "model",
-        "error": null,
-        "gold_screen": "whiteboard",
-        "latency_s": 33.546,
-        "pred_screen": "whiteboard",
-        "score": {
-          "chrome_fp": 3,
-          "chrome_hits": [
-            "Casey Moreno",
-            "Quinn Adler",
-            "100% Fit Undo"
-          ],
-          "core_nodes": {
-            "correct": 1,
-            "total": 2
-          },
-          "edge_direction": {
-            "correct": 0,
-            "total": 0
-          },
-          "edge_label": {
-            "correct": 0,
-            "total": 0
-          },
-          "edge_style": {
-            "correct": 0,
-            "total": 0
-          },
-          "edge_uncertain": 0,
-          "edges": {
-            "fn_": 1,
-            "fp": 2,
-            "tp": 0
-          },
-          "nodes": {
-            "fn_": 1,
-            "fp": 8,
-            "tp": 1
-          },
-          "owner_fp": 2,
-          "owners": {
-            "correct": 0,
-            "total": 0
-          },
-          "stickies": {
-            "fn_": 7,
-            "fp": 0,
-            "tp": 0
-          },
-          "sticky_cer": {
-            "errors": 0,
-            "reference_len": 0
-          }
-        }
-      },
-      {
-        "board": null,
-        "case": "chat_channel",
-        "classify_method": "model",
-        "error": null,
-        "gold_screen": "chat",
-        "latency_s": 6.592,
-        "pred_screen": "chat",
-        "score": {
-          "chrome_fp": 0,
-          "chrome_hits": [],
-          "core_nodes": {
-            "correct": 0,
-            "total": 0
-          },
-          "edge_direction": {
-            "correct": 0,
-            "total": 0
-          },
-          "edge_label": {
-            "correct": 0,
-            "total": 0
-          },
-          "edge_style": {
-            "correct": 0,
-            "total": 0
-          },
-          "edge_uncertain": 0,
-          "edges": {
-            "fn_": 0,
-            "fp": 0,
-            "tp": 0
-          },
-          "nodes": {
-            "fn_": 0,
-            "fp": 0,
-            "tp": 0
-          },
-          "owner_fp": 0,
-          "owners": {
-            "correct": 0,
-            "total": 0
-          },
-          "stickies": {
-            "fn_": 0,
-            "fp": 0,
-            "tp": 0
-          },
-          "sticky_cer": {
-            "errors": 0,
-            "reference_len": 0
-          }
-        }
-      },
-      {
-        "board": null,
-        "case": "cms_document_list",
-        "classify_method": "model",
-        "error": null,
-        "gold_screen": "cms",
-        "latency_s": 1.95,
-        "pred_screen": "cms",
-        "score": {
-          "chrome_fp": 0,
-          "chrome_hits": [],
-          "core_nodes": {
-            "correct": 0,
-            "total": 0
-          },
-          "edge_direction": {
-            "correct": 0,
-            "total": 0
-          },
-          "edge_label": {
-            "correct": 0,
-            "total": 0
-          },
-          "edge_style": {
-            "correct": 0,
-            "total": 0
-          },
-          "edge_uncertain": 0,
-          "edges": {
-            "fn_": 0,
-            "fp": 0,
-            "tp": 0
-          },
-          "nodes": {
-            "fn_": 0,
-            "fp": 0,
-            "tp": 0
-          },
-          "owner_fp": 0,
-          "owners": {
-            "correct": 0,
-            "total": 0
-          },
-          "stickies": {
-            "fn_": 0,
-            "fp": 0,
-            "tp": 0
-          },
-          "sticky_cer": {
-            "errors": 0,
-            "reference_len": 0
-          }
-        }
-      },
-      {
-        "board": null,
-        "case": "cms_editor",
-        "classify_method": "model",
-        "error": null,
-        "gold_screen": "cms",
-        "latency_s": 3.772,
-        "pred_screen": "cms",
-        "score": {
-          "chrome_fp": 0,
-          "chrome_hits": [],
-          "core_nodes": {
-            "correct": 0,
-            "total": 0
-          },
-          "edge_direction": {
-            "correct": 0,
-            "total": 0
-          },
-          "edge_label": {
-            "correct": 0,
-            "total": 0
-          },
-          "edge_style": {
-            "correct": 0,
-            "total": 0
-          },
-          "edge_uncertain": 0,
-          "edges": {
-            "fn_": 0,
-            "fp": 0,
-            "tp": 0
-          },
-          "nodes": {
-            "fn_": 0,
-            "fp": 0,
-            "tp": 0
-          },
-          "owner_fp": 0,
-          "owners": {
-            "correct": 0,
-            "total": 0
-          },
-          "stickies": {
-            "fn_": 0,
-            "fp": 0,
-            "tp": 0
-          },
-          "sticky_cer": {
-            "errors": 0,
-            "reference_len": 0
-          }
-        }
-      },
-      {
-        "board": null,
-        "case": "meet_gallery",
-        "classify_method": "model",
-        "error": null,
-        "gold_screen": "meet_gallery",
-        "latency_s": 1.95,
-        "pred_screen": "meet_gallery",
-        "score": {
-          "chrome_fp": 0,
-          "chrome_hits": [],
-          "core_nodes": {
-            "correct": 0,
-            "total": 0
-          },
-          "edge_direction": {
-            "correct": 0,
-            "total": 0
-          },
-          "edge_label": {
-            "correct": 0,
-            "total": 0
-          },
-          "edge_style": {
-            "correct": 0,
-            "total": 0
-          },
-          "edge_uncertain": 0,
-          "edges": {
-            "fn_": 0,
-            "fp": 0,
-            "tp": 0
-          },
-          "nodes": {
-            "fn_": 0,
-            "fp": 0,
-            "tp": 0
-          },
-          "owner_fp": 0,
-          "owners": {
-            "correct": 0,
-            "total": 0
-          },
-          "stickies": {
-            "fn_": 0,
-            "fp": 0,
-            "tp": 0
-          },
-          "sticky_cer": {
-            "errors": 0,
-            "reference_len": 0
-          }
-        }
-      },
-      {
-        "board": null,
-        "case": "terminal_build",
-        "classify_method": "model",
-        "error": null,
-        "gold_screen": "code",
-        "latency_s": 5.317,
-        "pred_screen": "code",
-        "score": {
-          "chrome_fp": 0,
-          "chrome_hits": [],
-          "core_nodes": {
-            "correct": 0,
-            "total": 0
-          },
-          "edge_direction": {
-            "correct": 0,
-            "total": 0
-          },
-          "edge_label": {
-            "correct": 0,
-            "total": 0
-          },
-          "edge_style": {
-            "correct": 0,
-            "total": 0
-          },
-          "edge_uncertain": 0,
-          "edges": {
-            "fn_": 0,
-            "fp": 0,
-            "tp": 0
-          },
-          "nodes": {
-            "fn_": 0,
-            "fp": 0,
-            "tp": 0
-          },
-          "owner_fp": 0,
-          "owners": {
-            "correct": 0,
-            "total": 0
-          },
-          "stickies": {
-            "fn_": 0,
-            "fp": 0,
-            "tp": 0
-          },
-          "sticky_cer": {
-            "errors": 0,
-            "reference_len": 0
-          }
-        }
-      }
-    ],
     "screen_confusion": {
       "chat": {
         "chat": 1
@@ -1454,7 +265,1235 @@
       "whiteboard": {
         "whiteboard": 6
       }
-    }
+    },
+    "cases": [
+      {
+        "case": "board_basic",
+        "gold_screen": "whiteboard",
+        "pred_screen": "whiteboard",
+        "classify_method": "model",
+        "board": {
+          "nodes": [
+            {
+              "text": "Ledger API",
+              "bbox": {
+                "x1": 342.80729166666663,
+                "y1": 247.05332086061742,
+                "x2": 638.9010416666666,
+                "y2": 313.1758652946679
+              }
+            },
+            {
+              "text": "Orbit Queue",
+              "bbox": {
+                "x1": 836.2968749999999,
+                "y1": 210.53788587464922,
+                "x2": 1033.6927083333333,
+                "y2": 285.5425631431244
+              }
+            },
+            {
+              "text": "Parcel Store",
+              "bbox": {
+                "x1": 1250.828125,
+                "y1": 232.24976613657626,
+                "x2": 1448.2239583333333,
+                "y2": 313.1758652946679
+              }
+            }
+          ],
+          "edges": [
+            {
+              "src": "Ledger API",
+              "dst": "Orbit Queue",
+              "label": "REST",
+              "style": "solid",
+              "direction": "forward"
+            },
+            {
+              "src": "Orbit Queue",
+              "dst": "Parcel Store",
+              "label": "gRPC",
+              "style": "solid",
+              "direction": "forward"
+            }
+          ],
+          "stickies": [
+            {
+              "text": "Who owns retries?",
+              "bbox": {
+                "x1": 271.74479166666663,
+                "y1": 688.199251637044,
+                "x2": 477.0364583333333,
+                "y2": 832.287184284378
+              }
+            }
+          ],
+          "owner_tags": [
+            {
+              "name": "Riley Park",
+              "near": ""
+            },
+            {
+              "name": "Casey Moreno",
+              "near": ""
+            },
+            {
+              "name": "Quinn Adler",
+              "near": ""
+            }
+          ],
+          "other_text": [
+            "boardly.example/app/board/q3-roadmap",
+            "100% Fit Undo"
+          ]
+        },
+        "score": {
+          "nodes": {
+            "tp": 3,
+            "fp": 0,
+            "fn_": 0
+          },
+          "core_nodes": {
+            "correct": 3,
+            "total": 3
+          },
+          "edges": {
+            "tp": 2,
+            "fp": 0,
+            "fn_": 0
+          },
+          "edge_direction": {
+            "correct": 2,
+            "total": 2
+          },
+          "edge_uncertain": 0,
+          "edge_label": {
+            "correct": 2,
+            "total": 2
+          },
+          "edge_style": {
+            "correct": 2,
+            "total": 2
+          },
+          "stickies": {
+            "tp": 1,
+            "fp": 0,
+            "fn_": 0
+          },
+          "sticky_cer": {
+            "errors": 0,
+            "reference_len": 17
+          },
+          "owners": {
+            "correct": 0,
+            "total": 0
+          },
+          "owner_fp": 3,
+          "chrome_fp": 5,
+          "chrome_hits": [
+            "Riley Park",
+            "Casey Moreno",
+            "Quinn Adler",
+            "boardly.example/app/board/q3-roadmap",
+            "100% Fit Undo"
+          ]
+        },
+        "latency_s": 24.868400209,
+        "error": null
+      },
+      {
+        "case": "board_chrome_menu",
+        "gold_screen": "whiteboard",
+        "pred_screen": "whiteboard",
+        "classify_method": "model",
+        "board": {
+          "nodes": [
+            {
+              "text": "Vault Proxy",
+              "bbox": {
+                "x1": 398.078125,
+                "y1": 222.38072965388216,
+                "x2": 595.4739583333333,
+                "y2": 299.35921421889617
+              }
+            },
+            {
+              "text": "Signal Hub",
+              "bbox": {
+                "x1": 773.1302083333333,
+                "y1": 222.38072965388216,
+                "x2": 1021.8489583333333,
+                "y2": 299.35921421889617
+              }
+            },
+            {
+              "text": "Pixel CDN",
+              "bbox": {
+                "x1": 773.1302083333333,
+                "y1": 478.97567820392896,
+                "x2": 1021.8489583333333,
+                "y2": 555.954162768943
+              }
+            },
+            {
+              "text": "Cache TTL still open",
+              "bbox": {
+                "x1": 275.6927083333333,
+                "y1": 681.2909260991581,
+                "x2": 510.59374999999994,
+                "y2": 798.732460243218
+              }
+            }
+          ],
+          "edges": [
+            {
+              "src": "Vault Proxy",
+              "dst": "Signal Hub",
+              "label": "mTLS",
+              "style": "solid",
+              "direction": "forward"
+            },
+            {
+              "src": "Signal Hub",
+              "dst": "Pixel CDN",
+              "label": "purge",
+              "style": "solid",
+              "direction": "forward"
+            }
+          ],
+          "stickies": [
+            {
+              "text": "Convert to Lock Copy",
+              "bbox": {
+                "x1": 398.078125,
+                "y1": 350.67820392890553,
+                "x2": 792.8697916666666,
+                "y2": 400.02338634237606
+              }
+            }
+          ],
+          "owner_tags": [
+            {
+              "name": "Casey",
+              "near": "Signal Hub"
+            },
+            {
+              "name": "Casey",
+              "near": "Pixel CDN"
+            },
+            {
+              "name": "Quinn",
+              "near": "Pixel CDN"
+            }
+          ],
+          "other_text": [
+            "boardly.example/app/board/q3-roadmap",
+            "100% Fit Undo"
+          ]
+        },
+        "score": {
+          "nodes": {
+            "tp": 3,
+            "fp": 1,
+            "fn_": 0
+          },
+          "core_nodes": {
+            "correct": 3,
+            "total": 3
+          },
+          "edges": {
+            "tp": 2,
+            "fp": 0,
+            "fn_": 0
+          },
+          "edge_direction": {
+            "correct": 2,
+            "total": 2
+          },
+          "edge_uncertain": 0,
+          "edge_label": {
+            "correct": 2,
+            "total": 2
+          },
+          "edge_style": {
+            "correct": 2,
+            "total": 2
+          },
+          "stickies": {
+            "tp": 0,
+            "fp": 1,
+            "fn_": 1
+          },
+          "sticky_cer": {
+            "errors": 0,
+            "reference_len": 0
+          },
+          "owners": {
+            "correct": 1,
+            "total": 1
+          },
+          "owner_fp": 2,
+          "chrome_fp": 3,
+          "chrome_hits": [
+            "Convert to Lock Copy",
+            "boardly.example/app/board/q3-roadmap",
+            "100% Fit Undo"
+          ]
+        },
+        "latency_s": 16.036008375,
+        "error": null
+      },
+      {
+        "case": "board_dashed",
+        "gold_screen": "whiteboard",
+        "pred_screen": "whiteboard",
+        "classify_method": "model",
+        "board": {
+          "nodes": [
+            {
+              "text": "Beacon Web",
+              "bbox": {
+                "x1": 371.77083333333337,
+                "y1": 220.67395264116576,
+                "x2": 650.1041666666667,
+                "y2": 264.1621129326047
+              }
+            },
+            {
+              "text": "Harbor Gateway",
+              "bbox": {
+                "x1": 824.0625,
+                "y1": 220.67395264116576,
+                "x2": 1102.3958333333335,
+                "y2": 264.1621129326047
+              }
+            },
+            {
+              "text": "Nimbus Auth",
+              "bbox": {
+                "x1": 1276.3541666666667,
+                "y1": 220.67395264116576,
+                "x2": 1552.9479166666667,
+                "y2": 264.1621129326047
+              }
+            },
+            {
+              "text": "Design Kit",
+              "bbox": {
+                "x1": 371.77083333333337,
+                "y1": 498.99817850637527,
+                "x2": 650.1041666666667,
+                "y2": 542.4863387978141
+              }
+            }
+          ],
+          "edges": [
+            {
+              "src": "Beacon Web",
+              "dst": "Harbor Gateway",
+              "label": "GraphQL",
+              "style": "solid",
+              "direction": "forward"
+            },
+            {
+              "src": "Harbor Gateway",
+              "dst": "Nimbus Auth",
+              "label": "OAuth",
+              "style": "solid",
+              "direction": "forward"
+            },
+            {
+              "src": "Beacon Web",
+              "dst": "Design Kit",
+              "label": "Relates copy to layout blocks",
+              "style": "dashed",
+              "direction": "forward"
+            }
+          ],
+          "stickies": [
+            {
+              "text": "Idea: batch uploads",
+              "bbox": {
+                "x1": 276.09375,
+                "y1": 681.648451730419,
+                "x2": 510.9375,
+                "y2": 812.1129326047359
+              }
+            },
+            {
+              "text": "Milestone 1: reorder feed",
+              "bbox": {
+                "x1": 532.6822916666667,
+                "y1": 681.648451730419,
+                "x2": 767.5260416666666,
+                "y2": 812.1129326047359
+              }
+            }
+          ],
+          "owner_tags": [],
+          "other_text": [
+            "100% Fit Undo"
+          ]
+        },
+        "score": {
+          "nodes": {
+            "tp": 2,
+            "fp": 2,
+            "fn_": 2
+          },
+          "core_nodes": {
+            "correct": 2,
+            "total": 4
+          },
+          "edges": {
+            "tp": 3,
+            "fp": 0,
+            "fn_": 1
+          },
+          "edge_direction": {
+            "correct": 3,
+            "total": 3
+          },
+          "edge_uncertain": 0,
+          "edge_label": {
+            "correct": 2,
+            "total": 3
+          },
+          "edge_style": {
+            "correct": 2,
+            "total": 3
+          },
+          "stickies": {
+            "tp": 2,
+            "fp": 0,
+            "fn_": 0
+          },
+          "sticky_cer": {
+            "errors": 0,
+            "reference_len": 44
+          },
+          "owners": {
+            "correct": 0,
+            "total": 0
+          },
+          "owner_fp": 0,
+          "chrome_fp": 1,
+          "chrome_hits": [
+            "100% Fit Undo"
+          ]
+        },
+        "latency_s": 28.073581875,
+        "error": null
+      },
+      {
+        "case": "board_owners",
+        "gold_screen": "whiteboard",
+        "pred_screen": "whiteboard",
+        "classify_method": "model",
+        "board": {
+          "nodes": [
+            {
+              "text": "Relay Service",
+              "bbox": {
+                "x1": 401.5833333333333,
+                "y1": 211.80537534754401,
+                "x2": 551.4270833333333,
+                "y2": 301.7219647822057
+              }
+            },
+            {
+              "text": "Summit App",
+              "bbox": {
+                "x1": 801.1666666666666,
+                "y1": 211.80537534754401,
+                "x2": 951.0104166666665,
+                "y2": 301.7219647822057
+              }
+            },
+            {
+              "text": "Ledger API",
+              "bbox": {
+                "x1": 321.66666666666663,
+                "y1": 511.52734012974975,
+                "x2": 571.4062499999999,
+                "y2": 601.4439295644114
+              }
+            },
+            {
+              "text": "Parcel Store",
+              "bbox": {
+                "x1": 801.1666666666666,
+                "y1": 511.52734012974975,
+                "x2": 951.0104166666665,
+                "y2": 601.4439295644114
+              }
+            },
+            {
+              "text": "Do we need a new queue?",
+              "bbox": {
+                "x1": 269.7208333333333,
+                "y1": 701.3512511584801,
+                "x2": 501.47916666666663,
+                "y2": 841.2215013901761
+              }
+            }
+          ],
+          "edges": [
+            {
+              "src": "Relay Service",
+              "dst": "Ledger API",
+              "label": "SQL",
+              "style": "solid",
+              "direction": "forward"
+            },
+            {
+              "src": "Summit App",
+              "dst": "Ledger API",
+              "label": "events",
+              "style": "solid",
+              "direction": "forward"
+            },
+            {
+              "src": "Summit App",
+              "dst": "Parcel Store",
+              "label": "REST",
+              "style": "solid",
+              "direction": "forward"
+            },
+            {
+              "src": "Ledger API",
+              "dst": "Parcel Store",
+              "label": "webhook",
+              "style": "solid",
+              "direction": "forward"
+            }
+          ],
+          "stickies": [],
+          "owner_tags": [
+            {
+              "name": "Morgan",
+              "near": "Relay Service"
+            },
+            {
+              "name": "Avery",
+              "near": "Summit App"
+            },
+            {
+              "name": "Jordan",
+              "near": "Ledger API"
+            }
+          ],
+          "other_text": [
+            "Q3 roadmap - Boardly",
+            "Inbox (3)",
+            "boardly.example/app/board/q3-roadmap",
+            "Boards",
+            "Templates",
+            "Recent",
+            "Starred",
+            "Create frame"
+          ]
+        },
+        "score": {
+          "nodes": {
+            "tp": 3,
+            "fp": 2,
+            "fn_": 1
+          },
+          "core_nodes": {
+            "correct": 3,
+            "total": 4
+          },
+          "edges": {
+            "tp": 3,
+            "fp": 1,
+            "fn_": 1
+          },
+          "edge_direction": {
+            "correct": 3,
+            "total": 3
+          },
+          "edge_uncertain": 0,
+          "edge_label": {
+            "correct": 3,
+            "total": 3
+          },
+          "edge_style": {
+            "correct": 3,
+            "total": 3
+          },
+          "stickies": {
+            "tp": 0,
+            "fp": 0,
+            "fn_": 1
+          },
+          "sticky_cer": {
+            "errors": 0,
+            "reference_len": 0
+          },
+          "owners": {
+            "correct": 3,
+            "total": 3
+          },
+          "owner_fp": 0,
+          "chrome_fp": 8,
+          "chrome_hits": [
+            "Q3 roadmap - Boardly",
+            "Inbox (3)",
+            "boardly.example/app/board/q3-roadmap",
+            "Boards",
+            "Templates",
+            "Recent",
+            "Starred",
+            "Create frame"
+          ]
+        },
+        "latency_s": 22.845121333999998,
+        "error": null
+      },
+      {
+        "case": "board_small_text",
+        "gold_screen": "whiteboard",
+        "pred_screen": "whiteboard",
+        "classify_method": "model",
+        "board": {
+          "nodes": [
+            {
+              "text": "Intake Form",
+              "bbox": {
+                "x1": 374.53125,
+                "y1": 246.89864864864865,
+                "x2": 607.578125,
+                "y2": 308.21621621621625
+              }
+            },
+            {
+              "text": "Rules Engine",
+              "bbox": {
+                "x1": 787.4739583333334,
+                "y1": 246.89864864864865,
+                "x2": 1040.9635416666667,
+                "y2": 308.21621621621625
+              }
+            },
+            {
+              "text": "Audit Log",
+              "bbox": {
+                "x1": 1220.859375,
+                "y1": 246.89864864864865,
+                "x2": 1474.3489583333335,
+                "y2": 308.21621621621625
+              }
+            },
+            {
+              "text": "Review Queue",
+              "bbox": {
+                "x1": 374.53125,
+                "y1": 500.34459459459464,
+                "x2": 607.578125,
+                "y2": 561.6621621621622
+              }
+            },
+            {
+              "text": "Notifier",
+              "bbox": {
+                "x1": 869.2447916666667,
+                "y1": 500.34459459459464,
+                "x2": 1040.9635416666667,
+                "y2": 561.6621621621622
+              }
+            },
+            {
+              "text": "Metrics Store",
+              "bbox": {
+                "x1": 1220.859375,
+                "y1": 500.34459459459464,
+                "x2": 1474.3489583333335,
+                "y2": 561.6621621621622
+              }
+            }
+          ],
+          "edges": [
+            {
+              "src": "Intake Form",
+              "dst": "Rules Engine",
+              "label": "validate",
+              "style": "solid",
+              "direction": "forward"
+            },
+            {
+              "src": "Rules Engine",
+              "dst": "Audit Log",
+              "label": "append",
+              "style": "solid",
+              "direction": "forward"
+            },
+            {
+              "src": "Intake Form",
+              "dst": "Review Queue",
+              "label": "manual",
+              "style": "solid",
+              "direction": "forward"
+            },
+            {
+              "src": "Review Queue",
+              "dst": "Notifier",
+              "label": "email",
+              "style": "solid",
+              "direction": "forward"
+            },
+            {
+              "src": "Notifier",
+              "dst": "Metrics Store",
+              "label": "counts",
+              "style": "solid",
+              "direction": "forward"
+            }
+          ],
+          "stickies": [
+            {
+              "text": "Some audit logs?",
+              "bbox": {
+                "x1": 374.53125,
+                "y1": 688.3851351351352,
+                "x2": 509.453125,
+                "y2": 831.4594594594595
+              }
+            },
+            {
+              "text": "Idea: weekly digest",
+              "bbox": {
+                "x1": 542.1614583333334,
+                "y1": 688.3851351351352,
+                "x2": 775.2083333333334,
+                "y2": 831.4594594594595
+              }
+            },
+            {
+              "text": "Out of scope: exports",
+              "bbox": {
+                "x1": 799.7395833333334,
+                "y1": 680.2094594594595,
+                "x2": 1032.7864583333335,
+                "y2": 823.2837837837839
+              }
+            }
+          ],
+          "owner_tags": [
+            {
+              "name": "Riley Park",
+              "near": ""
+            },
+            {
+              "name": "Casey Moreno",
+              "near": ""
+            },
+            {
+              "name": "Quinn Adler",
+              "near": ""
+            }
+          ],
+          "other_text": [
+            "100% Fit Undo"
+          ]
+        },
+        "score": {
+          "nodes": {
+            "tp": 6,
+            "fp": 0,
+            "fn_": 0
+          },
+          "core_nodes": {
+            "correct": 6,
+            "total": 6
+          },
+          "edges": {
+            "tp": 5,
+            "fp": 0,
+            "fn_": 1
+          },
+          "edge_direction": {
+            "correct": 5,
+            "total": 5
+          },
+          "edge_uncertain": 0,
+          "edge_label": {
+            "correct": 5,
+            "total": 5
+          },
+          "edge_style": {
+            "correct": 5,
+            "total": 5
+          },
+          "stickies": {
+            "tp": 2,
+            "fp": 1,
+            "fn_": 1
+          },
+          "sticky_cer": {
+            "errors": 0,
+            "reference_len": 40
+          },
+          "owners": {
+            "correct": 0,
+            "total": 0
+          },
+          "owner_fp": 3,
+          "chrome_fp": 4,
+          "chrome_hits": [
+            "Riley Park",
+            "Casey Moreno",
+            "Quinn Adler",
+            "100% Fit Undo"
+          ]
+        },
+        "latency_s": 22.122765417,
+        "error": null
+      },
+      {
+        "case": "board_sticky_grid",
+        "gold_screen": "whiteboard",
+        "pred_screen": "whiteboard",
+        "classify_method": "model",
+        "board": {
+          "nodes": [
+            {
+              "text": "Home Feed",
+              "bbox": {
+                "x1": 358.5989583333333,
+                "y1": 232.24976613657626,
+                "x2": 602.3828125,
+                "y2": 281.5949485500468
+              }
+            },
+            {
+              "text": "Card Picker",
+              "bbox": {
+                "x1": 1271.5546875,
+                "y1": 207.577174929841,
+                "x2": 1470.9244791666665,
+                "y2": 281.5949485500468
+              }
+            },
+            {
+              "text": "Step log",
+              "bbox": {
+                "x1": 276.6796875,
+                "y1": 691.1599625818523,
+                "x2": 509.6067708333333,
+                "y2": 740.5051449953228
+              }
+            },
+            {
+              "text": "Past entries",
+              "bbox": {
+                "x1": 539.2161458333333,
+                "y1": 691.1599625818523,
+                "x2": 772.1432291666666,
+                "y2": 740.5051449953228
+              }
+            },
+            {
+              "text": "Tips for you",
+              "bbox": {
+                "x1": 801.7526041666666,
+                "y1": 691.1599625818523,
+                "x2": 1034.6796875,
+                "y2": 740.5051449953228
+              }
+            },
+            {
+              "text": "Group posts",
+              "bbox": {
+                "x1": 1064.2890625,
+                "y1": 691.1599625818523,
+                "x2": 1297.2161458333333,
+                "y2": 740.5051449953228
+              }
+            },
+            {
+              "text": "Unread notes",
+              "bbox": {
+                "x1": 1327.8125,
+                "y1": 691.1599625818523,
+                "x2": 1560.7395833333333,
+                "y2": 740.5051449953228
+              }
+            },
+            {
+              "text": "Reminders",
+              "bbox": {
+                "x1": 276.6796875,
+                "y1": 829.3264733395697,
+                "x2": 509.6067708333333,
+                "y2": 878.6716557530403
+              }
+            },
+            {
+              "text": "Two columns or one?",
+              "bbox": {
+                "x1": 539.2161458333333,
+                "y1": 829.3264733395697,
+                "x2": 772.1432291666666,
+                "y2": 878.6716557530403
+              }
+            }
+          ],
+          "edges": [
+            {
+              "src": "Home Feed",
+              "dst": "Card Picker",
+              "label": "orders cards",
+              "style": "solid",
+              "direction": "forward"
+            }
+          ],
+          "stickies": [],
+          "owner_tags": [
+            {
+              "name": "Riley Park",
+              "near": ""
+            },
+            {
+              "name": "Casey Moreno",
+              "near": ""
+            },
+            {
+              "name": "Quinn Adler",
+              "near": ""
+            }
+          ],
+          "other_text": [
+            "boardly.example/app/board/q3-roadmap",
+            "100% Fit Undo"
+          ]
+        },
+        "score": {
+          "nodes": {
+            "tp": 2,
+            "fp": 7,
+            "fn_": 0
+          },
+          "core_nodes": {
+            "correct": 2,
+            "total": 2
+          },
+          "edges": {
+            "tp": 1,
+            "fp": 0,
+            "fn_": 0
+          },
+          "edge_direction": {
+            "correct": 1,
+            "total": 1
+          },
+          "edge_uncertain": 0,
+          "edge_label": {
+            "correct": 1,
+            "total": 1
+          },
+          "edge_style": {
+            "correct": 1,
+            "total": 1
+          },
+          "stickies": {
+            "tp": 0,
+            "fp": 0,
+            "fn_": 7
+          },
+          "sticky_cer": {
+            "errors": 0,
+            "reference_len": 0
+          },
+          "owners": {
+            "correct": 0,
+            "total": 0
+          },
+          "owner_fp": 3,
+          "chrome_fp": 5,
+          "chrome_hits": [
+            "Riley Park",
+            "Casey Moreno",
+            "Quinn Adler",
+            "boardly.example/app/board/q3-roadmap",
+            "100% Fit Undo"
+          ]
+        },
+        "latency_s": 20.293568792000002,
+        "error": null
+      },
+      {
+        "case": "chat_channel",
+        "gold_screen": "chat",
+        "pred_screen": "chat",
+        "classify_method": "model",
+        "board": null,
+        "score": {
+          "nodes": {
+            "tp": 0,
+            "fp": 0,
+            "fn_": 0
+          },
+          "core_nodes": {
+            "correct": 0,
+            "total": 0
+          },
+          "edges": {
+            "tp": 0,
+            "fp": 0,
+            "fn_": 0
+          },
+          "edge_direction": {
+            "correct": 0,
+            "total": 0
+          },
+          "edge_uncertain": 0,
+          "edge_label": {
+            "correct": 0,
+            "total": 0
+          },
+          "edge_style": {
+            "correct": 0,
+            "total": 0
+          },
+          "stickies": {
+            "tp": 0,
+            "fp": 0,
+            "fn_": 0
+          },
+          "sticky_cer": {
+            "errors": 0,
+            "reference_len": 0
+          },
+          "owners": {
+            "correct": 0,
+            "total": 0
+          },
+          "owner_fp": 0,
+          "chrome_fp": 0,
+          "chrome_hits": []
+        },
+        "latency_s": 6.352206792,
+        "error": null
+      },
+      {
+        "case": "cms_document_list",
+        "gold_screen": "cms",
+        "pred_screen": "cms",
+        "classify_method": "model",
+        "board": null,
+        "score": {
+          "nodes": {
+            "tp": 0,
+            "fp": 0,
+            "fn_": 0
+          },
+          "core_nodes": {
+            "correct": 0,
+            "total": 0
+          },
+          "edges": {
+            "tp": 0,
+            "fp": 0,
+            "fn_": 0
+          },
+          "edge_direction": {
+            "correct": 0,
+            "total": 0
+          },
+          "edge_uncertain": 0,
+          "edge_label": {
+            "correct": 0,
+            "total": 0
+          },
+          "edge_style": {
+            "correct": 0,
+            "total": 0
+          },
+          "stickies": {
+            "tp": 0,
+            "fp": 0,
+            "fn_": 0
+          },
+          "sticky_cer": {
+            "errors": 0,
+            "reference_len": 0
+          },
+          "owners": {
+            "correct": 0,
+            "total": 0
+          },
+          "owner_fp": 0,
+          "chrome_fp": 0,
+          "chrome_hits": []
+        },
+        "latency_s": 1.853645625,
+        "error": null
+      },
+      {
+        "case": "cms_editor",
+        "gold_screen": "cms",
+        "pred_screen": "cms",
+        "classify_method": "model",
+        "board": null,
+        "score": {
+          "nodes": {
+            "tp": 0,
+            "fp": 0,
+            "fn_": 0
+          },
+          "core_nodes": {
+            "correct": 0,
+            "total": 0
+          },
+          "edges": {
+            "tp": 0,
+            "fp": 0,
+            "fn_": 0
+          },
+          "edge_direction": {
+            "correct": 0,
+            "total": 0
+          },
+          "edge_uncertain": 0,
+          "edge_label": {
+            "correct": 0,
+            "total": 0
+          },
+          "edge_style": {
+            "correct": 0,
+            "total": 0
+          },
+          "stickies": {
+            "tp": 0,
+            "fp": 0,
+            "fn_": 0
+          },
+          "sticky_cer": {
+            "errors": 0,
+            "reference_len": 0
+          },
+          "owners": {
+            "correct": 0,
+            "total": 0
+          },
+          "owner_fp": 0,
+          "chrome_fp": 0,
+          "chrome_hits": []
+        },
+        "latency_s": 1.839646458,
+        "error": null
+      },
+      {
+        "case": "meet_gallery",
+        "gold_screen": "meet_gallery",
+        "pred_screen": "meet_gallery",
+        "classify_method": "model",
+        "board": null,
+        "score": {
+          "nodes": {
+            "tp": 0,
+            "fp": 0,
+            "fn_": 0
+          },
+          "core_nodes": {
+            "correct": 0,
+            "total": 0
+          },
+          "edges": {
+            "tp": 0,
+            "fp": 0,
+            "fn_": 0
+          },
+          "edge_direction": {
+            "correct": 0,
+            "total": 0
+          },
+          "edge_uncertain": 0,
+          "edge_label": {
+            "correct": 0,
+            "total": 0
+          },
+          "edge_style": {
+            "correct": 0,
+            "total": 0
+          },
+          "stickies": {
+            "tp": 0,
+            "fp": 0,
+            "fn_": 0
+          },
+          "sticky_cer": {
+            "errors": 0,
+            "reference_len": 0
+          },
+          "owners": {
+            "correct": 0,
+            "total": 0
+          },
+          "owner_fp": 0,
+          "chrome_fp": 0,
+          "chrome_hits": []
+        },
+        "latency_s": 1.8229073329999999,
+        "error": null
+      },
+      {
+        "case": "terminal_build",
+        "gold_screen": "code",
+        "pred_screen": "code",
+        "classify_method": "model",
+        "board": null,
+        "score": {
+          "nodes": {
+            "tp": 0,
+            "fp": 0,
+            "fn_": 0
+          },
+          "core_nodes": {
+            "correct": 0,
+            "total": 0
+          },
+          "edges": {
+            "tp": 0,
+            "fp": 0,
+            "fn_": 0
+          },
+          "edge_direction": {
+            "correct": 0,
+            "total": 0
+          },
+          "edge_uncertain": 0,
+          "edge_label": {
+            "correct": 0,
+            "total": 0
+          },
+          "edge_style": {
+            "correct": 0,
+            "total": 0
+          },
+          "stickies": {
+            "tp": 0,
+            "fp": 0,
+            "fn_": 0
+          },
+          "sticky_cer": {
+            "errors": 0,
+            "reference_len": 0
+          },
+          "owners": {
+            "correct": 0,
+            "total": 0
+          },
+          "owner_fp": 0,
+          "chrome_fp": 0,
+          "chrome_hits": []
+        },
+        "latency_s": 6.348997167,
+        "error": null
+      }
+    ]
   },
   "status": "pass",
   "passed": true

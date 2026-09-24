@@ -1,0 +1,10 @@
+{
+  "record_version": 1,
+  "key": "7f433ed5fcbbd27c26ece6ba2737aac0d49f02936f4f8332f34ff7502356f575",
+  "kind": "classify",
+  "case": "board_dashed",
+  "model": "qwen2.5vl:7b",
+  "model_digest": "5ced39dfa4bac325dc183dd1e4febaa1c46b3ea28bce48896c8e69c1e79611cc",
+  "raw_text": "{\n  \"screen_type\": \"whiteboard\",\n  \"app_hint\": \"Boardly\",\n  \"bbox_2d\": [100, 50, 1024, 630],\n  \"confidence\": 0.95\n}",
+  "wall_s": 6.409
+}

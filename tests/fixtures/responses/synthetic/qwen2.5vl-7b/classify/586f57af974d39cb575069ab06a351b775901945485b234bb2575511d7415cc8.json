@@ -1,0 +1,10 @@
+{
+  "record_version": 1,
+  "key": "586f57af974d39cb575069ab06a351b775901945485b234bb2575511d7415cc8",
+  "kind": "classify",
+  "case": "board_chrome_menu",
+  "model": "qwen2.5vl:7b",
+  "model_digest": "5ced39dfa4bac325dc183dd1e4febaa1c46b3ea28bce48896c8e69c1e79611cc",
+  "raw_text": "{\n  \"screen_type\": \"whiteboard\",\n  \"app_hint\": \"Boardly\",\n  \"bbox_2d\": [10, 10, 1194, 660],\n  \"confidence\": 0.95\n}",
+  "wall_s": 3.698
+}
