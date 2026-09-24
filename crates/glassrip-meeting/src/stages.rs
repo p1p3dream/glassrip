@@ -222,6 +222,30 @@ fn unscale_end(e: &mut Option<EndEvidence>, s: AxisScale) {
 }
 
 /// Load the crop and compute pixel evidence for one keyframe, in reading coordinates.
+/// Load a keyframe's canvas. The file is either the canvas crop itself or the
+/// whole frame; in the second case (the image extends past the crop box, as
+/// `glassrip.canvas_crop` items that name their source frame do) the crop box
+/// cuts the canvas out.
+pub fn load_canvas(path: &Path, crop: Option<BBox>) -> Result<RgbImage, String> {
+    let image = image::open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?
+        .to_rgb8();
+    let (w, h) = (f64::from(image.width()), f64::from(image.height()));
+    let Some(c) = crop.filter(|c| c.is_well_formed()) else {
+        return Ok(image);
+    };
+    let whole_frame =
+        w >= c.x2 - 1.0 && h >= c.y2 - 1.0 && (w > c.width() + 1.0 || h > c.height() + 1.0);
+    if !whole_frame {
+        return Ok(image);
+    }
+    let x = c.x1.max(0.0).floor() as u32;
+    let y = c.y1.max(0.0).floor() as u32;
+    let cw = (c.x2.min(w) - f64::from(x)).round().max(1.0) as u32;
+    let ch = (c.y2.min(h) - f64::from(y)).round().max(1.0) as u32;
+    Ok(image::imageops::crop_imm(&image, x, y, cw, ch).to_image())
+}
+
 pub fn pixel_frame(fw: &FrameWork, params: &PixelCheckParams) -> EdgeDirectionItem {
     let empty = |error: String| EdgeDirectionItem {
         keyframe_id: fw.keyframe_id.clone(),
@@ -240,9 +264,9 @@ pub fn pixel_frame(fw: &FrameWork, params: &PixelCheckParams) -> EdgeDirectionIt
     let Some(path) = &fw.image else {
         return empty("no canvas crop for this keyframe".into());
     };
-    let image = match image::open(path) {
-        Ok(i) => i.to_rgb8(),
-        Err(e) => return empty(format!("{}: {e}", path.display())),
+    let image = match load_canvas(path, fw.crop) {
+        Ok(i) => i,
+        Err(e) => return empty(e),
     };
     let (iw, ih) = (f64::from(image.width()), f64::from(image.height()));
     let (check, scale) = coordinate_check(&fw.board, fw.canvas, iw, ih);
@@ -383,8 +407,8 @@ impl EdgeDirectionStage {
                     continue;
                 };
                 let Some(path) = &fw.image else { continue };
-                let image = match image::open(path) {
-                    Ok(i) => i.to_rgb8(),
+                let image = match load_canvas(path, fw.crop) {
+                    Ok(i) => i,
                     Err(e) => {
                         record.errors.push(format!("{}: {e}", item.keyframe_id));
                         continue;

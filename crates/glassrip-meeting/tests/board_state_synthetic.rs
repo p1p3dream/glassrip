@@ -93,6 +93,7 @@ fn board(s: &Spec) -> ValidatedBoard {
             src: a.to_string(),
             dst: b.to_string(),
             label: l.to_string(),
+            label_bbox: None,
             style: EdgeStyle::Solid,
             conf: 0.8,
         })
