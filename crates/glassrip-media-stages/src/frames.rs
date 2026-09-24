@@ -3,18 +3,20 @@
 //! The video timeline is cut into interval buckets `[k, k+1) * interval` after the video
 //! stream's start. Bucket membership is computed on integer PTS (the interval must be a
 //! whole number of time-base ticks), from the demuxer's packet index, so the expected grid
-//! is known before decoding. Each non-empty bucket yields one frame, `f<k:06>`:
+//! is known before decoding. Each non-empty bucket yields one frame, `f<k:06>`, the one
+//! nearest the bucket's center (like the prototype's `fps` filter, whose frame for a grid
+//! point comes from around the middle of its window):
 //!
-//! - `grid`: the first frame of the bucket (every frame is decoded);
-//! - `sync`: the first sync (key) frame of the bucket (`-skip_frame nokey`, only sync frames
-//!   are decoded, typically 20 to 30 times less work);
+//! - `grid`: nearest of all frames (every frame is decoded);
+//! - `sync`: nearest sync (key) frame (`-skip_frame nokey`, only sync frames are decoded,
+//!   typically 20 to 30 times less work);
 //! - `auto` (default): `sync` for a chunk when every non-empty bucket in it has a sync
 //!   frame, else `grid`.
 //!
 //! Decoding runs `ffmpeg -noautorotate -copyts` per chunk of buckets, several chunks in
-//! parallel, writing JPEGs to disk (bounded memory). `showinfo` output is parsed strictly:
-//! a frame count, PTS range, or bucket set that differs from the expectation is an error,
-//! never a positional guess. Frames go to the blob store and are linked into
+//! parallel, selecting the planned PTS exactly and writing JPEGs to disk (bounded memory).
+//! `showinfo` output is parsed strictly: a frame count, PTS, or bucket set that differs from
+//! the plan is an error, never a positional guess. Frames go to the blob store and are linked into
 //! `frames/sampled/` in the run directory.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -96,6 +98,8 @@ pub struct ChunkPlan {
     pub k1: u64,
     /// Non-empty buckets expected from this chunk.
     pub buckets: BTreeSet<u64>,
+    /// Planned frame PTS per bucket.
+    pub targets: BTreeMap<u64, i64>,
     /// Selection rule.
     pub sampling: Sampling,
     /// Whether this is the final chunk (decode to the end).
@@ -222,18 +226,30 @@ pub fn plan_chunks(
     chunk_buckets: u64,
     mode: SamplingMode,
 ) -> Result<Vec<ChunkPlan>, String> {
-    let mut any = BTreeSet::new();
-    let mut sync = BTreeSet::new();
+    // Per bucket: the frame and the sync frame nearest the bucket center (earlier on ties).
+    let mut any_best: BTreeMap<u64, i64> = BTreeMap::new();
+    let mut sync_best: BTreeMap<u64, i64> = BTreeMap::new();
+    let dist = |pts: i64, k: u64| (2 * (pts - p0 - k as i64 * q) - q).abs();
+    let offer = |m: &mut BTreeMap<u64, i64>, k: u64, pts: i64| {
+        let better = m
+            .get(&k)
+            .is_none_or(|&cur| (dist(pts, k), pts) < (dist(cur, k), cur));
+        if better {
+            m.insert(k, pts);
+        }
+    };
     for &(pts, key) in packets {
         if pts < p0 {
             continue;
         }
         let k = ((pts - p0) / q) as u64;
-        any.insert(k);
+        offer(&mut any_best, k, pts);
         if key {
-            sync.insert(k);
+            offer(&mut sync_best, k, pts);
         }
     }
+    let any: BTreeSet<u64> = any_best.keys().copied().collect();
+    let sync: BTreeSet<u64> = sync_best.keys().copied().collect();
     let Some(&last) = any.iter().next_back() else {
         return Err("no packets at or after the stream start".into());
     };
@@ -258,11 +274,21 @@ pub fn plan_chunks(
             SamplingMode::Auto if all_sync => Sampling::Sync,
             SamplingMode::Auto => Sampling::Grid,
         };
+        let source = if sampling == Sampling::Sync {
+            &sync_best
+        } else {
+            &any_best
+        };
+        let targets = buckets
+            .iter()
+            .filter_map(|k| source.get(k).map(|p| (*k, *p)))
+            .collect();
         chunks.push(ChunkPlan {
             index: u32::try_from(c).map_err(|_| "too many chunks".to_string())?,
             k0,
             k1,
             buckets,
+            targets,
             sampling,
             last: c + 1 == n_chunks,
         });
@@ -333,11 +359,15 @@ fn chunk_argv(
     out_pattern: &Path,
 ) -> Result<Vec<String>, String> {
     let (sp, ep) = (grid.start_pts(chunk.k0), grid.start_pts(chunk.k1));
-    let select = format!(
-        "select='gte(pts\\,{sp})*lt(pts\\,{ep})*(isnan(prev_pts)+lt(prev_pts\\,{sp})+gt(floor((pts-{p0})/{q})\\,floor((prev_pts-{p0})/{q})))'",
-        p0 = grid.p0,
-        q = grid.q
-    );
+    let terms: Vec<String> = chunk
+        .targets
+        .values()
+        .map(|p| format!("eq(pts\\,{p})"))
+        .collect();
+    if terms.is_empty() {
+        return Err(format!("chunk {} has no planned frames", chunk.index));
+    }
+    let select = format!("select='{}'", terms.join("+"));
     let vf = format!(
         "{select},showinfo,{}scale={}:-2:flags=bicubic",
         rotation_filter(rotation)?,
@@ -420,8 +450,17 @@ fn validate_chunk(
         if s.pts < sp || s.pts >= ep {
             return Err(format!("frame pts {} outside chunk [{sp}, {ep})", s.pts));
         }
+        let k0 = grid.bucket(s.pts).unwrap_or(u64::MAX);
+        if chunk.targets.get(&k0) != Some(&s.pts) {
+            return Err(format!(
+                "frame pts {} is not the planned frame of bucket {k0} ({:?})",
+                s.pts,
+                chunk.targets.get(&k0)
+            ));
+        }
         let secs = grid.secs(s.pts);
-        if (secs - s.pts_time).abs() > 1e-3 {
+        // showinfo prints pts_time with 6 significant digits (`%.6g`).
+        if (secs - s.pts_time).abs() > 1e-5 * secs.abs() + 1e-6 {
             return Err(format!(
                 "pts {} with time base {}/{} is {secs} s but showinfo says {} s (time base mismatch)",
                 s.pts, grid.tb.0, grid.tb.1, s.pts_time
@@ -589,7 +628,7 @@ impl Stage for FramesStage {
         "frames"
     }
     fn version(&self) -> u32 {
-        1
+        2
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
@@ -801,12 +840,24 @@ mod tests {
         assert_eq!(c[0].buckets, [0u64, 2].into_iter().collect());
     }
 
-    fn chunk(buckets: &[u64]) -> ChunkPlan {
+    #[test]
+    fn targets_are_nearest_the_bucket_center() {
+        // Bucket [0, 10): center 5. Frames at 0, 2, 4, 6, 8; sync at 0 and 6.
+        let packets = vec![(0, true), (2, false), (4, false), (6, true), (8, false)];
+        let sync = plan_chunks(&packets, 0, 10, 4, SamplingMode::Sync).unwrap();
+        assert_eq!(sync[0].targets[&0], 6);
+        let grid = plan_chunks(&packets, 0, 10, 4, SamplingMode::Grid).unwrap();
+        assert_eq!(grid[0].targets[&0], 4, "ties go to the earlier frame");
+    }
+
+    /// Chunk over buckets `0..4` with `(bucket, planned pts)`.
+    fn chunk(targets: &[(u64, i64)]) -> ChunkPlan {
         ChunkPlan {
             index: 0,
             k0: 0,
             k1: 4,
-            buckets: buckets.iter().copied().collect(),
+            buckets: targets.iter().map(|t| t.0).collect(),
+            targets: targets.iter().copied().collect(),
             sampling: Sampling::Grid,
             last: true,
         }
@@ -824,25 +875,42 @@ mod tests {
             pts,
             pts_time: pts as f64 / 10.0,
         };
+        let plan = chunk(&[(0, 0), (1, 12), (2, 20)]);
         let ok = [si(0, 0), si(1, 12), si(2, 20)];
-        assert_eq!(
-            validate_chunk(&ok, 3, &chunk(&[0, 1, 2]), &grid)
-                .unwrap()
-                .len(),
-            3
-        );
+        assert_eq!(validate_chunk(&ok, 3, &plan, &grid).unwrap().len(), 3);
+        assert!(validate_chunk(&ok, 2, &plan, &grid).is_err(), "file count");
+        let more = chunk(&[(0, 0), (1, 12), (2, 20), (3, 30)]);
         assert!(
-            validate_chunk(&ok, 2, &chunk(&[0, 1, 2]), &grid).is_err(),
-            "file count"
-        );
-        assert!(
-            validate_chunk(&ok, 3, &chunk(&[0, 1, 2, 3]), &grid).is_err(),
+            validate_chunk(&ok, 3, &more, &grid).is_err(),
             "missing bucket"
+        );
+        let other = [si(0, 0), si(1, 14), si(2, 20)];
+        assert!(
+            validate_chunk(&other, 3, &plan, &grid).is_err(),
+            "not the planned frame"
         );
         let dup = [si(0, 0), si(1, 4)];
         assert!(
-            validate_chunk(&dup, 2, &chunk(&[0]), &grid).is_err(),
+            validate_chunk(&dup, 2, &chunk(&[(0, 0)]), &grid).is_err(),
             "two in one bucket"
+        );
+        let g90 = Grid {
+            p0: 0,
+            q: 180_000,
+            tb: (1, 90_000),
+        };
+        let c = ChunkPlan {
+            k1: 1000,
+            ..chunk(&[(960, 172_836_419)])
+        };
+        let rounded = [ShowInfo {
+            n: 0,
+            pts: 172_836_419,
+            pts_time: 1920.4,
+        }];
+        assert!(
+            validate_chunk(&rounded, 1, &c, &g90).is_ok(),
+            "6 significant digits"
         );
         let skew = [ShowInfo {
             n: 0,
@@ -850,7 +918,7 @@ mod tests {
             pts_time: 5.0,
         }];
         assert!(
-            validate_chunk(&skew, 1, &chunk(&[0]), &grid).is_err(),
+            validate_chunk(&skew, 1, &chunk(&[(0, 0)]), &grid).is_err(),
             "time base"
         );
     }
@@ -862,7 +930,7 @@ mod tests {
             q: 180000,
             tb: (1, 90000),
         };
-        let mut c = chunk(&[5]);
+        let mut c = chunk(&[(5, 990_000), (6, 1_170_000)]);
         c.k0 = 4;
         c.k1 = 8;
         c.last = false;
@@ -886,6 +954,9 @@ mod tests {
             "{s}"
         );
         assert!(s.contains("transpose=clock,scale=1920:-2"), "{s}");
-        assert!(s.contains("gte(pts\\,720000)*lt(pts\\,1440000)"), "{s}");
+        assert!(
+            s.contains("select='eq(pts\\,990000)+eq(pts\\,1170000)'"),
+            "{s}"
+        );
     }
 }

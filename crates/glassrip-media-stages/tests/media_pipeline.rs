@@ -197,8 +197,9 @@ async fn slides_to_rectified_keyframes_then_all_cached() {
     for k in &kfs[1..] {
         assert_ne!(k.boundary.reason, BoundaryReason::Start);
     }
+    // Slides change at 6 s and 12 s; frames sit near bucket centers (odd seconds).
     assert!(
-        (kfs[1].t_start_s - 6.0).abs() < 0.1 && (kfs[2].t_start_s - 12.0).abs() < 0.1,
+        (6.0..8.0).contains(&kfs[1].t_start_s) && (12.0..14.0).contains(&kfs[2].t_start_s),
         "{kfs:#?}"
     );
     assert!((kfs[2].t_end_s - probe[0].end_s).abs() < 1e-9);
