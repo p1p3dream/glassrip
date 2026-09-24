@@ -264,6 +264,30 @@ pub struct GateResult {
     pub detail: String,
 }
 
+/// Overall result of a report.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Status {
+    /// Every gate passed.
+    Pass,
+    /// A gate failed.
+    #[default]
+    Fail,
+    /// The suite did not run (for example no private fixtures); not a pass.
+    Skipped,
+}
+
+impl Status {
+    /// Upper-case label for the markdown.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Fail => "FAIL",
+            Self::Skipped => "SKIPPED",
+        }
+    }
+}
+
 /// The eval report.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvalReport {
@@ -297,14 +321,27 @@ pub struct EvalReport {
     /// Details of the first repetition.
     #[serde(default)]
     pub details: Value,
-    /// True when every gate passed.
+    /// Overall status.
+    #[serde(default)]
+    pub status: Status,
+    /// Why the suite was skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped_reason: Option<String>,
+    /// True when the run must not fail the build: every gate passed, or the suite was skipped.
     pub passed: bool,
 }
 
 impl EvalReport {
-    /// Recomputes `passed` from the gates.
+    /// Recomputes `status` and `passed` from the gates (a skipped report stays skipped).
     pub fn finish(&mut self) {
-        self.passed = self.gates.iter().all(|g| g.pass);
+        if self.skipped_reason.is_some() {
+            self.status = Status::Skipped;
+            self.passed = true;
+            return;
+        }
+        let ok = self.gates.iter().all(|g| g.pass);
+        self.status = if ok { Status::Pass } else { Status::Fail };
+        self.passed = ok;
     }
 }
 
@@ -341,8 +378,11 @@ pub fn render_markdown(r: &EvalReport) -> String {
         r.mode,
         r.vision_model,
         r.repetitions,
-        if r.passed { "PASS" } else { "FAIL" }
+        r.status.label()
     );
+    if let Some(reason) = &r.skipped_reason {
+        let _ = writeln!(s, "Skipped: {reason}\n");
+    }
     let _ = writeln!(s, "| Metric | Mean | Spread | Min | Max |");
     let _ = writeln!(s, "|---|---:|---:|---:|---:|");
     for (k, m) in &r.metrics {
@@ -484,13 +524,25 @@ mod tests {
             errors: vec![],
             bench: None,
             details: Value::Null,
+            status: Status::Fail,
+            skipped_reason: None,
             passed: false,
         };
         r.finish();
         assert!(r.passed);
+        assert_eq!(r.status, Status::Pass);
         let md = render_markdown(&r);
         assert!(md.contains("| board.chrome_fp | 0 |"));
         assert!(md.contains("PASS"));
         assert!(md.contains("Not run:"));
+        r.gates[0].pass = false;
+        r.finish();
+        assert_eq!((r.status, r.passed), (Status::Fail, false));
+        r.skipped_reason = Some("no private fixtures".into());
+        r.finish();
+        assert_eq!((r.status, r.passed), (Status::Skipped, true));
+        let md = render_markdown(&r);
+        assert!(md.contains("Result: **SKIPPED**"));
+        assert!(!md.contains("PASS"));
     }
 }

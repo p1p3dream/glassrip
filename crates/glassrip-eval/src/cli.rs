@@ -111,8 +111,10 @@ pub struct EvalArgs {
 /// What the command did.
 #[derive(Debug, Clone)]
 pub struct EvalOutcome {
-    /// Every gate passed (or the suite was skipped).
+    /// Every gate passed, or the suite was skipped (exit status 0 either way).
     pub passed: bool,
+    /// Pass, fail, or skipped.
+    pub status: crate::report::Status,
     /// Report path, when written.
     pub report_path: Option<PathBuf>,
 }
@@ -220,6 +222,8 @@ fn base_report(suite: Suite, mode: &str, model: &str, runs: &[SuiteRun]) -> Eval
         errors: first.errors,
         bench: None,
         details: first.details,
+        status: crate::report::Status::Fail,
+        skipped_reason: None,
         passed: false,
     }
 }
@@ -371,13 +375,28 @@ pub async fn run(args: EvalArgs) -> Result<EvalOutcome> {
         }
         Suite::Meeting | Suite::Docs => {
             let Some(private) = private.filter(|p| p.is_dir()) else {
-                eprintln!(
-                    "eval: suite {} skipped: eval.private_fixtures (or GLASSRIP_PRIVATE_FIXTURES) is not set or does not exist",
+                let reason = format!(
+                    "suite {} needs private fixtures: eval.private_fixtures (or GLASSRIP_PRIVATE_FIXTURES) is not set or does not exist",
                     suite.name()
                 );
+                eprintln!("eval: SKIPPED: {reason}");
+                let mut report = base_report(suite, "skipped", &model, &[]);
+                report.skipped_reason = Some(reason);
+                report.finish();
+                // Nothing private is known here, so the skip report goes to the public output path.
+                let out = args
+                    .out
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("target/glassrip-eval").join(suite.name()));
+                let json_path = out.join("eval_report.json");
+                write_json(&json_path, &report)?;
+                let md = render_markdown(&report);
+                write_text(&out.join("eval_report.md"), &md)?;
+                println!("{md}");
                 return Ok(EvalOutcome {
                     passed: true,
-                    report_path: None,
+                    status: report.status,
+                    report_path: Some(json_path),
                 });
             };
             if args.rerecord {
@@ -454,6 +473,7 @@ pub async fn run(args: EvalArgs) -> Result<EvalOutcome> {
     eprintln!("eval: wrote {}", json_path.display());
     Ok(EvalOutcome {
         passed: report.passed,
+        status: report.status,
         report_path: Some(json_path),
     })
 }
