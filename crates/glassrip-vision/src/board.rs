@@ -2,7 +2,8 @@
 //! validation rules that need no pixels.
 //!
 //! The model sees only the canvas crop and reports every element with a bbox in
-//! the pixels of the image it was sent. [`BoardReadOutput::to_canvas_coords`]
+//! the pixels of the image it was sent. [`BoardReadOutput::to_canvas_coords`] turns the wire
+//! form into a [`BoardReading`] in canvas pixels, the form artifacts store
 //! maps those boxes to canvas (crop source) pixels before [`validate_board`].
 
 use std::collections::{HashMap, HashSet};
@@ -34,7 +35,8 @@ the full text inside the box as its text (join wrapped lines with a space).
 - edges: lines or arrows connecting two nodes. \"src\" and \"dst\" must be local_id values from your \
 nodes list. \"src\" is the tail, \"dst\" is the end with the arrowhead. \"label\" is the small text \
 written on the line itself (for example a protocol name), or an empty string if the line has no text. \
-Never use a node's text as an edge label. \"style\" is \"dashed\" for dotted/dashed lines, otherwise \
+Never use a node's text as an edge label. \"label_bbox_2d\" is the box around the label text as \
+[x1, y1, x2, y2], or [0, 0, 0, 0] if the line has no text. \"style\" is \"dashed\" for dotted/dashed lines, otherwise \
 \"solid\". A dashed line may be long and curved and carry a text label; follow it to the box at each \
 end and put its text in \"label\".
 - stickies: colored sticky notes and cards (yellow, blue, pink, etc.) containing words, sentences, \
@@ -45,8 +47,10 @@ it once. Transcribe the full text.
 \"near\" is that box's local_id, or an empty string if it is not next to a box.
 - other_visible_text: any other readable text on the canvas itself (not UI chrome) that is not \
 already listed above.
-- bbox: for every node, sticky, owner tag, and other text, the box around it in pixel coordinates of \
-this image: x1, y1 is the top-left corner and x2, y2 the bottom-right corner.
+- bbox_2d (and label_bbox_2d): for every node, sticky, owner tag, other text, and edge label, the box \
+around it as \
+[x1, y1, x2, y2] in absolute pixel coordinates of this image, in exactly that order: x1, y1 is the \
+top-left corner and x2, y2 the bottom-right corner, so x1 < x2 and y1 < y2.
 
 Rules:
 - Transcribe text VERBATIM, exactly as written, including punctuation. Do not correct, summarize or \
@@ -55,6 +59,7 @@ complete it.
 Never guess or invent text.
 - List each item once. Only list items you can actually see in THIS image. Use empty lists when \
 nothing applies.
+- Write the JSON on a single line, without indentation or line breaks.
 - \"conf\" and \"confidence\" are numbers from 0 to 1; \"confidence\" is how legible the board is in \
 this image.";
 
@@ -78,16 +83,17 @@ pub enum StickyColor {
     Other,
 }
 
+/// A node (box) on the board. Boxes are in canvas pixels.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BoardNode {
     pub local_id: String,
     pub text: String,
     pub bbox: BBox,
-    #[schemars(range(min = 0.0, max = 1.0))]
     pub conf: f64,
 }
 
+/// A connector between two nodes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BoardEdge {
@@ -95,11 +101,14 @@ pub struct BoardEdge {
     pub dst: String,
     /// Empty string when the line carries no text.
     pub label: String,
+    /// Box around the label text; `None` without a label or box.
+    #[serde(default)]
+    pub label_bbox: Option<BBox>,
     pub style: EdgeStyle,
-    #[schemars(range(min = 0.0, max = 1.0))]
     pub conf: f64,
 }
 
+/// A sticky note.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Sticky {
@@ -108,6 +117,7 @@ pub struct Sticky {
     pub bbox: BBox,
 }
 
+/// An owner tag (a green note holding a name).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OwnerTag {
@@ -118,6 +128,7 @@ pub struct OwnerTag {
     pub bbox: BBox,
 }
 
+/// Other canvas text.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TextItem {
@@ -125,40 +136,154 @@ pub struct TextItem {
     pub bbox: BBox,
 }
 
-/// Model output for one board read. Array lengths are bounded to keep the schema grammar small.
+/// One board reading in canvas pixels (the form stored in artifacts and
+/// validated). Boxes serialize as `{x1, y1, x2, y2}` objects.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BoardReading {
+    pub nodes: Vec<BoardNode>,
+    pub edges: Vec<BoardEdge>,
+    pub stickies: Vec<Sticky>,
+    pub owner_tags: Vec<OwnerTag>,
+    pub other_visible_text: Vec<TextItem>,
+    pub confidence: f64,
+}
+
+/// Wire form of a node: what the model writes (`bbox_2d` array, sent-image pixels).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WireNode {
+    pub local_id: String,
+    pub text: String,
+    #[serde(rename = "bbox_2d", with = "crate::geometry::bbox2d")]
+    #[schemars(with = "[f64; 4]")]
+    pub bbox: BBox,
+    #[schemars(range(min = 0.0, max = 1.0))]
+    pub conf: f64,
+}
+
+/// Wire form of an edge; `label_bbox_2d` of `[0, 0, 0, 0]` means no box.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WireEdge {
+    pub src: String,
+    pub dst: String,
+    pub label: String,
+    #[serde(rename = "label_bbox_2d", with = "crate::geometry::opt_bbox2d")]
+    #[schemars(with = "[f64; 4]")]
+    pub label_bbox: Option<BBox>,
+    pub style: EdgeStyle,
+    #[schemars(range(min = 0.0, max = 1.0))]
+    pub conf: f64,
+}
+
+/// Wire form of a sticky.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WireSticky {
+    pub text: String,
+    pub color: StickyColor,
+    #[serde(rename = "bbox_2d", with = "crate::geometry::bbox2d")]
+    #[schemars(with = "[f64; 4]")]
+    pub bbox: BBox,
+}
+
+/// Wire form of an owner tag.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WireOwnerTag {
+    pub name_raw: String,
+    pub near: String,
+    #[serde(rename = "bbox_2d", with = "crate::geometry::bbox2d")]
+    #[schemars(with = "[f64; 4]")]
+    pub bbox: BBox,
+}
+
+/// Wire form of other canvas text.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WireText {
+    pub text: String,
+    #[serde(rename = "bbox_2d", with = "crate::geometry::bbox2d")]
+    #[schemars(with = "[f64; 4]")]
+    pub bbox: BBox,
+}
+
+/// Model output for one board read (the wire schema: Qwen2.5-VL `bbox_2d`
+/// arrays in sent-image pixels). Array lengths are bounded to keep the
+/// grammar small. Convert with [`BoardReadOutput::to_canvas_coords`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BoardReadOutput {
     #[schemars(length(max = 60))]
-    pub nodes: Vec<BoardNode>,
+    pub nodes: Vec<WireNode>,
     #[schemars(length(max = 80))]
-    pub edges: Vec<BoardEdge>,
+    pub edges: Vec<WireEdge>,
     #[schemars(length(max = 60))]
-    pub stickies: Vec<Sticky>,
+    pub stickies: Vec<WireSticky>,
     #[schemars(length(max = 20))]
-    pub owner_tags: Vec<OwnerTag>,
-    #[schemars(length(max = 40))]
-    pub other_visible_text: Vec<TextItem>,
+    pub owner_tags: Vec<WireOwnerTag>,
+    #[schemars(length(max = 20))]
+    pub other_visible_text: Vec<WireText>,
     #[schemars(range(min = 0.0, max = 1.0))]
     pub confidence: f64,
 }
 
 impl BoardReadOutput {
-    /// Map every bbox from sent-image pixels to canvas pixels.
-    pub fn to_canvas_coords(mut self, prepared: &PreparedImage) -> Self {
-        for n in &mut self.nodes {
-            n.bbox = n.bbox.to_source(prepared);
+    /// Map every box from sent-image pixels to canvas pixels.
+    pub fn to_canvas_coords(self, prepared: &PreparedImage) -> BoardReading {
+        let m = |b: BBox| b.to_source(prepared);
+        BoardReading {
+            nodes: self
+                .nodes
+                .into_iter()
+                .map(|n| BoardNode {
+                    local_id: n.local_id,
+                    text: n.text,
+                    bbox: m(n.bbox),
+                    conf: n.conf,
+                })
+                .collect(),
+            edges: self
+                .edges
+                .into_iter()
+                .map(|e| BoardEdge {
+                    src: e.src,
+                    dst: e.dst,
+                    label: e.label,
+                    label_bbox: e.label_bbox.map(m),
+                    style: e.style,
+                    conf: e.conf,
+                })
+                .collect(),
+            stickies: self
+                .stickies
+                .into_iter()
+                .map(|s| Sticky {
+                    text: s.text,
+                    color: s.color,
+                    bbox: m(s.bbox),
+                })
+                .collect(),
+            owner_tags: self
+                .owner_tags
+                .into_iter()
+                .map(|o| OwnerTag {
+                    name_raw: o.name_raw,
+                    near: o.near,
+                    bbox: m(o.bbox),
+                })
+                .collect(),
+            other_visible_text: self
+                .other_visible_text
+                .into_iter()
+                .map(|t| TextItem {
+                    text: t.text,
+                    bbox: m(t.bbox),
+                })
+                .collect(),
+            confidence: self.confidence,
         }
-        for s in &mut self.stickies {
-            s.bbox = s.bbox.to_source(prepared);
-        }
-        for o in &mut self.owner_tags {
-            o.bbox = o.bbox.to_source(prepared);
-        }
-        for t in &mut self.other_visible_text {
-            t.bbox = t.bbox.to_source(prepared);
-        }
-        self
     }
 }
 
@@ -250,21 +375,21 @@ impl Default for BoardValidationConfig {
         Self {
             denylist: ChromeDenylist::miro_meet_defaults(),
             participant_names: Vec::new(),
-            max_edge_label_words: 6,
+            max_edge_label_words: 8,
             bbox_tolerance_px: 2.0,
         }
     }
 }
 
 /// Canvas size in pixels (the coordinate space of the bboxes being validated).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct CanvasSize {
     pub width: f64,
     pub height: f64,
 }
 
 /// Which output list an element came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ElementList {
     Nodes,
@@ -274,19 +399,25 @@ pub enum ElementList {
     OtherVisibleText,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RejectReason {
     /// Text is on the chrome denylist.
     Denylist,
     /// Bbox lies outside the canvas, so the text is chrome by definition.
     OutsideCanvas,
-    /// A node whose text is a participant name.
+    /// A node or other text whose text is a participant name.
     ParticipantName,
+    /// Inside a detected participant video tile.
+    TileRegion,
+    /// Owner tag whose name matches no participant.
+    OwnerNotParticipant,
+    /// Owner tag not on a green tag (pixel check).
+    OwnerNotOnTag,
 }
 
 /// An element removed as UI chrome.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RejectedItem {
     pub list: ElementList,
     pub text: String,
@@ -294,11 +425,14 @@ pub struct RejectedItem {
     pub reason: RejectReason,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum IssueKind {
     EmptyText,
+    /// Non-finite box, or an inverted box with no unambiguous repair; dropped.
     MalformedBBox,
+    /// Inverted box read as `[x1, x2, y1, y2]` or with swapped corners; repaired.
+    BBoxRepaired,
     DuplicateNodeId,
     /// Same text in more than one list; the lower-priority copy was dropped.
     DuplicateAcrossLists,
@@ -318,7 +452,7 @@ pub enum IssueKind {
 }
 
 /// A non-fatal correction applied during validation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ValidationIssue {
     pub list: ElementList,
     pub kind: IssueKind,
@@ -326,7 +460,7 @@ pub struct ValidationIssue {
 }
 
 /// Board reading after validation. Bboxes are in canvas pixels.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ValidatedBoard {
     pub nodes: Vec<BoardNode>,
     pub edges: Vec<BoardEdge>,
@@ -363,7 +497,7 @@ impl Ctx<'_> {
     }
 
     /// Shared per-element checks. Returns false if the element must be dropped.
-    fn keep(&mut self, list: ElementList, text: &str, bbox: &BBox) -> bool {
+    fn keep(&mut self, list: ElementList, text: &str, bbox: &mut BBox) -> bool {
         if text.trim().is_empty() {
             self.issue(
                 list,
@@ -373,12 +507,24 @@ impl Ctx<'_> {
             return false;
         }
         if !bbox.is_well_formed() {
-            self.issue(
-                list,
-                IssueKind::MalformedBBox,
-                format!("{text:?} has bbox {bbox:?}"),
-            );
-            return false;
+            match repair_inverted(bbox, self.canvas, self.cfg.bbox_tolerance_px) {
+                Some(fixed) => {
+                    self.issue(
+                        list,
+                        IssueKind::BBoxRepaired,
+                        format!("{text:?}: bbox {bbox:?} repaired to {fixed:?}"),
+                    );
+                    *bbox = fixed;
+                }
+                None => {
+                    self.issue(
+                        list,
+                        IssueKind::MalformedBBox,
+                        format!("{text:?} has bbox {bbox:?}"),
+                    );
+                    return false;
+                }
+            }
         }
         if self.cfg.denylist.matches(text) {
             self.reject(list, text, Some(*bbox), RejectReason::Denylist);
@@ -397,6 +543,44 @@ impl Ctx<'_> {
 
     fn is_participant(&self, text: &str) -> bool {
         self.participants.contains(&normalize(text))
+    }
+}
+
+/// Words in an edge label: whitespace-separated tokens with at least one
+/// letter or digit ("A + B" is two words).
+pub fn label_words(label: &str) -> usize {
+    label
+        .split_whitespace()
+        .filter(|t| t.chars().any(char::is_alphanumeric))
+        .count()
+}
+
+/// Repair an inverted box when exactly one reading of its four numbers gives a
+/// well-formed box inside the canvas. Readings tried: `[x1, x2, y1, y2]`
+/// (axis-order swap), `[x2, y2, x1, y1]` (swapped corners), and either axis
+/// flipped. Returns `None` for non-finite values or zero or several candidates.
+pub fn repair_inverted(b: &BBox, canvas: CanvasSize, tolerance: f64) -> Option<BBox> {
+    if ![b.x1, b.y1, b.x2, b.y2].iter().all(|v| v.is_finite()) || b.is_well_formed() {
+        return None;
+    }
+    let (p, q, r, s) = (b.x1, b.y1, b.x2, b.y2);
+    let mut found: Vec<BBox> = Vec::new();
+    for c in [
+        BBox::new(p, r, q, s),
+        BBox::new(r, s, p, q),
+        BBox::new(r, q, p, s),
+        BBox::new(p, s, r, q),
+    ] {
+        if c.is_well_formed()
+            && c.is_inside(canvas.width, canvas.height, tolerance)
+            && !found.contains(&c)
+        {
+            found.push(c);
+        }
+    }
+    match found.as_slice() {
+        [one] => Some(*one),
+        _ => None,
     }
 }
 
@@ -419,7 +603,7 @@ impl Ctx<'_> {
 /// 6. Owner tag `near` must reference a kept node or be empty.
 /// 7. Flag re-classification when `confidence == 0` or nothing remains.
 pub fn validate_board(
-    output: BoardReadOutput,
+    output: BoardReading,
     canvas: CanvasSize,
     cfg: &BoardValidationConfig,
 ) -> ValidatedBoard {
@@ -430,11 +614,11 @@ pub fn validate_board(
         rejected: Vec::new(),
         issues: Vec::new(),
     };
-    let BoardReadOutput {
+    let BoardReading {
         nodes,
         edges,
         stickies,
-        owner_tags,
+        owner_tags: owner_tags_in,
         other_visible_text,
         confidence,
     } = output;
@@ -442,8 +626,8 @@ pub fn validate_board(
     // Rules 1-3 for nodes.
     let mut seen_ids = HashSet::new();
     let mut kept_nodes = Vec::new();
-    for n in nodes {
-        if !ctx.keep(ElementList::Nodes, &n.text, &n.bbox) {
+    for mut n in nodes {
+        if !ctx.keep(ElementList::Nodes, &n.text, &mut n.bbox) {
             continue;
         }
         if ctx.is_participant(&n.text) {
@@ -467,14 +651,16 @@ pub fn validate_board(
     }
     let mut nodes = kept_nodes;
 
-    let mut owner_tags: Vec<OwnerTag> = owner_tags
-        .into_iter()
-        .filter(|o| ctx.keep(ElementList::OwnerTags, &o.name_raw, &o.bbox))
-        .collect();
+    let mut owner_tags: Vec<OwnerTag> = Vec::new();
+    for mut o in owner_tags_in {
+        if ctx.keep(ElementList::OwnerTags, &o.name_raw, &mut o.bbox) {
+            owner_tags.push(o);
+        }
+    }
 
     let mut kept_stickies = Vec::new();
-    for s in stickies {
-        if !ctx.keep(ElementList::Stickies, &s.text, &s.bbox) {
+    for mut s in stickies {
+        if !ctx.keep(ElementList::Stickies, &s.text, &mut s.bbox) {
             continue;
         }
         if ctx.is_participant(&s.text) {
@@ -497,10 +683,23 @@ pub fn validate_board(
     }
     let mut stickies = kept_stickies;
 
-    let mut other: Vec<TextItem> = other_visible_text
-        .into_iter()
-        .filter(|t| ctx.keep(ElementList::OtherVisibleText, &t.text, &t.bbox))
-        .collect();
+    let mut other: Vec<TextItem> = Vec::new();
+    for mut t in other_visible_text {
+        if !ctx.keep(ElementList::OtherVisibleText, &t.text, &mut t.bbox) {
+            continue;
+        }
+        // Participant names outside owner tags are tile or banner text.
+        if ctx.is_participant(&t.text) {
+            ctx.reject(
+                ElementList::OtherVisibleText,
+                &t.text,
+                Some(t.bbox),
+                RejectReason::ParticipantName,
+            );
+            continue;
+        }
+        other.push(t);
+    }
 
     // Rule 4: exclusive membership by normalized text.
     let mut owner_of: HashMap<String, ElementList> = HashMap::new();
@@ -597,7 +796,7 @@ pub fn validate_board(
         }
         let label = e.label.trim().to_string();
         if !label.is_empty() {
-            let kind = if label.split_whitespace().count() > cfg.max_edge_label_words {
+            let kind = if label_words(&label) > cfg.max_edge_label_words {
                 Some(IssueKind::LabelTooLong)
             } else if node_texts.contains(&normalize(&label)) {
                 Some(IssueKind::LabelIsNodeText)
@@ -617,6 +816,43 @@ pub fn validate_board(
                 e.label = label;
             }
         }
+        e.label_bbox = if e.label.is_empty() {
+            None
+        } else {
+            e.label_bbox.and_then(|b| {
+                let fixed = if b.is_well_formed() {
+                    Some(b)
+                } else {
+                    repair_inverted(&b, ctx.canvas, cfg.bbox_tolerance_px)
+                };
+                match fixed {
+                    Some(f)
+                        if f.is_inside(
+                            ctx.canvas.width,
+                            ctx.canvas.height,
+                            cfg.bbox_tolerance_px,
+                        ) =>
+                    {
+                        if f != b {
+                            ctx.issue(
+                                ElementList::Edges,
+                                IssueKind::BBoxRepaired,
+                                format!("label {:?}: bbox {b:?} repaired to {f:?}", e.label),
+                            );
+                        }
+                        Some(f)
+                    }
+                    _ => {
+                        ctx.issue(
+                            ElementList::Edges,
+                            IssueKind::MalformedBBox,
+                            format!("label {:?}: bbox {b:?} dropped", e.label),
+                        );
+                        None
+                    }
+                }
+            })
+        };
         kept_edges.push(e);
     }
 
@@ -675,13 +911,14 @@ mod tests {
             src: src.into(),
             dst: dst.into(),
             label: label.into(),
+            label_bbox: None,
             style: EdgeStyle::Solid,
             conf: 0.8,
         }
     }
 
-    fn empty_output() -> BoardReadOutput {
-        BoardReadOutput {
+    fn empty_output() -> BoardReading {
+        BoardReading {
             nodes: vec![],
             edges: vec![],
             stickies: vec![],
@@ -696,6 +933,178 @@ mod tests {
             participant_names: vec!["Avery".into(), "Jordan".into()],
             ..BoardValidationConfig::default()
         }
+    }
+
+    #[test]
+    fn bbox_2d_wire_format() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let n = WireNode {
+            local_id: "n1".into(),
+            text: "Widget Service".into(),
+            bbox: BBox::new(100.0, 200.0, 220.0, 260.0),
+            conf: 0.9,
+        };
+        let v = serde_json::to_value(&n)?;
+        assert_eq!(
+            v["bbox_2d"],
+            serde_json::json!([100.0, 200.0, 220.0, 260.0])
+        );
+        assert!(v.get("bbox").is_none());
+        let back: WireNode = serde_json::from_value(v)?;
+        assert_eq!(back, n);
+        let short =
+            serde_json::json!({"local_id": "n", "text": "t", "bbox_2d": [1, 2, 3], "conf": 0.5});
+        assert!(serde_json::from_value::<WireNode>(short).is_err());
+        // Artifacts (the domain form) use box objects and null for no label box.
+        let d = serde_json::to_value(node("n1", "Widget Service", 100.0, 200.0))?;
+        assert_eq!(d["bbox"]["x2"], serde_json::json!(220.0));
+        assert!(d.get("bbox_2d").is_none());
+        let e = serde_json::to_value(edge("n1", "n2", ""))?;
+        assert!(e["label_bbox"].is_null());
+        let schema = crate::schema::OutputSchema::for_type::<BoardReadOutput>()?;
+        let text = schema.text();
+        assert!(
+            text.contains("bbox_2d") && !text.contains("\"x1\""),
+            "{text}"
+        );
+        assert!(BOARD_READ_PROMPT.contains("[x1, y1, x2, y2]"));
+        // Properties reach the grammar in declaration order: nodes before edges
+        // (edges reference node ids), and an element's text before its box.
+        let keys: Vec<&String> = schema.json()["properties"]
+            .as_object()
+            .map(|m| m.keys().collect())
+            .unwrap_or_default();
+        assert_eq!(
+            keys,
+            [
+                "nodes",
+                "edges",
+                "stickies",
+                "owner_tags",
+                "other_visible_text",
+                "confidence"
+            ]
+        );
+        let node_keys: Vec<&String> = schema.json()["properties"]["nodes"]["items"]["properties"]
+            .as_object()
+            .map(|m| m.keys().collect())
+            .unwrap_or_default();
+        assert_eq!(node_keys, ["local_id", "text", "bbox_2d", "conf"]);
+        Ok(())
+    }
+
+    #[test]
+    fn edge_label_words_and_label_boxes() {
+        assert_eq!(
+            label_words("Links between Quarry content + Frontend component"),
+            6
+        );
+        assert_eq!(label_words("a - b"), 2);
+        let mut out = empty_output();
+        out.nodes = vec![
+            node("n1", "Widget Service", 100.0, 100.0),
+            node("n2", "Queue", 900.0, 100.0),
+            node("n3", "Store", 100.0, 600.0),
+        ];
+        let mut long = edge(
+            "n1",
+            "n2",
+            "Links between Quarry content + Frontend component, v2 draft notes",
+        );
+        long.label_bbox = Some(BBox::new(300.0, 90.0, 700.0, 110.0));
+        let mut kept = edge(
+            "n1",
+            "n3",
+            "Links between Quarry content + Frontend component",
+        );
+        // Inverted label box, repairable (axis-order swap).
+        kept.label_bbox = Some(BBox::new(300.0, 1000.0, 400.0, 420.0));
+        let mut none = edge("n2", "n3", "");
+        none.label_bbox = Some(BBox::new(1.0, 1.0, 5.0, 5.0));
+        out.edges = vec![long, kept, none];
+        let v = validate_board(out, CANVAS, &cfg());
+        assert_eq!(v.edges.len(), 3);
+        assert!(v.edges[0].label.is_empty() && v.edges[0].label_bbox.is_none());
+        assert_eq!(
+            v.edges[1].label,
+            "Links between Quarry content + Frontend component"
+        );
+        assert_eq!(
+            v.edges[1].label_bbox,
+            Some(BBox::new(300.0, 400.0, 1000.0, 420.0))
+        );
+        assert!(v.edges[2].label_bbox.is_none());
+        // Wire format: [0, 0, 0, 0] means no label box.
+        let e: WireEdge = serde_json::from_value(serde_json::json!({
+            "src": "n1", "dst": "n2", "label": "", "label_bbox_2d": [0, 0, 0, 0],
+            "style": "solid", "conf": 0.5
+        }))
+        .map_err(|e| e.to_string())
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert!(e.label_bbox.is_none());
+    }
+
+    #[test]
+    fn inverted_boxes_repaired_only_when_unambiguous() {
+        // Emitted as [x1, x2, y1, y2] for x 600..1000, y 100..300: only one reading fits.
+        let axis_swap = BBox::new(600.0, 1000.0, 100.0, 300.0);
+        assert_eq!(
+            repair_inverted(&axis_swap, CANVAS, 2.0),
+            Some(BBox::new(600.0, 100.0, 1000.0, 300.0))
+        );
+        // Only the x axis flipped.
+        assert_eq!(
+            repair_inverted(&BBox::new(50.0, 50.0, 40.0, 60.0), CANVAS, 2.0),
+            Some(BBox::new(40.0, 50.0, 50.0, 60.0))
+        );
+        // Scrambled beyond one reading (two fit): rejected.
+        let scrambled = BBox::new(337.0, 467.0, 259.0, 337.0);
+        assert_eq!(repair_inverted(&scrambled, CANVAS, 2.0), None);
+        // Well-formed and non-finite boxes are not candidates.
+        assert_eq!(repair_inverted(&bb(1.0, 1.0), CANVAS, 2.0), None);
+        assert_eq!(
+            repair_inverted(&BBox::new(f64::NAN, 0.0, 1.0, 1.0), CANVAS, 2.0),
+            None
+        );
+
+        let mut out = empty_output();
+        out.nodes = vec![
+            BoardNode {
+                bbox: axis_swap,
+                ..node("n1", "Widget Service", 0.0, 0.0)
+            },
+            BoardNode {
+                bbox: scrambled,
+                ..node("n2", "Queue", 0.0, 0.0)
+            },
+        ];
+        let v = validate_board(out, CANVAS, &cfg());
+        assert_eq!(v.nodes.len(), 1);
+        assert!(v.nodes[0].bbox.is_well_formed());
+        assert!(v.nodes.iter().all(|n| n.bbox.is_well_formed()));
+        assert!(v.issues.iter().any(|i| i.kind == IssueKind::BBoxRepaired));
+        assert!(v.issues.iter().any(|i| i.kind == IssueKind::MalformedBBox));
+    }
+
+    #[test]
+    fn participant_names_in_other_text_are_chrome() {
+        let mut out = empty_output();
+        out.nodes = vec![node("n1", "Widget Service", 100.0, 100.0)];
+        out.other_visible_text = vec![
+            TextItem {
+                text: "Jordan".into(),
+                bbox: bb(500.0, 500.0),
+            },
+            TextItem {
+                text: "v2 draft".into(),
+                bbox: bb(700.0, 500.0),
+            },
+        ];
+        let v = validate_board(out, CANVAS, &cfg());
+        assert_eq!(v.other_visible_text.len(), 1);
+        assert!(v
+            .chrome_rejected
+            .iter()
+            .any(|r| r.text == "Jordan" && r.reason == RejectReason::ParticipantName));
     }
 
     #[test]
@@ -847,7 +1256,7 @@ mod tests {
             node("n3", "Store", 700.0, 100.0),
         ];
         out.edges = vec![
-            edge("n1", "n2", "one two three four five six seven"),
+            edge("n1", "n2", "one two three four five six seven eight nine"),
             edge("n2", "n3", "Widget Service"),
             edge("n1", "n3", " one two three four five six "),
         ];
@@ -870,8 +1279,8 @@ mod tests {
             node("n1", "Widget Service", 100.0, 100.0),
             node("n1", "Other Box", 400.0, 100.0),
             BoardNode {
-                bbox: BBox::new(50.0, 50.0, 40.0, 60.0),
-                ..node("n3", "Inverted", 0.0, 0.0)
+                bbox: BBox::new(f64::NAN, 50.0, 40.0, 60.0),
+                ..node("n3", "Not a number", 0.0, 0.0)
             },
         ];
         out.owner_tags = vec![OwnerTag {

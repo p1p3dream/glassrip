@@ -476,7 +476,7 @@ impl Default for EdgeDirectionConfig {
     fn default() -> Self {
         Self {
             arrowhead_search_px: 15,
-            max_label_words: 6,
+            max_label_words: 8,
         }
     }
 }

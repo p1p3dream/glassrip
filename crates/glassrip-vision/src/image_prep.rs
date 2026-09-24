@@ -154,16 +154,42 @@ fn fit_token_cap(width: u32, height: u32) -> (u32, u32, bool) {
     }
 }
 
+/// Board sizing rule parameters (spec 6.10).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoardSizing {
+    /// Long edge a crop at least `min_long_edge` wide is resized to.
+    pub target_long_edge: u32,
+    /// Crops with a shorter long edge are upscaled and flagged `low_res`.
+    pub min_long_edge: u32,
+    /// Upscale factor for low-resolution crops.
+    pub low_res_upscale: f64,
+}
+
+impl Default for BoardSizing {
+    fn default() -> Self {
+        Self {
+            target_long_edge: BOARD_LONG_EDGE,
+            min_long_edge: LOW_RES_THRESHOLD,
+            low_res_upscale: LOW_RES_UPSCALE,
+        }
+    }
+}
+
 /// Apply the board-read sizing rule to a crop of `width` x `height`.
 pub fn plan_board_size(width: u32, height: u32) -> SizePlan {
+    plan_board_size_with(width, height, &BoardSizing::default())
+}
+
+/// [`plan_board_size`] with explicit parameters.
+pub fn plan_board_size_with(width: u32, height: u32, p: &BoardSizing) -> SizePlan {
     let long = width.max(height);
-    let (w, h, low_res) = if long >= LOW_RES_THRESHOLD {
-        let factor = f64::from(BOARD_LONG_EDGE) / f64::from(long);
+    let (w, h, low_res) = if long >= p.min_long_edge {
+        let factor = f64::from(p.target_long_edge) / f64::from(long.max(1));
         (scaled(width, factor), scaled(height, factor), false)
     } else {
         (
-            scaled(width, LOW_RES_UPSCALE),
-            scaled(height, LOW_RES_UPSCALE),
+            scaled(width, p.low_res_upscale),
+            scaled(height, p.low_res_upscale),
             true,
         )
     };
@@ -226,8 +252,23 @@ fn prepare_with(image: &DynamicImage, plan: SizePlan) -> Result<PreparedImage> {
 
 /// Resize a canvas crop per the board-read rule and encode it.
 pub fn prepare_board_image(canvas_crop: &DynamicImage) -> Result<PreparedImage> {
+    prepare_board_image_with(canvas_crop, &BoardSizing::default())
+}
+
+/// [`prepare_board_image`] with explicit sizing parameters.
+pub fn prepare_board_image_with(
+    canvas_crop: &DynamicImage,
+    sizing: &BoardSizing,
+) -> Result<PreparedImage> {
     let (w, h) = canvas_crop.dimensions();
-    prepare_with(canvas_crop, plan_board_size(w, h))
+    prepare_with(canvas_crop, plan_board_size_with(w, h, sizing))
+}
+
+/// Resize to exactly `long_edge` px on the long side (still within the token
+/// cap) and encode. Used for board tiles, which are always sent at full size.
+pub fn prepare_long_edge(image: &DynamicImage, long_edge: u32) -> Result<PreparedImage> {
+    let (w, h) = image.dimensions();
+    prepare_with(image, plan_thumbnail_size(w, h, long_edge))
 }
 
 /// Resize a frame to the classification thumbnail and encode it.
@@ -240,6 +281,26 @@ pub fn prepare_thumbnail(frame: &DynamicImage) -> Result<PreparedImage> {
 mod tests {
     use super::*;
     use image::{Rgb, RgbImage};
+
+    #[test]
+    fn board_sizing_parameters_are_honored() {
+        let p = BoardSizing {
+            target_long_edge: 1600,
+            min_long_edge: 1000,
+            low_res_upscale: 2.0,
+        };
+        let big = plan_board_size_with(1200, 600, &p);
+        assert_eq!((big.width, big.height, big.low_res), (1600, 800, false));
+        let small = plan_board_size_with(900, 400, &p);
+        assert_eq!(
+            (small.width, small.height, small.low_res),
+            (1800, 800, true)
+        );
+        assert_eq!(
+            plan_board_size(1200, 600),
+            plan_board_size_with(1200, 600, &BoardSizing::default())
+        );
+    }
 
     #[test]
     fn token_formula_matches_spec_examples() {

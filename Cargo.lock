@@ -1431,6 +1431,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "glassrip-ocr"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "ort",
+ "schemars",
+ "serde",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
 name = "glassrip-vision"
 version = "0.1.0"
 dependencies = [
@@ -1445,10 +1459,39 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_path_to_error",
+ "strsim",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
  "tracing",
+ "wiremock",
+]
+
+[[package]]
+name = "glassrip-vision-stages"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "clap",
+ "fs-err",
+ "futures-util",
+ "glassrip-core",
+ "glassrip-meeting",
+ "glassrip-ocr",
+ "glassrip-vision",
+ "image",
+ "schemars",
+ "semver",
+ "serde",
+ "serde_json",
+ "strsim",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
  "wiremock",
 ]
 
@@ -3663,6 +3706,7 @@ version = "1.0.151"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",

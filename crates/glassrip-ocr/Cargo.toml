@@ -1,0 +1,32 @@
+[package]
+name = "glassrip-ocr"
+version = "0.1.0"
+edition = "2021"
+description = "PP-OCRv5 text detection and recognition (ONNX Runtime) shared by glassrip stages"
+publish = false
+
+[features]
+default = []
+# ONNX Runtime engine. On its own it links the ort prebuilt runtime and runs on CPU
+# (useful on a Mac for development).
+onnx = ["dep:ort"]
+# NVIDIA GPU: ONNX Runtime is loaded at run time from ORT_DYLIB_PATH (a GPU build
+# for the host's CUDA major version) and the CUDA execution provider is registered
+# with error_on_failure, so a broken CUDA setup is an error, never a CPU fallback.
+cuda = ["onnx", "ort/load-dynamic", "ort/cuda"]
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+ort = { version = "2.0.0-rc.13", optional = true }
+schemars = "1.2"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

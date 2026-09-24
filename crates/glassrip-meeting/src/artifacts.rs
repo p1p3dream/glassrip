@@ -137,11 +137,18 @@ pub struct CanvasCropView {
     /// Keyframe id (defaults to the record id).
     #[serde(default)]
     pub keyframe_id: Option<String>,
-    /// Crop image path, absolute or relative to the run directory.
-    #[serde(alias = "crop_path", alias = "image_path")]
+    /// Crop image path, absolute or relative to the run directory. It may name
+    /// the whole frame (`source_image_path`); `crop` then cuts the canvas out.
+    #[serde(alias = "crop_path", alias = "image_path", alias = "source_image_path")]
     pub path: String,
     /// Crop box in frame pixels, when recorded.
-    #[serde(default, alias = "crop_bbox", alias = "crop_box", alias = "bbox")]
+    #[serde(
+        default,
+        alias = "crop_bbox",
+        alias = "crop_box",
+        alias = "bbox",
+        alias = "canvas_bbox"
+    )]
     pub crop: Option<BBox>,
 }
 

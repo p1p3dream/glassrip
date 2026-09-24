@@ -85,6 +85,43 @@ impl BBox {
     }
 }
 
+/// Serde for a box as the array `[x1, y1, x2, y2]` in absolute pixels, the
+/// `bbox_2d` convention Qwen2.5-VL emits natively. Use with
+/// `#[serde(rename = "bbox_2d", with = "crate::geometry::bbox2d")]` and
+/// `#[schemars(with = "[f64; 4]")]`.
+pub mod bbox2d {
+    use super::BBox;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(b: &BBox, s: S) -> Result<S::Ok, S::Error> {
+        [b.x1, b.y1, b.x2, b.y2].serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<BBox, D::Error> {
+        let [x1, y1, x2, y2] = <[f64; 4]>::deserialize(d)?;
+        Ok(BBox::new(x1, y1, x2, y2))
+    }
+}
+
+/// Like [`bbox2d`] for an optional box: the model always writes an array and
+/// `[0, 0, 0, 0]` means "no box"; `None` is written back as `[0, 0, 0, 0]`.
+pub mod opt_bbox2d {
+    use super::BBox;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(b: &Option<BBox>, s: S) -> Result<S::Ok, S::Error> {
+        match b {
+            Some(b) => [b.x1, b.y1, b.x2, b.y2].serialize(s),
+            None => [0.0f64; 4].serialize(s),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<BBox>, D::Error> {
+        let v = <[f64; 4]>::deserialize(d)?;
+        Ok((v != [0.0; 4]).then(|| BBox::new(v[0], v[1], v[2], v[3])))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -381,6 +381,11 @@ pub fn meeting_mode_stage_decls() -> Vec<StageDecl> {
             &["glassrip.rectified_keyframes"],
         ),
         d(
+            "ocr_vocabulary",
+            "glassrip.asr_vocabulary",
+            &["glassrip.ocr"],
+        ),
+        d(
             "classify",
             "glassrip.screen_class",
             &["glassrip.rectified_keyframes", "glassrip.ocr"],
@@ -394,6 +399,7 @@ pub fn meeting_mode_stage_decls() -> Vec<StageDecl> {
                 "glassrip.screen_quads",
                 "glassrip.rectified_keyframes",
                 "glassrip.keyframes",
+                "glassrip.ocr",
             ],
         ),
         d(
@@ -422,7 +428,11 @@ pub fn meeting_mode_stage_decls() -> Vec<StageDecl> {
             ],
         ),
         d("audio_extract", "glassrip.audio", &["glassrip.media_probe"]),
-        d("asr", "glassrip.asr", &["glassrip.audio", "glassrip.ocr"]),
+        d(
+            "asr",
+            "glassrip.asr",
+            &["glassrip.audio", "glassrip.asr_vocabulary"],
+        ),
         d("diarize", "glassrip.diarization", &["glassrip.audio"]),
         d(
             "assign_words",
@@ -476,6 +486,13 @@ mod tests {
         assert!(pos("keyframes") < pos("rectify"));
         assert!(pos("ocr_harvest") < pos("classify"));
         assert!(pos("ocr_harvest") < pos("asr"));
+        // The ASR vocabulary comes from on-screen text and is consumed by asr.
+        assert!(pos("ocr_vocabulary") < pos("asr"));
+        assert!(
+            g.decl("asr")
+                .is_some_and(|d| d.inputs.iter().any(|i| i == "glassrip.asr_vocabulary"))
+        );
+        assert!(g.descendants("ocr_vocabulary").unwrap().contains("asr"));
         assert!(pos("board_state") < pos("notes"));
         assert_eq!(order.last(), Some(&"render"));
         // board_read takes no transcript input in v1.
