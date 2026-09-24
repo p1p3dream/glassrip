@@ -1,0 +1,245 @@
+{
+  "schema": "glassrip.eval.synthetic_document",
+  "schema_version": "1.0.0",
+  "screen_type": "doc",
+  "document": {
+    "page_id": "release-checklist",
+    "type": "doc",
+    "title": "Release checklist",
+    "blocks": [
+      {
+        "kind": "heading",
+        "level": 1,
+        "content": "Release checklist"
+      },
+      {
+        "kind": "heading",
+        "level": 2,
+        "content": "Step 1: Freeze"
+      },
+      {
+        "kind": "paragraph",
+        "content": "Announce the freeze in the release channel and stop merging features."
+      },
+      {
+        "kind": "list",
+        "content": "Owner confirms step 1\nChecklist item ticked\nTime recorded\nLinks attached\nNext owner paged"
+      },
+      {
+        "kind": "heading",
+        "level": 2,
+        "content": "Step 2: Branch"
+      },
+      {
+        "kind": "paragraph",
+        "content": "Cut the release branch from main and tag the candidate build."
+      },
+      {
+        "kind": "list",
+        "content": "Owner confirms step 2\nChecklist item ticked\nTime recorded\nLinks attached\nNext owner paged"
+      },
+      {
+        "kind": "heading",
+        "level": 2,
+        "content": "Step 3: Verify"
+      },
+      {
+        "kind": "paragraph",
+        "content": "Run the smoke list on staging and record every failure with its owner."
+      },
+      {
+        "kind": "list",
+        "content": "Owner confirms step 3\nChecklist item ticked\nTime recorded\nLinks attached\nNext owner paged"
+      },
+      {
+        "kind": "heading",
+        "level": 2,
+        "content": "Step 4: Notes"
+      },
+      {
+        "kind": "paragraph",
+        "content": "Collect merged changes and write short release notes for support."
+      },
+      {
+        "kind": "list",
+        "content": "Owner confirms step 4\nChecklist item ticked\nTime recorded\nLinks attached\nNext owner paged"
+      },
+      {
+        "kind": "heading",
+        "level": 2,
+        "content": "Step 5: Ship"
+      },
+      {
+        "kind": "paragraph",
+        "content": "Promote the candidate to production during the quiet window."
+      },
+      {
+        "kind": "list",
+        "content": "Owner confirms step 5\nChecklist item ticked\nTime recorded\nLinks attached\nNext owner paged"
+      },
+      {
+        "kind": "heading",
+        "level": 2,
+        "content": "Step 6: Watch"
+      },
+      {
+        "kind": "paragraph",
+        "content": "Watch error rates for one hour and roll back if they double."
+      },
+      {
+        "kind": "list",
+        "content": "Owner confirms step 6\nChecklist item ticked\nTime recorded\nLinks attached\nNext owner paged"
+      },
+      {
+        "kind": "heading",
+        "level": 2,
+        "content": "Step 7: Close"
+      },
+      {
+        "kind": "paragraph",
+        "content": "Close the release ticket and unfreeze the main branch."
+      },
+      {
+        "kind": "list",
+        "content": "Owner confirms step 7\nChecklist item ticked\nTime recorded\nLinks attached\nNext owner paged"
+      },
+      {
+        "kind": "heading",
+        "level": 2,
+        "content": "Step 8: Audit"
+      },
+      {
+        "kind": "paragraph",
+        "content": "Compare the shipped build hash with the tagged candidate."
+      },
+      {
+        "kind": "list",
+        "content": "Owner confirms step 8\nChecklist item ticked\nTime recorded\nLinks attached\nNext owner paged"
+      },
+      {
+        "kind": "heading",
+        "level": 2,
+        "content": "Step 9: Support"
+      },
+      {
+        "kind": "paragraph",
+        "content": "Brief the support rotation on known issues and workarounds."
+      },
+      {
+        "kind": "list",
+        "content": "Owner confirms step 9\nChecklist item ticked\nTime recorded\nLinks attached\nNext owner paged"
+      },
+      {
+        "kind": "heading",
+        "level": 2,
+        "content": "Step 10: Docs"
+      },
+      {
+        "kind": "paragraph",
+        "content": "Publish the updated user guide pages that changed in this release."
+      },
+      {
+        "kind": "list",
+        "content": "Owner confirms step 10\nChecklist item ticked\nTime recorded\nLinks attached\nNext owner paged"
+      },
+      {
+        "kind": "heading",
+        "level": 2,
+        "content": "Step 11: Metrics"
+      },
+      {
+        "kind": "paragraph",
+        "content": "Snapshot the release dashboard for the weekly review."
+      },
+      {
+        "kind": "list",
+        "content": "Owner confirms step 11\nChecklist item ticked\nTime recorded\nLinks attached\nNext owner paged"
+      },
+      {
+        "kind": "heading",
+        "level": 2,
+        "content": "Step 12: Cleanup"
+      },
+      {
+        "kind": "paragraph",
+        "content": "Delete temporary feature flags that were fully rolled out."
+      },
+      {
+        "kind": "list",
+        "content": "Owner confirms step 12\nChecklist item ticked\nTime recorded\nLinks attached\nNext owner paged"
+      },
+      {
+        "kind": "heading",
+        "level": 2,
+        "content": "Step 13: Retro"
+      },
+      {
+        "kind": "paragraph",
+        "content": "Hold a short retro and file follow-up tickets with owners."
+      },
+      {
+        "kind": "list",
+        "content": "Owner confirms step 13\nChecklist item ticked\nTime recorded\nLinks attached\nNext owner paged"
+      },
+      {
+        "kind": "heading",
+        "level": 2,
+        "content": "Step 14: Archive"
+      },
+      {
+        "kind": "paragraph",
+        "content": "Archive the release channel thread and link it from the ticket."
+      },
+      {
+        "kind": "list",
+        "content": "Owner confirms step 14\nChecklist item ticked\nTime recorded\nLinks attached\nNext owner paged"
+      }
+    ]
+  },
+  "page_height_px": 3594,
+  "viewport_width": 1280,
+  "viewport_height": 720,
+  "fixed_header_px": 64,
+  "frames": [
+    {
+      "file": "frames/f_000.png",
+      "scroll_y": 0
+    },
+    {
+      "file": "frames/f_001.png",
+      "scroll_y": 360
+    },
+    {
+      "file": "frames/f_002.png",
+      "scroll_y": 720
+    },
+    {
+      "file": "frames/f_003.png",
+      "scroll_y": 1080
+    },
+    {
+      "file": "frames/f_004.png",
+      "scroll_y": 1440
+    },
+    {
+      "file": "frames/f_005.png",
+      "scroll_y": 1800
+    },
+    {
+      "file": "frames/f_006.png",
+      "scroll_y": 2160
+    },
+    {
+      "file": "frames/f_007.png",
+      "scroll_y": 2520
+    },
+    {
+      "file": "frames/f_008.png",
+      "scroll_y": 2880
+    },
+    {
+      "file": "frames/f_009.png",
+      "scroll_y": 2938
+    }
+  ]
+}

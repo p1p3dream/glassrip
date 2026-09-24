@@ -1,0 +1,8 @@
+case = "board_basic"
+suite = "synthetic"
+description = "Three nodes, two labelled solid edges, one question sticky."
+generator = "gen_synthetic"
+generator_version = 1
+seed = 11
+screen_type = "whiteboard"
+tags = ["basic", "labelled_edges"]

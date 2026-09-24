@@ -1,0 +1,77 @@
+{
+  "schema": "glassrip.eval.synthetic_document",
+  "schema_version": "1.0.0",
+  "screen_type": "ticket",
+  "document": {
+    "page_id": "ORB-412",
+    "type": "ticket",
+    "title": "Retry failed parcel uploads",
+    "fields": {
+      "key": "ORB-412",
+      "title": "Retry failed parcel uploads",
+      "type": "Story",
+      "status": "In Progress",
+      "priority": "High",
+      "assignee": "Avery Stone",
+      "reporter": "Jordan Vale",
+      "labels": [
+        "backend",
+        "uploads"
+      ],
+      "epic": "ORB-400",
+      "sprint": "Sprint 14",
+      "description": "Uploads that fail with a network error are dropped today. Retry them with backoff so a short outage does not lose parcels.",
+      "acceptance_criteria": [
+        "Failed uploads retry three times with backoff",
+        "A parcel is never uploaded twice",
+        "Retries show up in the upload log"
+      ],
+      "comments": [
+        {
+          "author": "Morgan Lee",
+          "time": "2 days ago",
+          "body": "Can we reuse the queue retry helper here?"
+        },
+        {
+          "author": "Avery Stone",
+          "time": "2 days ago",
+          "body": "Yes, it already handles jitter."
+        },
+        {
+          "author": "Jordan Vale",
+          "time": "1 day ago",
+          "body": "Please add a metric for dropped parcels too."
+        }
+      ],
+      "links": [
+        {
+          "relation": "blocks",
+          "key": "ORB-415"
+        },
+        {
+          "relation": "relates to",
+          "key": "ORB-388"
+        }
+      ],
+      "attachments": []
+    }
+  },
+  "page_height_px": 1069,
+  "viewport_width": 1280,
+  "viewport_height": 720,
+  "fixed_header_px": 64,
+  "frames": [
+    {
+      "file": "frames/f_000.png",
+      "scroll_y": 0
+    },
+    {
+      "file": "frames/f_001.png",
+      "scroll_y": 360
+    },
+    {
+      "file": "frames/f_002.png",
+      "scroll_y": 413
+    }
+  ]
+}

@@ -1,0 +1,144 @@
+{
+  "schema": "glassrip.eval.synthetic_board",
+  "schema_version": "1.0.0",
+  "screen_type": "whiteboard",
+  "frame_width": 1920,
+  "frame_height": 1080,
+  "canvas_bbox": {
+    "x1": 220.0,
+    "y1": 110.0,
+    "x2": 1640.0,
+    "y2": 1030.0
+  },
+  "board": {
+    "nodes": [
+      {
+        "id": "feed",
+        "text": "Home Feed",
+        "bbox": {
+          "x1": 351.0,
+          "y1": 236.0,
+          "x2": 623.0,
+          "y2": 309.0
+        },
+        "core": true
+      },
+      {
+        "id": "picker",
+        "text": "Card Picker",
+        "bbox": {
+          "x1": 1269.0,
+          "y1": 210.0,
+          "x2": 1469.0,
+          "y2": 316.0
+        },
+        "core": true
+      }
+    ],
+    "edges": [
+      {
+        "src": "feed",
+        "dst": "picker",
+        "label": "orders cards",
+        "style": "solid",
+        "directed": true
+      }
+    ],
+    "stickies": [
+      {
+        "text": "Step log",
+        "bbox": {
+          "x1": 269.0,
+          "y1": 694.0,
+          "x2": 499.0,
+          "y2": 834.0
+        },
+        "kind": "note"
+      },
+      {
+        "text": "Past entries",
+        "bbox": {
+          "x1": 534.0,
+          "y1": 686.0,
+          "x2": 764.0,
+          "y2": 826.0
+        },
+        "kind": "note"
+      },
+      {
+        "text": "Tips for you",
+        "bbox": {
+          "x1": 802.0,
+          "y1": 684.0,
+          "x2": 1032.0,
+          "y2": 824.0
+        },
+        "kind": "note"
+      },
+      {
+        "text": "Group posts",
+        "bbox": {
+          "x1": 1059.0,
+          "y1": 694.0,
+          "x2": 1289.0,
+          "y2": 834.0
+        },
+        "kind": "note"
+      },
+      {
+        "text": "Unread notes",
+        "bbox": {
+          "x1": 1329.0,
+          "y1": 685.0,
+          "x2": 1559.0,
+          "y2": 825.0
+        },
+        "kind": "note"
+      },
+      {
+        "text": "Reminders",
+        "bbox": {
+          "x1": 264.0,
+          "y1": 849.0,
+          "x2": 494.0,
+          "y2": 989.0
+        },
+        "kind": "note"
+      },
+      {
+        "text": "Two columns or one?",
+        "bbox": {
+          "x1": 535.0,
+          "y1": 851.0,
+          "x2": 765.0,
+          "y2": 991.0
+        },
+        "kind": "question"
+      }
+    ],
+    "owners": []
+  },
+  "chrome_texts": [
+    "Q3 roadmap - Boardly",
+    "Inbox (3)",
+    "boardly.example/app/board/q3-roadmap",
+    "Boards",
+    "Templates",
+    "Recent",
+    "Starred",
+    "Create frame",
+    "Share",
+    "Riley Park (Presenting)",
+    "100%",
+    "Fit",
+    "Undo",
+    "Riley Park",
+    "Casey Moreno",
+    "Quinn Adler"
+  ],
+  "participants": [
+    "Riley Park",
+    "Casey Moreno",
+    "Quinn Adler"
+  ]
+}

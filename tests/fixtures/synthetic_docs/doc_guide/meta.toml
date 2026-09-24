@@ -1,0 +1,8 @@
+case = "doc_guide"
+suite = "synthetic_docs"
+description = "Documentation page with a list, a code block, an 8-row table, and a quote."
+generator = "gen_synthetic"
+generator_version = 1
+seed = 32
+screen_type = "doc"
+tags = ["doc", "table", "code", "quote"]

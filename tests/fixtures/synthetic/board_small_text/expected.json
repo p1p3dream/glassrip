@@ -1,0 +1,183 @@
+{
+  "schema": "glassrip.eval.synthetic_board",
+  "schema_version": "1.0.0",
+  "screen_type": "whiteboard",
+  "frame_width": 1920,
+  "frame_height": 1080,
+  "canvas_bbox": {
+    "x1": 220.0,
+    "y1": 110.0,
+    "x2": 1640.0,
+    "y2": 1030.0
+  },
+  "board": {
+    "nodes": [
+      {
+        "id": "intake",
+        "text": "Intake Form",
+        "bbox": {
+          "x1": 368.0,
+          "y1": 248.0,
+          "x2": 600.0,
+          "y2": 310.0
+        },
+        "core": true
+      },
+      {
+        "id": "rules",
+        "text": "Rules Engine",
+        "bbox": {
+          "x1": 809.0,
+          "y1": 252.0,
+          "x2": 1057.0,
+          "y2": 314.0
+        },
+        "core": true
+      },
+      {
+        "id": "audit",
+        "text": "Audit Log",
+        "bbox": {
+          "x1": 1277.0,
+          "y1": 238.0,
+          "x2": 1477.0,
+          "y2": 300.0
+        },
+        "core": true
+      },
+      {
+        "id": "review",
+        "text": "Review Queue",
+        "bbox": {
+          "x1": 367.0,
+          "y1": 506.0,
+          "x2": 615.0,
+          "y2": 568.0
+        },
+        "core": true
+      },
+      {
+        "id": "notify",
+        "text": "Notifier",
+        "bbox": {
+          "x1": 838.0,
+          "y1": 487.0,
+          "x2": 1038.0,
+          "y2": 549.0
+        },
+        "core": true
+      },
+      {
+        "id": "metrics",
+        "text": "Metrics Store",
+        "bbox": {
+          "x1": 1237.0,
+          "y1": 488.0,
+          "x2": 1501.0,
+          "y2": 550.0
+        },
+        "core": true
+      }
+    ],
+    "edges": [
+      {
+        "src": "intake",
+        "dst": "rules",
+        "label": "validate",
+        "style": "solid",
+        "directed": true
+      },
+      {
+        "src": "rules",
+        "dst": "audit",
+        "label": "append",
+        "style": "solid",
+        "directed": true
+      },
+      {
+        "src": "rules",
+        "dst": "notify",
+        "label": "trigger",
+        "style": "solid",
+        "directed": true
+      },
+      {
+        "src": "review",
+        "dst": "notify",
+        "label": "email",
+        "style": "solid",
+        "directed": true
+      },
+      {
+        "src": "notify",
+        "dst": "metrics",
+        "label": "counts",
+        "style": "solid",
+        "directed": true
+      },
+      {
+        "src": "intake",
+        "dst": "review",
+        "label": "manual",
+        "style": "solid",
+        "directed": true
+      }
+    ],
+    "stickies": [
+      {
+        "text": "Rename audit fields?",
+        "bbox": {
+          "x1": 269.0,
+          "y1": 690.0,
+          "x2": 499.0,
+          "y2": 830.0
+        },
+        "kind": "question"
+      },
+      {
+        "text": "Idea: weekly digest",
+        "bbox": {
+          "x1": 536.0,
+          "y1": 693.0,
+          "x2": 766.0,
+          "y2": 833.0
+        },
+        "kind": "idea"
+      },
+      {
+        "text": "Out of scope: exports",
+        "bbox": {
+          "x1": 795.0,
+          "y1": 685.0,
+          "x2": 1025.0,
+          "y2": 825.0
+        },
+        "kind": "note"
+      }
+    ],
+    "owners": []
+  },
+  "chrome_texts": [
+    "Q3 roadmap - Boardly",
+    "Inbox (3)",
+    "boardly.example/app/board/q3-roadmap",
+    "Boards",
+    "Templates",
+    "Recent",
+    "Starred",
+    "Create frame",
+    "Share",
+    "Quinn Adler (Presenting)",
+    "100%",
+    "Fit",
+    "Undo",
+    "Riley Park",
+    "Casey Moreno",
+    "Quinn Adler"
+  ],
+  "participants": [
+    "Riley Park",
+    "Casey Moreno",
+    "Quinn Adler"
+  ]
+}

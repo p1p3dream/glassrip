@@ -1,0 +1,8 @@
+case = "meet_gallery"
+suite = "synthetic"
+description = "Video call gallery of four participants."
+generator = "gen_synthetic"
+generator_version = 1
+seed = 25
+screen_type = "meet_gallery"
+tags = ["screen_type"]

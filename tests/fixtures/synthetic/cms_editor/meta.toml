@@ -1,0 +1,8 @@
+case = "cms_editor"
+suite = "synthetic"
+description = "Content studio editing one document; a trap that must not be read as a board."
+generator = "gen_synthetic"
+generator_version = 1
+seed = 22
+screen_type = "cms"
+tags = ["trap", "cms"]

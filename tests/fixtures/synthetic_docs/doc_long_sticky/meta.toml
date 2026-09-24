@@ -1,0 +1,8 @@
+case = "doc_long_sticky"
+suite = "synthetic_docs"
+description = "Long page (at least 5 screens) with a fixed header and a fixed sidebar."
+generator = "gen_synthetic"
+generator_version = 1
+seed = 33
+screen_type = "doc"
+tags = ["doc", "long_page", "sticky_header", "sidebar"]

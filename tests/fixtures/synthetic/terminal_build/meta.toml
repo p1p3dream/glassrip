@@ -1,0 +1,8 @@
+case = "terminal_build"
+suite = "synthetic"
+description = "Terminal running a build."
+generator = "gen_synthetic"
+generator_version = 1
+seed = 24
+screen_type = "code"
+tags = ["screen_type"]

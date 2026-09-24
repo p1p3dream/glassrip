@@ -1,0 +1,26 @@
+{
+  "schema": "glassrip.eval.synthetic_board",
+  "schema_version": "1.0.0",
+  "screen_type": "chat",
+  "frame_width": 1920,
+  "frame_height": 1080,
+  "board": {
+    "nodes": [],
+    "edges": [],
+    "stickies": [],
+    "owners": []
+  },
+  "chrome_texts": [
+    "releases - Northwind",
+    "Inbox (3)",
+    "chat.example/northwind/releases",
+    "Riley Park",
+    "Casey Moreno",
+    "Quinn Adler"
+  ],
+  "participants": [
+    "Riley Park",
+    "Casey Moreno",
+    "Quinn Adler"
+  ]
+}

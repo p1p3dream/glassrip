@@ -1,0 +1,10 @@
+{
+  "record_version": 1,
+  "key": "396c1400267cefb7729784b3ec178acc765b46ec4572c1a898e9825985adf2a3",
+  "kind": "classify",
+  "case": "meet_gallery",
+  "model": "qwen2.5vl:7b",
+  "model_digest": "5ced39dfa4bac325dc183dd1e4febaa1c46b3ea28bce48896c8e69c1e79611cc",
+  "raw_text": "{\n  \"app_hint\": \"\",\n  \"canvas_bbox\": {\n    \"x1\": 78,\n    \"x2\": 1122,\n    \"y1\": 65,\n    \"y2\": 622\n  },\n  \"confidence\": 0.95,\n  \"screen_type\": \"meet_gallery\"\n}",
+  "wall_s": 1.95
+}

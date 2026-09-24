@@ -76,6 +76,8 @@ enum Commands {
         #[arg(long, default_value_t = 4)]
         refine_agents: usize,
     },
+    /// Evaluate against golden fixtures and gate regressions (spec section 9)
+    Eval(glassrip_eval::cli::EvalArgs),
 }
 
 #[tokio::main]
@@ -128,6 +130,12 @@ async fn main() -> Result<()> {
             };
             glassrip::pipeline::run_pipeline(&args).await
         }
+        Commands::Eval(args) => {
+            if !glassrip_eval::cli::run(args).await?.passed {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -156,14 +164,19 @@ mod tests {
             vlm_timeout,
             max_frame_failure_rate,
             ..
-        } = scrape(&[]).unwrap();
+        } = scrape(&[]).unwrap()
+        else {
+            panic!("expected scrape")
+        };
         assert_eq!(vlm_timeout, 120);
         assert_eq!(max_frame_failure_rate, 0.10);
     }
 
     #[test]
     fn refine_model_default() {
-        let Commands::Scrape { refine_model, .. } = scrape(&[]).unwrap();
+        let Commands::Scrape { refine_model, .. } = scrape(&[]).unwrap() else {
+            panic!("expected scrape")
+        };
         assert_eq!(refine_model, "claude-opus-5-5");
     }
 
@@ -173,7 +186,10 @@ mod tests {
             vlm_timeout,
             max_frame_failure_rate,
             ..
-        } = scrape(&["--vlm-timeout", "300", "--max-frame-failure-rate", "0.25"]).unwrap();
+        } = scrape(&["--vlm-timeout", "300", "--max-frame-failure-rate", "0.25"]).unwrap()
+        else {
+            panic!("expected scrape")
+        };
         assert_eq!(vlm_timeout, 300);
         assert_eq!(max_frame_failure_rate, 0.25);
     }
@@ -186,9 +202,19 @@ mod tests {
     }
 
     #[test]
+    fn eval_subcommand_parses() {
+        let cli =
+            Cli::try_parse_from(["glassrip", "eval", "--suite", "synthetic", "--bench"]).unwrap();
+        assert!(matches!(cli.command, Commands::Eval(ref a) if a.bench));
+        assert!(Cli::try_parse_from(["glassrip", "eval"]).is_err());
+    }
+
+    #[test]
     fn zero_vlm_timeout_rejected() {
         assert!(scrape(&["--vlm-timeout", "0"]).is_err());
-        let Commands::Scrape { vlm_timeout, .. } = scrape(&["--vlm-timeout", "1"]).unwrap();
+        let Commands::Scrape { vlm_timeout, .. } = scrape(&["--vlm-timeout", "1"]).unwrap() else {
+            panic!("expected scrape")
+        };
         assert_eq!(vlm_timeout, 1);
     }
 }

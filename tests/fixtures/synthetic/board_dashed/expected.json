@@ -1,0 +1,137 @@
+{
+  "schema": "glassrip.eval.synthetic_board",
+  "schema_version": "1.0.0",
+  "screen_type": "whiteboard",
+  "frame_width": 1920,
+  "frame_height": 1080,
+  "canvas_bbox": {
+    "x1": 220.0,
+    "y1": 110.0,
+    "x2": 1640.0,
+    "y2": 1030.0
+  },
+  "board": {
+    "nodes": [
+      {
+        "id": "beacon",
+        "text": "Beacon Web",
+        "bbox": {
+          "x1": 346.0,
+          "y1": 225.0,
+          "x2": 642.0,
+          "y2": 298.0
+        },
+        "core": true
+      },
+      {
+        "id": "harbor",
+        "text": "Harbor Gateway",
+        "bbox": {
+          "x1": 828.0,
+          "y1": 242.0,
+          "x2": 1052.0,
+          "y2": 348.0
+        },
+        "core": true
+      },
+      {
+        "id": "nimbus",
+        "text": "Nimbus Auth",
+        "bbox": {
+          "x1": 1267.0,
+          "y1": 237.0,
+          "x2": 1467.0,
+          "y2": 343.0
+        },
+        "core": true
+      },
+      {
+        "id": "kit",
+        "text": "Design Kit",
+        "bbox": {
+          "x1": 345.0,
+          "y1": 482.0,
+          "x2": 641.0,
+          "y2": 555.0
+        },
+        "core": true
+      }
+    ],
+    "edges": [
+      {
+        "src": "beacon",
+        "dst": "harbor",
+        "label": "GraphQL",
+        "style": "solid",
+        "directed": true
+      },
+      {
+        "src": "harbor",
+        "dst": "nimbus",
+        "label": "OAuth",
+        "style": "solid",
+        "directed": true
+      },
+      {
+        "src": "beacon",
+        "dst": "kit",
+        "label": "",
+        "style": "solid",
+        "directed": true
+      },
+      {
+        "src": "kit",
+        "dst": "nimbus",
+        "label": "Relates copy to layout blocks",
+        "style": "dashed",
+        "directed": true
+      }
+    ],
+    "stickies": [
+      {
+        "text": "Idea: batch uploads",
+        "bbox": {
+          "x1": 272.0,
+          "y1": 691.0,
+          "x2": 502.0,
+          "y2": 831.0
+        },
+        "kind": "idea"
+      },
+      {
+        "text": "Milestone 1: reorder feed",
+        "bbox": {
+          "x1": 530.0,
+          "y1": 689.0,
+          "x2": 760.0,
+          "y2": 829.0
+        },
+        "kind": "milestone"
+      }
+    ],
+    "owners": []
+  },
+  "chrome_texts": [
+    "Q3 roadmap - Boardly",
+    "Inbox (3)",
+    "boardly.example/app/board/q3-roadmap",
+    "Boards",
+    "Templates",
+    "Recent",
+    "Starred",
+    "Create frame",
+    "Share",
+    "Riley Park (Presenting)",
+    "100%",
+    "Fit",
+    "Undo",
+    "Riley Park",
+    "Casey Moreno",
+    "Quinn Adler"
+  ],
+  "participants": [
+    "Riley Park",
+    "Casey Moreno",
+    "Quinn Adler"
+  ]
+}

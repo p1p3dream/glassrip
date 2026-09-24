@@ -1,0 +1,8 @@
+case = "board_owners"
+suite = "synthetic"
+description = "Owner tags on nodes next to video tiles whose names must not become owners."
+generator = "gen_synthetic"
+generator_version = 1
+seed = 13
+screen_type = "whiteboard"
+tags = ["owner_tags", "tile_names"]

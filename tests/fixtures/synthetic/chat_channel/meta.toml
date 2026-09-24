@@ -1,0 +1,8 @@
+case = "chat_channel"
+suite = "synthetic"
+description = "Chat application with channels and messages."
+generator = "gen_synthetic"
+generator_version = 1
+seed = 23
+screen_type = "chat"
+tags = ["screen_type"]

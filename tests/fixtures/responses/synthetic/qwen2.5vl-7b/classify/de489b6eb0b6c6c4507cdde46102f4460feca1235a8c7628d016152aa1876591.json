@@ -1,0 +1,10 @@
+{
+  "record_version": 1,
+  "key": "de489b6eb0b6c6c4507cdde46102f4460feca1235a8c7628d016152aa1876591",
+  "kind": "classify",
+  "case": "cms_editor",
+  "model": "qwen2.5vl:7b",
+  "model_digest": "5ced39dfa4bac325dc183dd1e4febaa1c46b3ea28bce48896c8e69c1e79611cc",
+  "raw_text": "{\n  \"app_hint\": \"Plinth Studio\",\n  \"canvas_bbox\": {\n    \"x1\": 0,\n    \"x2\": 1200,\n    \"y1\": 0,\n    \"y2\": 672\n  },\n  \"confidence\": 0.95,\n  \"screen_type\": \"cms\"\n}",
+  "wall_s": 3.772
+}

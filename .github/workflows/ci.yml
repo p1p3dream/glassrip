@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --workspace
+      - name: Synthetic eval (recorded responses, regression gate)
+        run: >
+          cargo run --quiet -- eval --suite synthetic
+          --baseline tests/fixtures/eval_baselines/synthetic.qwen2.5vl-7b.json
+      - name: Synthetic docs fixtures load
+        run: cargo run --quiet -- eval --suite synthetic_docs
+      - name: Privacy scan (committed hashed denylist and built-in checks)
+        run: cargo run --quiet -p glassrip-eval --bin glassrip-privacy-scan

@@ -19,6 +19,7 @@ gpu-cuda = ["gpu", "ort/cuda"]
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+glassrip-eval = { path = "crates/glassrip-eval" }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 imageproc = "0.25"
 md-5 = "0.10"
