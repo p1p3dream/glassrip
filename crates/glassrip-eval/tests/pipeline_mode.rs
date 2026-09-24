@@ -43,14 +43,16 @@ fn board_frame() -> RgbImage {
     let mut img = RgbImage::from_pixel(W, H, Rgb([250, 250, 250]));
     rect(&mut img, A, [30, 30, 30], 5);
     rect(&mut img, B, [30, 30, 30], 5);
-    // Connector with an arrowhead at B.
-    for x in 460..740 {
+    // Connector with an arrowhead at B. The head (14 px base, 12 px long on a
+    // 5 px line) stays within the pixel check's search disk: a head wider than
+    // 0.8 of `arrow_radius_px` is treated as a line crossing by design.
+    for x in 460..748 {
         for y in 258..263 {
             img.put_pixel(x, y, Rgb([30, 30, 30]));
         }
     }
-    for x in 740..760u32 {
-        let half = (760 - x) as i64 * 3 / 5;
+    for x in 748..760u32 {
+        let half = (760 - x) as i64 * 7 / 12;
         for dy in -half..=half {
             img.put_pixel(x, (260 + dy) as u32, Rgb([30, 30, 30]));
         }
@@ -261,9 +263,10 @@ async fn pipeline_mode_records_then_replays_identically() {
         .unwrap()
         .clone();
     let dir = board_case["board"]["edges"][0]["direction"].clone();
-    assert!(
-        dir == json!("forward") || dir == json!("uncertain"),
-        "{dir}"
+    assert_eq!(
+        dir,
+        json!("forward"),
+        "the drawn arrowhead must be detected"
     );
 
     // Replay: no model, no OCR engine; identical results.
