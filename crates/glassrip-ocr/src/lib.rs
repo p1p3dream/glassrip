@@ -72,9 +72,20 @@ pub struct OcrConfig {
     pub rec_batch: usize,
     /// Spans whose recognition confidence is below this are dropped.
     pub drop_score: f64,
-    /// CUDA memory arena limit per session, MiB. The server detector at 1920 px
-    /// needs about 3 GiB of working memory (spec 5.3 plans 1 to 2 GB).
+    /// Total CUDA memory arena limit for OCR, MiB, split between the two
+    /// sessions by [`OcrConfig::session_limits_mib`]. The server detector at
+    /// 1920 px needs about 3 GiB of working memory (spec 5.3 plans 1 to 2 GB).
     pub cuda_mem_limit_mib: u32,
+}
+
+impl OcrConfig {
+    /// Arena limits `(detector, recognizer)` in MiB: the recognizer gets a
+    /// quarter of the total, at most 1024 MiB, and the detector the rest, so
+    /// the two never exceed `cuda_mem_limit_mib` together.
+    pub fn session_limits_mib(&self) -> (u32, u32) {
+        let rec = (self.cuda_mem_limit_mib / 4).min(1024);
+        (self.cuda_mem_limit_mib - rec, rec)
+    }
 }
 
 impl Default for OcrConfig {
@@ -89,7 +100,7 @@ impl Default for OcrConfig {
             rec_max_width: 3200,
             rec_batch: 8,
             drop_score: 0.5,
-            cuda_mem_limit_mib: 3072,
+            cuda_mem_limit_mib: 4096,
         }
     }
 }
@@ -133,4 +144,23 @@ pub trait TextRecognizer: Send + Sync {
 
     /// Identity of the models (file hashes), recorded in cache keys.
     fn model_fingerprint(&self) -> String;
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_budget_is_a_total() {
+        let c = OcrConfig::default();
+        let (det, rec) = c.session_limits_mib();
+        assert_eq!(det + rec, c.cuda_mem_limit_mib);
+        assert_eq!((det, rec), (3072, 1024));
+        let small = OcrConfig {
+            cuda_mem_limit_mib: 2048,
+            ..OcrConfig::default()
+        };
+        assert_eq!(small.session_limits_mib(), (1536, 512));
+    }
 }

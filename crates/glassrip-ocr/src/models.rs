@@ -20,6 +20,8 @@ pub const DICT_FILE: &str = "dict.txt";
 
 /// Pinned SHA-256 of the detector.
 pub const DET_SHA256: &str = "61824840edf6e74581898930b8091b1b2318f4b2705a2e8a40ad3de7ac480133";
+/// Pinned SHA-256 of the recognizer dictionary.
+pub const DICT_SHA256: &str = "e025a66d31f327ba0c232e03f407ae8d105e1e709e7ccb3f408aa778c24e70d6";
 /// Pinned SHA-256 of the recognizer.
 pub const REC_SHA256: &str = "4e16deb22c4da6468bdca539b2cd3c8687825538b67109177c47d359ab994cd7";
 
@@ -76,11 +78,15 @@ pub fn sha256_file(path: &Path) -> Result<String, OcrError> {
         .collect())
 }
 
-/// Check both ONNX files against their pinned hashes; returns a fingerprint.
+/// Check the model and dictionary files against their pinned hashes; returns a fingerprint.
 pub fn verify(dir: &Path) -> Result<String, OcrError> {
     check_present(dir)?;
     let mut parts = Vec::new();
-    for (file, expected) in [(DET_FILE, DET_SHA256), (REC_FILE, REC_SHA256)] {
+    for (file, expected) in [
+        (DET_FILE, DET_SHA256),
+        (REC_FILE, REC_SHA256),
+        (DICT_FILE, DICT_SHA256),
+    ] {
         let actual = sha256_file(&dir.join(file))?;
         if actual != expected {
             return Err(OcrError::ModelHashMismatch {
@@ -91,7 +97,6 @@ pub fn verify(dir: &Path) -> Result<String, OcrError> {
         }
         parts.push(actual);
     }
-    parts.push(sha256_file(&dir.join(DICT_FILE))?);
     Ok(parts.join(":"))
 }
 

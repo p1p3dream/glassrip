@@ -51,7 +51,7 @@ pub fn execution_provider() -> &'static str {
     }
 }
 
-fn session_builder(cfg: &OcrConfig) -> Result<SessionBuilder, OcrError> {
+fn session_builder(limit_mib: u32) -> Result<SessionBuilder, OcrError> {
     let builder = Session::builder()
         .map_err(rt)?
         .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -61,14 +61,14 @@ fn session_builder(cfg: &OcrConfig) -> Result<SessionBuilder, OcrError> {
     #[cfg(feature = "cuda")]
     let builder = builder
         .with_execution_providers([ort::ep::CUDA::default()
-            .with_memory_limit(cfg.cuda_mem_limit_mib as usize * 1024 * 1024)
+            .with_memory_limit(limit_mib as usize * 1024 * 1024)
             .with_arena_extend_strategy(ort::ep::ArenaExtendStrategy::SameAsRequested)
             .with_conv_algorithm_search(ort::ep::cuda::ConvAlgorithmSearch::Heuristic)
             .build()
             .error_on_failure()])
         .map_err(|e| OcrError::Runtime(format!("CUDA execution provider: {e}")))?;
     #[cfg(not(feature = "cuda"))]
-    let _ = cfg;
+    let _ = limit_mib;
     Ok(builder)
 }
 
@@ -91,10 +91,11 @@ impl PpOcrEngine {
     pub fn new(dir: &Path, cfg: OcrConfig) -> Result<Self, OcrError> {
         let fingerprint = models::verify(dir)?;
         init_runtime()?;
-        let det = session_builder(&cfg)?
+        let (det_mib, rec_mib) = cfg.session_limits_mib();
+        let det = session_builder(det_mib)?
             .commit_from_file(dir.join(models::DET_FILE))
             .map_err(|e| OcrError::Runtime(format!("detector: {e}")))?;
-        let rec = session_builder(&cfg)?
+        let rec = session_builder(rec_mib)?
             .commit_from_file(dir.join(models::REC_FILE))
             .map_err(|e| OcrError::Runtime(format!("recognizer: {e}")))?;
         let dict = models::read_dict(dir)?;
