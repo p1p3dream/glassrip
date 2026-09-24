@@ -14,6 +14,14 @@ const MANIFEST: &str = include_str!("../models.toml");
 
 /// Name of the orientation model in the manifest.
 pub const ORIENT_MODEL: &str = "pp-lcnet-x1-0-doc-ori";
+/// Text-line detector for the 180 degree confirmation.
+pub const OCR_DET_MODEL: &str = "pp-ocrv3-det";
+/// PP-OCRv5 recognizer for the 180 degree confirmation.
+pub const OCR_REC_MODEL: &str = "en-pp-ocrv5-mobile-rec";
+/// `ocrs` detection model (fallback).
+pub const OCRS_DET_MODEL: &str = "ocrs-text-detection";
+/// `ocrs` recognition model (fallback).
+pub const OCRS_REC_MODEL: &str = "ocrs-text-recognition";
 
 /// Error resolving a model.
 #[derive(Debug, thiserror::Error)]
@@ -200,6 +208,11 @@ mod tests {
         let e = entry(ORIENT_MODEL).unwrap();
         assert_eq!(e.sha256.len(), 64);
         assert!(e.url.starts_with("https://") && e.url.contains("/resolve/"));
+        for n in [OCR_DET_MODEL, OCR_REC_MODEL, OCRS_DET_MODEL, OCRS_REC_MODEL] {
+            let e = entry(n).unwrap();
+            assert_eq!(e.sha256.len(), 64, "{n}");
+            assert!(e.url.starts_with("https://"), "{n}");
+        }
         assert!(entry("nope").is_err());
     }
 

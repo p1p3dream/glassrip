@@ -24,6 +24,7 @@ pub mod features;
 pub mod frames;
 pub mod keyframes;
 pub mod models;
+pub mod ocr;
 pub mod orient;
 pub mod pipeline;
 pub mod probe;

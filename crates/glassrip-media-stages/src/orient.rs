@@ -41,6 +41,22 @@ pub struct OrientParams {
     pub tile_min_confidence: f64,
     /// Skip the model and apply this clockwise rotation (0, 90, 180, 270).
     pub override_rotation_deg: Option<u32>,
+    /// 180 degree confirmation: samples read.
+    pub confirm_frames: u32,
+    /// 180 degree confirmation: text lines read per sample at most.
+    pub confirm_max_lines: u32,
+    /// 180 degree confirmation: fewer lines than this leave the vote unconfirmed but valid.
+    pub confirm_min_lines: u32,
+    /// 180 degree confirmation: required confidence margin over the flip.
+    pub confirm_margin: f64,
+    /// `ocrs` fallback: samples read (at four rotations each).
+    pub fallback_frames: u32,
+    /// `ocrs` fallback: long side the samples are resized to.
+    pub fallback_long_side: u32,
+    /// `ocrs` fallback: minimum dictionary hits for the winner.
+    pub fallback_min_hits: u32,
+    /// `ocrs` fallback: winner must have this many times the runner-up's hits.
+    pub fallback_min_ratio: f64,
 }
 
 impl Default for OrientParams {
@@ -53,6 +69,14 @@ impl Default for OrientParams {
             sample_short_side: 896,
             tile_min_confidence: 0.6,
             override_rotation_deg: None,
+            confirm_frames: 4,
+            confirm_max_lines: 12,
+            confirm_min_lines: 3,
+            confirm_margin: 0.05,
+            fallback_frames: 6,
+            fallback_long_side: 1280,
+            fallback_min_hits: 5,
+            fallback_min_ratio: 1.5,
         }
     }
 }
@@ -90,9 +114,11 @@ impl OrientStage {
         let model_digest = if params.override_rotation_deg.is_some() {
             None
         } else {
-            crate::models::entry(crate::models::ORIENT_MODEL)
-                .ok()
-                .map(|e| e.sha256)
+            let hashes: Vec<String> = model_names()
+                .iter()
+                .filter_map(|n| crate::models::entry(n).ok().map(|e| e.sha256))
+                .collect();
+            Some(hashes.join("+"))
         };
         Self {
             params,
@@ -102,6 +128,21 @@ impl OrientStage {
             allow_download,
             model_digest,
         }
+    }
+}
+
+/// Models this build uses for orientation.
+pub fn model_names() -> &'static [&'static str] {
+    if cfg!(any(feature = "onnx", feature = "onnx-dynamic")) {
+        &[
+            crate::models::ORIENT_MODEL,
+            crate::models::OCR_DET_MODEL,
+            crate::models::OCR_REC_MODEL,
+        ]
+    } else if cfg!(feature = "ocrs") {
+        &[crate::models::OCRS_DET_MODEL, crate::models::OCRS_REC_MODEL]
+    } else {
+        &[]
     }
 }
 
@@ -331,7 +372,7 @@ impl Stage for OrientStage {
         "orient"
     }
     fn version(&self) -> u32 {
-        1
+        2
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
@@ -387,17 +428,35 @@ impl Stage for OrientStage {
                 container_rotation_deg: probe.container_rotation_deg,
                 container_rotation_trusted: false,
                 model: None,
+                confirmation: None,
                 execution_provider: None,
             });
         }
-        let entry = crate::models::entry(crate::models::ORIENT_MODEL)
-            .map_err(|e| ErrorInfo::new(ErrorCode::Internal, e.to_string()))?;
-        let (dir, entry2, dl) = (self.models_dir.clone(), entry.clone(), self.allow_download);
-        let model_path = crate::util::on_rayon(move || {
-            crate::models::ensure(&dir, &entry2, dl)
-                .map_err(|e| ErrorInfo::new(ErrorCode::InvalidInput, e.to_string()))
-        })
-        .await?;
+        let mut paths = Vec::new();
+        let mut refs = Vec::new();
+        for name in model_names() {
+            let entry = crate::models::entry(name)
+                .map_err(|e| ErrorInfo::new(ErrorCode::Internal, e.to_string()))?;
+            let (dir, e2, dl) = (self.models_dir.clone(), entry.clone(), self.allow_download);
+            paths.push(
+                crate::util::on_rayon(move || {
+                    crate::models::ensure(&dir, &e2, dl)
+                        .map_err(|e| ErrorInfo::new(ErrorCode::InvalidInput, e.to_string()))
+                })
+                .await?,
+            );
+            refs.push(ModelRef {
+                name: entry.name,
+                sha256: entry.sha256,
+            });
+        }
+        if paths.is_empty() {
+            return Err(ErrorInfo::new(
+                ErrorCode::InvalidInput,
+                "this build has neither ONNX Runtime (`onnx`, `onnx-dynamic`, `cuda`) nor the \
+                 `ocrs` fallback, and no orient.override_rotation_deg was given",
+            ));
+        }
         let times = sample_times(probe.start_time_s, probe.end_s, self.params.sample_frames);
         let mut images = Vec::with_capacity(times.len());
         for &t in &times {
@@ -411,28 +470,115 @@ impl Stage for OrientStage {
             .await?;
             images.push((t, img));
         }
-        let opts = ClassifyOptions {
-            tile_short_side: self.params.sample_short_side,
-            tile_min_conf: self.params.tile_min_confidence,
-            min_conf: self.params.min_confidence,
-        };
-        let (samples, ep) =
-            crate::util::on_rayon(move || classify_all(&model_path, &images, opts)).await?;
-        let (rot, votes) = decide(&samples, &self.params)?;
-        Ok(Orientation {
-            applied_rotation_deg: rot,
-            method: OrientMethod::PpLcnetVote,
-            votes,
-            samples,
-            container_rotation_deg: probe.container_rotation_deg,
-            container_rotation_trusted: false,
-            model: Some(ModelRef {
-                name: entry.name,
-                sha256: entry.sha256,
-            }),
-            execution_provider: Some(ep),
-        })
+        let params = self.params.clone();
+        let container = probe.container_rotation_deg;
+        crate::util::on_rayon(move || orient_images(&paths, refs, &images, &params, container))
+            .await
     }
+}
+
+/// ONNX builds: PP-LCNet vote, then the PP-OCRv5 180 degree confirmation.
+#[cfg(any(feature = "onnx", feature = "onnx-dynamic"))]
+fn orient_images(
+    paths: &[std::path::PathBuf],
+    refs: Vec<ModelRef>,
+    images: &[(f64, RgbImage)],
+    p: &OrientParams,
+    container: Option<f64>,
+) -> Result<Orientation, ErrorInfo> {
+    let opts = ClassifyOptions {
+        tile_short_side: p.sample_short_side,
+        tile_min_conf: p.tile_min_confidence,
+        min_conf: p.min_confidence,
+    };
+    let (samples, ep) = classify_all(&paths[0], images, opts)?;
+    let (rot, votes) = decide(&samples, p)?;
+    let mut ocr = crate::ocr::PpOcr::new(&paths[1], &paths[2])?;
+    let turned: Vec<RgbImage> = images
+        .iter()
+        .take(p.confirm_frames as usize)
+        .map(|(_, im)| crate::ocr::rotate_cw(im, rot))
+        .collect();
+    let scores = ocr.flip_scores(&turned, p.confirm_max_lines as usize)?;
+    let status =
+        crate::ocr::confirm_flip(scores, rot, p.confirm_min_lines as usize, p.confirm_margin)?;
+    let mut refs = refs.into_iter();
+    let model = refs.next();
+    Ok(Orientation {
+        applied_rotation_deg: rot,
+        method: OrientMethod::PpLcnetVote,
+        votes,
+        samples,
+        container_rotation_deg: container,
+        container_rotation_trusted: false,
+        model,
+        confirmation: Some(crate::schema::OrientConfirmation {
+            status,
+            chosen_confidence: scores.chosen,
+            flipped_confidence: scores.flipped,
+            lines: scores.lines as u32,
+            models: refs.collect(),
+        }),
+        execution_provider: Some(ep),
+    })
+}
+
+/// Builds without ONNX Runtime: `ocrs` dictionary hits at the four rotations.
+#[cfg(all(feature = "ocrs", not(any(feature = "onnx", feature = "onnx-dynamic"))))]
+fn orient_images(
+    paths: &[std::path::PathBuf],
+    refs: Vec<ModelRef>,
+    images: &[(f64, RgbImage)],
+    p: &OrientParams,
+    container: Option<f64>,
+) -> Result<Orientation, ErrorInfo> {
+    let small: Vec<RgbImage> = images
+        .iter()
+        .take(p.fallback_frames as usize)
+        .map(|(_, im)| {
+            let (w, h) = im.dimensions();
+            let s = (f64::from(p.fallback_long_side) / f64::from(w.max(h))).min(1.0);
+            image::imageops::resize(
+                im,
+                ((f64::from(w) * s).round() as u32).max(1),
+                ((f64::from(h) * s).round() as u32).max(1),
+                image::imageops::FilterType::Triangle,
+            )
+        })
+        .collect();
+    let hits = crate::ocr::ocrs_hits(&paths[0], &paths[1], &small)?;
+    let rot = crate::ocr::decide_by_hits(hits, p.fallback_min_hits, p.fallback_min_ratio)?;
+    Ok(Orientation {
+        applied_rotation_deg: rot,
+        method: OrientMethod::OcrsDictionary,
+        votes: RotationVotes {
+            deg_0: hits[0],
+            deg_90: hits[1],
+            deg_180: hits[2],
+            deg_270: hits[3],
+        },
+        samples: Vec::new(),
+        container_rotation_deg: container,
+        container_rotation_trusted: false,
+        model: refs.into_iter().next(),
+        confirmation: None,
+        execution_provider: Some("cpu".into()),
+    })
+}
+
+/// Builds with no orientation backend: unreachable because `model_names` is empty.
+#[cfg(not(any(feature = "ocrs", feature = "onnx", feature = "onnx-dynamic")))]
+fn orient_images(
+    _paths: &[std::path::PathBuf],
+    _refs: Vec<ModelRef>,
+    _images: &[(f64, RgbImage)],
+    _p: &OrientParams,
+    _container: Option<f64>,
+) -> Result<Orientation, ErrorInfo> {
+    Err(ErrorInfo::new(
+        ErrorCode::Internal,
+        "no orientation backend",
+    ))
 }
 
 /// Classification settings.
@@ -454,23 +600,11 @@ pub fn classify_all(
     images: &[(f64, RgbImage)],
     opts: ClassifyOptions,
 ) -> Result<(Vec<OrientSample>, String), ErrorInfo> {
-    use ort::session::Session;
     use ort::value::Tensor;
     let err = |e: &dyn std::fmt::Display| {
         ErrorInfo::new(ErrorCode::ModelRequest, format!("onnx runtime: {e}"))
     };
-    let builder = Session::builder().map_err(|e| err(&e))?;
-    #[cfg(feature = "cuda")]
-    let builder = builder
-        .with_execution_providers([ort::ep::CUDA::default().build().error_on_failure()])
-        .map_err(|e| err(&e))?;
-    let ep = if cfg!(feature = "cuda") {
-        "cuda"
-    } else {
-        "cpu"
-    };
-    let mut builder = builder;
-    let mut session = builder.commit_from_file(model).map_err(|e| err(&e))?;
+    let (mut session, ep) = crate::ocr::onnx_session(model)?;
     let mut samples = Vec::with_capacity(images.len());
     for (t, img) in images {
         let crops = preprocess_tiles(img, opts.tile_short_side);
@@ -496,20 +630,6 @@ pub fn classify_all(
         samples.push(sample_from_class_probs(*t, probs, opts.min_conf));
     }
     Ok((samples, ep.to_string()))
-}
-
-/// Without ONNX Runtime: always an error.
-#[cfg(not(any(feature = "onnx", feature = "onnx-dynamic")))]
-pub fn classify_all(
-    _model: &std::path::Path,
-    _images: &[(f64, RgbImage)],
-    _opts: ClassifyOptions,
-) -> Result<(Vec<OrientSample>, String), ErrorInfo> {
-    Err(ErrorInfo::new(
-        ErrorCode::InvalidInput,
-        "this build has no ONNX Runtime (enable the `onnx`, `onnx-dynamic` or `cuda` feature) \
-         and no orient.override_rotation_deg was given",
-    ))
 }
 
 #[cfg(test)]

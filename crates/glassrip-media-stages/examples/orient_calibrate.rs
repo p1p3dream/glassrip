@@ -7,11 +7,17 @@
 //!     IMAGE [SHORT_SIDE...]
 //! ```
 
-use anyhow::{Context, Result};
-use glassrip_media_stages::models;
-use glassrip_media_stages::orient::{ClassifyOptions, classify_all};
+#[cfg(not(any(feature = "onnx", feature = "onnx-dynamic")))]
+fn main() {
+    eprintln!("orient_calibrate needs the `onnx`, `onnx-dynamic` or `cuda` feature");
+}
 
-fn main() -> Result<()> {
+#[cfg(any(feature = "onnx", feature = "onnx-dynamic"))]
+fn main() -> anyhow::Result<()> {
+    use anyhow::Context;
+    use glassrip_media_stages::models;
+    use glassrip_media_stages::orient::{ClassifyOptions, classify_all};
+
     let path = std::env::args()
         .nth(1)
         .context("usage: orient_calibrate IMAGE [SHORT_SIDE...]")?;

@@ -7,7 +7,9 @@ description = "Media-branch stages of glassrip meeting mode: probe, orient, fram
 publish = false
 
 [features]
-default = []
+# Pure-Rust orientation fallback (ocrs), used when no ONNX feature is enabled.
+default = ["ocrs"]
+ocrs = ["dep:ocrs", "dep:rten"]
 # Orientation model through ONNX Runtime, using the prebuilt binaries `ort` downloads.
 onnx = ["dep:ort", "ort/download-binaries", "ort/tls-rustls"]
 # Orientation model with ONNX Runtime loaded at run time from ORT_DYLIB_PATH.
@@ -18,12 +20,15 @@ cuda = ["onnx-dynamic", "ort/cuda"]
 [dependencies]
 blake3 = { version = "1.8.7", features = ["rayon", "mmap"] }
 fs-err = "3.3.1"
+fs4 = { version = "1.1.0", default-features = false, features = ["fs-err3"] }
 glassrip-core = { path = "../glassrip-core" }
 glassrip-media = { path = "../glassrip-media" }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 imageproc = { version = "0.25", default-features = false }
 ort = { version = "2.0.0-rc.13", optional = true, default-features = false, features = ["std"] }
+ocrs = { version = "0.13.1", optional = true, default-features = false, features = ["onnx"] }
 rayon = "1"
+rten = { version = "0.26", optional = true, default-features = false, features = ["onnx_format"] }
 schemars = { version = "1.2.2", features = ["semver1"] }
 semver = { version = "1.0.28", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }

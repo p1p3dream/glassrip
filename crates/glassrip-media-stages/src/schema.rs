@@ -147,6 +147,34 @@ pub enum OrientMethod {
     PpLcnetVote,
     /// Set by configuration (`--orient-override`).
     Override,
+    /// `ocrs` fallback (no ONNX Runtime): dictionary hits per rotation. `votes` holds the
+    /// hit counts.
+    OcrsDictionary,
+}
+
+/// Outcome of the 180 degree text-recognition check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfirmStatus {
+    /// The chosen rotation reads clearly better than its 180 degree flip.
+    Confirmed,
+    /// Too few text lines to compare; the vote stands.
+    InsufficientText,
+}
+
+/// PP-OCRv5 recognition confidence at the chosen rotation versus its 180 degree flip.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct OrientConfirmation {
+    /// Result.
+    pub status: ConfirmStatus,
+    /// Mean line confidence at the chosen rotation.
+    pub chosen_confidence: f64,
+    /// Mean line confidence turned 180 degrees.
+    pub flipped_confidence: f64,
+    /// Lines compared.
+    pub lines: u32,
+    /// Detector and recognizer used.
+    pub models: Vec<ModelRef>,
 }
 
 /// One sampled frame's classification.
@@ -188,6 +216,8 @@ pub struct Orientation {
     pub container_rotation_trusted: bool,
     /// Model used, when any.
     pub model: Option<ModelRef>,
+    /// 180 degree confirmation (ONNX builds).
+    pub confirmation: Option<OrientConfirmation>,
     /// ONNX Runtime execution provider (`cpu`, `cuda`), when a model ran.
     pub execution_provider: Option<String>,
 }
@@ -198,9 +228,9 @@ pub struct Orientation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Sampling {
-    /// First frame of the bucket (full decode).
+    /// Frame nearest the bucket's center (every frame decoded).
     Grid,
-    /// First sync (key) frame of the bucket (only sync frames decoded).
+    /// Sync (key) frame nearest the bucket's center (only sync frames decoded).
     Sync,
 }
 
@@ -338,7 +368,8 @@ pub enum BoundaryReason {
 pub struct Boundary {
     /// Reason.
     pub reason: BoundaryReason,
-    /// Anchor frame compared with (the previous run's first frame).
+    /// Frame compared with: the previous run's first frame (segmentation), or the
+    /// preceding frame (production island runs and the runs around them).
     pub anchor_frame_id: Option<String>,
     /// SSIM of anchor vs first frame.
     pub ssim: Option<f64>,
