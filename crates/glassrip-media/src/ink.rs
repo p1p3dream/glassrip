@@ -30,7 +30,7 @@ pub const DILATE: usize = 5;
 /// on a small share of pixels; this function reproduces the Carotene result.
 pub fn bgr_to_gray(img: &Bgr) -> Plane<u8> {
     let mut out = Plane::new(img.width, img.height);
-    for (o, px) in out.data.iter_mut().zip(img.data.chunks_exact(3)) {
+    for (o, px) in out.data.iter_mut().zip(img.data.as_chunks::<3>().0) {
         let v = u32::from(px[0]) * 3735 + u32::from(px[1]) * 19235 + u32::from(px[2]) * 9798;
         *o = ((v + (1 << 14)) >> 15).min(255) as u8;
     }
@@ -59,7 +59,7 @@ fn sdiv_table() -> [i32; 256] {
 pub fn color_mask(img: &Bgr) -> Plane<u8> {
     let sdiv = sdiv_table();
     let mut out = Plane::new(img.width, img.height);
-    for (o, px) in out.data.iter_mut().zip(img.data.chunks_exact(3)) {
+    for (o, px) in out.data.iter_mut().zip(img.data.as_chunks::<3>().0) {
         let (s, v) = hsv_s_v(px[0], px[1], px[2], &sdiv);
         *o = if s > MIN_SAT && v > MIN_VAL { 255 } else { 0 };
     }

@@ -53,6 +53,9 @@ pub struct VisionBranch {
 
 impl VisionBranch {
     /// Run every stage up to and including `until` (all when `None`).
+    // `RunnerError` carries stage declarations for its mismatch report; this error
+    // path runs once per pipeline, so its size does not matter.
+    #[allow(clippy::result_large_err)]
     pub async fn run(
         &self,
         runner: &mut Runner,
