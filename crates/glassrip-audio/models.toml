@@ -1,0 +1,220 @@
+# Model files for glassrip-audio. URLs are pinned to upstream revisions;
+# SHA-256 values were measured on the downloaded files. Binaries are never
+# committed. Paths are relative to $GLASSRIP_MODELS_DIR or ~/.glassrip/models.
+
+[[model]]
+name = "whisper-large-v3"
+path = "ggml-large-v3.bin"
+url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3.bin"
+sha256 = "64d182b440b98d5203c4f9bd541544d84c605196c4f7b845dfa11fb23594d1e2"
+license = "MIT"
+
+[[model]]
+name = "whisper-large-v3-turbo"
+path = "ggml-large-v3-turbo.bin"
+url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo.bin"
+sha256 = "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69"
+license = "MIT"
+
+[[model]]
+name = "silero-vad-v6.2.0"
+path = "ggml-silero-v6.2.0.bin"
+url = "https://huggingface.co/ggml-org/whisper-vad/resolve/9ffd54a1e1ee413ddf265af9913beaf518d1639b/ggml-silero-v6.2.0.bin"
+sha256 = "2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987"
+license = "MIT"
+
+[[model]]
+name = "speakrs/plda_lda.npy"
+path = "speakrs/plda_lda.npy"
+url = "https://huggingface.co/avencera/speakrs-models/resolve/a785ebdbe6313868088c36c93d9efa71c470bd34/plda_lda.npy"
+sha256 = "e20c9b012bebd1aabda5a38a127e63a43cf35debdc502715fc143e2fb6bc3c4b"
+license = "CC-BY-4.0"
+
+[[model]]
+name = "speakrs/plda_mean1.npy"
+path = "speakrs/plda_mean1.npy"
+url = "https://huggingface.co/avencera/speakrs-models/resolve/a785ebdbe6313868088c36c93d9efa71c470bd34/plda_mean1.npy"
+sha256 = "e424c0c352182aa8e0f555dec1f3b30e29a20b9ed6b25d339f112af92e51e36f"
+license = "CC-BY-4.0"
+
+[[model]]
+name = "speakrs/plda_mean2.npy"
+path = "speakrs/plda_mean2.npy"
+url = "https://huggingface.co/avencera/speakrs-models/resolve/a785ebdbe6313868088c36c93d9efa71c470bd34/plda_mean2.npy"
+sha256 = "6f6fb708a2037197b5b84ffeaa8f140cb878088fbecd6ab042ad26a7691bd2cf"
+license = "CC-BY-4.0"
+
+[[model]]
+name = "speakrs/plda_mu.npy"
+path = "speakrs/plda_mu.npy"
+url = "https://huggingface.co/avencera/speakrs-models/resolve/a785ebdbe6313868088c36c93d9efa71c470bd34/plda_mu.npy"
+sha256 = "d286d48acf99bbc1ed1502fed0a3e361ae5626ce1870c8be9f7397c5e47886c6"
+license = "CC-BY-4.0"
+
+[[model]]
+name = "speakrs/plda_phi.npy"
+path = "speakrs/plda_phi.npy"
+url = "https://huggingface.co/avencera/speakrs-models/resolve/a785ebdbe6313868088c36c93d9efa71c470bd34/plda_phi.npy"
+sha256 = "1f403ada4969a5897b24912e5c25b81ed446b3a513a90135bef3c5c885992677"
+license = "CC-BY-4.0"
+
+[[model]]
+name = "speakrs/plda_psi.npy"
+path = "speakrs/plda_psi.npy"
+url = "https://huggingface.co/avencera/speakrs-models/resolve/a785ebdbe6313868088c36c93d9efa71c470bd34/plda_psi.npy"
+sha256 = "d7128c9ed2f28a9781971805131129f077c04f948e2df12e52dcdb99f2b4e5f5"
+license = "CC-BY-4.0"
+
+[[model]]
+name = "speakrs/plda_tr.npy"
+path = "speakrs/plda_tr.npy"
+url = "https://huggingface.co/avencera/speakrs-models/resolve/a785ebdbe6313868088c36c93d9efa71c470bd34/plda_tr.npy"
+sha256 = "e700b68cb319de3fafb5fa093eb9222c23c447084741f8d3a533640d425510ee"
+license = "CC-BY-4.0"
+
+[[model]]
+name = "speakrs/segmentation-3.0-b32.onnx"
+path = "speakrs/segmentation-3.0-b32.onnx"
+url = "https://huggingface.co/avencera/speakrs-models/resolve/a785ebdbe6313868088c36c93d9efa71c470bd34/segmentation-3.0-b32.onnx"
+sha256 = "94deac93dacc90d3191511f87f6f4d8517e3b2f5e10a449a851bcbf0ba9cdc94"
+license = "MIT"
+
+[[model]]
+name = "speakrs/segmentation-3.0.onnx"
+path = "speakrs/segmentation-3.0.onnx"
+url = "https://huggingface.co/avencera/speakrs-models/resolve/a785ebdbe6313868088c36c93d9efa71c470bd34/segmentation-3.0.onnx"
+sha256 = "038b971741ed623af9773ecafdefa4b7bc523520099c2a68f8568b24189e8ad9"
+license = "MIT"
+
+[[model]]
+name = "speakrs/wespeaker-fbank-b32.onnx"
+path = "speakrs/wespeaker-fbank-b32.onnx"
+url = "https://huggingface.co/avencera/speakrs-models/resolve/a785ebdbe6313868088c36c93d9efa71c470bd34/wespeaker-fbank-b32.onnx"
+sha256 = "5cd98072f28a02358200213e2ff00551ecf170ed7f382a2131f5c8a745fc2263"
+license = "CC-BY-4.0"
+
+[[model]]
+name = "speakrs/wespeaker-fbank.onnx"
+path = "speakrs/wespeaker-fbank.onnx"
+url = "https://huggingface.co/avencera/speakrs-models/resolve/a785ebdbe6313868088c36c93d9efa71c470bd34/wespeaker-fbank.onnx"
+sha256 = "67e4e9772eb344eafdbae0ca14b82129e67ade4bb980eb99e49f3d2a3c01a4a9"
+license = "CC-BY-4.0"
+
+[[model]]
+name = "speakrs/wespeaker-multimask-tail-b32.onnx"
+path = "speakrs/wespeaker-multimask-tail-b32.onnx"
+url = "https://huggingface.co/avencera/speakrs-models/resolve/a785ebdbe6313868088c36c93d9efa71c470bd34/wespeaker-multimask-tail-b32.onnx"
+sha256 = "2cd6b4d911dfe2014024563a7337e7ad23b1b0037a5dd9a5bbad3f56cc77a369"
+license = "CC-BY-4.0"
+
+[[model]]
+name = "speakrs/wespeaker-multimask-tail.onnx"
+path = "speakrs/wespeaker-multimask-tail.onnx"
+url = "https://huggingface.co/avencera/speakrs-models/resolve/a785ebdbe6313868088c36c93d9efa71c470bd34/wespeaker-multimask-tail.onnx"
+sha256 = "3695eeb26e875c606d5b5d82314f08dbcbb685d691837c035d7ea690863c64ea"
+license = "CC-BY-4.0"
+
+[[model]]
+name = "speakrs/wespeaker-voxceleb-resnet34-b64.onnx"
+path = "speakrs/wespeaker-voxceleb-resnet34-b64.onnx"
+url = "https://huggingface.co/avencera/speakrs-models/resolve/a785ebdbe6313868088c36c93d9efa71c470bd34/wespeaker-voxceleb-resnet34-b64.onnx"
+sha256 = "c4c29d077b40404ae141b951a945fdf670fdebffef3a6fb0370bdb8ed191c1c0"
+license = "CC-BY-4.0"
+
+[[model]]
+name = "speakrs/wespeaker-voxceleb-resnet34.min_num_samples.txt"
+path = "speakrs/wespeaker-voxceleb-resnet34.min_num_samples.txt"
+url = "https://huggingface.co/avencera/speakrs-models/resolve/a785ebdbe6313868088c36c93d9efa71c470bd34/wespeaker-voxceleb-resnet34.min_num_samples.txt"
+sha256 = "e4df891c484d7abb985dadf539fa1883a646dab6337af5cae4159c587b7050cc"
+license = "CC-BY-4.0"
+
+[[model]]
+name = "speakrs/wespeaker-voxceleb-resnet34.onnx"
+path = "speakrs/wespeaker-voxceleb-resnet34.onnx"
+url = "https://huggingface.co/avencera/speakrs-models/resolve/a785ebdbe6313868088c36c93d9efa71c470bd34/wespeaker-voxceleb-resnet34.onnx"
+sha256 = "203a4c67112167580ab1fcb62f4568c633499fb283805890aebe1c48564fcc0f"
+license = "CC-BY-4.0"
+
+[[model]]
+name = "speakrs/wespeaker-voxceleb-resnet34.onnx.data"
+path = "speakrs/wespeaker-voxceleb-resnet34.onnx.data"
+url = "https://huggingface.co/avencera/speakrs-models/resolve/a785ebdbe6313868088c36c93d9efa71c470bd34/wespeaker-voxceleb-resnet34.onnx.data"
+sha256 = "dc105e7857156611381b95cc961b277d8e1e098e7af1c919a77c68c7257ce956"
+license = "CC-BY-4.0"
+
+[[model]]
+name = "speakrs/segmentation-3.0-b64.onnx"
+path = "speakrs/segmentation-3.0-b64.onnx"
+url = "https://huggingface.co/avencera/speakrs-models/resolve/a785ebdbe6313868088c36c93d9efa71c470bd34/segmentation-3.0-b64.onnx"
+sha256 = "4be0dcf108f247d2d89de50cfdc70f9502b372f7164b3e83a416a7134cdde63d"
+license = "MIT"
+
+[[model]]
+name = "speakrs/wespeaker-pool-classify-b32.onnx"
+path = "speakrs/wespeaker-pool-classify-b32.onnx"
+url = "https://huggingface.co/avencera/speakrs-models/resolve/a785ebdbe6313868088c36c93d9efa71c470bd34/wespeaker-pool-classify-b32.onnx"
+sha256 = "deabcba9b4a8db5770ddf9658a3d366952adf39f2cbe699bda83410a9291b99d"
+license = "CC-BY-4.0"
+
+[[model]]
+name = "speakrs/wespeaker-pool-classify-b3.onnx"
+path = "speakrs/wespeaker-pool-classify-b3.onnx"
+url = "https://huggingface.co/avencera/speakrs-models/resolve/a785ebdbe6313868088c36c93d9efa71c470bd34/wespeaker-pool-classify-b3.onnx"
+sha256 = "250ee1776dd2e20f623e20f7894eef06045b87c2d5605647351738197c105314"
+license = "CC-BY-4.0"
+
+[[model]]
+name = "speakrs/wespeaker-pool-classify.onnx"
+path = "speakrs/wespeaker-pool-classify.onnx"
+url = "https://huggingface.co/avencera/speakrs-models/resolve/a785ebdbe6313868088c36c93d9efa71c470bd34/wespeaker-pool-classify.onnx"
+sha256 = "2354fdb4b062fe80f86e445982f1d4348b68870baa99e48c4ed9b7e997dfe6a9"
+license = "CC-BY-4.0"
+
+[[model]]
+name = "speakrs/wespeaker-resnet-frames-b32.onnx"
+path = "speakrs/wespeaker-resnet-frames-b32.onnx"
+url = "https://huggingface.co/avencera/speakrs-models/resolve/a785ebdbe6313868088c36c93d9efa71c470bd34/wespeaker-resnet-frames-b32.onnx"
+sha256 = "547555121775fce2e8b2e7128856383d1bfbcf812717c76c1f839c4c5a768a4f"
+license = "CC-BY-4.0"
+
+[[model]]
+name = "speakrs/wespeaker-resnet-frames.onnx"
+path = "speakrs/wespeaker-resnet-frames.onnx"
+url = "https://huggingface.co/avencera/speakrs-models/resolve/a785ebdbe6313868088c36c93d9efa71c470bd34/wespeaker-resnet-frames.onnx"
+sha256 = "a9b319dfddc51cb9c194c0c1e00636fd7b99fb864b2ce2beb7163f97fed71de6"
+license = "CC-BY-4.0"
+
+[[model]]
+name = "speakrs/wespeaker-voxceleb-resnet34-tail-b32.onnx"
+path = "speakrs/wespeaker-voxceleb-resnet34-tail-b32.onnx"
+url = "https://huggingface.co/avencera/speakrs-models/resolve/a785ebdbe6313868088c36c93d9efa71c470bd34/wespeaker-voxceleb-resnet34-tail-b32.onnx"
+sha256 = "f2aae56fd52fcb6afb0964e04ee6c81a4caec5d8a3bb1183f8fceb96855f1869"
+license = "CC-BY-4.0"
+
+[[model]]
+name = "speakrs/wespeaker-voxceleb-resnet34-tail-b3.onnx"
+path = "speakrs/wespeaker-voxceleb-resnet34-tail-b3.onnx"
+url = "https://huggingface.co/avencera/speakrs-models/resolve/a785ebdbe6313868088c36c93d9efa71c470bd34/wespeaker-voxceleb-resnet34-tail-b3.onnx"
+sha256 = "824510137f407f4fa50f342445ded0f59a42cfdbf7352acc8f38302887d9421e"
+license = "CC-BY-4.0"
+
+[[model]]
+name = "speakrs/wespeaker-voxceleb-resnet34-tail.onnx"
+path = "speakrs/wespeaker-voxceleb-resnet34-tail.onnx"
+url = "https://huggingface.co/avencera/speakrs-models/resolve/a785ebdbe6313868088c36c93d9efa71c470bd34/wespeaker-voxceleb-resnet34-tail.onnx"
+sha256 = "9e78a7566200700065c9d2ea677e7dbcd847420009a134aa5fa3ac656b09a45f"
+license = "CC-BY-4.0"
+
+[[model]]
+name = "onnxruntime-gpu-cuda12-1.28.2"
+path = "ort/onnxruntime-linux-x64-gpu_cuda12-1.28.2.tgz"
+url = "https://github.com/microsoft/onnxruntime/releases/download/v1.28.2/onnxruntime-linux-x64-gpu_cuda12-1.28.2.tgz"
+sha256 = "e172d4d52bc4399ca36553bd9705389adae900b1f1e08ade50078db1c84b6c1f"
+license = "MIT"
+
+[[model]]
+name = "cuda-runtime-12.9.79"
+path = "ort/cuda_cudart-linux-x86_64-12.9.79-archive.tar.xz"
+url = "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/linux-x86_64/cuda_cudart-linux-x86_64-12.9.79-archive.tar.xz"
+sha256 = "1f6ad42d4f530b24bfa35894ccf6b7209d2354f59101fd62ec4a6192a184ce99"
+license = "LicenseRef-NVIDIA-CUDA-EULA"

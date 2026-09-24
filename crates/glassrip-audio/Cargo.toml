@@ -1,0 +1,36 @@
+[package]
+name = "glassrip-audio"
+version = "0.1.0"
+edition = "2021"
+description = "Audio extraction, ASR, diarization and word-level speaker assignment for glassrip meeting mode"
+license = "MIT"
+publish = false
+
+[features]
+default = []
+# speakrs diarization (pyannote community-1 port). On macOS arm64 this builds
+# OpenBLAS from source and needs the Homebrew gfortran runtime on LIBRARY_PATH
+# (see README). On Linux x86_64 it links Intel MKL statically.
+diarize = ["dep:speakrs"]
+# NVIDIA GPU: whisper.cpp CUDA backend plus the ONNX Runtime CUDA provider.
+# ONNX Runtime is loaded at run time from ORT_DYLIB_PATH (see README).
+cuda = ["diarize", "whisper-rs/cuda", "speakrs/cuda", "speakrs/load-dynamic"]
+
+[dependencies]
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+speakrs = { version = "0.5", optional = true, default-features = false, features = ["default-linalg"] }
+thiserror = "2"
+tokio = { version = "1", features = ["process", "rt", "rt-multi-thread", "macros", "fs", "io-util"] }
+toml = "0.8"
+whisper-rs = "0.16"
+
+# Metal is always on for macOS builds so the default Mac build uses the GPU.
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { version = "0.16", features = ["metal"] }
+
+[dev-dependencies]
+clap = { version = "4", features = ["derive"] }
+tempfile = "3"
