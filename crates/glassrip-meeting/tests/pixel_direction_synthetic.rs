@@ -206,3 +206,41 @@ fn missing_connector_is_not_invented() {
     assert_eq!(ev.verdict, EndVerdict::Unknown, "{ev:?}");
     assert_ne!(ev.status, PixelStatus::Traced);
 }
+
+#[test]
+fn small_head_on_a_slanted_outline_with_an_imprecise_box() {
+    // Photographed screens: outlines are slightly slanted and the reader's boxes are a
+    // few pixels off; heads are small and touch the outline.
+    let mut c = Canvas::new(720, 420);
+    let a = BBox::new(80.0, 120.0, 220.0, 200.0);
+    c.node(a);
+    // B's outline: left side slants by 5 px over its height.
+    let (bx1, by1, bx2, by2) = (480.0, 118.0, 620.0, 206.0);
+    c.line((bx1, by1), (bx2, by1), 2);
+    c.line((bx1 + 5.0, by2), (bx2, by2), 2);
+    c.line((bx1, by1), (bx1 + 5.0, by2), 2);
+    c.line((bx2, by1), (bx2, by2), 2);
+    c.glyphs(520.0, 158.0, 60.0);
+    let y = 160.0;
+    let tip = bx1 + 5.0 * (y - by1) / (by2 - by1);
+    c.arrowhead((a.x2, y), (tip, y), 7.0, 3.5);
+    c.line((a.x2, y), (tip - 6.0, y), 2);
+    // The reader's box for B sits 3 px inside the drawn outline.
+    let b = BBox::new(bx1 + 3.0, by1 + 3.0, bx2 - 3.0, by2 - 3.0);
+    let case = Case {
+        canvas: c,
+        nodes: vec![a, b],
+        texts: vec![],
+    };
+    let ev = run(
+        &case,
+        &EdgeQuery {
+            src: a,
+            dst: b,
+            label: None,
+            style: EdgeStyle::Solid,
+        },
+    );
+    assert_eq!(ev.status, PixelStatus::Traced, "{ev:?}");
+    assert_eq!(ev.verdict, EndVerdict::Forward, "{ev:?}");
+}
