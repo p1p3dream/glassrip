@@ -33,17 +33,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info, info_span, warn};
 
 use crate::atomic::{self, AtomicWriteError};
-use crate::cache::{Cache, CacheError, CacheKey, CacheKeyParts};
+use crate::cache::{Cache, CacheError, CacheKey, CacheKeyParts, CacheLease};
 use crate::canonical::{self, CanonicalJsonError};
 use crate::config::RunnerConfig;
 use crate::envelope::{
-    EnvelopeHeader, ErrorCode, ErrorInfo, InputRef, Keyed, Outcome, Record, SchemaReq, Status,
+    EnvelopeHeader, ErrorCode, ErrorInfo, InputRef, Keyed, Outcome, Record, RestoredFrom,
+    SchemaReq, Status, content_hash,
 };
 use crate::graph::{GraphError, Plan, Selection, StageDecision, StageDecl, StageGraph};
 use crate::jsonl::{self, JsonlError, JsonlWriter};
-use crate::manifest::{
-    ARTIFACTS_DIR, CommandRecord, ManifestError, RunDir, StageRecord, StageStatus, unix_now,
-};
+use crate::manifest::{CommandRecord, ManifestError, RunDir, StageRecord, StageStatus, unix_now};
 
 /// Cache file extension for stage outputs.
 pub const OUTPUT_EXT: &str = "jsonl";
@@ -297,6 +296,8 @@ pub struct StageReport {
     pub status: StageStatus,
     /// Cache key, when computed.
     pub cache_key: Option<CacheKey>,
+    /// Content hash of the output artifact.
+    pub content_hash: Option<String>,
     /// Items planned.
     pub items_total: u64,
     /// Items ok.
@@ -435,17 +436,22 @@ pub enum RunnerError {
 }
 
 /// Runs stages against a locked run directory.
+///
+/// Holds a shared [`CacheLease`] for its lifetime, so `cache gc` cannot delete
+/// entries while a run is using them.
 #[derive(Debug)]
 pub struct Runner {
     run: RunDir,
     graph: StageGraph,
     plan: Plan,
     cache: Cache,
+    _cache_lease: CacheLease,
     opts: RunnerOptions,
     cancel: CancellationToken,
+    commands: Arc<Mutex<Vec<CommandRecord>>>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default, Clone, Copy)]
 struct Counts {
     ok: u64,
     error: u64,
@@ -460,6 +466,24 @@ impl Counts {
             Status::Skipped => self.skipped += 1,
         }
     }
+
+    fn of<T>(records: &[Record<T>]) -> Self {
+        let mut c = Self::default();
+        for r in records {
+            c.add(r.outcome.status);
+        }
+        c
+    }
+}
+
+/// A verified cache entry ready to be restored.
+struct CachedArtifact {
+    header: EnvelopeHeader,
+    counts: Counts,
+    total: u64,
+    content_hash: String,
+    /// Bytes after the header line (the item lines), copied verbatim.
+    body: Vec<u8>,
 }
 
 async fn run_with_timeout<T, F>(fut: F, timeout: Option<Duration>) -> Outcome<T>
@@ -483,7 +507,8 @@ where
 }
 
 impl Runner {
-    /// Builds a runner for a validated graph and selection.
+    /// Builds a runner for a validated graph and selection, taking a shared lease on
+    /// the cache.
     pub fn new(
         run: RunDir,
         graph: StageGraph,
@@ -493,13 +518,16 @@ impl Runner {
         cancel: CancellationToken,
     ) -> Result<Self, RunnerError> {
         let plan = graph.plan(selection)?;
+        let lease = cache.lease()?;
         Ok(Self {
             run,
             graph,
             plan,
             cache,
+            _cache_lease: lease,
             opts,
             cancel,
+            commands: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -513,7 +541,8 @@ impl Runner {
         &mut self.run
     }
 
-    /// Releases the runner, returning the (still locked) run directory.
+    /// Releases the runner and its cache lease, returning the (still locked) run
+    /// directory.
     pub fn into_run_dir(self) -> RunDir {
         self.run
     }
@@ -546,6 +575,16 @@ impl Runner {
         let span = info_span!("stage", stage = name, version = stage.version());
         let started = Instant::now();
         let result = self.run_stage_inner(stage, started).instrument(span).await;
+
+        // Commands recorded by items are kept whatever the stage outcome.
+        let new_commands =
+            std::mem::take(&mut *self.commands.lock().unwrap_or_else(PoisonError::into_inner));
+        if !new_commands.is_empty() {
+            if let Err(e) = self.run.update(|m| m.commands.extend(new_commands)) {
+                warn!(stage = name, error = %e, "could not record commands in manifest");
+            }
+        }
+
         if let Err(err) = &result {
             let status = match err {
                 RunnerError::Cancelled { .. } => StageStatus::Cancelled,
@@ -589,6 +628,80 @@ impl Runner {
         }
     }
 
+    /// Reads and verifies a cache entry. Any problem is returned as a message so the
+    /// caller can treat it as a miss.
+    fn load_cached<S: Stage>(
+        &self,
+        path: &Path,
+        req: &SchemaReq,
+    ) -> Result<CachedArtifact, String> {
+        let bytes = fs_err::read(path).map_err(|e| e.to_string())?;
+        if !bytes.ends_with(b"\n") {
+            return Err("entry ends in a partial line".into());
+        }
+        let (header, items) = jsonl::parse_bytes::<Record<S::Output>>(path, &bytes, req)
+            .map_err(|e| e.to_string())?;
+        let recorded = header
+            .content_hash
+            .clone()
+            .ok_or_else(|| "entry header has no content_hash".to_string())?;
+        let actual = content_hash(
+            &header.schema,
+            &header.schema_version,
+            &header.params,
+            &items,
+        )
+        .map_err(|e| e.to_string())?;
+        if actual != recorded {
+            return Err(format!(
+                "content hash mismatch: header {recorded}, items {actual}"
+            ));
+        }
+        let header_len = bytes
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(bytes.len(), |i| i + 1);
+        Ok(CachedArtifact {
+            counts: Counts::of(&items),
+            total: items.len() as u64,
+            header,
+            content_hash: recorded,
+            body: bytes[header_len..].to_vec(),
+        })
+    }
+
+    /// Looks up the cache. A missing entry is a miss; an unreadable or corrupt entry
+    /// is quarantined and also treated as a miss.
+    fn cache_lookup<S: Stage>(
+        &self,
+        name: &str,
+        key: &CacheKey,
+        req: &SchemaReq,
+    ) -> Option<CachedArtifact> {
+        let path = match self.cache.get_path(name, key, OUTPUT_EXT) {
+            Ok(Some(p)) => p,
+            Ok(None) => return None,
+            Err(e) => {
+                warn!(stage = name, key = %key, error = %e, "cache lookup failed; recomputing");
+                return None;
+            }
+        };
+        match self.load_cached::<S>(&path, req) {
+            Ok(cached) => Some(cached),
+            Err(reason) => {
+                warn!(stage = name, key = %key, path = %path.display(), %reason, "corrupt cache entry; recomputing");
+                match self.cache.quarantine(name, key, OUTPUT_EXT) {
+                    Ok(Some(dest)) => {
+                        warn!(stage = name, to = %dest.display(), "quarantined cache entry")
+                    }
+                    Ok(None) => {}
+                    Err(e) => warn!(stage = name, error = %e, "could not quarantine cache entry"),
+                }
+                None
+            }
+        }
+    }
+
     async fn run_stage_inner<S: Stage>(
         &mut self,
         stage: &S,
@@ -600,6 +713,7 @@ impl Runner {
             stage: name.to_string(),
             status: StageStatus::Skipped,
             cache_key: None,
+            content_hash: None,
             items_total: 0,
             items_ok: 0,
             items_error: 0,
@@ -626,13 +740,13 @@ impl Runner {
             });
         }
 
-        // Inputs: existence, schema check, hashes.
+        // Inputs: existence, schema check, content hashes.
         let mut artifacts = BTreeMap::new();
         let mut input_refs = Vec::new();
         let mut input_hashes = Vec::new();
         for decl in stage.inputs() {
             let path = self.run.artifact_path(decl.schema);
-            if !path.is_file() {
+            if !atomic::is_file(&path).map_err(Self::io_err(&path))? {
                 return Err(RunnerError::MissingInputArtifact {
                     stage: name.to_string(),
                     schema: decl.schema.to_string(),
@@ -640,14 +754,22 @@ impl Runner {
                 });
             }
             let req = SchemaReq::new(decl.schema, decl.major);
-            let header = jsonl::read_header(&path, &req).map_err(|source| RunnerError::Input {
+            let input_err = |source| RunnerError::Input {
                 stage: name.to_string(),
                 source,
-            })?;
-            let hash = crate::blake3_file(&path).map_err(|source| RunnerError::HashInput {
-                path: path.clone(),
-                source,
-            })?;
+            };
+            let header = jsonl::read_header(&path, &req).map_err(input_err)?;
+            // The content hash excludes run metadata, so an upstream rerun that
+            // produces identical items leaves this stage's key unchanged.
+            let hash = match &header.content_hash {
+                Some(h) => h.clone(),
+                None => jsonl::compute_content_hash(&path, &req).map_err(|source| {
+                    RunnerError::Input {
+                        stage: name.to_string(),
+                        source,
+                    }
+                })?,
+            };
             input_refs.push(InputRef {
                 path: RunDir::artifact_rel_path(decl.schema),
                 blake3: hash.clone(),
@@ -672,7 +794,7 @@ impl Runner {
         }
 
         // Cache key.
-        let params = serde_json::to_value(stage.params())?;
+        let params = canonical::to_checked_value(stage.params())?;
         if !params.is_object() {
             return Err(RunnerError::ParamsNotObject {
                 stage: name.to_string(),
@@ -707,6 +829,7 @@ impl Runner {
         self.set_stage(name, version, |r| {
             r.status = StageStatus::Running;
             r.cache_key = Some(key_text);
+            r.content_hash = None;
             r.started_unix_s = Some(started_unix);
             r.finished_unix_s = None;
             r.wall_s = None;
@@ -715,19 +838,28 @@ impl Runner {
 
         let out_req = SchemaReq::new(output.schema, output.version.major);
 
-        // Cache hit.
+        // Cache hit: restore with a header rewritten for this run; item lines are
+        // copied byte for byte, so the content hash is unchanged.
         if !force {
-            if let Some(cached) = self.cache.get_path(name, &key, OUTPUT_EXT)? {
-                atomic::copy_atomic(&cached, &out_path)?;
-                let env = jsonl::read::<Record<S::Output>>(&out_path, &out_req)?;
-                let mut counts = Counts::default();
-                for r in &env.items {
-                    counts.add(r.outcome.status);
-                }
-                let total = env.items.len() as u64;
+            if let Some(cached) = self.cache_lookup::<S>(name, &key, &out_req) {
+                let mut header = cached.header.clone();
+                header.restored_from = Some(RestoredFrom {
+                    run_id: std::mem::take(&mut header.run_id),
+                    cache_key: key.to_string(),
+                });
+                header.run_id = self.run.manifest().run_id.clone();
+                header.producer = self.run.manifest().producer.clone();
+                let line = jsonl::header_line(&header)?;
+                atomic::write_atomic_with(&out_path, |w| {
+                    w.write_all(&line)?;
+                    w.write_all(&cached.body)
+                })?;
                 let wall = started.elapsed().as_secs_f64();
+                let (counts, total, hash) = (cached.counts, cached.total, cached.content_hash);
+                let hash_text = hash.clone();
                 self.set_stage(name, version, |r| {
                     r.status = StageStatus::Cached;
+                    r.content_hash = Some(hash_text);
                     r.items_total = total;
                     r.items_ok = counts.ok;
                     r.items_error = counts.error;
@@ -737,6 +869,7 @@ impl Runner {
                 })?;
                 info!(stage = name, key = %key, "restored from cache");
                 report.status = StageStatus::Cached;
+                report.content_hash = Some(hash);
                 report.items_total = total;
                 report.items_ok = counts.ok;
                 report.items_error = counts.error;
@@ -748,21 +881,24 @@ impl Runner {
         }
 
         // Partial (resumable) store.
-        let header = EnvelopeHeader {
+        let mut header = EnvelopeHeader {
             schema: output.schema.to_string(),
             schema_version: output.version.clone(),
             run_id: self.run.manifest().run_id.clone(),
             producer: self.run.manifest().producer.clone(),
             inputs: input_refs,
             params,
+            content_hash: None,
+            restored_from: None,
         };
         let partial = self
             .run
-            .root()
-            .join(ARTIFACTS_DIR)
-            .join(".partial")
+            .partials_dir()
             .join(format!("{name}-{}.jsonl", &key.as_str()[..16]));
-        if force && partial.exists() {
+        let partial_exists = atomic::metadata_opt(&partial)
+            .map_err(Self::io_err(&partial))?
+            .is_some();
+        if force && partial_exists {
             fs_err::remove_file(&partial).map_err(Self::io_err(&partial))?;
         }
         let (writer, resumed) = match JsonlWriter::<Record<S::Output>>::open_resume(
@@ -772,7 +908,8 @@ impl Runner {
             Err(
                 JsonlError::HeaderMismatch(_)
                 | JsonlError::BadLine { .. }
-                | JsonlError::MissingHeader(_),
+                | JsonlError::MissingHeader(_)
+                | JsonlError::Header { .. },
             ) => {
                 warn!(stage = name, path = %partial.display(), "discarding unusable partial output");
                 fs_err::remove_file(&partial).map_err(Self::io_err(&partial))?;
@@ -825,9 +962,9 @@ impl Runner {
         );
 
         // Process.
-        let commands = Arc::new(Mutex::new(Vec::new()));
         let timeout = stage.item_timeout().or(self.opts.default_item_timeout);
         let cancel = self.cancel.clone();
+        let commands = Arc::clone(&self.commands);
         let mut cancelled = false;
         let mut processed = 0u64;
         {
@@ -871,11 +1008,6 @@ impl Runner {
             }
         }
         writer.checkpoint()?;
-        let new_commands =
-            std::mem::take(&mut *commands.lock().unwrap_or_else(PoisonError::into_inner));
-        if !new_commands.is_empty() {
-            self.run.update(|m| m.commands.extend(new_commands))?;
-        }
 
         let mut counts = Counts::default();
         for id in &order {
@@ -885,13 +1017,12 @@ impl Runner {
         }
         let total = order.len() as u64;
         let wall = started.elapsed().as_secs_f64();
-        let record_counts = |r: &mut StageRecord, counts: &Counts| {
+        self.set_stage(name, version, |r| {
             r.items_total = total;
             r.items_ok = counts.ok;
             r.items_error = counts.error;
             r.items_skipped = counts.skipped;
-        };
-        self.set_stage(name, version, |r| record_counts(r, &counts))?;
+        })?;
 
         if cancelled || self.cancel.is_cancelled() {
             return Err(RunnerError::Cancelled {
@@ -915,10 +1046,21 @@ impl Runner {
 
         // Finalize.
         let items: Vec<Record<S::Output>> = order.iter().filter_map(|id| done.remove(id)).collect();
+        let hash = content_hash(
+            &header.schema,
+            &header.schema_version,
+            &header.params,
+            &items,
+        )?;
+        header.content_hash = Some(hash.clone());
         jsonl::write_atomic(&out_path, &header, &items)?;
         drop(writer);
         if counts.error == 0 {
-            self.cache.put_file(name, &key, OUTPUT_EXT, &out_path)?;
+            // A cache that cannot be written (read-only, full) costs a future
+            // recompute, not this run.
+            if let Err(e) = self.cache.put_file(name, &key, OUTPUT_EXT, &out_path) {
+                warn!(stage = name, error = %e, "could not store output in cache");
+            }
             fs_err::remove_file(&partial).map_err(Self::io_err(&partial))?;
         } else {
             info!(
@@ -927,8 +1069,10 @@ impl Runner {
                 "not caching output with failed items; rerun retries them"
             );
         }
+        let hash_text = hash.clone();
         self.set_stage(name, version, |r| {
             r.status = StageStatus::Ok;
+            r.content_hash = Some(hash_text);
             r.finished_unix_s = Some(unix_now());
             r.wall_s = Some(wall);
         })?;
@@ -941,6 +1085,7 @@ impl Runner {
         );
 
         report.status = StageStatus::Ok;
+        report.content_hash = Some(hash);
         report.items_total = total;
         report.items_ok = counts.ok;
         report.items_error = counts.error;
@@ -964,6 +1109,7 @@ mod tests {
     #[derive(Debug, Clone, Serialize, JsonSchema)]
     struct SourceParams {
         n: usize,
+        scale: f64,
     }
 
     #[derive(Default)]
@@ -971,6 +1117,7 @@ mod tests {
         fail: HashSet<usize>,
         slow: HashSet<usize>,
         cancel_at: Option<(usize, CancellationToken)>,
+        offset: u64,
     }
 
     struct SourceStage {
@@ -984,7 +1131,7 @@ mod tests {
     impl SourceStage {
         fn new(n: usize) -> Self {
             Self {
-                params: SourceParams { n },
+                params: SourceParams { n, scale: 1.0 },
                 calls: Arc::new(AtomicUsize::new(0)),
                 behavior: Arc::new(Mutex::new(Behavior::default())),
                 external: Vec::new(),
@@ -1035,14 +1182,14 @@ mod tests {
         }
         async fn process(&self, ctx: &ItemContext, i: usize) -> Result<u64, ErrorInfo> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let (fail, slow, cancel) = {
+            let (fail, slow, cancel, offset) = {
                 let b = self.behavior.lock().unwrap();
                 let cancel = b
                     .cancel_at
                     .as_ref()
                     .filter(|(at, _)| *at == i)
                     .map(|(_, t)| t.clone());
-                (b.fail.contains(&i), b.slow.contains(&i), cancel)
+                (b.fail.contains(&i), b.slow.contains(&i), cancel, b.offset)
             };
             if i == 0 {
                 ctx.record_command(
@@ -1068,7 +1215,7 @@ mod tests {
                     format!("synthetic failure {i}"),
                 ));
             }
-            Ok(i as u64 * 10)
+            Ok(i as u64 * 10 + offset)
         }
     }
 
@@ -1232,10 +1379,17 @@ mod tests {
         assert_eq!(s2.cache_key, s.cache_key);
         assert_eq!(source.calls(), 5);
         assert_eq!(double.calls.load(Ordering::SeqCst), 5);
+        let bytes_b = fs_err::read(r2.run_dir().artifact_path(DOUBLED)).unwrap();
+        let body = |b: &[u8]| {
+            let i = b.iter().position(|c| *c == b'\n').unwrap();
+            b[i + 1..].to_vec()
+        };
         assert_eq!(
-            fs_err::read(r2.run_dir().artifact_path(DOUBLED)).unwrap(),
-            bytes_a
+            body(&bytes_b),
+            body(&bytes_a),
+            "item lines restored byte for byte"
         );
+        assert_eq!(d2.content_hash, d.content_hash);
         assert_eq!(
             r2.run_dir().manifest().stages["double"].status,
             StageStatus::Cached
@@ -1313,6 +1467,11 @@ mod tests {
         assert!(!r.run_dir().artifact_path(SOURCE).exists());
         let rec = &r.run_dir().manifest().stages["source"];
         assert_eq!((rec.status, rec.items_error), (StageStatus::Failed, 2));
+        assert_eq!(
+            r.run_dir().manifest().commands.len(),
+            1,
+            "commands from a failed stage are still recorded"
+        );
         assert!(rec.error.as_deref().unwrap_or("").contains("2 of 10"));
     }
 
@@ -1519,6 +1678,8 @@ mod tests {
             producer: Producer::glassrip("0.1.0", None),
             inputs: vec![],
             params: json!({}),
+            content_hash: None,
+            restored_from: None,
         };
         jsonl::write_atomic::<Record<u64>>(&r.run_dir().artifact_path(SOURCE), &header, &[])
             .unwrap();
@@ -1529,5 +1690,193 @@ mod tests {
             }) => {}
             other => panic!("expected input header error, got {other:?}"),
         }
+    }
+
+    fn read_header_of(r: &Runner, schema: &str) -> EnvelopeHeader {
+        jsonl::read_header(
+            &r.run_dir().artifact_path(schema),
+            &SchemaReq::new(schema, 1),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn forced_upstream_with_identical_items_keeps_downstream_cached() {
+        let env = env();
+        let source = SourceStage::new(5);
+        let double = DoubleStage::new();
+        let mut r = runner(&env, "run-a", &Selection::default());
+        let s1 = r.run_stage(&source).await.unwrap();
+        r.run_stage(&double).await.unwrap();
+        drop(r);
+
+        let sel = Selection {
+            force: ["source".to_string()].into(),
+            ..Default::default()
+        };
+        let mut r = runner(&env, "run-b", &sel);
+        let s2 = r.run_stage(&source).await.unwrap();
+        assert_eq!(s2.status, StageStatus::Ok, "forced stage recomputes");
+        assert_eq!(
+            s2.content_hash, s1.content_hash,
+            "identical items, identical content hash"
+        );
+        assert_eq!(read_header_of(&r, SOURCE).run_id, "run-b");
+        let d2 = r.run_stage(&double).await.unwrap();
+        assert_eq!(d2.status, StageStatus::Cached, "downstream stays cached");
+        assert_eq!(double.calls.load(Ordering::SeqCst), 5);
+        assert_eq!(
+            r.run_dir().manifest().stages["source"].content_hash,
+            s1.content_hash
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_upstream_items_recompute_downstream() {
+        let env = env();
+        let source = SourceStage::new(5);
+        let double = DoubleStage::new();
+        let mut r = runner(&env, "run-a", &Selection::default());
+        r.run_stage(&source).await.unwrap();
+        r.run_stage(&double).await.unwrap();
+        drop(r);
+
+        source.behavior.lock().unwrap().offset = 1;
+        let sel = Selection {
+            force: ["source".to_string()].into(),
+            ..Default::default()
+        };
+        let mut r = runner(&env, "run-b", &sel);
+        r.run_stage(&source).await.unwrap();
+        let d = r.run_stage(&double).await.unwrap();
+        assert_eq!((d.status, d.items_processed), (StageStatus::Ok, 5));
+        assert_eq!(read_doubled(&r)[1].outcome.result, Some(22));
+    }
+
+    #[tokio::test]
+    async fn restored_artifact_header_names_current_run() {
+        let env = env();
+        let source = SourceStage::new(3);
+        let mut r = runner(&env, "run-a", &Selection::default());
+        let first = r.run_stage(&source).await.unwrap();
+        let original = fs_err::read_to_string(r.run_dir().artifact_path(SOURCE)).unwrap();
+        drop(r);
+
+        let mut r = runner(&env, "run-b", &Selection::default());
+        let restored = r.run_stage(&source).await.unwrap();
+        assert_eq!(restored.status, StageStatus::Cached);
+        let header = read_header_of(&r, SOURCE);
+        assert_eq!(header.run_id, "run-b");
+        assert_eq!(
+            header.restored_from,
+            Some(RestoredFrom {
+                run_id: "run-a".into(),
+                cache_key: first.cache_key.as_ref().unwrap().to_string(),
+            })
+        );
+        assert_eq!(header.content_hash, first.content_hash);
+        let now = fs_err::read_to_string(r.run_dir().artifact_path(SOURCE)).unwrap();
+        let body = |t: &str| t.split_once('\n').map(|(_, b)| b.to_string()).unwrap();
+        assert_eq!(body(&now), body(&original), "item lines are byte-identical");
+        assert_eq!(
+            jsonl::compute_content_hash(
+                &r.run_dir().artifact_path(SOURCE),
+                &SchemaReq::new(SOURCE, 1)
+            )
+            .unwrap(),
+            first.content_hash.unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_cache_entry_is_quarantined_and_recomputed() {
+        let env = env();
+        let source = SourceStage::new(3);
+        let mut r = runner(&env, "run-a", &Selection::default());
+        let first = r.run_stage(&source).await.unwrap();
+        drop(r);
+        let key = first.cache_key.unwrap();
+        let entry = env.cache.entry_path("source", &key, OUTPUT_EXT).unwrap();
+
+        // Still valid JSON, but an item changed: the content hash no longer matches.
+        let text = fs_err::read_to_string(&entry).unwrap();
+        fs_err::write(&entry, text.replace("\"result\":10", "\"result\":11")).unwrap();
+        let mut r = runner(&env, "run-b", &Selection::default());
+        let rep = r.run_stage(&source).await.unwrap();
+        assert_eq!(rep.status, StageStatus::Ok);
+        assert_eq!(source.calls(), 6);
+        let quarantined: Vec<_> =
+            fs_err::read_dir(env.cache.root().join(crate::cache::QUARANTINE_DIR))
+                .unwrap()
+                .collect();
+        assert_eq!(quarantined.len(), 1);
+        drop(r);
+
+        // Garbage bytes: also a miss, never a run failure.
+        fs_err::write(&entry, b"not json at all\n").unwrap();
+        let mut r = runner(&env, "run-c", &Selection::default());
+        assert_eq!(r.run_stage(&source).await.unwrap().status, StageStatus::Ok);
+        assert_eq!(source.calls(), 9);
+        drop(r);
+        let mut r = runner(&env, "run-d", &Selection::default());
+        assert_eq!(
+            r.run_stage(&source).await.unwrap().status,
+            StageStatus::Cached
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_only_cache_serves_hits() {
+        use std::os::unix::fs::PermissionsExt;
+        let env = env();
+        let source = SourceStage::new(3);
+        let mut r = runner(&env, "run-a", &Selection::default());
+        r.run_stage(&source).await.unwrap();
+        drop(r);
+
+        let set_mode = |mode: u32| {
+            for e in env.cache.ls().unwrap() {
+                fs_err::set_permissions(&e.path, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+        };
+        set_mode(0o444);
+        let mut r = runner(&env, "run-b", &Selection::default());
+        let result = r.run_stage(&source).await;
+        set_mode(0o644);
+        assert_eq!(result.unwrap().status, StageStatus::Cached);
+        assert_eq!(source.calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn gc_refused_while_runner_holds_cache() {
+        let env = env();
+        let mut r = runner(&env, "run-a", &Selection::default());
+        r.run_stage(&SourceStage::new(2)).await.unwrap();
+        assert!(matches!(
+            env.cache.gc(Duration::ZERO, std::time::SystemTime::now()),
+            Err(CacheError::Busy(_))
+        ));
+        drop(r);
+        assert!(
+            env.cache
+                .gc(Duration::ZERO, std::time::SystemTime::now())
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn non_finite_params_rejected() {
+        let env = env();
+        let mut source = SourceStage::new(2);
+        source.params.scale = f64::NAN;
+        let mut r = runner(&env, "run-a", &Selection::default());
+        match r.run_stage(&source).await {
+            Err(RunnerError::Canonical(CanonicalJsonError::NonFinite { path })) => {
+                assert_eq!(path, "$.scale");
+            }
+            other => panic!("expected NonFinite, got {other:?}"),
+        }
+        assert_eq!(source.calls(), 0);
     }
 }

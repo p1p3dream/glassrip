@@ -68,6 +68,24 @@ pub struct EnvelopeHeader {
     pub inputs: Vec<InputRef>,
     /// Stage parameters (a JSON object; structured, never prose).
     pub params: Value,
+    /// Content hash of the finished artifact (see [`content_hash()`]); absent while
+    /// an artifact is still being written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    /// Set when the artifact was restored from the cache rather than computed in
+    /// this run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_from: Option<RestoredFrom>,
+}
+
+/// Provenance of an artifact restored from the cache.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RestoredFrom {
+    /// Run that originally computed the artifact.
+    pub run_id: String,
+    /// Cache key it was restored under.
+    pub cache_key: String,
 }
 
 /// A complete artifact: header fields plus items.
@@ -86,6 +104,12 @@ pub struct Envelope<T> {
     pub inputs: Vec<InputRef>,
     /// Stage parameters (a JSON object).
     pub params: Value,
+    /// Content hash of the artifact (see [`content_hash()`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    /// Cache provenance, when restored from the cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_from: Option<RestoredFrom>,
     /// Items (always a list).
     pub items: Vec<T>,
 }
@@ -197,6 +221,8 @@ impl EnvelopeHeader {
             producer: self.producer,
             inputs: self.inputs,
             params: self.params,
+            content_hash: self.content_hash,
+            restored_from: self.restored_from,
             items,
         }
     }
@@ -218,6 +244,8 @@ impl<T> Envelope<T> {
                 producer: self.producer,
                 inputs: self.inputs,
                 params: self.params,
+                content_hash: self.content_hash,
+                restored_from: self.restored_from,
             },
             self.items,
         )
@@ -263,6 +291,36 @@ impl EnvelopeHeader {
         check_parts(&probe.schema, &probe.schema_version, &probe.params, req)?;
         Ok(serde_json::from_value(value)?)
     }
+}
+
+#[derive(Serialize)]
+struct ContentView<'a, T> {
+    schema: &'a str,
+    schema_version: String,
+    params: &'a Value,
+    items: Vec<&'a T>,
+}
+
+/// Content hash of an artifact: blake3 over the canonical JSON of its schema name,
+/// schema version, params, and items sorted by id.
+///
+/// It deliberately excludes `run_id`, `producer`, and `inputs`, so rerunning a
+/// stage that produces identical items yields the same hash and downstream cache
+/// keys do not change. `items` must already be deduplicated by id.
+pub fn content_hash<T: Serialize + Keyed>(
+    schema: &str,
+    schema_version: &Version,
+    params: &Value,
+    items: &[T],
+) -> Result<String, crate::canonical::CanonicalJsonError> {
+    let mut sorted: Vec<&T> = items.iter().collect();
+    sorted.sort_by(|a, b| a.key().cmp(b.key()));
+    crate::canonical::canonical_hash(&ContentView {
+        schema,
+        schema_version: schema_version.to_string(),
+        params,
+        items: sorted,
+    })
 }
 
 /// Status of one unit of work.
@@ -475,6 +533,8 @@ mod tests {
                 schema_version: None,
             }],
             params: json!({"interval_s": 2.0}),
+            content_hash: None,
+            restored_from: None,
         }
     }
 
@@ -601,6 +661,35 @@ mod tests {
             serde_json::to_value(Outcome::<u32>::skipped()).unwrap(),
             json!({"status": "skipped"})
         );
+    }
+
+    #[test]
+    fn content_hash_ignores_run_metadata_and_order() {
+        let env = envelope("1.0.0");
+        let h = |e: &Envelope<Record<Frame>>| {
+            content_hash(&e.schema, &e.schema_version, &e.params, &e.items).unwrap()
+        };
+        let base = h(&env);
+
+        let mut other = env.clone();
+        other.run_id = "run-9999".into();
+        other.producer = Producer::glassrip("9.9.9", Some("fff".into()));
+        other.inputs.clear();
+        other.items.reverse();
+        assert_eq!(h(&other), base);
+
+        let mut changed = env.clone();
+        changed.items[0].outcome = Outcome::ok(Frame {
+            frame_id: "f0".into(),
+            pts_s: 0.5,
+        });
+        assert_ne!(h(&changed), base);
+        let mut params = env.clone();
+        params.params = json!({"interval_s": 1.0});
+        assert_ne!(h(&params), base);
+        let mut version = env;
+        version.schema_version = Version::new(1, 1, 0);
+        assert_ne!(h(&version), base);
     }
 
     #[test]

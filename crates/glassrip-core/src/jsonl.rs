@@ -10,7 +10,7 @@
 //! truncated away before anything else is appended.
 
 use std::collections::HashMap;
-use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
@@ -67,12 +67,33 @@ pub enum JsonlError {
     /// An item could not be serialized.
     #[error("cannot serialize item: {0}")]
     Serialize(#[from] serde_json::Error),
+    /// The filesystem is full.
+    #[error("disk full writing {path} ({}): {source}", atomic::describe_space(*available_bytes))]
+    DiskFull {
+        /// File involved.
+        path: PathBuf,
+        /// Bytes available on that filesystem, if measurable.
+        available_bytes: Option<u64>,
+        /// Underlying error.
+        #[source]
+        source: io::Error,
+    },
+    /// The content hash could not be computed.
+    #[error(transparent)]
+    Canonical(#[from] crate::canonical::CanonicalJsonError),
 }
 
 fn io_err(path: &Path) -> impl FnOnce(io::Error) -> JsonlError + '_ {
-    move |source| JsonlError::Io {
-        path: path.to_path_buf(),
-        source,
+    move |source| match atomic::available_space_if_full(path, &source) {
+        Some(available_bytes) => JsonlError::DiskFull {
+            path: path.to_path_buf(),
+            available_bytes,
+            source,
+        },
+        None => JsonlError::Io {
+            path: path.to_path_buf(),
+            source,
+        },
     }
 }
 
@@ -122,10 +143,11 @@ fn parse_lines<T: DeserializeOwned + Keyed>(
     complete: &[u8],
     req: Option<&SchemaReq>,
 ) -> Result<(EnvelopeHeader, Vec<T>), JsonlError> {
-    let mut lines = complete
-        .split(|b| *b == b'\n')
-        .filter(|l| !l.is_empty())
-        .enumerate();
+    // `complete` ends in a newline (or is empty), so the final split element is the
+    // empty remainder after it; every other element is a physical line.
+    let mut physical: Vec<&[u8]> = complete.split(|b| *b == b'\n').collect();
+    physical.pop();
+    let mut lines = physical.into_iter().enumerate();
     let (_, first) = lines
         .next()
         .ok_or_else(|| JsonlError::MissingHeader(path.to_path_buf()))?;
@@ -153,6 +175,13 @@ fn parse_lines<T: DeserializeOwned + Keyed>(
 
     let mut items = Vec::new();
     for (i, line) in lines {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            return Err(JsonlError::BadLine {
+                path: path.to_path_buf(),
+                line: i + 1,
+                message: "blank line".to_string(),
+            });
+        }
         let LineIn::Item(item) =
             serde_json::from_slice::<LineIn<T>>(line).map_err(|e| JsonlError::BadLine {
                 path: path.to_path_buf(),
@@ -162,6 +191,44 @@ fn parse_lines<T: DeserializeOwned + Keyed>(
         items.push(item);
     }
     Ok((header, dedupe(items)))
+}
+
+/// Encodes a header record line (including the trailing newline).
+pub fn header_line(header: &EnvelopeHeader) -> Result<Vec<u8>, serde_json::Error> {
+    encode_line::<()>(&LineOut::Header(header))
+}
+
+/// Parses the complete lines of an in-memory JSONL artifact (a trailing partial line
+/// is ignored), checking the header against `req`.
+pub fn parse_bytes<T: DeserializeOwned + Keyed>(
+    path: &Path,
+    bytes: &[u8],
+    req: &SchemaReq,
+) -> Result<(EnvelopeHeader, Vec<T>), JsonlError> {
+    parse_lines(path, &bytes[..complete_prefix_len(bytes)], Some(req))
+}
+
+/// An item read as raw JSON, keyed by its `id` field.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RawItem(pub Value);
+
+impl Keyed for RawItem {
+    fn key(&self) -> &str {
+        self.0.get("id").and_then(Value::as_str).unwrap_or("")
+    }
+}
+
+/// Computes the content hash of a JSONL artifact from its items (see
+/// [`crate::envelope::content_hash`]), without trusting the header's value.
+pub fn compute_content_hash(path: &Path, req: &SchemaReq) -> Result<String, JsonlError> {
+    let env = read::<RawItem>(path, req)?;
+    Ok(crate::envelope::content_hash(
+        &env.schema,
+        &env.schema_version,
+        &env.params,
+        &env.items,
+    )?)
 }
 
 /// Reads only the header line of a JSONL artifact and checks it against `req`.
@@ -221,7 +288,15 @@ pub struct Resumed<T> {
     pub fresh: bool,
 }
 
-/// Append-only writer for a JSONL artifact.
+fn open_append(path: &Path) -> Result<fs_err::File, JsonlError> {
+    fs_err::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .open(path)
+        .map_err(io_err(path))
+}
+
+/// Append-only writer for a JSONL artifact (the file is opened in append mode).
 #[derive(Debug)]
 pub struct JsonlWriter<T> {
     path: PathBuf,
@@ -234,23 +309,9 @@ pub struct JsonlWriter<T> {
 impl<T: Serialize + DeserializeOwned + Keyed> JsonlWriter<T> {
     /// Creates (or truncates) the file and writes the header, synced.
     pub fn create(path: &Path, header: &EnvelopeHeader) -> Result<Self, JsonlError> {
-        if let Some(parent) = path.parent() {
-            fs_err::create_dir_all(parent).map_err(io_err(path))?;
-        }
-        let mut file = fs_err::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .read(true)
-            .open(path)
-            .map_err(io_err(path))?;
-        file.write_all(&encode_line::<T>(&LineOut::Header(header))?)
-            .map_err(io_err(path))?;
-        file.sync_all().map_err(io_err(path))?;
-        if let Some(parent) = path.parent() {
-            atomic::sync_dir(parent).map_err(io_err(path))?;
-        }
-        Ok(Self::from_file(path, file))
+        // The header is written atomically, so the file never exists without it.
+        atomic::write_atomic(path, &encode_line::<T>(&LineOut::Header(header))?)?;
+        Ok(Self::from_file(path, open_append(path)?))
     }
 
     fn from_file(path: &Path, file: fs_err::File) -> Self {
@@ -272,7 +333,7 @@ impl<T: Serialize + DeserializeOwned + Keyed> JsonlWriter<T> {
         path: &Path,
         header: &EnvelopeHeader,
     ) -> Result<(Self, Resumed<T>), JsonlError> {
-        if !path.exists() {
+        if atomic::metadata_opt(path).map_err(io_err(path))?.is_none() {
             return Ok((
                 Self::create(path, header)?,
                 Resumed {
@@ -282,11 +343,7 @@ impl<T: Serialize + DeserializeOwned + Keyed> JsonlWriter<T> {
                 },
             ));
         }
-        let mut file = fs_err::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(io_err(path))?;
+        let mut file = open_append(path)?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).map_err(io_err(path))?;
         let keep = complete_prefix_len(&bytes);
@@ -312,7 +369,6 @@ impl<T: Serialize + DeserializeOwned + Keyed> JsonlWriter<T> {
             file.set_len(keep as u64).map_err(io_err(path))?;
             file.sync_all().map_err(io_err(path))?;
         }
-        file.seek(SeekFrom::End(0)).map_err(io_err(path))?;
         Ok((
             Self::from_file(path, file),
             Resumed {
@@ -370,6 +426,8 @@ mod tests {
             producer: Producer::glassrip("0.1.0", None),
             inputs: vec![],
             params: json!({"n": 3}),
+            content_hash: None,
+            restored_from: None,
         }
     }
 
@@ -490,6 +548,93 @@ mod tests {
         assert!(matches!(
             read::<Rec>(&path, &req()),
             Err(JsonlError::BadLine { line: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn line_numbers_are_physical_and_blank_lines_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.jsonl");
+        let mut w = JsonlWriter::<Rec>::create(&path, &header("r1")).unwrap();
+        w.append(&rec("a", 1)).unwrap();
+        w.checkpoint().unwrap();
+        let mut f = fs_err::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(b"\n").unwrap();
+        drop(f);
+        assert!(matches!(
+            read::<Rec>(&path, &req()),
+            Err(JsonlError::BadLine { line: 3, ref message, .. }) if message == "blank line"
+        ));
+
+        let path2 = dir.path().join("b.jsonl");
+        let mut w = JsonlWriter::<Rec>::create(&path2, &header("r1")).unwrap();
+        w.append(&rec("a", 1)).unwrap();
+        w.append(&rec("b", 2)).unwrap();
+        w.checkpoint().unwrap();
+        let mut f = fs_err::OpenOptions::new()
+            .append(true)
+            .open(&path2)
+            .unwrap();
+        f.write_all(b"{\"record\":\"item\",\"id\":\"c\"}\n")
+            .unwrap();
+        drop(f);
+        assert!(matches!(
+            read::<Rec>(&path2, &req()),
+            Err(JsonlError::BadLine { line: 4, .. })
+        ));
+    }
+
+    #[test]
+    fn writer_appends_after_external_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.jsonl");
+        let mut w = JsonlWriter::<Rec>::create(&path, &header("r1")).unwrap();
+        // Another handle appends; an append-mode writer must not overwrite it.
+        let mut other = fs_err::OpenOptions::new().append(true).open(&path).unwrap();
+        other
+            .write_all(&encode_line(&LineOut::Item(&rec("x", 9))).unwrap())
+            .unwrap();
+        drop(other);
+        w.append(&rec("a", 1)).unwrap();
+        w.checkpoint().unwrap();
+        assert_eq!(
+            read::<Rec>(&path, &req()).unwrap().items,
+            vec![rec("x", 9), rec("a", 1)]
+        );
+    }
+
+    #[test]
+    fn content_hash_from_raw_items_matches_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.jsonl");
+        let items = vec![rec("b", 2), rec("a", 1)];
+        write_atomic::<Rec>(&path, &header("r1"), &items).unwrap();
+        let h = header("r1");
+        let typed =
+            crate::envelope::content_hash(&h.schema, &h.schema_version, &h.params, &items).unwrap();
+        assert_eq!(compute_content_hash(&path, &req()).unwrap(), typed);
+    }
+
+    #[test]
+    fn disk_full_reports_path_and_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.jsonl");
+        let err = io_err(&path)(io::Error::new(io::ErrorKind::StorageFull, "no space"));
+        match &err {
+            JsonlError::DiskFull {
+                path: p,
+                available_bytes,
+                ..
+            } => {
+                assert_eq!(p, &path);
+                assert!(available_bytes.is_some());
+            }
+            other => panic!("expected DiskFull, got {other:?}"),
+        }
+        assert!(err.to_string().contains("bytes available"));
+        assert!(matches!(
+            io_err(&path)(io::Error::other("x")),
+            JsonlError::Io { .. }
         ));
     }
 
