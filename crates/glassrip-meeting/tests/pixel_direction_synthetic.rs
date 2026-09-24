@@ -1,0 +1,338 @@
+//! Pixel check on rendered synthetic boards.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+mod common;
+
+use common::Canvas;
+use glassrip_meeting::direction::EndVerdict;
+use glassrip_meeting::pixel_direction::{
+    bgr_from_rgb, EdgeQuery, PixelCheckParams, PixelStatus, PreparedCanvas,
+};
+use glassrip_vision::board::EdgeStyle;
+use glassrip_vision::BBox;
+
+struct Case {
+    canvas: Canvas,
+    nodes: Vec<BBox>,
+    texts: Vec<BBox>,
+}
+
+fn run(case: &Case, q: &EdgeQuery) -> glassrip_meeting::pixel_direction::PixelEvidence {
+    let prepared = PreparedCanvas::new(
+        &bgr_from_rgb(&case.canvas.img),
+        &case.nodes,
+        &case.texts,
+        &PixelCheckParams::default(),
+    );
+    prepared.check(q)
+}
+
+fn a_box() -> BBox {
+    BBox::new(80.0, 120.0, 220.0, 190.0)
+}
+fn b_box() -> BBox {
+    BBox::new(480.0, 120.0, 620.0, 190.0)
+}
+
+fn horizontal(head_at_a: bool, head_at_b: bool, labelled: bool, dashed: bool) -> (Case, EdgeQuery) {
+    let mut c = Canvas::new(720, 420);
+    let (a, b) = (a_box(), b_box());
+    c.node(a);
+    c.node(b);
+    c.connector(
+        &[(a.x2, 155.0), (b.x1, 155.0)],
+        head_at_a,
+        head_at_b,
+        dashed,
+    );
+    let mut texts = Vec::new();
+    let label = labelled.then(|| {
+        let l = c.label(350.0, 155.0, 40.0);
+        texts.push(l);
+        l
+    });
+    let q = EdgeQuery {
+        src: a,
+        dst: b,
+        label,
+        style: if dashed {
+            EdgeStyle::Dashed
+        } else {
+            EdgeStyle::Solid
+        },
+    };
+    (
+        Case {
+            canvas: c,
+            nodes: vec![a, b],
+            texts,
+        },
+        q,
+    )
+}
+
+#[test]
+fn labelled_solid_arrow_points_to_dst() {
+    let (case, q) = horizontal(false, true, true, false);
+    let ev = run(&case, &q);
+    assert_eq!(ev.status, PixelStatus::Traced, "{ev:?}");
+    assert_eq!(ev.verdict, EndVerdict::Forward, "{ev:?}");
+}
+
+#[test]
+fn reader_reversal_is_caught() {
+    // The line's head is at A, but the reader said A -> B.
+    let (case, q) = horizontal(true, false, true, false);
+    let ev = run(&case, &q);
+    assert_eq!(ev.verdict, EndVerdict::Reverse, "{ev:?}");
+}
+
+#[test]
+fn unlabelled_line_without_heads() {
+    let (case, q) = horizontal(false, false, false, false);
+    let ev = run(&case, &q);
+    assert_eq!(ev.status, PixelStatus::Traced, "{ev:?}");
+    assert_eq!(ev.verdict, EndVerdict::NoArrowhead, "{ev:?}");
+}
+
+#[test]
+fn bidirectional_needs_both_heads() {
+    let (case, q) = horizontal(true, true, false, false);
+    assert_eq!(run(&case, &q).verdict, EndVerdict::Bidirectional);
+}
+
+#[test]
+fn dashed_labelled_connector() {
+    let (case, q) = horizontal(false, true, true, true);
+    let ev = run(&case, &q);
+    assert_eq!(ev.status, PixelStatus::Traced, "{ev:?}");
+    assert_eq!(ev.verdict, EndVerdict::Forward, "{ev:?}");
+}
+
+#[test]
+fn elbow_connector_is_followed() {
+    let mut c = Canvas::new(720, 480);
+    let a = BBox::new(60.0, 60.0, 200.0, 130.0);
+    let b = BBox::new(420.0, 330.0, 560.0, 400.0);
+    c.node(a);
+    c.node(b);
+    // Right out of A, across, then down into the top of B.
+    c.connector(
+        &[(a.x2, 95.0), (490.0, 95.0), (490.0, b.y1)],
+        false,
+        true,
+        false,
+    );
+    let case = Case {
+        canvas: c,
+        nodes: vec![a, b],
+        texts: vec![],
+    };
+    let ev = run(
+        &case,
+        &EdgeQuery {
+            src: a,
+            dst: b,
+            label: None,
+            style: EdgeStyle::Solid,
+        },
+    );
+    assert_eq!(ev.status, PixelStatus::Traced, "{ev:?}");
+    assert_eq!(ev.verdict, EndVerdict::Forward, "{ev:?}");
+    // And read backwards it is a reversal.
+    let ev = run(
+        &case,
+        &EdgeQuery {
+            src: b,
+            dst: a,
+            label: None,
+            style: EdgeStyle::Solid,
+        },
+    );
+    assert_eq!(ev.verdict, EndVerdict::Reverse, "{ev:?}");
+}
+
+#[test]
+fn vertical_edge_with_neighbouring_connector() {
+    let mut c = Canvas::new(600, 600);
+    let top = BBox::new(200.0, 40.0, 340.0, 110.0);
+    let mid = BBox::new(200.0, 250.0, 340.0, 320.0);
+    let side = BBox::new(440.0, 250.0, 560.0, 320.0);
+    for b in [top, mid, side] {
+        c.node(b);
+    }
+    // mid -> top (head at top), and an unrelated mid -> side connector.
+    c.connector(&[(270.0, mid.y1), (270.0, top.y2)], false, true, false);
+    c.connector(&[(mid.x2, 285.0), (side.x1, 285.0)], false, true, false);
+    let label = c.label(270.0, 180.0, 32.0);
+    let case = Case {
+        canvas: c,
+        nodes: vec![top, mid, side],
+        texts: vec![label],
+    };
+    // Reader says top -> mid (reversed).
+    let ev = run(
+        &case,
+        &EdgeQuery {
+            src: top,
+            dst: mid,
+            label: Some(label),
+            style: EdgeStyle::Solid,
+        },
+    );
+    assert_eq!(ev.verdict, EndVerdict::Reverse, "{ev:?}");
+}
+
+#[test]
+fn missing_connector_is_not_invented() {
+    let mut c = Canvas::new(720, 420);
+    let (a, b) = (a_box(), b_box());
+    c.node(a);
+    c.node(b);
+    let case = Case {
+        canvas: c,
+        nodes: vec![a, b],
+        texts: vec![],
+    };
+    let ev = run(
+        &case,
+        &EdgeQuery {
+            src: a,
+            dst: b,
+            label: None,
+            style: EdgeStyle::Solid,
+        },
+    );
+    assert_eq!(ev.verdict, EndVerdict::Unknown, "{ev:?}");
+    assert_ne!(ev.status, PixelStatus::Traced);
+}
+
+#[test]
+fn small_head_on_a_slanted_outline_with_an_imprecise_box() {
+    // Photographed screens: outlines are slightly slanted and the reader's boxes are a
+    // few pixels off; heads are small and touch the outline.
+    let mut c = Canvas::new(720, 420);
+    let a = BBox::new(80.0, 120.0, 220.0, 200.0);
+    c.node(a);
+    // B's outline: left side slants by 5 px over its height.
+    let (bx1, by1, bx2, by2) = (480.0, 118.0, 620.0, 206.0);
+    c.line((bx1, by1), (bx2, by1), 2);
+    c.line((bx1 + 5.0, by2), (bx2, by2), 2);
+    c.line((bx1, by1), (bx1 + 5.0, by2), 2);
+    c.line((bx2, by1), (bx2, by2), 2);
+    c.glyphs(520.0, 158.0, 60.0);
+    let y = 160.0;
+    let tip = bx1 + 5.0 * (y - by1) / (by2 - by1);
+    c.arrowhead((a.x2, y), (tip, y), 7.0, 3.5);
+    c.line((a.x2, y), (tip - 6.0, y), 2);
+    // The reader's box for B sits 3 px inside the drawn outline.
+    let b = BBox::new(bx1 + 3.0, by1 + 3.0, bx2 - 3.0, by2 - 3.0);
+    let case = Case {
+        canvas: c,
+        nodes: vec![a, b],
+        texts: vec![],
+    };
+    let ev = run(
+        &case,
+        &EdgeQuery {
+            src: a,
+            dst: b,
+            label: None,
+            style: EdgeStyle::Solid,
+        },
+    );
+    assert_eq!(ev.status, PixelStatus::Traced, "{ev:?}");
+    assert_eq!(ev.verdict, EndVerdict::Forward, "{ev:?}");
+}
+
+#[test]
+fn heads_of_several_sizes() {
+    for (len, half) in [(7.0, 3.5), (10.0, 5.0), (13.0, 6.0), (16.0, 8.0)] {
+        let mut c = Canvas::new(720, 420);
+        let (a, b) = (a_box(), b_box());
+        c.node(a);
+        c.node(b);
+        c.arrowhead((a.x2, 155.0), (b.x1, 155.0), len, half);
+        c.line((a.x2, 155.0), (b.x1 - len + 2.0, 155.0), 2);
+        let case = Case {
+            canvas: c,
+            nodes: vec![a, b],
+            texts: vec![],
+        };
+        let ev = run(
+            &case,
+            &EdgeQuery {
+                src: a,
+                dst: b,
+                label: None,
+                style: EdgeStyle::Solid,
+            },
+        );
+        assert_eq!(ev.verdict, EndVerdict::Forward, "head {len}x{half}: {ev:?}");
+    }
+}
+
+#[test]
+fn a_line_crossing_near_a_terminus_is_not_a_head() {
+    let mut c = Canvas::new(720, 420);
+    let (a, b) = (a_box(), b_box());
+    c.node(a);
+    c.node(b);
+    // Plain connector, no heads, crossed by another line 8 px before B.
+    c.line((a.x2, 155.0), (b.x1, 155.0), 2);
+    c.line((b.x1 - 8.0, 60.0), (b.x1 - 8.0, 260.0), 2);
+    let case = Case {
+        canvas: c,
+        nodes: vec![a, b],
+        texts: vec![],
+    };
+    let ev = run(
+        &case,
+        &EdgeQuery {
+            src: a,
+            dst: b,
+            label: None,
+            style: EdgeStyle::Solid,
+        },
+    );
+    assert!(
+        !ev.dst_end.is_some_and(|e| e.arrow),
+        "crossing counted as a head: {ev:?}"
+    );
+    assert_ne!(ev.verdict, EndVerdict::Forward, "{ev:?}");
+}
+
+#[test]
+fn curved_connector_is_followed() {
+    let mut c = Canvas::new(720, 420);
+    let (a, b) = (a_box(), b_box());
+    c.node(a);
+    c.node(b);
+    c.bezier(
+        [(a.x2, 155.0), (320.0, 40.0), (400.0, 300.0), (b.x1, 155.0)],
+        (12.0, 6.0),
+    );
+    let case = Case {
+        canvas: c,
+        nodes: vec![a, b],
+        texts: vec![],
+    };
+    let q = EdgeQuery {
+        src: a,
+        dst: b,
+        label: None,
+        style: EdgeStyle::Solid,
+    };
+    let ev = run(&case, &q);
+    assert_eq!(ev.status, PixelStatus::Traced, "{ev:?}");
+    assert_eq!(ev.verdict, EndVerdict::Forward, "{ev:?}");
+    let back = run(
+        &case,
+        &EdgeQuery {
+            src: b,
+            dst: a,
+            ..q
+        },
+    );
+    assert_eq!(back.verdict, EndVerdict::Reverse, "{back:?}");
+}

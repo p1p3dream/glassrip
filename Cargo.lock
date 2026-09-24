@@ -1377,6 +1377,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "glassrip-meeting"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "glassrip-core",
+ "glassrip-media",
+ "glassrip-vision",
+ "image",
+ "imageproc",
+ "nalgebra",
+ "proptest",
+ "schemars",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "glassrip-vision"
 version = "0.1.0"
 dependencies = [
@@ -2219,11 +2240,23 @@ checksum = "7b5c17de023a86f59ed79891b2e5d5a94c705dbe904a5b5c9c952ea6221b03e4"
 dependencies = [
  "approx",
  "matrixmultiply",
+ "nalgebra-macros",
  "num-complex",
  "num-rational",
  "num-traits",
  "simba",
  "typenum",
+]
+
+[[package]]
+name = "nalgebra-macros"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "254a5372af8fc138e36684761d3c0cdb758a4410e938babcff1c860ce14ddbfc"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
