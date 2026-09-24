@@ -51,7 +51,7 @@ pub struct ScreenClassOutput {
 pub const MIN_CANVAS_SIDE_FRACTION: f64 = 0.05;
 
 /// Why the model's canvas box was replaced by the full frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CanvasBBoxIssue {
     /// `x2 < x1` or `y2 < y1`, or non-finite coordinates.
@@ -345,7 +345,7 @@ impl ClassifyRules {
 }
 
 /// A rule that fired.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RuleHit {
     pub rule: String,
     pub screen_type: ScreenType,
@@ -369,7 +369,7 @@ impl RuleEvaluation {
 }
 
 /// How the final class was decided.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ClassifyMethod {
     /// Model and rule agree.

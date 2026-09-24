@@ -230,6 +230,13 @@ pub fn prepare_board_image(canvas_crop: &DynamicImage) -> Result<PreparedImage> 
     prepare_with(canvas_crop, plan_board_size(w, h))
 }
 
+/// Resize to exactly `long_edge` px on the long side (still within the token
+/// cap) and encode. Used for board tiles, which are always sent at full size.
+pub fn prepare_long_edge(image: &DynamicImage, long_edge: u32) -> Result<PreparedImage> {
+    let (w, h) = image.dimensions();
+    prepare_with(image, plan_thumbnail_size(w, h, long_edge))
+}
+
 /// Resize a frame to the classification thumbnail and encode it.
 pub fn prepare_thumbnail(frame: &DynamicImage) -> Result<PreparedImage> {
     let (w, h) = frame.dimensions();

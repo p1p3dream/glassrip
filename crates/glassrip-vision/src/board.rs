@@ -257,14 +257,14 @@ impl Default for BoardValidationConfig {
 }
 
 /// Canvas size in pixels (the coordinate space of the bboxes being validated).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct CanvasSize {
     pub width: f64,
     pub height: f64,
 }
 
 /// Which output list an element came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ElementList {
     Nodes,
@@ -274,7 +274,7 @@ pub enum ElementList {
     OtherVisibleText,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RejectReason {
     /// Text is on the chrome denylist.
@@ -286,7 +286,7 @@ pub enum RejectReason {
 }
 
 /// An element removed as UI chrome.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RejectedItem {
     pub list: ElementList,
     pub text: String,
@@ -294,7 +294,7 @@ pub struct RejectedItem {
     pub reason: RejectReason,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum IssueKind {
     EmptyText,
@@ -318,7 +318,7 @@ pub enum IssueKind {
 }
 
 /// A non-fatal correction applied during validation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ValidationIssue {
     pub list: ElementList,
     pub kind: IssueKind,
@@ -326,7 +326,7 @@ pub struct ValidationIssue {
 }
 
 /// Board reading after validation. Bboxes are in canvas pixels.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ValidatedBoard {
     pub nodes: Vec<BoardNode>,
     pub edges: Vec<BoardEdge>,
