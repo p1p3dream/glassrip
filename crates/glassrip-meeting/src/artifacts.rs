@@ -163,9 +163,12 @@ pub struct OcrSpanView {
     /// Recognition confidence.
     #[serde(default, alias = "conf")]
     pub confidence: Option<f64>,
-    /// `canvas`, `chrome`, or `tile`.
+    /// `canvas`, `unassigned`, `chrome`, or `tile`.
     #[serde(default)]
     pub region: Option<String>,
+    /// Why a chrome span is chrome (for example `app_panel`, `banner`).
+    #[serde(default)]
+    pub chrome_reason: Option<String>,
 }
 
 /// OCR spans of one keyframe (consumer view of `glassrip.ocr`).

@@ -30,6 +30,58 @@ pub fn is_unreliable(text: &str) -> bool {
     n.is_empty() || n.contains("[illegible]") || n.ends_with("...") || n.ends_with('\u{2026}')
 }
 
+/// True for arrow glyphs and similar connector marks.
+fn is_arrow(c: char) -> bool {
+    matches!(u32::from(c), 0x2190..=0x21FF | 0x27F0..=0x27FF | 0x2900..=0x297F | 0x2B00..=0x2B2F)
+        || matches!(c, '>' | '<' | '-' | '=' | '~' | '\u{2014}' | '\u{2013}')
+}
+
+/// An edge label with arrow glyphs trimmed from both ends; empty when nothing
+/// alphanumeric is left (a label of only glyphs or punctuation is not a label).
+pub fn clean_label(label: &str) -> String {
+    let t = label.trim_matches(|c: char| c.is_whitespace() || is_arrow(c));
+    // Line style words written into the label slot describe the line, not a label.
+    let style_word = matches!(
+        normalize(t).as_str(),
+        "solid" | "dashed" | "dotted" | "line" | "arrow" | "none" | "null"
+    );
+    if !style_word && t.chars().any(char::is_alphanumeric) {
+        t.to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Alphanumeric tokens of the normalized text.
+pub fn tokens(text: &str) -> Vec<String> {
+    normalize(text)
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// True when `short` reads as a piece of `long`: its tokens are a strict subset of
+/// `long`'s, or its normalized text is contained in `long`'s starting at a word
+/// boundary (a cut-off reading).
+pub fn is_fragment_of(short: &str, long: &str) -> bool {
+    let (s, l) = (normalize(short), normalize(long));
+    if s.chars().filter(|c| c.is_alphanumeric()).count() < 3 || s.len() >= l.len() {
+        return false;
+    }
+    let (ts, tl) = (tokens(short), tokens(long));
+    let subset = !ts.is_empty() && ts.len() < tl.len() && ts.iter().all(|t| tl.contains(t));
+    // Contained text must start at a word boundary ("updates" in "shared updates", or
+    // a cut-off "ledger_wr"), not inside a word ("eta" in "theta").
+    let at_boundary = l.match_indices(s.as_str()).any(|(i, _)| {
+        l[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric())
+    });
+    subset || at_boundary
+}
+
 /// One meeting participant and the names they may appear under.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -156,6 +208,27 @@ mod tests {
         );
         assert!(t.resolve("Morgan").is_none());
         assert!(t.resolve("").is_none());
+    }
+
+    #[test]
+    fn labels_and_fragments() {
+        assert_eq!(clean_label("\u{2192}"), "");
+        assert_eq!(clean_label(" -> "), "");
+        assert_eq!(clean_label("\u{2192} REST"), "REST");
+        assert_eq!(clean_label("gRPC"), "gRPC");
+        assert_eq!(clean_label("solid"), "");
+        assert_eq!(clean_label(" Dashed "), "");
+        assert_eq!(clean_label("..."), "");
+        assert!(is_fragment_of("updates", "Shared updates"));
+        assert!(is_fragment_of("Store", "Invoice Ledger Store"));
+        assert!(is_fragment_of(
+            "ledger_wr",
+            "Ledger worker ledger_writer_py"
+        ));
+        assert!(!is_fragment_of("Queue", "Queue"));
+        assert!(!is_fragment_of("ab", "abc def"));
+        assert!(!is_fragment_of("Ledger", "Queue worker"));
+        assert!(!is_fragment_of("Eta card", "Theta card"));
     }
 
     #[test]

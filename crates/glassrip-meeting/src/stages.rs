@@ -125,6 +125,8 @@ pub fn pixel_evidence(
         .map(|s| s.bbox)
         .chain(board.owner_tags.iter().map(|o| o.bbox))
         .chain(board.other_visible_text.iter().map(|t| t.bbox))
+        // Edge labels are text too: unmasked, their glyphs join the connector.
+        .chain(board.edges.iter().filter_map(|e| e.label_bbox))
         .collect();
     let prepared = PreparedCanvas::new(&bgr, &nodes, &texts, params);
     let by_id: HashMap<&str, &glassrip_vision::board::BoardNode> = board
@@ -140,7 +142,10 @@ pub fn pixel_evidence(
         let pixel = prepared.check(&EdgeQuery {
             src: s.bbox,
             dst: d.bbox,
-            label: label_box(board, &e.label),
+            label: e
+                .label_bbox
+                .filter(|_| !crate::text::clean_label(&e.label).is_empty())
+                .or_else(|| label_box(board, &crate::text::clean_label(&e.label))),
             style: e.style,
         });
         out.push(EdgeEvidence {
@@ -176,6 +181,9 @@ pub fn scale_board(board: &ValidatedBoard, sx: f64, sy: f64) -> ValidatedBoard {
     }
     for t in &mut b.other_visible_text {
         t.bbox = scale_box(&t.bbox, sx, sy);
+    }
+    for e in &mut b.edges {
+        e.label_bbox = e.label_bbox.map(|l| scale_box(&l, sx, sy));
     }
     b
 }
@@ -629,13 +637,17 @@ pub fn ocr_anchors(ocr: &OcrView, dirs: Option<&EdgeDirectionItem>) -> Vec<TextA
     );
     ocr.spans
         .iter()
-        .filter(|s| match s.region.as_deref() {
-            Some(r) => r == "canvas",
-            None => {
-                s.bbox.x1 >= crop.x1
-                    && s.bbox.y1 >= crop.y1
-                    && s.bbox.x2 <= crop.x2
-                    && s.bbox.y2 <= crop.y2
+        .filter(|s| {
+            // Canvas spans, and spans the crop stage left unassigned when they lie
+            // inside the crop; chrome and tile names never anchor.
+            let inside = s.bbox.x1 >= crop.x1
+                && s.bbox.y1 >= crop.y1
+                && s.bbox.x2 <= crop.x2
+                && s.bbox.y2 <= crop.y2;
+            match s.region.as_deref() {
+                Some("canvas") => true,
+                Some("unassigned") | None => inside,
+                Some(_) => false,
             }
         })
         .filter(|s| s.bbox.is_well_formed() && !normalize(&s.text).is_empty())
@@ -696,6 +708,17 @@ pub fn board_frames(
             .get(&b.keyframe_id)
             .map(|o| ocr_anchors(o, d.as_ref()))
             .unwrap_or_default();
+        // App panel text (board title bar, board list) names the board, not content.
+        let title_hints = ocr
+            .get(&b.keyframe_id)
+            .map(|o| {
+                o.spans
+                    .iter()
+                    .filter(|s| s.chrome_reason.as_deref() == Some("app_panel"))
+                    .map(|s| s.text.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
         out.push(BoardFrame {
             keyframe_index: i,
             t_start_s: kf[i].t_start_s,
@@ -708,6 +731,7 @@ pub fn board_frames(
             board: b.board,
             ink_change,
             ocr_anchors: anchors,
+            title_hints,
         });
     }
     out
@@ -916,6 +940,7 @@ mod tests {
             bbox: b,
             confidence: Some(0.9),
             region: region.map(String::from),
+            chrome_reason: None,
         };
         let ocr = OcrView {
             keyframe_id: Some("a".into()),

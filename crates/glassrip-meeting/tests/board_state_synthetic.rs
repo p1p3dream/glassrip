@@ -152,6 +152,7 @@ fn frames(specs: &[Spec]) -> Vec<BoardFrame> {
             directions: None,
             board_title: None,
             ocr_anchors: vec![],
+            title_hints: vec![],
         })
         .collect()
 }
@@ -888,4 +889,292 @@ fn output_matches_the_eval_contract_names() {
     assert!(t["src"].is_string() && t["dst"].is_string());
     assert!(v["owner_assignments"][0]["name_raw"].is_string());
     assert!(v["events"][0]["event_id"].is_string());
+}
+
+#[test]
+fn title_bar_and_app_panel_text_are_not_content() {
+    let mut fr = frames(&(0..4).map(|_| base()).collect::<Vec<_>>());
+    for (i, f) in fr.iter_mut().enumerate() {
+        // The board title in the title bar band (top 5% of the canvas).
+        f.board.nodes.push(BoardNode {
+            local_id: "t1".into(),
+            text: "Widget Platform Plan (Draft)".into(),
+            bbox: BBox::new(20.0, 8.0, 330.0, 30.0),
+            conf: 0.9,
+        });
+        // The same title read lower down in one keyframe, and an app panel entry
+        // (board list, elided) read as a node in another.
+        if i == 1 {
+            f.board.nodes.push(BoardNode {
+                local_id: "t2".into(),
+                text: "Widget Platform Plan (Draft)".into(),
+                bbox: BBox::new(900.0, 700.0, 1200.0, 730.0),
+                conf: 0.9,
+            });
+        }
+        f.title_hints = vec!["Quarterly Roadmap Review Bo...".into()];
+        if i == 2 {
+            f.board.nodes.push(BoardNode {
+                local_id: "t3".into(),
+                text: "Quarterly Roadmap Review Board".into(),
+                bbox: BBox::new(900.0, 800.0, 1200.0, 830.0),
+                conf: 0.9,
+            });
+        }
+    }
+    let s = run(fr, &params());
+    assert!(
+        !s.nodes
+            .iter()
+            .any(|n| n.text.contains("Widget Platform") || n.text.contains("Roadmap")),
+        "{:?}",
+        s.nodes.iter().map(|n| &n.text).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        s.board_title.as_deref(),
+        Some("Widget Platform Plan (Draft)")
+    );
+    assert_eq!(s.nodes.len(), 4);
+}
+
+fn grid_spec() -> Spec {
+    let cards = [
+        "Alpha card",
+        "Beta card",
+        "Gamma card",
+        "Delta card",
+        "Epsilon card",
+        "Zeta card",
+        "Eta card",
+        "Theta card",
+        "Iota card",
+    ];
+    let mut s = base();
+    s.stickies = cards
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            (
+                *t,
+                (
+                    900.0 + (i % 3) as f64 * 130.0,
+                    450.0 + (i / 3) as f64 * 110.0,
+                ),
+            )
+        })
+        .collect();
+    s
+}
+
+#[test]
+fn grid_stickies_carry_boxes_and_form_a_group_with_its_heading() {
+    let specs: Vec<Spec> = (0..3).map(|_| grid_spec()).collect();
+    let mut fr = frames(&specs);
+    for f in &mut fr {
+        f.board.other_visible_text.push(TextItem {
+            text: "Things to show first".into(),
+            bbox: BBox::new(900.0, 350.0, 1150.0, 380.0),
+        });
+    }
+    let s = run(fr, &params());
+    assert!(s
+        .stickies
+        .iter()
+        .all(|x| x.bbox.is_some() && x.last_seen.is_some()));
+    let g = s
+        .groups
+        .iter()
+        .find(|g| g.sticky_ids.len() == 9)
+        .unwrap_or_else(|| {
+            panic!(
+                "{:#?} {:?}",
+                s.groups,
+                s.stickies
+                    .iter()
+                    .map(|x| (&x.text, x.in_final))
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert_eq!((g.rows, g.cols), (3, 3));
+    assert_eq!(g.title.as_deref(), Some("Things to show first"));
+    let first = s.stickies.iter().find(|x| x.id == g.sticky_ids[0]).unwrap();
+    assert_eq!(first.text, "Alpha card");
+    assert!(!s.stickies.iter().any(|x| x.text == "Things to show first"));
+    assert!(!s.nodes.iter().any(|x| x.text == "Things to show first"));
+}
+
+#[test]
+fn fragments_fold_into_colocated_longer_stickies_only() {
+    let mut specs: Vec<Spec> = (0..5).map(|_| base()).collect();
+    for (i, s) in specs.iter_mut().enumerate() {
+        s.stickies.push(("Shared updates", (300.0, 780.0)));
+        s.stickies.push(("Tasks - due this week", (1300.0, 420.0)));
+        s.stickies.push(("Tasks", (450.0, 400.0)));
+        if i == 1 || i == 3 {
+            // A cut-off reading of the same card.
+            s.stickies.push(("updates", (320.0, 785.0)));
+        }
+    }
+    let s = run(frames(&specs), &params());
+    let texts: Vec<&str> = s.stickies.iter().map(|x| x.text.as_str()).collect();
+    assert!(!texts.contains(&"updates"), "{texts:?}");
+    assert!(
+        texts.contains(&"Shared updates")
+            && texts.contains(&"Tasks")
+            && texts.contains(&"Tasks - due this week")
+    );
+    assert!(s
+        .folded
+        .iter()
+        .any(|f| f.text == "updates" && f.into == "Shared updates"));
+}
+
+#[test]
+fn a_tag_moved_onto_a_connector_beside_a_box_is_a_move_to_that_box() {
+    let mut specs: Vec<Spec> = (0..6).map(|_| base()).collect();
+    for (i, s) in specs.iter_mut().enumerate() {
+        // Next to Ingest Gateway, then on the Queue -> Ledger Store connector right
+        // beside Ledger Store.
+        let at = if i < 4 {
+            (200.0, 120.0)
+        } else {
+            (1060.0, 210.0)
+        };
+        s.owners.push(("Avery", at, ""));
+    }
+    let s = run(frames(&specs), &params());
+    let a: Vec<_> = s
+        .owner_assignments
+        .iter()
+        .filter(|x| x.person_id == "p-avery")
+        .collect();
+    assert_eq!(a.len(), 2, "{a:#?}");
+    assert_eq!(a[1].target.texts(), vec!["Ledger Store"]);
+    assert_eq!(a[1].valid_from_s, 80.0);
+    assert!(a[1]
+        .moved_from
+        .as_ref()
+        .is_some_and(|m| m.texts() == vec!["Ingest Gateway"]));
+    assert!(s
+        .events
+        .iter()
+        .any(|e| e.kind == EventKind::OwnerMoved && e.keyframe_id == "kf04"));
+}
+
+#[test]
+fn one_tag_bridging_two_boxes_owns_both_nodes_not_their_link() {
+    let mut specs: Vec<Spec> = (0..4).map(|_| base()).collect();
+    for s in &mut specs {
+        s.nodes.push(("n6", "Left Pane".into(), (300.0, 450.0)));
+        s.nodes.push(("n7", "Right Pane".into(), (520.0, 450.0)));
+        s.edges.push(("n6", "n7", ""));
+        // Above the gap between the two boxes, touching neither the connector nor
+        // the gap.
+        s.owners.push(("Jordy", (410.0, 375.0), ""));
+    }
+    let s = run(frames(&specs), &params());
+    let mut t: Vec<String> = s
+        .owner_assignments
+        .iter()
+        .filter(|x| x.person_id == "p-jordan")
+        .flat_map(|x| {
+            x.target
+                .texts()
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    t.sort();
+    assert_eq!(
+        t,
+        vec!["Left Pane", "Right Pane"],
+        "{:#?}",
+        s.owner_assignments
+    );
+    assert!(s
+        .owner_assignments
+        .iter()
+        .all(|x| !matches!(x.target, OwnerTarget::Edge { .. })));
+}
+
+#[test]
+fn glyph_and_style_labels_are_stripped() {
+    let mut specs: Vec<Spec> = (0..3).map(|_| base()).collect();
+    for s in &mut specs {
+        s.edges = vec![
+            ("n1", "n2", "\u{2192}"),
+            ("n2", "n3", "solid"),
+            ("n2", "n4", "gRPC \u{2192}"),
+        ];
+    }
+    let s = run(frames(&specs), &params());
+    let mut labels: Vec<&str> = s.edges.iter().map(|e| e.label.as_str()).collect();
+    labels.sort();
+    assert_eq!(labels, vec!["", "", "gRPC"]);
+}
+
+#[test]
+fn a_node_read_with_an_imprecise_box_stays_one_node() {
+    let mut fr = frames(&(0..4).map(|_| base()).collect::<Vec<_>>());
+    // In one keyframe the reader's Queue box is 140 px off.
+    for n in &mut fr[2].board.nodes {
+        if n.text == "Queue" {
+            n.bbox = BBox::new(n.bbox.x1 - 140.0, n.bbox.y1, n.bbox.x2 - 140.0, n.bbox.y2);
+        }
+    }
+    let s = run(fr, &params());
+    assert_eq!(s.nodes.iter().filter(|n| n.text == "Queue").count(), 1);
+}
+
+#[test]
+fn direction_votes_use_every_sighting_of_the_edge() {
+    // The edge is seen in keyframes 0-2 (head at Ingest Gateway), erased while both
+    // boxes stay in view, then seen again without a decisive head.
+    let mut specs: Vec<Spec> = (0..9).map(|_| base()).collect();
+    for s in specs.iter_mut().take(7).skip(3) {
+        s.edges.retain(|e| e.0 != "n1");
+    }
+    let mut fr = frames(&specs);
+    for (i, f) in fr.iter_mut().enumerate() {
+        let v = match i {
+            0..=2 => Some(EndVerdict::Reverse),
+            7 | 8 => Some(EndVerdict::NoArrowhead),
+            _ => None,
+        };
+        if let Some(v) = v {
+            f.directions = Some(dir_item(
+                &f.keyframe_id,
+                vec![evidence("n1", "n2", v, None)],
+            ));
+        }
+    }
+    let s = run(fr, &params());
+    let e = s.edges.iter().find(|e| e.label == "HTTP").expect("edge");
+    assert_eq!(e.direction, EdgeOrientation::Forward);
+    let src = s.nodes.iter().find(|n| n.id == e.src).unwrap();
+    assert_eq!(src.text, "Queue");
+}
+
+#[test]
+fn a_node_well_above_a_card_row_is_not_its_heading() {
+    let mut specs: Vec<Spec> = (0..3).map(|_| base()).collect();
+    for s in &mut specs {
+        s.stickies = vec![
+            ("Plan the rollout", (700.0, 845.0)),
+            ("Order the badges", (830.0, 845.0)),
+            ("Book the venue", (960.0, 845.0)),
+        ];
+    }
+    // Report Builder sits more than a card height above the row: a component, not a
+    // heading.
+    let s = run(frames(&specs), &params());
+    assert!(s.nodes.iter().any(|n| n.text == "Report Builder"));
+    let g = s
+        .groups
+        .iter()
+        .find(|g| g.sticky_ids.len() == 3)
+        .expect("row");
+    assert_eq!((g.rows, g.cols), (1, 3));
+    assert!(g.title.is_none());
 }

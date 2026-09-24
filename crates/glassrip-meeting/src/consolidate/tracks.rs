@@ -37,6 +37,8 @@ pub struct Obs {
     pub text: String,
     /// Box in the cluster reference frame, when the keyframe is registered.
     pub bbox: Option<BBox>,
+    /// Box in the keyframe's own canvas coordinates (none for edge labels).
+    pub raw_bbox: Option<BBox>,
     /// Registration cluster (only meaningful with `bbox`).
     pub cluster: usize,
     /// Node `local_id` in the keyframe, for node observations.
@@ -268,8 +270,15 @@ pub fn assign_frame(tracks: &mut Vec<Track>, obs: Vec<Obs>, p: &MatchParams) -> 
                     if text_score >= p.fuzzy && same_place {
                         Some(2.0 + text_score)
                     } else if text_score >= p.fuzzy {
-                        // Same text in another place of the same canvas: another element.
-                        None
+                        // Same text in another place of the same canvas. For stickies
+                        // (grids repeat card texts) that is another element; other
+                        // labels are nearly unique on a board, so an off position is
+                        // more likely an imprecise box and still matches, below any
+                        // same-place match. Duplicates within one keyframe stay apart
+                        // through the one-to-one assignment.
+                        let sticky_pair =
+                            o.lists.contains(&ObsList::Sticky) && t.votes().sticky > 0;
+                        (!sticky_pair).then_some(1.2 + text_score)
                     } else if iou >= p.label_change_min_iou
                         && o.lists.contains(&ObsList::Node)
                         && t.votes().node > 0
@@ -485,6 +494,7 @@ mod tests {
                 lists: vec![l],
                 text: text.into(),
                 bbox: None,
+                raw_bbox: None,
                 cluster: usize::MAX,
                 local_id: None,
                 color: None,

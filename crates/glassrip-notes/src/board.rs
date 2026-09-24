@@ -232,6 +232,9 @@ pub mod build {
     pub fn board(id: &str, end_s: f64) -> BoardStateItem {
         BoardStateItem {
             board_id: id.into(),
+            board_title: None,
+            groups: vec![],
+            folded: vec![],
             is_final: true,
             t_end_s: Some(end_s),
             board_keyframes: vec![],
@@ -299,6 +302,8 @@ pub mod build {
             text: text.into(),
             kind: glassrip_meeting::consolidate::sticky_kind(text),
             color: Some(StickyColor::Yellow),
+            bbox: None,
+            last_seen: None,
             lifetimes: vec![life(first_s, end_s)],
             in_final: true,
         }

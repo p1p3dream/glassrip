@@ -17,6 +17,8 @@
 //! 5. Owner tags become timed assignments ([`owners`]).
 //! 6. Events are computed from the state changes and gated on ink ([`events`]).
 
+pub mod anchor;
+mod cleanup;
 pub mod events;
 pub mod owners;
 pub mod tracks;
@@ -30,12 +32,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::artifacts::{CanvasDims, EdgeDirectionItem, EdgeEvidence};
 use crate::direction::{frame_weight, DirectionBasis, DirectionVotes, EdgeDirection, EndVerdict};
-use crate::pixel_direction::{dist_to_bbox, exit_point};
+use crate::pixel_direction::exit_point;
 use crate::register::{
     map_bbox, register, Anchors, FrameRegistration, RegistrationMode, RegistrationParams,
 };
-use crate::text::{is_unreliable, normalize, AliasTable};
+use crate::text::{clean_label, is_unreliable, normalize, AliasTable};
 
+use anchor::{anchor_tag, AnchorParams, Anchored, EdgeGeom};
+use cleanup::{derive_groups, fold_fragments, Titles};
 use events::{BoardEvent, EventGate, EventKind, SuppressedEvent};
 use owners::{
     apply_alternation, assign, collapse_edge_pairs, AnchorKind, Corroborator, OwnerAssignment,
@@ -71,6 +75,16 @@ pub struct BoardFrame {
     pub directions: Option<EdgeDirectionItem>,
     /// OCR spans inside the canvas, in the reading's coordinates (anchors).
     pub ocr_anchors: Vec<TextAnchor>,
+    /// Texts from the app's title bar and board list (they name the board, and are
+    /// never board content).
+    pub title_hints: Vec<String>,
+}
+
+/// Keys used for tag geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnchorKey {
+    Node(usize),
+    Edge((usize, usize)),
 }
 
 /// A text with its box, used as a registration anchor.
@@ -128,14 +142,20 @@ pub struct ConsolidationParams {
     /// Reading confidence (element and board) a single sighting needs, together with
     /// the pixel check, to be kept.
     pub single_sighting_min_conf: f64,
+    /// Top band of the canvas, as a share of its height, treated as the title bar:
+    /// text entirely inside it is the board title, not content.
+    pub title_band_share: f64,
+    /// Minimum cards for a derived sticky group (grid or row).
+    pub min_group_cards: usize,
     /// Aligned ink change needed for a content event.
     pub ink_event_threshold: f64,
     /// Share of the decisive weight a direction needs within a channel.
     pub vote_min_share: f64,
     /// Consecutive consistent keyframes to open or move an owner assignment.
     pub owner_confirm_keyframes: usize,
-    /// A tag anchors to the nearest node within this many tag sizes.
-    pub owner_node_anchor_share: f64,
+    /// Owner tag geometry thresholds.
+    #[serde(default)]
+    pub owner_anchor: AnchorParams,
     /// Alternations (A, B, A, B has 3) a strictly interleaving stretch between an
     /// edge's ends needs before its sightings are re-anchored to the edge.
     pub alternation_min_alternations: usize,
@@ -158,10 +178,12 @@ impl Default for ConsolidationParams {
             final_window_s: 120.0,
             min_final_keyframes: 3,
             single_sighting_min_conf: 0.8,
+            title_band_share: 0.05,
+            min_group_cards: 3,
             ink_event_threshold: 0.05,
             vote_min_share: 0.6,
             owner_confirm_keyframes: 2,
-            owner_node_anchor_share: 1.5,
+            owner_anchor: AnchorParams::default(),
             alternation_min_alternations: 3,
             backfill_untargeted_owners: false,
         }
@@ -271,6 +293,10 @@ pub struct StickyState {
     pub kind: StickyKind,
     /// Most frequent color.
     pub color: Option<StickyColor>,
+    /// Box in the largest registered cluster's reference frame.
+    pub bbox: Option<BBox>,
+    /// Box at the last sighting, in that keyframe's canvas coordinates.
+    pub last_seen: Option<SeenBox>,
     /// Supported lifetimes.
     pub lifetimes: Vec<Lifetime>,
     /// Alive in the final window.
@@ -288,6 +314,46 @@ pub enum EdgeOrientation {
     Uncertain,
     /// Arrowheads at both ends.
     Bidirectional,
+}
+
+/// A box in one keyframe's canvas coordinates.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SeenBox {
+    /// Keyframe id.
+    pub keyframe_id: String,
+    /// Box in that keyframe's canvas pixels.
+    pub bbox: BBox,
+}
+
+/// Stickies laid out together (a grid or a row of same-size cards).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StickyGroup {
+    /// Stable id.
+    pub id: String,
+    /// Heading written just above the group, when there is one.
+    pub title: Option<String>,
+    /// Member sticky ids, row by row.
+    pub sticky_ids: Vec<String>,
+    /// Rows.
+    pub rows: u32,
+    /// Columns.
+    pub cols: u32,
+    /// Keyframe the layout was taken from.
+    pub keyframe_id: String,
+    /// Group extent in that keyframe's canvas pixels.
+    pub bbox: BBox,
+}
+
+/// An element read as a piece of a longer element at the same place.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FoldedElement {
+    /// Text of the fragment.
+    pub text: String,
+    /// Text of the element it was folded into.
+    pub into: String,
 }
 
 /// A consolidated edge between nodes `a` and `b`.
@@ -383,6 +449,12 @@ pub struct FinalWindow {
 pub struct BoardStateItem {
     /// Board id.
     pub board_id: String,
+    /// Board title (from the title bar), when seen.
+    pub board_title: Option<String>,
+    /// Sticky groups derived from the layout.
+    pub groups: Vec<StickyGroup>,
+    /// Fragments folded into longer elements (not counted as support).
+    pub folded: Vec<FoldedElement>,
     /// This is the board's final state (the last stable board window).
     #[serde(rename = "final")]
     pub is_final: bool,
@@ -476,18 +548,6 @@ fn geometry_ok(board: &ValidatedBoard) -> bool {
     true
 }
 
-fn point_segment_distance(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
-    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-    let l2 = dx * dx + dy * dy;
-    let t = if l2 > 0.0 {
-        (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / l2).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let (qx, qy) = (a.0 + t * dx, a.1 + t * dy);
-    ((p.0 - qx).powi(2) + (p.1 - qy).powi(2)).sqrt()
-}
-
 fn median(mut v: Vec<f64>) -> f64 {
     v.retain(|x| x.is_finite());
     if v.is_empty() {
@@ -514,10 +574,15 @@ pub fn consolidate(
     let n = frames.len();
     let fz = params.fuzzy_threshold;
 
+    // 0. Board title: title bar text and app panel text are never content.
+    let titles = Titles::collect(&frames, params);
+    let is_title = |fi: usize, text: &str, b: &BBox| titles.is_title(&frames[fi], text, b, params);
+
     // 1. Registration.
     let anchors: Vec<Anchors> = frames
         .iter()
-        .map(|f| {
+        .enumerate()
+        .map(|(fi, f)| {
             let b = &f.board;
             Anchors::from_items(
                 b.nodes
@@ -529,7 +594,8 @@ pub fn consolidate(
                             .iter()
                             .map(|x| (x.text.as_str(), &x.bbox)),
                     )
-                    .chain(f.ocr_anchors.iter().map(|x| (x.text.as_str(), &x.bbox))),
+                    .chain(f.ocr_anchors.iter().map(|x| (x.text.as_str(), &x.bbox)))
+                    .filter(|(t, bb)| !is_title(fi, t, bb)),
             )
         })
         .collect();
@@ -560,7 +626,10 @@ pub fn consolidate(
         for nd in &f.board.nodes {
             // A node whose text resolves to a participant (fuzzy, unlike the
             // validator's exact check) is an owner tag read in the wrong list.
-            if is_unreliable(&nd.text) || params.participants.resolve(&nd.text).is_some() {
+            if is_unreliable(&nd.text)
+                || params.participants.resolve(&nd.text).is_some()
+                || is_title(fi, &nd.text, &nd.bbox)
+            {
                 continue;
             }
             // Single sightings: the pixel check traced a connector to this node and the
@@ -581,6 +650,7 @@ pub fn consolidate(
                 lists: vec![ObsList::Node],
                 text: nd.text.clone(),
                 bbox: to_ref(&nd.bbox),
+                raw_bbox: Some(nd.bbox),
                 cluster,
                 local_id: Some(nd.local_id.clone()),
                 color: None,
@@ -588,7 +658,7 @@ pub fn consolidate(
             });
         }
         for s in &f.board.stickies {
-            if is_unreliable(&s.text) {
+            if is_unreliable(&s.text) || is_title(fi, &s.text, &s.bbox) {
                 continue;
             }
             obs.push(Obs {
@@ -596,6 +666,7 @@ pub fn consolidate(
                 lists: vec![ObsList::Sticky],
                 text: s.text.clone(),
                 bbox: to_ref(&s.bbox),
+                raw_bbox: Some(s.bbox),
                 cluster,
                 local_id: None,
                 color: Some(s.color),
@@ -603,7 +674,7 @@ pub fn consolidate(
             });
         }
         for t in &f.board.other_visible_text {
-            if is_unreliable(&t.text) {
+            if is_unreliable(&t.text) || is_title(fi, &t.text, &t.bbox) {
                 continue;
             }
             obs.push(Obs {
@@ -611,6 +682,7 @@ pub fn consolidate(
                 lists: vec![ObsList::Other],
                 text: t.text.clone(),
                 bbox: to_ref(&t.bbox),
+                raw_bbox: Some(t.bbox),
                 cluster,
                 local_id: None,
                 color: None,
@@ -618,7 +690,8 @@ pub fn consolidate(
             });
         }
         for e in &f.board.edges {
-            let l = e.label.trim();
+            let cleaned = clean_label(&e.label);
+            let l = cleaned.as_str();
             if l.is_empty() || is_unreliable(l) {
                 continue;
             }
@@ -634,6 +707,7 @@ pub fn consolidate(
                     lists: vec![ObsList::EdgeLabel],
                     text: l.to_string(),
                     bbox: None,
+                    raw_bbox: None,
                     cluster,
                     local_id: None,
                     color: None,
@@ -649,6 +723,32 @@ pub fn consolidate(
             }
         }
     }
+
+    // Fragments: a shorter reading of a longer element at the same place is folded
+    // into it. The fragment's sightings do not count as support; references to it
+    // (edge endpoints, owner targets) are redirected.
+    let fold_to = fold_fragments(&tracks);
+    let resolve = |mut t: usize| {
+        let mut guard = 0;
+        while let Some(&u) = fold_to.get(&t) {
+            t = u;
+            guard += 1;
+            if guard > tracks.len() {
+                break;
+            }
+        }
+        t
+    };
+    for ti in node_track.values_mut() {
+        *ti = resolve(*ti);
+    }
+    let folded: Vec<FoldedElement> = fold_to
+        .iter()
+        .map(|(&t, &u)| FoldedElement {
+            text: tracks[t].text(),
+            into: tracks[resolve(u)].text(),
+        })
+        .collect();
 
     // Views and visibility.
     let views: Vec<Option<BBox>> = (0..n)
@@ -699,6 +799,18 @@ pub fn consolidate(
                 &support,
                 |f| t.obs.iter().any(|o| o.frame == f && o.single_ok),
             )
+        })
+        .collect();
+    // Folded fragments have no lifetime of their own.
+    let track_intervals: Vec<Vec<Interval>> = track_intervals
+        .into_iter()
+        .enumerate()
+        .map(|(ti, iv)| {
+            if fold_to.contains_key(&ti) {
+                Vec::new()
+            } else {
+                iv
+            }
         })
         .collect();
 
@@ -807,16 +919,41 @@ pub fn consolidate(
                 let text = t.current_text(fz);
                 let id = format!("sticky-{}", stickies.len() + 1);
                 sticky_id.insert(ti, id.clone());
+                let last_seen = t.obs.iter().rev().find_map(|o| {
+                    o.raw_bbox.map(|b| SeenBox {
+                        keyframe_id: frames[o.frame].keyframe_id.clone(),
+                        bbox: b,
+                    })
+                });
                 stickies.push(StickyState {
                     id,
                     kind: sticky_kind(&text),
                     text,
                     color: t.color(),
+                    bbox: largest_cluster.and_then(|c| t.bbox_in(c)),
+                    last_seen,
                     lifetimes,
                     in_final: alive_in_final(ivs),
                 });
             }
             ObsList::Other | ObsList::EdgeLabel => {}
+        }
+    }
+
+    // Sticky groups (grids, rows of cards); their headings are not nodes or stickies.
+    let final_sticky: HashMap<usize, String> = sticky_id
+        .iter()
+        .filter(|(_, id)| stickies.iter().any(|s| &s.id == *id && s.in_final))
+        .map(|(t, id)| (*t, id.clone()))
+        .collect();
+    let (groups, heading_tracks) =
+        derive_groups(&tracks, &frames, &final_sticky, params.min_group_cards);
+    for t in &heading_tracks {
+        if let Some(id) = node_id.remove(t) {
+            nodes.retain(|n| n.id != id);
+        }
+        if let Some(id) = sticky_id.remove(t) {
+            stickies.retain(|s| s.id != id);
         }
     }
 
@@ -871,7 +1008,7 @@ pub fn consolidate(
             list.push(EdgeObs {
                 frame: fi,
                 src: s,
-                label: e.label.trim().to_string(),
+                label: clean_label(&e.label),
                 style: e.style,
                 evidence,
                 segment,
@@ -934,8 +1071,10 @@ pub fn consolidate(
             .iter()
             .filter(|o| o.frame >= last_iv.first && o.frame <= last_iv.last)
             .collect();
+        // The direction vote uses every sighting of the edge, not only its last
+        // lifetime: more keyframes outvote a bad one, and flips are events of their own.
         let mut votes = DirectionVotes::default();
-        for o in &in_iv {
+        for o in list {
             let w = weight_of(o.frame);
             let orient = |v: EndVerdict| if o.src == a { v } else { v.flipped() };
             votes.reader.add(orient(EndVerdict::Forward), 1.0);
@@ -1026,12 +1165,6 @@ pub fn consolidate(
     let mut by_person: BTreeMap<String, (String, Vec<OwnerSighting>)> = BTreeMap::new();
     for (fi, f) in frames.iter().enumerate() {
         let geo = geometry_ok(&f.board);
-        let geo_nodes: Vec<&glassrip_vision::board::BoardNode> = f
-            .board
-            .nodes
-            .iter()
-            .filter(|x| params.participants.resolve(&x.text).is_none())
-            .collect();
         let mut tags: Vec<(String, String, BBox)> = f
             .board
             .owner_tags
@@ -1051,12 +1184,40 @@ pub fn consolidate(
                 tags.push((nd.text.clone(), String::new(), nd.bbox));
             }
         }
-        let frame_edges: Vec<((usize, usize), Segment)> = edge_obs
+        // Boxes of the tracked nodes in this keyframe, and of the supported edges seen
+        // here (for tag geometry).
+        let node_boxes: Vec<(AnchorKey, BBox)> = f
+            .board
+            .nodes
+            .iter()
+            .filter(|x| params.participants.resolve(&x.text).is_none())
+            .filter_map(|x| {
+                node_track
+                    .get(&(fi, x.local_id.clone()))
+                    .filter(|ti| node_id.contains_key(ti))
+                    .map(|&ti| (AnchorKey::Node(ti), x.bbox))
+            })
+            .collect();
+        let box_of = |ti: usize| {
+            node_boxes
+                .iter()
+                .find(|(k, _)| *k == AnchorKey::Node(ti))
+                .map(|(_, b)| *b)
+        };
+        let frame_edges: Vec<EdgeGeom<AnchorKey>> = edge_obs
             .iter()
             .filter(|(k, _)| edge_id_of.contains_key(k))
-            .filter_map(|(k, l)| l.iter().find(|o| o.frame == fi).map(|o| (*k, o.segment)))
+            .filter_map(|(k, l)| {
+                let o = l.iter().find(|o| o.frame == fi)?;
+                Some(EdgeGeom {
+                    key: AnchorKey::Edge(*k),
+                    a: (AnchorKey::Node(k.0), box_of(k.0)?),
+                    b: (AnchorKey::Node(k.1), box_of(k.1)?),
+                    segment: o.segment,
+                })
+            })
             .collect();
-        for (name, near, tb) in tags {
+        for (tag_index, (name, near, tb)) in tags.into_iter().enumerate() {
             let Some(person) = params.participants.resolve(&name) else {
                 rejected_owner_tags.push(RejectedOwnerTag {
                     keyframe_id: f.keyframe_id.clone(),
@@ -1064,66 +1225,62 @@ pub fn consolidate(
                 });
                 continue;
             };
-            let c = ((tb.x1 + tb.x2) / 2.0, (tb.y1 + tb.y2) / 2.0);
-            let size = tb.width().max(tb.height()).max(1.0);
-            let mut target: Option<(OwnerTarget, AnchorKind)> = None;
+            let mut targets: Vec<(OwnerTarget, AnchorKind)> = Vec::new();
             if geo {
-                let overlaps_node = geo_nodes.iter().any(|x| x.bbox.iou(&tb) > 0.0);
-                let on_edge = frame_edges
-                    .iter()
-                    .map(|(k, (p, q))| (*k, point_segment_distance(c, *p, *q)))
-                    .filter(|(_, d)| *d <= size / 2.0)
-                    .min_by(|x, y| x.1.total_cmp(&y.1));
-                if let (false, Some((k, _))) = (overlaps_node, on_edge) {
-                    target = edge_target(k).map(|t| (t, AnchorKind::GeometryEdge));
-                }
-                if target.is_none() {
-                    let mut d: Vec<(f64, &str)> = geo_nodes
-                        .iter()
-                        .map(|x| (dist_to_bbox(c, &x.bbox), x.local_id.as_str()))
-                        .collect();
-                    d.sort_by(|x, y| x.0.total_cmp(&y.0));
-                    let unique = d.len() == 1 || (d.len() > 1 && d[1].0 - d[0].0 > 1.0);
-                    if let Some(&(dist, local)) = d.first() {
-                        if unique && dist <= params.owner_node_anchor_share * size {
-                            target = node_track
-                                .get(&(fi, local.to_string()))
-                                .and_then(|&ti| node_target(ti))
-                                .map(|t| (t, AnchorKind::GeometryNode));
-                        }
+                let node_of = |k: &AnchorKey| match k {
+                    AnchorKey::Node(t) => node_target(*t),
+                    AnchorKey::Edge(_) => None,
+                };
+                match anchor_tag(&tb, &node_boxes, &frame_edges, &params.owner_anchor) {
+                    Some(Anchored::Node(k)) => {
+                        targets.extend(node_of(&k).map(|t| (t, AnchorKind::GeometryNode)));
                     }
+                    Some(Anchored::Bridge(x, y)) => {
+                        targets.extend(node_of(&x).map(|t| (t, AnchorKind::GeometryBridge)));
+                        targets.extend(node_of(&y).map(|t| (t, AnchorKind::GeometryBridge)));
+                    }
+                    Some(Anchored::Edge(AnchorKey::Edge(k))) => {
+                        targets.extend(edge_target(k).map(|t| (t, AnchorKind::GeometryEdge)));
+                    }
+                    Some(Anchored::Edge(AnchorKey::Node(_))) | None => {}
                 }
             }
-            if target.is_none() && !near.is_empty() {
-                target = node_track
-                    .get(&(fi, near.clone()))
-                    .and_then(|&ti| node_target(ti))
-                    .map(|t| (t, AnchorKind::Near));
+            if targets.is_empty() && !near.is_empty() {
+                targets.extend(
+                    node_track
+                        .get(&(fi, near.clone()))
+                        .and_then(|&ti| node_target(ti))
+                        .map(|t| (t, AnchorKind::Near)),
+                );
             }
             let entry = by_person
                 .entry(person.person_id.clone())
                 .or_insert_with(|| (person.display_name.clone(), Vec::new()));
-            let (t, anchor) = match target {
-                Some((t, a)) => (Some(t), a),
-                None => (None, AnchorKind::Untargeted),
+            let targets: Vec<(Option<OwnerTarget>, AnchorKind)> = if targets.is_empty() {
+                vec![(None, AnchorKind::Untargeted)]
+            } else {
+                targets.into_iter().map(|(t, a)| (Some(t), a)).collect()
             };
-            // Several tags of one person in a keyframe are kept when their targets
-            // differ (multi-target owners).
-            if entry
-                .1
-                .iter()
-                .any(|s| s.keyframe_id == f.keyframe_id && s.target == t)
-            {
-                continue;
+            for (t, anchor) in targets {
+                // Several tags of one person in a keyframe are kept when their targets
+                // differ (multi-target owners).
+                if entry
+                    .1
+                    .iter()
+                    .any(|s| s.keyframe_id == f.keyframe_id && s.target == t)
+                {
+                    continue;
+                }
+                entry.1.push(OwnerSighting {
+                    keyframe_id: f.keyframe_id.clone(),
+                    t_start_s: f.t_start_s,
+                    t_end_s: f.t_end_s,
+                    name_raw: name.clone(),
+                    target: t,
+                    anchor,
+                    tag: tag_index as u32,
+                });
             }
-            entry.1.push(OwnerSighting {
-                keyframe_id: f.keyframe_id.clone(),
-                t_start_s: f.t_start_s,
-                t_end_s: f.t_end_s,
-                name_raw: name,
-                target: t,
-                anchor,
-            });
         }
     }
     let alternation_edges: Vec<(OwnerTarget, OwnerTarget, OwnerTarget)> = edge_id_of
@@ -1134,6 +1291,29 @@ pub fn consolidate(
     let owner_params = OwnerParams {
         confirm_keyframes: params.owner_confirm_keyframes,
         backfill_untargeted: params.backfill_untargeted_owners,
+    };
+    // A target is visible in a keyframe where its node (or both edge ends) was read.
+    let track_of_id: HashMap<&str, usize> =
+        node_id.iter().map(|(t, id)| (id.as_str(), *t)).collect();
+    let edge_of_id: HashMap<&str, (usize, usize)> =
+        edge_id_of.iter().map(|(k, id)| (id.as_str(), *k)).collect();
+    let frame_of_kf: HashMap<&str, usize> = frames
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.keyframe_id.as_str(), i))
+        .collect();
+    let seen = |ti: usize, kf: &str| {
+        frame_of_kf
+            .get(kf)
+            .is_some_and(|fi| tracks[ti].obs.iter().any(|o| o.frame == *fi))
+    };
+    let target_visible = |kf: &str, t: &OwnerTarget| match t {
+        OwnerTarget::Node { node_id, .. } => track_of_id
+            .get(node_id.as_str())
+            .is_some_and(|&ti| seen(ti, kf)),
+        OwnerTarget::Edge { edge_id, .. } => edge_of_id
+            .get(edge_id.as_str())
+            .is_some_and(|&(a, b)| seen(a, kf) && seen(b, kf)),
     };
     let mut owner_assignments: Vec<OwnerAssignment> = Vec::new();
     for (pid, (name, mut sightings)) in by_person {
@@ -1150,6 +1330,7 @@ pub fn consolidate(
             timeline_end_s,
             &owner_params,
             corroborator,
+            &target_visible,
         ));
     }
 
@@ -1261,6 +1442,9 @@ pub fn consolidate(
 
     BoardStateItem {
         board_id: board_id.to_string(),
+        board_title: titles.board_title(),
+        groups,
+        folded,
         is_final: true,
         t_end_s: window.as_ref().map(|w| w.end_s),
         board_keyframes: frames.iter().map(|f| f.keyframe_id.clone()).collect(),

@@ -80,8 +80,10 @@ pub enum AnchorKind {
     GeometryNode,
     /// The reader's `near` field.
     Near,
-    /// Tagged on both ends of one edge in the same keyframe.
+    /// Tagged on both ends of one edge in the same keyframe (two separate tags).
     BothEnds,
+    /// One tag bridging two nodes, adjacent to both.
+    GeometryBridge,
     /// `near` strictly alternating between the two ends of one edge.
     NearAlternation,
     /// Presence without a target.
@@ -114,6 +116,10 @@ pub struct OwnerSighting {
     pub target: Option<OwnerTarget>,
     /// Anchor method.
     pub anchor: AnchorKind,
+    /// Index of the physical tag within its keyframe: one tag bridging two nodes
+    /// yields two sightings with the same index.
+    #[serde(default)]
+    pub tag: u32,
 }
 
 /// A move or opening that a corroborator may confirm.
@@ -283,7 +289,9 @@ fn close(o: Open<'_>, person_id: &str, display_name: &str, to_s: f64) -> OwnerAs
 }
 
 /// Replay one person's sightings (time order; several per keyframe allowed) into
-/// assignments. `timeline_end_s` closes those still open.
+/// assignments. `timeline_end_s` closes those still open. `visible(keyframe_id,
+/// target)` says whether a target was read in a keyframe: an open target only counts
+/// as absent where it was visible (a node the reader missed is not a move).
 pub fn assign(
     person_id: &str,
     display_name: &str,
@@ -291,6 +299,7 @@ pub fn assign(
     timeline_end_s: f64,
     params: &OwnerParams,
     corroborator: &dyn Corroborator,
+    visible: &dyn Fn(&str, &OwnerTarget) -> bool,
 ) -> Vec<OwnerAssignment> {
     let confirm = params.confirm_keyframes.max(1);
     let keys = by_keyframe(sightings);
@@ -319,7 +328,8 @@ pub fn assign(
                     o.sightings.push((*s).clone());
                     o.missing.clear();
                 }
-                None => o.missing.push(k),
+                None if visible(k.keyframe_id, &o.target) => o.missing.push(k),
+                None => {}
             }
         }
         let before = pending.len();
@@ -394,6 +404,18 @@ pub fn assign(
                     done.push(close(o, person_id, display_name, at));
                 }
             }
+            // A target that was visible but untagged from the start of this run was
+            // left for the new one: a move, even if it is not read again afterwards.
+            if moved_from.is_none() {
+                if let Some(pos) = open
+                    .iter()
+                    .position(|o| o.missing.first().is_some_and(|m| m.t_start_s <= at + 1e-9))
+                {
+                    let o = open.remove(pos);
+                    moved_from = Some(o.target.clone());
+                    done.push(close(o, person_id, display_name, at));
+                }
+            }
             let backfill_from_s = if !ever_opened && params.backfill_untargeted {
                 presence.first().map(|p| p.t_start_s).filter(|s| *s < at)
             } else {
@@ -447,7 +469,11 @@ pub fn collapse_edge_pairs(
         for (edge, a, b) in edges {
             let pa = group.iter().position(|s| s.target.as_ref() == Some(a));
             let pb = group.iter().position(|s| s.target.as_ref() == Some(b));
+            // Only two separate tags; one tag bridging both ends stays two node targets.
             if let (Some(pa), Some(pb)) = (pa, pb) {
+                if group[pa].tag == group[pb].tag {
+                    continue;
+                }
                 let mut merged = group[pa.min(pb)].clone();
                 merged.target = Some(edge.clone());
                 merged.anchor = AnchorKind::BothEnds;
@@ -540,6 +566,7 @@ mod tests {
                 AnchorKind::Untargeted
             },
             target,
+            tag: 0,
         }
     }
 
@@ -571,7 +598,15 @@ mod tests {
             s(140.0, Some(node("n3"))),
             s(150.0, Some(node("n3"))),
         ];
-        let a = assign("p1", "Avery", &seq, 500.0, &params(), &NoCorroboration);
+        let a = assign(
+            "p1",
+            "Avery",
+            &seq,
+            500.0,
+            &params(),
+            &NoCorroboration,
+            &|_, _| true,
+        );
         assert_eq!(a.len(), 2, "{a:#?}");
         assert_eq!((a[0].valid_from_s, a[0].valid_to_s), (100.0, 140.0));
         assert_eq!(a[1].target, node("n3"));
@@ -598,9 +633,17 @@ mod tests {
             s(110.0, Some(node("n1"))),
             s(200.0, Some(node("n2"))),
         ];
-        let a = assign("p1", "Avery", &seq, 300.0, &params(), &NoCorroboration);
+        let a = assign(
+            "p1",
+            "Avery",
+            &seq,
+            300.0,
+            &params(),
+            &NoCorroboration,
+            &|_, _| true,
+        );
         assert_eq!(a.len(), 1);
-        let b = assign("p1", "Avery", &seq, 300.0, &params(), &Always);
+        let b = assign("p1", "Avery", &seq, 300.0, &params(), &Always, &|_, _| true);
         assert_eq!(b.len(), 2);
         assert_eq!(b[1].opened_by, OpenReason::Corroborated);
         assert_eq!(b[1].moved_from, Some(node("n1")));
@@ -616,21 +659,46 @@ mod tests {
             s(100.0, Some(node("n1"))),
             s(110.0, Some(node("n1"))),
         ];
-        let a = assign("p1", "Avery", &seq, 300.0, &params(), &NoCorroboration);
+        let a = assign(
+            "p1",
+            "Avery",
+            &seq,
+            300.0,
+            &params(),
+            &NoCorroboration,
+            &|_, _| true,
+        );
         assert_eq!(a[0].valid_from_s, 100.0);
         assert!(a[0].backfill_from_s.is_none());
         let on = OwnerParams {
             backfill_untargeted: true,
             ..params()
         };
-        let b = assign("p1", "Avery", &seq, 300.0, &on, &NoCorroboration);
+        let b = assign(
+            "p1",
+            "Avery",
+            &seq,
+            300.0,
+            &on,
+            &NoCorroboration,
+            &|_, _| true,
+        );
         // The confirmed opening is unchanged; the backfill is separate.
         assert_eq!(b[0].valid_from_s, 100.0);
         assert_eq!(b[0].backfill_from_s, Some(50.0));
         assert!(!b[0].valid_at(55.0) && b[0].valid_at_with_backfill(55.0));
         // Presence alone never opens anything.
         let only = [s(50.0, None), s(60.0, None), s(100.0, Some(node("n1")))];
-        assert!(assign("p1", "Avery", &only, 300.0, &on, &NoCorroboration).is_empty());
+        assert!(assign(
+            "p1",
+            "Avery",
+            &only,
+            300.0,
+            &on,
+            &NoCorroboration,
+            &|_, _| true
+        )
+        .is_empty());
     }
 
     #[test]
@@ -640,7 +708,15 @@ mod tests {
             v.push(s(t, Some(node("n1"))));
             v.push(s(t, Some(node("n3"))));
         }
-        let a = assign("p1", "Avery", &v, 100.0, &params(), &NoCorroboration);
+        let a = assign(
+            "p1",
+            "Avery",
+            &v,
+            100.0,
+            &params(),
+            &NoCorroboration,
+            &|_, _| true,
+        );
         assert_eq!(a.len(), 2);
         assert!(a.iter().all(|x| x.valid_at(50.0) && x.moved_from.is_none()));
     }
@@ -650,14 +726,33 @@ mod tests {
         let mut v = Vec::new();
         for t in [0.0, 10.0] {
             v.push(s(t, Some(node("n1"))));
-            v.push(s(t, Some(node("n2"))));
+            v.push(OwnerSighting {
+                tag: 1,
+                ..s(t, Some(node("n2")))
+            });
         }
+        // One tag bridging both ends stays two node targets.
+        let mut bridge: Vec<OwnerSighting> = v
+            .iter()
+            .cloned()
+            .map(|x| OwnerSighting { tag: 0, ..x })
+            .collect();
+        collapse_edge_pairs(&mut bridge, &pairs());
+        assert_eq!(bridge.len(), 4);
         collapse_edge_pairs(&mut v, &pairs());
         assert_eq!(v.len(), 2);
         assert!(v
             .iter()
             .all(|x| x.target == Some(edge()) && x.anchor == AnchorKind::BothEnds));
-        let a = assign("p1", "Avery", &v, 100.0, &params(), &NoCorroboration);
+        let a = assign(
+            "p1",
+            "Avery",
+            &v,
+            100.0,
+            &params(),
+            &NoCorroboration,
+            &|_, _| true,
+        );
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].target, edge());
     }
@@ -677,7 +772,15 @@ mod tests {
         let mut v = seq(&["n1", "n1", "n2", "n2", "n1", "n1"]);
         apply_alternation(&mut v, &pairs(), 3);
         assert!(v.iter().all(|x| x.anchor == AnchorKind::Near));
-        let a = assign("p1", "Avery", &v, 100.0, &params(), &NoCorroboration);
+        let a = assign(
+            "p1",
+            "Avery",
+            &v,
+            100.0,
+            &params(),
+            &NoCorroboration,
+            &|_, _| true,
+        );
         let targets: Vec<&OwnerTarget> = a.iter().map(|x| &x.target).collect();
         assert_eq!(targets, vec![&node("n1"), &node("n2"), &node("n1")]);
         assert_eq!(a[1].moved_from, Some(node("n1")));
@@ -712,11 +815,62 @@ mod tests {
                 v.push(s(t, Some(node("n1"))));
             }
         }
-        let a = assign("p1", "Avery", &v, 100.0, &params(), &NoCorroboration);
+        let a = assign(
+            "p1",
+            "Avery",
+            &v,
+            100.0,
+            &params(),
+            &NoCorroboration,
+            &|_, _| true,
+        );
         let n1: Vec<&OwnerAssignment> = a.iter().filter(|x| x.target == node("n1")).collect();
         assert_eq!(n1.len(), 2, "{a:#?}");
         assert_eq!((n1[0].valid_from_s, n1[0].valid_to_s), (0.0, 20.0));
         assert_eq!(n1[1].valid_from_s, 40.0);
         assert!(n1.iter().all(|x| x.moved_from.is_none()));
+    }
+
+    #[test]
+    fn unread_targets_do_not_close() {
+        // n1 and n3 both owned; n3 is not read in two keyframes, which is not absence.
+        let mut v = Vec::new();
+        for t in [0.0, 10.0, 20.0, 30.0, 40.0] {
+            v.push(s(t, Some(node("n1"))));
+            if !(15.0..35.0).contains(&t) {
+                v.push(OwnerSighting {
+                    tag: 1,
+                    ..s(t, Some(node("n3")))
+                });
+            }
+        }
+        let vis = |kf: &str, t: &OwnerTarget| !(t == &node("n3") && (kf == "kf20" || kf == "kf30"));
+        let a = assign("p1", "Avery", &v, 100.0, &params(), &NoCorroboration, &vis);
+        assert_eq!(a.len(), 2, "{a:#?}");
+        assert!(a.iter().all(|x| x.valid_at(25.0)));
+        // Read and untagged: that is absence.
+        let b = assign(
+            "p1",
+            "Avery",
+            &v,
+            100.0,
+            &params(),
+            &NoCorroboration,
+            &|_, _| true,
+        );
+        let n3: Vec<_> = b.iter().filter(|x| x.target == node("n3")).collect();
+        assert_eq!(n3[0].valid_to_s, 20.0);
+    }
+
+    #[test]
+    fn a_move_closes_the_old_target_even_if_it_is_not_read_again() {
+        // n1 held; n2 tagged twice while n1 is visible at the first of those keyframes
+        // only (n1 is not read at the second).
+        let v = seq(&["n1", "n1", "n2", "n2"]);
+        let vis = |kf: &str, t: &OwnerTarget| !(t == &node("n1") && kf == "kf30");
+        let a = assign("p1", "Avery", &v, 100.0, &params(), &NoCorroboration, &vis);
+        assert_eq!(a.len(), 2, "{a:#?}");
+        assert_eq!(a[0].valid_to_s, 20.0);
+        assert_eq!(a[1].moved_from, Some(node("n1")));
     }
 }

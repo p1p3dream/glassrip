@@ -211,6 +211,7 @@ fn frame(i: usize) -> BoardFrame {
             error: None,
         }),
         ocr_anchors: vec![],
+        title_hints: vec![],
     }
 }
 
