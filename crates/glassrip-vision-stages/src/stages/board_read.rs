@@ -62,7 +62,11 @@ impl Default for BoardReadParams {
     fn default() -> Self {
         Self {
             seed: 0,
-            num_predict: 2048,
+            // Dense boards (a 3x3 card grid plus stickies) need about 2,500
+            // output tokens; 2,048 truncated them. With at most about 2,700
+            // image tokens and 1,500 prompt and schema tokens the total stays
+            // within the fixed num_ctx of 8,192.
+            num_predict: 3072,
             target_long_edge_px: BOARD_LONG_EDGE,
             min_long_edge_px: LOW_RES_THRESHOLD,
             low_res_upscale: LOW_RES_UPSCALE,

@@ -69,6 +69,8 @@ pub fn meeting_denylist() -> ChromeDenylist {
         .map(|s| s.to_string()),
     );
     d.contains.push("Tidy up your Space".into());
+    // The text toolbar is often read as one merged line ("Convert to Aa Auto ...").
+    d.contains.push("Convert to".into());
     d
 }
 

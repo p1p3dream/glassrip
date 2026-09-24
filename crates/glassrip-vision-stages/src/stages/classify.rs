@@ -68,6 +68,13 @@ impl Default for ClassifyParams {
 /// studio (its product name, "content") need a second, UI-only match.
 pub fn meeting_rules() -> ClassifyRules {
     let mut rules = ClassifyRules::spec_examples();
+    // A bare "% " also starts whiteboard toolbar fragments ("% D"); keep the
+    // prompts that do not occur in whiteboard UI.
+    for r in &mut rules.rules {
+        if r.screen_type == ScreenType::Code {
+            r.patterns.retain(|p| p.text != "% ");
+        }
+    }
     for r in &mut rules.rules {
         if r.screen_type == ScreenType::Cms {
             r.patterns = r
@@ -398,6 +405,12 @@ mod tests {
         let r = meeting_rules();
         let e = r.evaluate(&["Drafts", "Stuctue", "Article"]);
         assert_eq!(e.best().map(|h| h.screen_type), Some(ScreenType::Cms));
+        // Toolbar fragments are not shell prompts.
+        assert!(r.evaluate(&["% D", "size"]).best().is_none());
+        assert_eq!(
+            r.evaluate(&["$ cargo build"]).best().map(|h| h.screen_type),
+            Some(ScreenType::Code)
+        );
         // One studio word on a board is not enough.
         let e = r.evaluate(&["Relationships between content", "Content Manager"]);
         assert!(e.best().is_none());
