@@ -124,3 +124,23 @@ fn docs_suite_scores_predictions_end_to_end() {
     assert_eq!(m["docs.hallucinated_spans"], 1.0);
     assert_eq!(m["docs.pages_missing"], 0.0);
 }
+
+#[test]
+fn committed_hashed_denylist_and_allowlist_work_together() {
+    use glassrip_eval::privacy::{
+        scan_text, Allowlist, HashedDenylist, Matcher, ALLOWLIST, HASHED_DENYLIST,
+    };
+    let root = workspace_root();
+    let list = HashedDenylist::parse(&fs_err::read_to_string(root.join(HASHED_DENYLIST)).unwrap())
+        .unwrap();
+    assert!(!list.hashes.is_empty());
+    let allow = Allowlist::parse(&fs_err::read_to_string(root.join(ALLOWLIST)).unwrap());
+    let m = Matcher::Hashed(&list);
+    let words = "vitamin\nviv\nvivid\n";
+    let audio = Path::new("crates/glassrip-audio/common_words.txt");
+    assert!(scan_text(audio, words, &m, &allow, "h").is_empty());
+    assert_eq!(
+        scan_text(Path::new("src/other.rs"), words, &m, &allow, "h").len(),
+        1
+    );
+}

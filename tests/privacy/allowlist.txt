@@ -1,0 +1,5 @@
+# N-grams that are generic in a specific file ("path: phrase") or everywhere
+# ("phrase"). Matched on the lowercased, space-joined token form.
+#
+# The audio crate's tokenizer word list contains "viv" as a generic word.
+crates/glassrip-audio/common_words.txt: viv

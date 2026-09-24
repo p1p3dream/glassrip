@@ -1,9 +1,9 @@
 //! `glassrip-privacy-scan [REPO_ROOT]`: fails (exit 1) on any denylist term,
 //! private IPv4 address, or absolute home path in the repository (spec 9.1).
 //!
-//! The private root comes from `GLASSRIP_PRIVATE_FIXTURES`, else from
-//! `eval.private_fixtures` in `./glassrip.toml`; without it the denylist scan is
-//! skipped with a notice and only the built-in checks run.
+//! The hashed denylist (`tests/privacy/denylist.sha256`) and the built-in checks
+//! always run. The plaintext denylist runs when the private root is known, from
+//! `GLASSRIP_PRIVATE_FIXTURES` or `eval.private_fixtures` in `./glassrip.toml`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -41,8 +41,10 @@ fn main() -> ExitCode {
         eprintln!("{}:{}: {}", f.path.display(), f.line, f.what);
     }
     eprintln!(
-        "privacy scan: {} finding(s); denylist scanned {} file(s), built-in scanned {} tracked file(s)",
+        "privacy scan: {} finding(s); hashed denylist ({} terms) scanned {} tracked file(s), plaintext denylist scanned {} file(s), built-in scanned {} tracked file(s)",
         report.findings.len(),
+        report.hashed_terms,
+        report.hashed_files,
         report.denylist_files,
         report.builtin_files
     );

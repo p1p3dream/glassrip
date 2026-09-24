@@ -31,5 +31,5 @@ jobs:
           --baseline tests/fixtures/eval_baselines/synthetic.qwen2.5vl-7b.json
       - name: Synthetic docs fixtures load
         run: cargo run --quiet -- eval --suite synthetic_docs
-      - name: Privacy scan
+      - name: Privacy scan (committed hashed denylist and built-in checks)
         run: cargo run --quiet -p glassrip-eval --bin glassrip-privacy-scan
