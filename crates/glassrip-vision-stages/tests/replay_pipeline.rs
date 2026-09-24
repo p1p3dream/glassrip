@@ -84,7 +84,7 @@ impl TextRecognizer for ScriptedOcr {
             span("3:15 PM | Weekly Sync", 100.0, 30.0, 300.0, 48.0),
             span("Ada Quill (Presenting)", 700.0, 30.0, 880.0, 48.0),
             span("Order Service", 330.0, 280.0, 470.0, 298.0),
-            span("100%", 850.0, 520.0, 890.0, 536.0),
+            span("Convert to", 780.0, 420.0, 880.0, 436.0),
             span("Ada Quill", 935.0, 282.0, 1010.0, 298.0),
             span("Bo Tran Liu", 935.0, 540.0, 1030.0, 556.0),
             span("Cy Obi Tar", 1110.0, 540.0, 1200.0, 556.0),
@@ -331,7 +331,7 @@ async fn record_then_replay_vision_branch() {
     );
     assert!(c.canvas_bbox.y1 > 48.0);
     assert!(c.stabilized);
-    assert!(c.masks.iter().any(|m| m.text == "100%"));
+    assert!(c.masks.iter().any(|m| m.text == "Convert to"));
 
     let readings: Vec<(String, BoardReadingItem)> = read(&live, artifacts::BOARD_READING);
     assert_eq!(readings.len(), 2);

@@ -124,6 +124,8 @@ pub struct Layout {
     pub panel_top: Option<f64>,
     /// Canvas from layout alone (share area minus panels), when any evidence was found.
     pub canvas: Option<BBox>,
+    /// Top of the whiteboard zoom control, which marks the canvas bottom.
+    pub zoom_top: Option<f64>,
     /// Names from banners and tile labels.
     pub names: Vec<String>,
     /// Per-span chrome reason (same order as the input).
@@ -575,14 +577,15 @@ fn compute_share_and_canvas(layout: &mut Layout, spans: &[Span], cfg: &LayoutCon
                 center(&s.bbox).0 >= a.x1 && center(&s.bbox).0 <= a.x2 + width * 0.02
             })
         })
-        .map(|s| s.bbox.y2)
+        .map(|s| s.bbox.y1)
         .fold(None, |a: Option<f64>, v| Some(a.map_or(v, |a| a.max(v))));
+    layout.zoom_top = zoom_bottom;
     if let Some(a) = share.as_mut() {
         let tall = layout
             .tile_region
             .is_some_and(|t| t.height() >= height * 0.4 && t.x1 >= width * 0.45);
         a.y2 = match zoom_bottom {
-            Some(z) => (z + height * 0.012).min(height),
+            Some(z) => (z - height * 0.005).clamp(a.y1 + 1.0, height),
             None if tall => a.y2,
             None => height,
         };
@@ -602,6 +605,29 @@ fn compute_share_and_canvas(layout: &mut Layout, spans: &[Span], cfg: &LayoutCon
                 && center(&s.bbox).0 < area.x1 + area.width() * 0.35
         })
         .collect();
+    // No known sidebar strings: a column of at least four short lines hugging
+    // the left edge of the shared area is an application sidebar.
+    let sidebar: Vec<&Span> = if sidebar.is_empty() {
+        let near_edge: Vec<&Span> = spans
+            .iter()
+            .filter(|s| {
+                in_area(s)
+                    && s.text.split_whitespace().count() <= 3
+                    && s.bbox.x1 <= area.x1 + width * 0.05
+                    && center(&s.bbox).0 < area.x1 + area.width() * 0.2
+            })
+            .collect();
+        let mut lines: Vec<f64> = near_edge.iter().map(|s| center(&s.bbox).1).collect();
+        lines.sort_by(f64::total_cmp);
+        lines.dedup_by(|a, b| (*a - *b).abs() < height * 0.01);
+        if lines.len() >= 4 {
+            near_edge
+        } else {
+            Vec::new()
+        }
+    } else {
+        sidebar
+    };
     layout.panel_left = if sidebar.is_empty() {
         None
     } else {
@@ -650,13 +676,18 @@ fn compute_share_and_canvas(layout: &mut Layout, spans: &[Span], cfg: &LayoutCon
 
     let evidence =
         layout.share_area.is_some() || layout.panel_left.is_some() || layout.panel_top.is_some();
+    let bottom = match layout.zoom_top {
+        Some(z) if z > area.y1 + area.height() * 0.5 => area.y2.min(z - height * 0.005),
+        _ => area.y2,
+    };
+    let evidence = evidence || layout.zoom_top.is_some();
     layout.canvas = evidence
         .then(|| {
             BBox::new(
                 layout.panel_left.map_or(area.x1, |p| p.max(area.x1)),
                 layout.panel_top.map_or(area.y1, |p| p.max(area.y1)),
                 area.x2,
-                area.y2,
+                bottom,
             )
         })
         .filter(|c| c.is_well_formed() && c.area() >= width * height * 0.08);
@@ -762,6 +793,23 @@ mod tests {
         assert_eq!(r, TextRegion::Canvas);
         let (r, _) = region_of(&l, 10, &spans[10], Some(&canvas));
         assert_eq!(r, TextRegion::Tile);
+    }
+
+    #[test]
+    fn generic_sidebar_and_zoom_bound_the_canvas() {
+        let spans = vec![
+            span("Ada Quill (Presenting)", 300.0, 20.0, 460.0, 34.0),
+            span("Folders", 10.0, 60.0, 70.0, 72.0),
+            span("Drafts", 10.0, 90.0, 60.0, 102.0),
+            span("Recent", 10.0, 120.0, 60.0, 132.0),
+            span("New frame", 10.0, 150.0, 90.0, 162.0),
+            span("Order Service", 300.0, 200.0, 420.0, 214.0),
+            span("100%", 700.0, 560.0, 740.0, 572.0),
+        ];
+        let l = analyze(&spans, 1000.0, 600.0, &LayoutConfig::default());
+        let c = l.canvas.unwrap();
+        assert!(c.x1 > 90.0 && c.x1 < 300.0, "{c:?}");
+        assert!(c.y2 < 560.0 && c.y2 > 500.0, "{c:?}");
     }
 
     #[test]

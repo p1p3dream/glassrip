@@ -213,7 +213,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             digest,
             server_version,
         ),
-        board_validate: BoardValidateStage::new(BoardValidateParams::default()),
+        board_validate: BoardValidateStage::new({
+            let mut v = BoardValidateParams::default();
+            v.validation.participant_names = args.participants.clone();
+            v
+        }),
     };
     let reports = branch.run(&mut runner, args.until.as_deref()).await?;
 

@@ -362,7 +362,12 @@ pub fn validate_reading(
         }
     }
     moved.owner_tags = kept;
-    let aliases = participant_aliases(participants);
+    let all: Vec<String> = participants
+        .iter()
+        .chain(&p.validation.participant_names)
+        .cloned()
+        .collect();
+    let aliases = participant_aliases(&all);
     let mut cfg = p.validation.clone();
     cfg.participant_names.extend(aliases.iter().cloned());
     for n in &moved.nodes {
