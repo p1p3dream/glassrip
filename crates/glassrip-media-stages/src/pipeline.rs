@@ -127,7 +127,9 @@ impl MediaRunOptions {
     }
 }
 
-fn materialize<T, F>(
+/// Links the files an artifact references (`(run-relative path, blake3)` per
+/// ok item) from the blob store into the run directory; returns the count.
+pub fn materialize<T, F>(
     run: &Path,
     blobs: &BlobStore,
     schema: &str,
@@ -204,6 +206,9 @@ pub async fn run_media_stages(
     let probe = ProbeStage::new(video, opts.ffprobe.clone(), ffprobe_v.clone());
     let mut orient_params = opts.orient.clone();
     orient_params.sample_frames = cfg.orient.sample_frames;
+    if cfg.orient.override_rotation_deg.is_some() {
+        orient_params.override_rotation_deg = cfg.orient.override_rotation_deg;
+    }
     let orient = OrientStage::new(
         orient_params,
         opts.ffmpeg.clone(),

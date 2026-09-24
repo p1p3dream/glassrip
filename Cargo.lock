@@ -1386,9 +1386,20 @@ name = "glassrip"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64 0.22.1",
  "clap",
+ "fs-err",
+ "glassrip-audio",
+ "glassrip-core",
  "glassrip-eval",
+ "glassrip-media-stages",
+ "glassrip-meeting",
+ "glassrip-notes",
+ "glassrip-ocr",
+ "glassrip-render",
+ "glassrip-vision",
+ "glassrip-vision-stages",
  "image",
  "imageproc",
  "md-5",
@@ -1399,7 +1410,11 @@ dependencies = [
  "serde_json",
  "similar",
  "tempfile",
+ "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1408,7 +1423,10 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "clap",
+ "fs-err",
+ "glassrip-core",
  "schemars",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
@@ -1417,6 +1435,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "toml 0.8.23",
+ "tracing",
  "whisper-rs",
 ]
 
@@ -4757,6 +4776,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-serde"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704b1aeb7be0d0a84fc9828cae51dab5970fee5088f83d1dd7ee6f6246fc6ff1"
+dependencies = [
+ "serde",
+ "tracing-core",
+]
+
+[[package]]
 name = "tracing-subscriber"
 version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4766,12 +4795,15 @@ dependencies = [
  "nu-ansi-term",
  "once_cell",
  "regex-automata",
+ "serde",
+ "serde_json",
  "sharded-slab",
  "smallvec",
  "thread_local",
  "tracing",
  "tracing-core",
  "tracing-log",
+ "tracing-serde",
 ]
 
 [[package]]
