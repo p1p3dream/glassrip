@@ -23,6 +23,8 @@ pub const MANIFEST_FILE: &str = "run.lock.json";
 pub const LOCK_FILE: &str = ".glassrip.lock";
 /// Directory holding artifacts inside a run directory.
 pub const ARTIFACTS_DIR: &str = "artifacts";
+/// Directory (inside `artifacts/`) holding resumable partial outputs.
+pub const PARTIAL_DIR: &str = ".partial";
 /// Schema name of the manifest.
 pub const MANIFEST_SCHEMA: &str = "glassrip.run_manifest";
 /// Current manifest schema major version.
@@ -46,6 +48,9 @@ pub enum StageStatus {
     Failed,
     /// Stopped by cancellation.
     Cancelled,
+    /// Was `running` when the previous process stopped (crash or kill); set when a
+    /// run directory is reopened.
+    Interrupted,
 }
 
 /// Per-stage manifest entry.
@@ -74,6 +79,9 @@ pub struct StageRecord {
     pub items_skipped: u64,
     /// Stage-level error message.
     pub error: Option<String>,
+    /// Content hash of the stage's output artifact.
+    #[serde(default)]
+    pub content_hash: Option<String>,
 }
 
 impl StageRecord {
@@ -91,6 +99,7 @@ impl StageRecord {
             items_error: 0,
             items_skipped: 0,
             error: None,
+            content_hash: None,
         }
     }
 }
@@ -165,6 +174,12 @@ pub fn unix_now() -> f64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+#[derive(Deserialize)]
+struct ManifestProbe {
+    schema: String,
+    schema_version: Version,
 }
 
 /// Error from the manifest or lock.
@@ -245,22 +260,39 @@ impl RunDir {
         }
 
         let manifest_path = root.join(MANIFEST_FILE);
-        let manifest = if manifest_path.is_file() {
+        let existing = atomic::is_file(&manifest_path).map_err(io_err(&manifest_path))?;
+        let manifest = if existing {
             let bytes = fs_err::read(&manifest_path).map_err(io_err(&manifest_path))?;
+            // Phase 1: identify the schema loosely, so a foreign version is reported
+            // as a schema mismatch rather than a field-level parse error.
+            let probe: ManifestProbe =
+                serde_json::from_slice(&bytes).map_err(|source| ManifestError::Parse {
+                    path: manifest_path.clone(),
+                    source,
+                })?;
+            if probe.schema != MANIFEST_SCHEMA || probe.schema_version.major != MANIFEST_MAJOR {
+                return Err(ManifestError::Schema {
+                    path: manifest_path,
+                    schema: probe.schema,
+                    version: probe.schema_version,
+                });
+            }
+            // Phase 2: strict parse of the current version.
             let mut m: RunManifest =
                 serde_json::from_slice(&bytes).map_err(|source| ManifestError::Parse {
                     path: manifest_path.clone(),
                     source,
                 })?;
-            if m.schema != MANIFEST_SCHEMA || m.schema_version.major != MANIFEST_MAJOR {
-                return Err(ManifestError::Schema {
-                    path: manifest_path,
-                    schema: m.schema,
-                    version: m.schema_version,
-                });
-            }
             m.run_id = run_id.to_string();
             m.producer = producer;
+            for (name, record) in &mut m.stages {
+                if record.status == StageStatus::Running {
+                    tracing::warn!(stage = %name, "stage was running when the previous process stopped");
+                    record.status = StageStatus::Interrupted;
+                    record.error =
+                        Some("interrupted: the previous process stopped mid-stage".into());
+                }
+            }
             m
         } else {
             RunManifest::new(run_id, producer)
@@ -289,6 +321,57 @@ impl RunDir {
         self.root
             .join(ARTIFACTS_DIR)
             .join(format!("{schema}.jsonl"))
+    }
+
+    /// Removes resumable partial outputs (`artifacts/.partial/*`) last modified more
+    /// than `older_than` before `now`, plus orphaned atomic-write temp files older
+    /// than the cache grace window. Safe because the caller holds the run lock.
+    pub fn gc_partials(
+        &self,
+        older_than: std::time::Duration,
+        now: SystemTime,
+    ) -> Result<Vec<PathBuf>, ManifestError> {
+        let before = |age| now.checked_sub(age).unwrap_or(UNIX_EPOCH);
+        let artifacts = self.root.join(ARTIFACTS_DIR);
+        let partials = artifacts.join(PARTIAL_DIR);
+        let mut candidates = Vec::new();
+        for (dir, only_temp) in [(&self.root, true), (&artifacts, true), (&partials, false)] {
+            if !atomic::is_dir(dir).map_err(io_err(dir))? {
+                continue;
+            }
+            for entry in fs_err::read_dir(dir).map_err(io_err(dir))? {
+                let path = entry.map_err(io_err(dir))?.path();
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let is_temp = name.starts_with(".glassrip-tmp-");
+                if only_temp && !is_temp {
+                    continue;
+                }
+                let cutoff = if is_temp {
+                    before(crate::cache::DEFAULT_GC_GRACE)
+                } else {
+                    before(older_than)
+                };
+                candidates.push((path, cutoff));
+            }
+        }
+        let mut removed = Vec::new();
+        for (path, cutoff) in candidates {
+            let meta = fs_err::symlink_metadata(&path).map_err(io_err(&path))?;
+            if meta.is_file() && meta.modified().map_err(io_err(&path))? < cutoff {
+                fs_err::remove_file(&path).map_err(io_err(&path))?;
+                removed.push(path);
+            }
+        }
+        removed.sort();
+        Ok(removed)
+    }
+
+    /// Directory holding resumable partial outputs.
+    pub fn partials_dir(&self) -> PathBuf {
+        self.root.join(ARTIFACTS_DIR).join(PARTIAL_DIR)
     }
 
     /// Path of an artifact relative to the run root (as recorded in `inputs`).
@@ -386,6 +469,85 @@ mod tests {
             RunDir::open(dir.path(), "r1", producer()),
             Err(ManifestError::Schema { .. })
         ));
+    }
+
+    #[test]
+    fn foreign_version_with_new_fields_reports_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = serde_json::to_value(RunManifest::new("r0", producer())).unwrap();
+        v["schema_version"] = serde_json::json!("2.0.0");
+        v["field_from_the_future"] = serde_json::json!(true);
+        v.as_object_mut().unwrap().remove("commands");
+        fs_err::write(
+            dir.path().join(MANIFEST_FILE),
+            serde_json::to_vec(&v).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            RunDir::open(dir.path(), "r1", producer()),
+            Err(ManifestError::Schema { .. })
+        ));
+    }
+
+    #[test]
+    fn running_stage_becomes_interrupted_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut run = RunDir::open(dir.path(), "r1", producer()).unwrap();
+            run.update(|m| {
+                m.stages
+                    .insert("frames".into(), StageRecord::new(StageStatus::Running, 1));
+                m.stages
+                    .insert("probe".into(), StageRecord::new(StageStatus::Ok, 1));
+            })
+            .unwrap();
+            // Dropped without finishing, as after a crash.
+        }
+        let run = RunDir::open(dir.path(), "r2", producer()).unwrap();
+        assert_eq!(
+            run.manifest().stages["frames"].status,
+            StageStatus::Interrupted
+        );
+        assert_eq!(run.manifest().stages["probe"].status, StageStatus::Ok);
+        let on_disk: RunManifest =
+            serde_json::from_slice(&fs_err::read(dir.path().join(MANIFEST_FILE)).unwrap()).unwrap();
+        assert_eq!(on_disk.stages["frames"].status, StageStatus::Interrupted);
+    }
+
+    #[test]
+    fn gc_partials_by_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = RunDir::open(dir.path(), "r1", producer()).unwrap();
+        fs_err::create_dir_all(run.partials_dir()).unwrap();
+        let old = run.partials_dir().join("frames-0123.jsonl");
+        let new = run.partials_dir().join("frames-4567.jsonl");
+        let old_tmp = dir.path().join("artifacts/.glassrip-tmp-abc");
+        let keep = dir.path().join("artifacts/glassrip.frames.jsonl");
+        for p in [&old, &new, &old_tmp, &keep] {
+            fs_err::write(p, b"x").unwrap();
+        }
+        let past = SystemTime::now() - std::time::Duration::from_secs(40 * 86_400);
+        for p in [&old, &old_tmp, &keep] {
+            fs_err::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .file()
+                .set_modified(past)
+                .unwrap();
+        }
+        let removed = run
+            .gc_partials(
+                std::time::Duration::from_secs(30 * 86_400),
+                SystemTime::now(),
+            )
+            .unwrap();
+        assert_eq!(removed, {
+            let mut v = vec![old.clone(), old_tmp.clone()];
+            v.sort();
+            v
+        });
+        assert!(new.exists() && keep.exists());
     }
 
     #[test]
