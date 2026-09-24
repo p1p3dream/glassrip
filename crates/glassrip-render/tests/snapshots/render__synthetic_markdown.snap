@@ -1,0 +1,117 @@
+---
+source: crates/glassrip-render/tests/render.rs
+expression: r.markdown_text
+---
+# Kiosk Relay Pilot
+
+| | |
+|---|---|
+| **Date** | 2031-04-02, 10:00 to 10:02 |
+| **Length** | 1 min |
+| **Participants** | Avery Quinn (presenting), Rohan Dasgupta, Mira Okafor |
+| **Source** | Meeting recording. Speaker-attributed transcript and board read by glassrip; every item cites transcript segments or board events and was checked by the validator. |
+
+## Summary
+
+- The pilot focuses on the relay side; the badge flow stays as it is (00:26 to 00:32)
+- Rohan owns the relay storage schema and Mira maps ledger entries to kit widgets (00:33 to 00:43)
+- Which kiosk widgets to build is still open (00:12 to 01:03)
+
+## Architecture
+
+![Kiosk Relay Pilot architecture](kiosk-architecture.svg)
+
+PNG preview: [kiosk-architecture.png](kiosk-architecture.png)
+
+Arrows point from caller to callee, as drawn on the board. Final board state at 01:20.
+
+| Component | Role | Owner on the board | Status |
+|---|---|---|---|
+| Ledger Service | Service | Rohan (on the link from Relay API, from 00:40); Mira (00:40 to 01:10) | On the board from 00:02 |
+| Relay API | API layer | Rohan (on the link to Ledger Service, from 00:40) | On the board from 00:02 |
+| Kiosk App | Client | Avery (from 00:40) | On the board from 00:12 |
+| Design Kit | Client | Mira (from 01:10, moved from Ledger Service) | **Deferred** (00:26) |
+| Old Sketch | External system | none shown | Removed (seen 00:02 to 00:30) |
+
+Groups on the board:
+
+- **Things to show on the kiosk** (grid, from 00:45): Visitor log, Today's hosts, Wayfinding [highlighted], Badge preview [highlighted], Safety notice, Wi-Fi card
+- **Lobby modules** (container, fed by Lobby Renderer, from 01:00): Check-in (per site), Host alert (live), Promo tile (new)
+
+## Decisions
+
+1. **Leave the badge flow alone for the pilot and focus on the relay side, badge changes wait** (00:26 to 00:32). "leave the badge flow alone for the pilot"
+2. **Rohan pairs with Mira on the relay tests** (00:47 to 00:56). "pair with Mira on the relay tests"
+3. **Park the Design Kit links for now and focus on the relay side** (00:26 to 00:32). "focus on the relay side"
+
+## Owners and next steps
+
+**Avery Quinn**
+
+- Scope the relay side for the pilot (00:26 to 00:32). "focus on the relay side"
+
+**Rohan Dasgupta**
+
+- Design the relay storage schema this week (00:40). "design the relay storage schema"
+- Pair with Mira on the relay tests (00:52).
+
+**Mira Okafor**
+
+- Map ledger entries to kit widgets (00:33 to 00:40). "map entries to kit widgets"
+
+**Everyone**
+
+- Push work to a branch early, even if it is rough (01:06 to 01:11). "push work to a branch early"
+
+## Open questions
+
+- **Which widgets does the kiosk need?** (board sticky; discussed at 00:12). "Which widgets do we need for the kiosk"
+- **Do we have to change anything in the badge flow?** (board sticky; discussed at 00:20). "change anything in the badge flow"
+
+## Timeline
+
+| Time | What happened |
+|---|---|
+| 00:00 to 00:17 | Avery walks through the relay, ledger and kiosk architecture |
+| 00:26 to 00:43 | Owners are assigned and the badge flow is left alone |
+| 00:47 to 01:11 | Pairing, open widget question and wrap-up |
+
+## Caveats
+
+- 0 of 13 transcript lines have a low-confidence speaker (below 0.5); 2 were reassigned from the diarizer's label by on-screen speaker or direct-address cues, for example 00:06 "Hey, Mira." (Avery Quinn), 00:07 "Hey." (Mira Okafor). Flagged lines are marked in the transcript.
+- 10% of words (14 words, 6 s of speech) were attributed by gap filling, where the diarizer marked speech as silence; their speaker is less certain. Checked against the video: 1 of 1 runs had an on-screen speaker cue; 1 agreed, 0 disagreed (0 relabeled, 0 words).
+- 2 drafted items were removed because their citations or quotes could not be verified.
+
+Speaker labels from diarization and how they were matched:
+
+| Diarization label | Speaker | Confidence | Talk time |
+|---|---|---|---|
+| L0 | Avery Quinn | 0.90 | 35 s |
+| L1 | Rohan Dasgupta | 0.85 | 14 s |
+| L2 | Mira Okafor | 0.49 | 8 s |
+
+## Full transcript
+
+[00:00] Avery Quinn (speaker uncertain): Welcome everyone, this is the kiosk relay planning session for the pilot. Hey, Mira.
+
+[00:07] Mira Okafor (speaker uncertain): Hey.
+
+[00:09] Avery Quinn: So the relay pulls entries from the ledger service over REST and the kiosk app talks GraphQL to the relay.
+
+[00:20] Rohan Dasgupta: Do we have to change anything in the badge flow, or can we leave it alone?
+
+[00:26] Avery Quinn: Let's leave the badge flow alone for the pilot and focus on the relay side.
+
+[00:33] Mira Okafor: I can take the ledger side and map entries to kit widgets.
+
+[00:40] Rohan Dasgupta: I'll design the relay storage schema this week.
+
+[00:47] Avery Quinn: Rohan, can you also pair with Mira on the relay tests?
+
+[00:52] Rohan Dasgupta: Yes, I will pair with Mira on the relay tests.
+
+[00:58] Avery Quinn: Which widgets do we need for the kiosk? We still have not settled that.
+
+[01:06] Avery Quinn: and everyone should push work to a branch early even if it is rough
+
+[01:20] Mira Okafor: Sounds good, I'll see you all later.

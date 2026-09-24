@@ -1,0 +1,176 @@
+{%- macro text(t) -%}
+<text class="{{ t.class }}" x="{{ t.x|n }}" y="{{ t.y|n }}"{% if t.anchor == "middle" %} text-anchor="middle"{% endif %}{% if t.fill %} style="fill:{{ t.fill }}"{% endif %}>{{ t.text }}</text>
+{%- endmacro -%}
+{%- macro pill(p) -%}
+<rect x="{{ p.r.x|n }}" y="{{ p.r.y|n }}" width="{{ p.r.w|n }}" height="{{ p.r.h|n }}" rx="{{ p.rx|n }}" fill="{{ p.fill }}"{% if p.stroke %} stroke="{{ p.stroke }}"{% endif %}/>
+  {{ text(p.text) }}
+{%- endmacro -%}
+<svg xmlns="http://www.w3.org/2000/svg" width="{{ width|n }}" height="{{ height|n }}" viewBox="0 0 {{ width|n }} {{ height|n }}">
+  <defs>
+    <style>
+      .title { font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 24px; font-weight: 700; fill: #0f172a; }
+      .subtitle { font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 13px; font-weight: 400; fill: #64748b; }
+      .section-label { font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 18px; font-weight: 700; fill: #0f172a; }
+      .heading { font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 14px; font-weight: 600; fill: #ffffff; }
+      .body { font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 12px; font-weight: 400; fill: #334155; }
+      .body-strong { font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 12px; font-weight: 600; fill: #0f172a; }
+      .small { font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 10px; font-weight: 400; fill: #475569; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; font-weight: 400; fill: #0f172a; }
+      .label { font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 10px; font-weight: 700; letter-spacing: 0.05em; fill: #ffffff; }
+      .edge-label { font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 11px; font-weight: 700; fill: #0f172a; }
+      .pill-text { font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 11px; font-weight: 600; fill: #ffffff; }
+      .sticky-text { font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 12px; font-weight: 500; fill: #422006; }
+      .grid-text { font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 12px; font-weight: 600; fill: #1e3a8a; }
+      .grid-text-green { font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 12px; font-weight: 600; fill: #065f46; }
+      .card-title { font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 13px; font-weight: 600; fill: #5b21b6; }
+    </style>
+    <filter id="shadow" x="-4%" y="-4%" width="108%" height="116%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="3"/>
+      <feOffset dy="2" result="offsetblur"/>
+      <feFlood flood-color="#000000" flood-opacity="0.1"/>
+      <feComposite in2="offsetblur" operator="in"/>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="shadow-sm" x="-4%" y="-4%" width="108%" height="116%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="1.5"/>
+      <feOffset dy="1" result="offsetblur"/>
+      <feFlood flood-color="#000000" flood-opacity="0.06"/>
+      <feComposite in2="offsetblur" operator="in"/>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <linearGradient id="canvas-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f0f4ff"/>
+      <stop offset="100%" stop-color="#e8efff"/>
+    </linearGradient>
+{%- for role, color in roles %}
+    <linearGradient id="zone-{{ role }}" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="{{ color }}" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="{{ color }}" stop-opacity="0.02"/>
+    </linearGradient>
+    <filter id="glow-{{ role }}" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="6"/>
+      <feFlood flood-color="{{ color }}" flood-opacity="0.18"/>
+      <feComposite operator="in" in2="SourceAlpha"/>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+{%- endfor %}
+  </defs>
+
+  <!-- background -->
+  <rect x="0" y="0" width="{{ width|n }}" height="{{ height|n }}" fill="url(#canvas-bg)"/>
+
+  <!-- title -->
+  {{ text(title) }}
+  {{ text(subtitle) }}
+
+  <!-- legend -->
+  <g transform="translate({{ legend.r.x|n }}, {{ legend.r.y|n }})">
+    <rect width="{{ legend.r.w|n }}" height="{{ legend.r.h|n }}" rx="8" fill="#ffffff" fill-opacity="0.9" stroke="#e2e8f0"/>
+{%- for it in legend.items %}
+{%- if it.kind == "solid" %}
+    <line x1="{{ it.x|n }}" y1="22" x2="{{ (it.x + 30)|n }}" y2="22" stroke="#0f172a" stroke-width="2"/>
+    <polygon points="{{ (it.x + 40)|n }},22 {{ (it.x + 29)|n }},16 {{ (it.x + 29)|n }},28" fill="#0f172a"/>
+    <text class="body" x="{{ (it.x + 48)|n }}" y="26">{{ it.label }}</text>
+{%- elif it.kind == "dashed" %}
+    <line x1="{{ it.x|n }}" y1="22" x2="{{ (it.x + 28)|n }}" y2="22" stroke="#7c3aed" stroke-width="1.5" stroke-dasharray="6,4"/>
+    <polygon points="{{ (it.x + 38)|n }},22 {{ (it.x + 27)|n }},16 {{ (it.x + 27)|n }},28" fill="#7c3aed"/>
+    <text class="body" x="{{ (it.x + 48)|n }}" y="26">{{ it.label }}</text>
+{%- elif it.kind == "owner" %}
+    <rect x="{{ it.x|n }}" y="12" width="64" height="20" rx="10" fill="#16a34a"/>
+    <text class="pill-text" x="{{ (it.x + 32)|n }}" y="26" text-anchor="middle">Owner</text>
+    <text class="body" x="{{ (it.x + 72)|n }}" y="26">{{ it.label }}</text>
+{%- elif it.kind == "deferred" %}
+    <rect x="{{ it.x|n }}" y="12" width="76" height="20" rx="6" fill="#ef4444"/>
+    <text class="label" x="{{ (it.x + 38)|n }}" y="26" text-anchor="middle">DEFERRED</text>
+    <text class="body" x="{{ (it.x + 84)|n }}" y="26">{{ it.label }}</text>
+{%- elif it.kind == "sticky" %}
+    <rect x="{{ it.x|n }}" y="12" width="20" height="20" rx="3" fill="#fef9c3" stroke="#eab308"/>
+    <text class="body" x="{{ (it.x + 28)|n }}" y="26">{{ it.label }}</text>
+{%- endif %}
+{%- endfor %}
+  </g>
+{% for z in zones %}
+  <!-- zone: {{ z.label.text|cmt }} -->
+  <rect x="{{ z.r.x|n }}" y="{{ z.r.y|n }}" width="{{ z.r.w|n }}" height="{{ z.r.h|n }}" rx="12" fill="url(#zone-{{ z.role }})" stroke="{{ z.color }}" stroke-width="2" stroke-dasharray="8,4"/>
+  {{ text(z.label) }}
+{%- if z.badge %}
+  {{ pill(z.badge) }}
+{%- endif %}
+{% endfor %}
+{%- for c in cards %}
+  <!-- card: {{ c.id|cmt }} -->
+  <g filter="url(#{% if c.glow %}glow-{{ c.role }}{% else %}shadow{% endif %})">
+    <rect x="{{ c.r.x|n }}" y="{{ c.r.y|n }}" width="{{ c.r.w|n }}" height="{{ c.r.h|n }}" rx="10" fill="#ffffff" stroke="{{ c.color }}" stroke-width="2"{% if c.dashed %} stroke-dasharray="6,3"{% endif %}/>
+    <rect x="{{ c.r.x|n }}" y="{{ c.r.y|n }}" width="{{ c.r.w|n }}" height="32" rx="10" fill="{{ c.color }}"/>
+    <rect x="{{ c.r.x|n }}" y="{{ (c.r.y + 20)|n }}" width="{{ c.r.w|n }}" height="12" fill="{{ c.color }}"/>
+    {{ text(c.title) }}
+{%- for l in c.lines %}
+    {{ text(l) }}
+{%- endfor %}
+  </g>
+{% endfor %}
+  <!-- edges -->
+{%- for e in edges %}
+  <path d="{{ e.d }}" stroke="{{ e.color }}" stroke-width="{{ e.width|n }}" fill="none"{% if e.dash %} stroke-dasharray="{{ e.dash }}"{% endif %}/>
+  <polygon points="{{ e.arrow }}" fill="{{ e.color }}"/>
+{%- if e.label %}
+  {{ pill(e.label) }}
+{%- endif %}
+{%- endfor %}
+
+  <!-- owners and badges -->
+{%- for p in pills %}
+  {{ pill(p) }}
+{%- endfor %}
+{%- for t in notes %}
+  {{ text(t) }}
+{%- endfor %}
+{% if stickies %}
+  <!-- stickies -->
+{%- for s in stickies %}
+  <g filter="url(#shadow-sm)">
+    <rect x="{{ s.r.x|n }}" y="{{ s.r.y|n }}" width="{{ s.r.w|n }}" height="{{ s.r.h|n }}" rx="6" fill="#fef9c3" stroke="#eab308"/>
+    <rect x="{{ s.r.x|n }}" y="{{ s.r.y|n }}" width="{{ s.r.w|n }}" height="24" rx="6" fill="{{ s.header }}"/>
+    <rect x="{{ s.r.x|n }}" y="{{ (s.r.y + 16)|n }}" width="{{ s.r.w|n }}" height="8" fill="{{ s.header }}"/>
+    {{ text(s.kind) }}
+{%- for l in s.lines %}
+    {{ text(l) }}
+{%- endfor %}
+  </g>
+{%- endfor %}
+{% endif %}
+{%- if banner %}
+  <!-- decision banner -->
+  <g filter="url(#shadow)">
+    <rect x="{{ banner.r.x|n }}" y="{{ banner.r.y|n }}" width="{{ banner.r.w|n }}" height="{{ banner.r.h|n }}" rx="10" fill="#fef3c7" stroke="#f59e0b" stroke-width="2"/>
+  </g>
+  {{ pill(banner.label) }}
+{%- for l in banner.lines %}
+  {{ text(l) }}
+{%- endfor %}
+{% endif %}
+{%- for p in panels %}
+  <!-- panel: {{ p.title.text|cmt }} -->
+  <g filter="url(#shadow)">
+    <rect x="{{ p.r.x|n }}" y="{{ p.r.y|n }}" width="{{ p.r.w|n }}" height="{{ p.r.h|n }}" rx="12" fill="#ffffff" stroke="{{ p.color }}" stroke-width="2"/>
+    <rect x="{{ p.r.x|n }}" y="{{ p.r.y|n }}" width="{{ p.r.w|n }}" height="36" rx="12" fill="{{ p.color }}"/>
+    <rect x="{{ p.r.x|n }}" y="{{ (p.r.y + 24)|n }}" width="{{ p.r.w|n }}" height="12" fill="{{ p.color }}"/>
+    {{ text(p.title) }}
+  </g>
+{%- for s in p.shapes %}
+  <rect x="{{ s.r.x|n }}" y="{{ s.r.y|n }}" width="{{ s.r.w|n }}" height="{{ s.r.h|n }}" rx="{{ s.rx|n }}" fill="{{ s.fill }}" stroke="{{ s.stroke }}" stroke-width="{{ s.stroke_width|n }}"{% if s.dash %} stroke-dasharray="{{ s.dash }}"{% endif %}{% if s.shadow %} filter="url(#shadow-sm)"{% endif %}/>
+{%- endfor %}
+{%- for a in p.arrows %}
+  <path d="{{ a[0] }}" stroke="#0f172a" stroke-width="2" fill="none"/>
+  <polygon points="{{ a[1] }}" fill="#0f172a"/>
+{%- endfor %}
+{%- for t in p.texts %}
+  {{ text(t) }}
+{%- endfor %}
+{%- for b in p.pills %}
+  {{ pill(b) }}
+{%- endfor %}
+{% endfor %}
+  <!-- footer -->
+  {{ text(footer) }}
+</svg>

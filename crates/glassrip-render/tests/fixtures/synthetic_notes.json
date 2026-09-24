@@ -1,0 +1,580 @@
+{
+  "title": "Kiosk Relay Pilot",
+  "duration_s": 82.8,
+  "people": [
+    {
+      "person_id": "avery-quinn",
+      "display_name": "Avery Quinn",
+      "aliases": [
+        "Avery",
+        "Quinn"
+      ]
+    },
+    {
+      "person_id": "rohan-dasgupta",
+      "display_name": "Rohan Dasgupta",
+      "aliases": [
+        "Rohan",
+        "Dasgupta"
+      ]
+    },
+    {
+      "person_id": "mira-okafor",
+      "display_name": "Mira Okafor",
+      "aliases": [
+        "Mira",
+        "Okafor"
+      ]
+    }
+  ],
+  "presenter": "Avery Quinn",
+  "summary": [
+    {
+      "id": "s1",
+      "text": "The pilot focuses on the relay side; the badge flow stays as it is",
+      "t_start_s": 26.0,
+      "t_end_s": 32.0,
+      "evidence": {
+        "segment_ids": [
+          "seg_00005"
+        ],
+        "event_ids": [],
+        "keyframe_ids": []
+      }
+    },
+    {
+      "id": "s2",
+      "text": "Rohan owns the relay storage schema and Mira maps ledger entries to kit widgets",
+      "t_start_s": 33.0,
+      "t_end_s": 43.2,
+      "evidence": {
+        "segment_ids": [
+          "seg_00006",
+          "seg_00007"
+        ],
+        "event_ids": [
+          "ev_003"
+        ],
+        "keyframe_ids": []
+      }
+    },
+    {
+      "id": "s3",
+      "text": "Which kiosk widgets to build is still open",
+      "t_start_s": 12.0,
+      "t_end_s": 63.6,
+      "evidence": {
+        "segment_ids": [
+          "seg_00010"
+        ],
+        "event_ids": [],
+        "keyframe_ids": [
+          "kf_0012"
+        ]
+      }
+    }
+  ],
+  "decisions": [
+    {
+      "id": "d1",
+      "text": "Leave the badge flow alone for the pilot and focus on the relay side, badge changes wait",
+      "t_start_s": 26.0,
+      "t_end_s": 32.0,
+      "evidence": {
+        "segment_ids": [
+          "seg_00005"
+        ],
+        "event_ids": [],
+        "keyframe_ids": []
+      },
+      "quote": {
+        "text": "leave the badge flow alone for the pilot",
+        "segment_id": "seg_00005",
+        "matched": "raw"
+      }
+    },
+    {
+      "id": "d2",
+      "text": "Rohan pairs with Mira on the relay tests",
+      "t_start_s": 47.0,
+      "t_end_s": 56.0,
+      "evidence": {
+        "segment_ids": [
+          "seg_00008",
+          "seg_00009"
+        ],
+        "event_ids": [],
+        "keyframe_ids": []
+      },
+      "quote": {
+        "text": "pair with Mira on the relay tests",
+        "segment_id": "seg_00008",
+        "matched": "raw"
+      }
+    },
+    {
+      "id": "d3",
+      "text": "Park the Design Kit links for now and focus on the relay side",
+      "t_start_s": 26.0,
+      "t_end_s": 32.0,
+      "evidence": {
+        "segment_ids": [
+          "seg_00005"
+        ],
+        "event_ids": [],
+        "keyframe_ids": []
+      },
+      "quote": {
+        "text": "focus on the relay side",
+        "segment_id": "seg_00005",
+        "matched": "raw"
+      }
+    }
+  ],
+  "action_items": [
+    {
+      "id": "a1",
+      "person_id": "rohan-dasgupta",
+      "owner": "Rohan Dasgupta",
+      "task": "Design the relay storage schema this week",
+      "t_s": 40.0,
+      "t_end_s": 43.2,
+      "evidence": {
+        "segment_ids": [
+          "seg_00007"
+        ],
+        "event_ids": [],
+        "keyframe_ids": []
+      },
+      "quote": {
+        "text": "design the relay storage schema",
+        "segment_id": "seg_00007",
+        "matched": "raw"
+      }
+    },
+    {
+      "id": "a2",
+      "person_id": "mira-okafor",
+      "owner": "Mira Okafor",
+      "task": "Map ledger entries to kit widgets",
+      "t_s": 33.0,
+      "t_end_s": 40.0,
+      "evidence": {
+        "segment_ids": [
+          "seg_00006"
+        ],
+        "event_ids": [
+          "ev_003"
+        ],
+        "keyframe_ids": []
+      },
+      "quote": {
+        "text": "map entries to kit widgets",
+        "segment_id": "seg_00006",
+        "matched": "raw"
+      }
+    },
+    {
+      "id": "a3",
+      "person_id": "rohan-dasgupta",
+      "owner": "Rohan Dasgupta",
+      "task": "Pair with Mira on the relay tests",
+      "t_s": 52.0,
+      "t_end_s": 56.0,
+      "evidence": {
+        "segment_ids": [
+          "seg_00009"
+        ],
+        "event_ids": [],
+        "keyframe_ids": []
+      },
+      "quote": null
+    },
+    {
+      "id": "a4",
+      "person_id": null,
+      "owner": "Everyone",
+      "task": "Push work to a branch early, even if it is rough",
+      "t_s": 66.0,
+      "t_end_s": 71.6,
+      "evidence": {
+        "segment_ids": [
+          "seg_00011"
+        ],
+        "event_ids": [],
+        "keyframe_ids": []
+      },
+      "quote": {
+        "text": "push work to a branch early",
+        "segment_id": "seg_00011",
+        "matched": "raw"
+      }
+    },
+    {
+      "id": "a5",
+      "person_id": "avery-quinn",
+      "owner": "Avery Quinn",
+      "task": "Scope the relay side for the pilot",
+      "t_s": 26.0,
+      "t_end_s": 32.0,
+      "evidence": {
+        "segment_ids": [
+          "seg_00005"
+        ],
+        "event_ids": [],
+        "keyframe_ids": []
+      },
+      "quote": {
+        "text": "focus on the relay side",
+        "segment_id": "seg_00005",
+        "matched": "raw"
+      }
+    }
+  ],
+  "open_questions": [
+    {
+      "id": "q1",
+      "text": "Which widgets does the kiosk need?",
+      "source": "board_and_transcript",
+      "t_s": 12.0,
+      "evidence": {
+        "segment_ids": [
+          "seg_00010"
+        ],
+        "event_ids": [],
+        "keyframe_ids": [
+          "kf_0012"
+        ]
+      },
+      "quote": {
+        "text": "Which widgets do we need for the kiosk",
+        "segment_id": "seg_00010",
+        "matched": "raw"
+      }
+    },
+    {
+      "id": "q2",
+      "text": "Do we have to change anything in the badge flow?",
+      "source": "board_and_transcript",
+      "t_s": 20.0,
+      "evidence": {
+        "segment_ids": [
+          "seg_00004"
+        ],
+        "event_ids": [
+          "ev_002"
+        ],
+        "keyframe_ids": [
+          "kf_0020"
+        ]
+      },
+      "quote": {
+        "text": "change anything in the badge flow",
+        "segment_id": "seg_00004",
+        "matched": "raw"
+      }
+    }
+  ],
+  "timeline": [
+    {
+      "id": "t1",
+      "t_start_s": 0.0,
+      "t_end_s": 17.0,
+      "text": "Avery walks through the relay, ledger and kiosk architecture",
+      "evidence": {
+        "segment_ids": [
+          "seg_00000",
+          "seg_00003"
+        ],
+        "event_ids": [
+          "ev_001"
+        ],
+        "keyframe_ids": []
+      }
+    },
+    {
+      "id": "t2",
+      "t_start_s": 26.0,
+      "t_end_s": 43.2,
+      "text": "Owners are assigned and the badge flow is left alone",
+      "evidence": {
+        "segment_ids": [
+          "seg_00005",
+          "seg_00006",
+          "seg_00007"
+        ],
+        "event_ids": [
+          "ev_003"
+        ],
+        "keyframe_ids": []
+      }
+    },
+    {
+      "id": "t3",
+      "t_start_s": 47.0,
+      "t_end_s": 71.6,
+      "text": "Pairing, open widget question and wrap-up",
+      "evidence": {
+        "segment_ids": [
+          "seg_00008",
+          "seg_00010",
+          "seg_00011"
+        ],
+        "event_ids": [
+          "ev_004"
+        ],
+        "keyframe_ids": []
+      }
+    }
+  ],
+  "caveats": [
+    {
+      "kind": "speakers",
+      "text": "0 of 13 transcript lines have a low-confidence speaker (below 0.5); 2 were reassigned from the diarizer's label by on-screen speaker or direct-address cues, for example 00:06 \"Hey, Mira.\" (Avery Quinn), 00:07 \"Hey.\" (Mira Okafor). Flagged lines are marked in the transcript."
+    },
+    {
+      "kind": "gap_fill",
+      "text": "10% of words (14 words, 6 s of speech) were attributed by gap filling, where the diarizer marked speech as silence; their speaker is less certain. Checked against the video: 1 of 1 runs had an on-screen speaker cue; 1 agreed, 0 disagreed (0 relabeled, 0 words)."
+    },
+    {
+      "kind": "dropped",
+      "text": "2 drafted items were removed because their citations or quotes could not be verified."
+    }
+  ],
+  "speakers": [
+    {
+      "label": "L0",
+      "name": "Avery Quinn",
+      "status": "mapped",
+      "confidence": 0.8992962,
+      "talk_time_s": 34.8
+    },
+    {
+      "label": "L1",
+      "name": "Rohan Dasgupta",
+      "status": "mapped",
+      "confidence": 0.8547427,
+      "talk_time_s": 14.400000000000002
+    },
+    {
+      "label": "L2",
+      "name": "Mira Okafor",
+      "status": "mapped",
+      "confidence": 0.49067384,
+      "talk_time_s": 7.599999999999994
+    }
+  ],
+  "transcript": [
+    {
+      "start_s": 0.0,
+      "end_s": 6.8,
+      "speaker": "Avery Quinn",
+      "person_id": "avery-quinn",
+      "text": "Welcome everyone, this is the kiosk relay planning session for the pilot. Hey, Mira.",
+      "segment_ids": [
+        "seg_00000",
+        "seg_00001"
+      ],
+      "flagged": true
+    },
+    {
+      "start_s": 7.4,
+      "end_s": 7.800000000000001,
+      "speaker": "Mira Okafor",
+      "person_id": "mira-okafor",
+      "text": "Hey.",
+      "segment_ids": [
+        "seg_00002"
+      ],
+      "flagged": true
+    },
+    {
+      "start_s": 9.0,
+      "end_s": 17.0,
+      "speaker": "Avery Quinn",
+      "person_id": "avery-quinn",
+      "text": "So the relay pulls entries from the ledger service over REST and the kiosk app talks GraphQL to the relay.",
+      "segment_ids": [
+        "seg_00003"
+      ],
+      "flagged": false
+    },
+    {
+      "start_s": 20.0,
+      "end_s": 26.4,
+      "speaker": "Rohan Dasgupta",
+      "person_id": "rohan-dasgupta",
+      "text": "Do we have to change anything in the badge flow, or can we leave it alone?",
+      "segment_ids": [
+        "seg_00004"
+      ],
+      "flagged": false
+    },
+    {
+      "start_s": 26.0,
+      "end_s": 32.0,
+      "speaker": "Avery Quinn",
+      "person_id": "avery-quinn",
+      "text": "Let's leave the badge flow alone for the pilot and focus on the relay side.",
+      "segment_ids": [
+        "seg_00005"
+      ],
+      "flagged": false
+    },
+    {
+      "start_s": 33.0,
+      "end_s": 37.8,
+      "speaker": "Mira Okafor",
+      "person_id": "mira-okafor",
+      "text": "I can take the ledger side and map entries to kit widgets.",
+      "segment_ids": [
+        "seg_00006"
+      ],
+      "flagged": false
+    },
+    {
+      "start_s": 40.0,
+      "end_s": 43.2,
+      "speaker": "Rohan Dasgupta",
+      "person_id": "rohan-dasgupta",
+      "text": "I'll design the relay storage schema this week.",
+      "segment_ids": [
+        "seg_00007"
+      ],
+      "flagged": false
+    },
+    {
+      "start_s": 47.0,
+      "end_s": 51.4,
+      "speaker": "Avery Quinn",
+      "person_id": "avery-quinn",
+      "text": "Rohan, can you also pair with Mira on the relay tests?",
+      "segment_ids": [
+        "seg_00008"
+      ],
+      "flagged": false
+    },
+    {
+      "start_s": 52.0,
+      "end_s": 56.0,
+      "speaker": "Rohan Dasgupta",
+      "person_id": "rohan-dasgupta",
+      "text": "Yes, I will pair with Mira on the relay tests.",
+      "segment_ids": [
+        "seg_00009"
+      ],
+      "flagged": false
+    },
+    {
+      "start_s": 58.0,
+      "end_s": 63.6,
+      "speaker": "Avery Quinn",
+      "person_id": "avery-quinn",
+      "text": "Which widgets do we need for the kiosk? We still have not settled that.",
+      "segment_ids": [
+        "seg_00010"
+      ],
+      "flagged": false
+    },
+    {
+      "start_s": 66.0,
+      "end_s": 71.6,
+      "speaker": "Avery Quinn",
+      "person_id": "avery-quinn",
+      "text": "and everyone should push work to a branch early even if it is rough",
+      "segment_ids": [
+        "seg_00011"
+      ],
+      "flagged": false
+    },
+    {
+      "start_s": 80.0,
+      "end_s": 82.8,
+      "speaker": "Mira Okafor",
+      "person_id": "mira-okafor",
+      "text": "Sounds good, I'll see you all later.",
+      "segment_ids": [
+        "seg_00012"
+      ],
+      "flagged": false
+    }
+  ],
+  "report": {
+    "status": "ok",
+    "model": "text:27b",
+    "model_digest": "sha256:synthetic",
+    "windows": 3,
+    "calls": [
+      {
+        "purpose": "map 1/3",
+        "wall_s": 0.0,
+        "prompt_tokens": null,
+        "eval_tokens": 100,
+        "done_reason": null,
+        "parse_error": null
+      },
+      {
+        "purpose": "map 2/3",
+        "wall_s": 0.0,
+        "prompt_tokens": null,
+        "eval_tokens": 100,
+        "done_reason": null,
+        "parse_error": null
+      },
+      {
+        "purpose": "map 3/3",
+        "wall_s": 0.0,
+        "prompt_tokens": null,
+        "eval_tokens": 100,
+        "done_reason": null,
+        "parse_error": null
+      },
+      {
+        "purpose": "reduce",
+        "wall_s": 0.0,
+        "prompt_tokens": null,
+        "eval_tokens": 100,
+        "done_reason": null,
+        "parse_error": null
+      },
+      {
+        "purpose": "repair",
+        "wall_s": 0.0,
+        "prompt_tokens": null,
+        "eval_tokens": 100,
+        "done_reason": null,
+        "parse_error": null
+      }
+    ],
+    "items_drafted": 17,
+    "items_kept": 15,
+    "items_failed_first_pass": 3,
+    "items_repaired": 1,
+    "dropped": [
+      {
+        "section": "action_items",
+        "text": "Mira: See you all later",
+        "reasons": [
+          "greeting or farewell"
+        ]
+      },
+      {
+        "section": "decisions",
+        "text": "Ship the kiosk to every lobby next month",
+        "reasons": [
+          "unknown segment id seg_00042",
+          "after repair: unknown segment id seg_00043"
+        ]
+      }
+    ],
+    "drop_rate": 0.11764705882352941,
+    "placement": {
+      "name": "text:27b",
+      "size": 100,
+      "size_vram": 100,
+      "context_length": 16384
+    },
+    "unloaded_vision_model": "vision:7b",
+    "wall_s": 0.0
+  }
+}

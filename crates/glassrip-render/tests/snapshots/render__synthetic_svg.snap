@@ -1,0 +1,169 @@
+---
+source: crates/glassrip-render/tests/render.rs
+expression: text
+---
+<svg xmlns="http://www.w3.org/2000/svg" width="1640" height="1449" viewBox="0 0 1640 1449">
+  <defs>
+    <style>
+      .title { font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 24px; font-weight: 700; fill: #0f172a; }
+      .subtitle { font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 13px; font-weight: 400; fill: #64748b; }
+      .section-label { font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 18px; font-weight: 700; fill: #0f172a; }
+      .heading { font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 14px; font-weight: 600; fill: #ffffff; }
+      .body { font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 12px; font-weight: 400; fill: #334155; }
+      .body-strong { font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 12px; font-weight: 600; fill: #0f172a; }
+      .small { font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 10px; font-weight: 400; fill: #475569; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; font-weight: 400; fill: #0f172a; }
+      .label { font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 10px; font-weight: 700; letter-spacing: 0.05em; fill: #ffffff; }
+      .edge-label { font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 11px; font-weight: 700; fill: #0f172a; }
+      .pill-text { font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 11px; font-weight: 600; fill: #ffffff; }
+      .sticky-text { font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 12px; font-weight: 500; fill: #422006; }
+      .grid-text { font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 12px; font-weight: 600; fill: #1e3a8a; }
+      .grid-text-green { font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 12px; font-weight: 600; fill: #065f46; }
+      .card-title { font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 13px; font-weight: 600; fill: #5b21b6; }
+    </style>
+    <filter id="shadow" x="-4%" y="-4%" width="108%" height="116%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="3"/>
+      <feOffset dy="2" result="offsetblur"/>
+      <feFlood flood-color="#000000" flood-opacity="0.1"/>
+      <feComposite in2="offsetblur" operator="in"/>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="shadow-sm" x="-4%" y="-4%" width="108%" height="116%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="1.5"/>
+      <feOffset dy="1" result="offsetblur"/>
+      <feFlood flood-color="#000000" flood-opacity="0.06"/>
+      <feComposite in2="offsetblur" operator="in"/>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <linearGradient id="canvas-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f0f4ff"/>
+      <stop offset="100%" stop-color="#e8efff"/>
+    </linearGradient>    <linearGradient id="zone-client" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#6366f1" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#6366f1" stop-opacity="0.02"/>
+    </linearGradient>
+    <filter id="glow-client" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="6"/>
+      <feFlood flood-color="#6366f1" flood-opacity="0.18"/>
+      <feComposite operator="in" in2="SourceAlpha"/>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>    <linearGradient id="zone-api" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#2563eb" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#2563eb" stop-opacity="0.02"/>
+    </linearGradient>
+    <filter id="glow-api" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="6"/>
+      <feFlood flood-color="#2563eb" flood-opacity="0.18"/>
+      <feComposite operator="in" in2="SourceAlpha"/>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>    <linearGradient id="zone-processing" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#10b981" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#10b981" stop-opacity="0.02"/>
+    </linearGradient>
+    <filter id="glow-processing" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="6"/>
+      <feFlood flood-color="#10b981" flood-opacity="0.18"/>
+      <feComposite operator="in" in2="SourceAlpha"/>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>  </defs>
+
+  <!-- background -->
+  <rect x="0" y="0" width="1640" height="1449" fill="url(#canvas-bg)"/>
+
+  <!-- title -->
+  <text class="title" x="820" y="40" text-anchor="middle">Kiosk Relay Pilot</text>
+  <text class="subtitle" x="820" y="62" text-anchor="middle">Architecture as drawn on the board during the meeting (final state at 01:20)</text>
+
+  <!-- legend -->
+  <g transform="translate(262, 76)">
+    <rect width="1116" height="44" rx="8" fill="#ffffff" fill-opacity="0.9" stroke="#e2e8f0"/>    <line x1="16" y1="22" x2="46" y2="22" stroke="#0f172a" stroke-width="2"/>
+    <polygon points="56,22 45,16 45,28" fill="#0f172a"/>
+    <text class="body" x="64" y="26">Request (caller to callee)</text>    <line x1="263.6" y1="22" x2="291.6" y2="22" stroke="#7c3aed" stroke-width="1.5" stroke-dasharray="6,4"/>
+    <polygon points="301.6,22 290.6,16 290.6,28" fill="#7c3aed"/>
+    <text class="body" x="311.6" y="26">Proposed relationship</text>    <rect x="478.2" y="12" width="64" height="20" rx="10" fill="#16a34a"/>
+    <text class="pill-text" x="510.2" y="26" text-anchor="middle">Owner</text>
+    <text class="body" x="550.2" y="26">Owner tag on the board</text>    <rect x="723.4" y="12" width="76" height="20" rx="6" fill="#ef4444"/>
+    <text class="label" x="761.4" y="26" text-anchor="middle">DEFERRED</text>
+    <text class="body" x="807.4" y="26">Deferred by a decision</text>    <rect x="980.6" y="12" width="20" height="20" rx="3" fill="#fef9c3" stroke="#eab308"/>
+    <text class="body" x="1008.6" y="26">Board sticky</text>  </g>
+  <!-- zone: API -->
+  <rect x="40" y="633" width="284" height="272" rx="12" fill="url(#zone-api)" stroke="#2563eb" stroke-width="2" stroke-dasharray="8,4"/>
+  <text class="section-label" x="60" y="661">API</text>  <rect x="60" y="673" width="56" height="24" rx="6" fill="#2563eb"/>
+  <text class="label" x="88" y="689" text-anchor="middle">FOCUS</text>  <!-- zone: Services -->
+  <rect x="40" y="148" width="284" height="272" rx="12" fill="url(#zone-processing)" stroke="#10b981" stroke-width="2" stroke-dasharray="8,4"/>
+  <text class="section-label" x="60" y="176">Services</text>  <!-- zone: Client -->
+  <rect x="882" y="633" width="718" height="272" rx="12" fill="url(#zone-client)" stroke="#6366f1" stroke-width="2" stroke-dasharray="8,4"/>
+  <text class="section-label" x="902" y="661">Client</text>  <!-- card: n_ledger -->
+  <g filter="url(#shadow)">
+    <rect x="72" y="248" width="220" height="132" rx="10" fill="#ffffff" stroke="#10b981" stroke-width="2"/>
+    <rect x="72" y="248" width="220" height="32" rx="10" fill="#10b981"/>
+    <rect x="72" y="268" width="220" height="12" fill="#10b981"/>
+    <text class="heading" x="84" y="269">Ledger Service</text>    <text class="body" x="84" y="306">Service</text>    <text class="small" x="84" y="326">On the board from 00:02</text>  </g>
+  <!-- card: n_relay -->
+  <g filter="url(#glow-api)">
+    <rect x="72" y="733" width="220" height="132" rx="10" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+    <rect x="72" y="733" width="220" height="32" rx="10" fill="#2563eb"/>
+    <rect x="72" y="753" width="220" height="12" fill="#2563eb"/>
+    <text class="heading" x="84" y="754">Relay API</text>    <text class="body" x="84" y="791">API layer</text>    <text class="small" x="84" y="811">On the board from 00:02</text>  </g>
+  <!-- card: n_kiosk -->
+  <g filter="url(#shadow)">
+    <rect x="914" y="733" width="220" height="132" rx="10" fill="#ffffff" stroke="#6366f1" stroke-width="2"/>
+    <rect x="914" y="733" width="220" height="32" rx="10" fill="#6366f1"/>
+    <rect x="914" y="753" width="220" height="12" fill="#6366f1"/>
+    <text class="heading" x="926" y="754">Kiosk App</text>    <text class="body" x="926" y="791">Client</text>    <text class="small" x="926" y="811">On the board from 00:12</text>  </g>
+  <!-- card: n_kit -->
+  <g filter="url(#shadow)">
+    <rect x="1348" y="733" width="220" height="132" rx="10" fill="#ffffff" stroke="#6366f1" stroke-width="2" stroke-dasharray="6,3"/>
+    <rect x="1348" y="733" width="220" height="32" rx="10" fill="#6366f1"/>
+    <rect x="1348" y="753" width="220" height="12" fill="#6366f1"/>
+    <text class="heading" x="1360" y="754">Design Kit</text>    <text class="body" x="1360" y="791">Client</text>    <text class="small" x="1360" y="811">On the board from 00:12</text>    <text class="small" x="1360" y="829" style="fill:#b91c1c">Deferred at 00:26</text>  </g>
+  <!-- edges -->  <path d="M 182,733 L 182,391" stroke="#0f172a" stroke-width="2" fill="none"/>
+  <polygon points="182,380 188,391 176,391" fill="#0f172a"/>  <rect x="190" y="553" width="42" height="18" rx="4" fill="#ffffff" stroke="#cbd5e1"/>
+  <text class="edge-label" x="211" y="566" text-anchor="middle">REST</text>  <path d="M 914,799 L 303,799" stroke="#0f172a" stroke-width="2" fill="none"/>
+  <polygon points="292,799 303,793 303,805" fill="#0f172a"/>  <rect x="577" y="775" width="62" height="18" rx="4" fill="#ffffff" stroke="#cbd5e1"/>
+  <text class="edge-label" x="608" y="788" text-anchor="middle">GraphQL</text>  <path d="M 1134,799 L 1337,799" stroke="#0f172a" stroke-width="2" fill="none"/>
+  <polygon points="1348,799 1337,805 1337,793" fill="#0f172a"/>  <path d="M 292,314 L 1458,314 L 1458,722" stroke="#7c3aed" stroke-width="1.5" fill="none" stroke-dasharray="6,4"/>
+  <polygon points="1458,733 1452,722 1464,722" fill="#7c3aed"/>  <rect x="724" y="302" width="301" height="24" rx="6" fill="#ffffff" stroke="#7c3aed"/>
+  <text class="body" x="875" y="318" text-anchor="middle" style="fill:#5b21b6">Links between ledger entries + kit widgets</text>
+  <!-- owners and badges -->  <rect x="115" y="566" width="57" height="24" rx="12" fill="#16a34a"/>
+  <text class="pill-text" x="144" y="582" text-anchor="middle">Rohan</text>  <rect x="914" y="699" width="57" height="24" rx="12" fill="#16a34a"/>
+  <text class="pill-text" x="943" y="715" text-anchor="middle">Avery</text>  <rect x="1348" y="699" width="56" height="24" rx="12" fill="#16a34a"/>
+  <text class="pill-text" x="1376" y="715" text-anchor="middle">Mira</text>  <rect x="1205" y="699" width="135" height="24" rx="6" fill="#ef4444"/>
+  <text class="label" x="1272.5" y="715" text-anchor="middle">DEFERRED (00:26)</text>  <text class="small" x="1412" y="715">moved from Ledger Service (01:10)</text>  <!-- stickies -->  <g filter="url(#shadow-sm)">
+    <rect x="230" y="929" width="220" height="96" rx="6" fill="#fef9c3" stroke="#eab308"/>
+    <rect x="230" y="929" width="220" height="24" rx="6" fill="#f59e0b"/>
+    <rect x="230" y="945" width="220" height="8" fill="#f59e0b"/>
+    <text class="label" x="242" y="945">OPEN QUESTION</text>    <text class="sticky-text" x="242" y="975">Which widgets do we need</text>    <text class="sticky-text" x="242" y="993">for the kiosk?</text>  </g>  <g filter="url(#shadow-sm)">
+    <rect x="550" y="929" width="220" height="96" rx="6" fill="#fef9c3" stroke="#eab308"/>
+    <rect x="550" y="929" width="220" height="24" rx="6" fill="#f59e0b"/>
+    <rect x="550" y="945" width="220" height="8" fill="#f59e0b"/>
+    <text class="label" x="562" y="945">OPEN QUESTION</text>    <text class="sticky-text" x="562" y="975">Do we change the badge</text>    <text class="sticky-text" x="562" y="993">flow?</text>  </g>  <g filter="url(#shadow-sm)">
+    <rect x="870" y="929" width="220" height="96" rx="6" fill="#fef9c3" stroke="#eab308"/>
+    <rect x="870" y="929" width="220" height="24" rx="6" fill="#6366f1"/>
+    <rect x="870" y="945" width="220" height="8" fill="#6366f1"/>
+    <text class="label" x="882" y="945">IDEA</text>    <text class="sticky-text" x="882" y="975">visitors pick their badge</text>    <text class="sticky-text" x="882" y="993">color</text>  </g>  <g filter="url(#shadow-sm)">
+    <rect x="1190" y="929" width="220" height="96" rx="6" fill="#fef9c3" stroke="#eab308"/>
+    <rect x="1190" y="929" width="220" height="24" rx="6" fill="#2563eb"/>
+    <rect x="1190" y="945" width="220" height="8" fill="#2563eb"/>
+    <text class="label" x="1202" y="945">NOTE</text>    <text class="sticky-text" x="1202" y="975">Clone the lobby page</text>  </g>  <!-- decision banner -->
+  <g filter="url(#shadow)">
+    <rect x="40" y="1049" width="1560" height="56" rx="10" fill="#fef3c7" stroke="#f59e0b" stroke-width="2"/>
+  </g>
+  <rect x="56" y="1065" width="78" height="24" rx="6" fill="#f59e0b"/>
+  <text class="label" x="95" y="1081" text-anchor="middle">DECISION</text>  <text class="body-strong" x="152" y="1074">Park the Design Kit links for now and focus on the relay side (00:26 to 00:32)</text>  <text class="small" x="152" y="1092" style="fill:#92400e">2 more decisions in the notes</text>  <!-- panel: Things to show on the kiosk -->
+  <g filter="url(#shadow)">
+    <rect x="40" y="1129" width="760" height="256" rx="12" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+    <rect x="40" y="1129" width="760" height="36" rx="12" fill="#2563eb"/>
+    <rect x="40" y="1153" width="760" height="12" fill="#2563eb"/>
+    <text class="heading" x="56" y="1152">Things to show on the kiosk</text>
+  </g>  <rect x="56" y="1205" width="232" height="52" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1" filter="url(#shadow-sm)"/>  <rect x="304" y="1205" width="232" height="52" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1" filter="url(#shadow-sm)"/>  <rect x="552" y="1205" width="232" height="52" rx="8" fill="#dcfce7" stroke="#10b981" stroke-width="2" filter="url(#shadow-sm)"/>  <rect x="56" y="1273" width="232" height="52" rx="8" fill="#dcfce7" stroke="#10b981" stroke-width="2" filter="url(#shadow-sm)"/>  <rect x="304" y="1273" width="232" height="52" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1" filter="url(#shadow-sm)"/>  <rect x="552" y="1273" width="232" height="52" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1" filter="url(#shadow-sm)"/>  <rect x="56" y="1345" width="16" height="16" rx="4" fill="#dcfce7" stroke="#10b981" stroke-width="2"/>  <text class="small" x="56" y="1189">On the board from 00:45 (6 cards)</text>  <text class="grid-text" x="172" y="1235" text-anchor="middle">Visitor log</text>  <text class="grid-text" x="420" y="1235" text-anchor="middle">Today&#x27;s hosts</text>  <text class="grid-text-green" x="668" y="1235" text-anchor="middle">Wayfinding</text>  <text class="grid-text-green" x="172" y="1303" text-anchor="middle">Badge preview</text>  <text class="grid-text" x="420" y="1303" text-anchor="middle">Safety notice</text>  <text class="grid-text" x="668" y="1303" text-anchor="middle">Wi-Fi card</text>  <text class="small" x="80" y="1357">Green: drawn in a different color on the board</text>  <!-- panel: Lobby modules -->
+  <g filter="url(#shadow)">
+    <rect x="840" y="1129" width="760" height="256" rx="12" fill="#ffffff" stroke="#7c3aed" stroke-width="2"/>
+    <rect x="840" y="1129" width="760" height="36" rx="12" fill="#7c3aed"/>
+    <rect x="840" y="1153" width="760" height="12" fill="#7c3aed"/>
+    <text class="heading" x="856" y="1152">Lobby modules</text>
+  </g>  <rect x="856" y="1233" width="164" height="72" rx="8" fill="#e0e7ff" stroke="#6366f1" stroke-width="2" filter="url(#shadow-sm)"/>  <rect x="1080" y="1205" width="504" height="128" rx="10" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.5" stroke-dasharray="6,3"/>  <rect x="1096" y="1235" width="152" height="80" rx="8" fill="#ede9fe" stroke="#7c3aed" stroke-width="1" filter="url(#shadow-sm)"/>  <rect x="1256" y="1235" width="152" height="80" rx="8" fill="#ede9fe" stroke="#7c3aed" stroke-width="1" filter="url(#shadow-sm)"/>  <rect x="1416" y="1235" width="152" height="80" rx="8" fill="#ede9fe" stroke="#7c3aed" stroke-width="1" filter="url(#shadow-sm)"/>  <path d="M 1020,1269 L 1061,1269" stroke="#0f172a" stroke-width="2" fill="none"/>
+  <polygon points="1072,1269 1061,1275 1061,1263" fill="#0f172a"/>  <text class="small" x="856" y="1189">On the board from 01:00 (3 cards)</text>  <text class="card-title" x="938" y="1274" text-anchor="middle" style="fill:#3730a3">Lobby Renderer</text>  <text class="small" x="1096" y="1223" style="fill:#5b21b6">LOBBY MODULES</text>  <text class="card-title" x="1108" y="1261">Check-in</text>  <text class="small" x="1108" y="1281">per site</text>  <text class="card-title" x="1268" y="1261">Host alert</text>  <text class="small" x="1268" y="1281">live</text>  <text class="card-title" x="1428" y="1261">Promo tile</text>  <rect x="1428" y="1287" width="44" height="18" rx="6" fill="#22c55e"/>
+  <text class="label" x="1450" y="1300" text-anchor="middle">NEW</text>  <!-- footer -->
+  <text class="small" x="820" y="1425" text-anchor="middle">Source: board read from the meeting recording (final state at 01:20); owners from name tags on the board; deferrals and the banner from decisions validated against the transcript.</text>
+</svg>
