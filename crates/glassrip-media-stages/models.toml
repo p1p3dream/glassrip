@@ -1,0 +1,10 @@
+# Model files used by the media stages. URLs are pinned to an upstream revision;
+# SHA-256 values were measured on the downloaded files. Binaries are never
+# committed. Paths are relative to $GLASSRIP_MODELS_DIR or ~/.glassrip/models.
+
+[[model]]
+name = "pp-lcnet-x1-0-doc-ori"
+path = "orient/PP-LCNet_x1_0_doc_ori.onnx"
+url = "https://huggingface.co/monkt/paddleocr-onnx/resolve/7b02d0a30a07ba2b92ad1ff5a8941ae2c633de65/preprocessing/doc-orientation/PP-LCNet_x1_0_doc_ori.onnx"
+sha256 = "f5516822af9262711e197ff224a8a9d884f8046a6321b762e34f8cbf082c45ef"
+license = "Apache-2.0"
