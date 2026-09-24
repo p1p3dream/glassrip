@@ -12,8 +12,9 @@
 //!    two connected boxes (widened by `gap_margin_share` sizes across the link) belongs
 //!    to that edge (the gap whose center is nearest the
 //!    tag's when several touch it), with the same beside exception.
-//! 4. **Bridging two nodes.** A tag adjacent to two boxes (within `bridge_share`
-//!    sizes of each) whose center lies between them belongs to both nodes.
+//! 4. **Bridging two nodes.** A tag adjacent to two boxes joined by a connector
+//!    (within `bridge_share` sizes of each) whose center lies between them belongs to
+//!    both nodes. Without a connector between them geometry gives no answer.
 //! 5. **Nearest node.** Otherwise the unique nearest box within `node_range_share`
 //!    sizes.
 
@@ -231,7 +232,14 @@ pub fn anchor_tag<K: Clone + PartialEq>(
         let (c, a, b) = (center(tag), center(near[0].1), center(near[1].1));
         let between = |t: f64, u: f64, v: f64| (u < t && t < v) || (v < t && t < u);
         if between(c.0, a.0, b.0) || between(c.1, a.1, b.1) {
-            return Some(Anchored::Bridge(near[0].0.clone(), near[1].0.clone()));
+            // Only boxes joined by a connector form a bridged pair; a tag resting in
+            // the seam of two unconnected boxes is ambiguous, so geometry gives up
+            // and the caller falls back to the reader's `near`.
+            let (x, y) = (near[0].0, near[1].0);
+            let linked = edges
+                .iter()
+                .any(|e| (&e.a.0 == x && &e.b.0 == y) || (&e.a.0 == y && &e.b.0 == x));
+            return linked.then(|| Anchored::Bridge(x.clone(), y.clone()));
         }
     }
     // 5. Nearest node.
@@ -366,5 +374,19 @@ mod tests {
             &AnchorParams::default(),
         );
         assert_eq!(got, Some(Anchored::Edge("top-mid")));
+    }
+
+    #[test]
+    fn a_tag_between_two_unconnected_boxes_is_not_a_bridge() {
+        let (n, e) = board();
+        // `right` and `far` without their connector.
+        let e: Vec<_> = e.into_iter().filter(|x| x.key != "right-far").collect();
+        let got = anchor_tag(
+            &b(1097.0, 370.0, 1201.0, 461.0),
+            &n,
+            &e,
+            &AnchorParams::default(),
+        );
+        assert_eq!(got, None);
     }
 }

@@ -15,15 +15,23 @@ fn elided(n: &str) -> Option<String> {
     (t.len() < n.len()).then(|| t.to_string())
 }
 
-/// The board's title as read from the title bar, the app panel, or the producer.
+/// The board's title, from corroborated title bar text, the app panel, or the producer.
+///
+/// Text inside the title band of the canvas is only treated as a title when it looks
+/// like one (two or more words, eight or more characters) and is corroborated: it
+/// matches the producer's board title or app panel text, or it persists (read inside
+/// the band in at least two keyframes, and no more often outside it than inside). Outside the band, only
+/// chrome context removes text: app panel entries and elided title prefixes.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Titles {
-    /// Normalized full titles with how often they were seen, and a display form.
+    /// Corroborated normalized titles with how often they were seen, and a display form.
     exact: BTreeMap<String, (usize, String)>,
     /// Normalized prefixes of elided titles ("Board name...").
     prefixes: Vec<String>,
-    /// Normalized app panel texts (board list and title bar entries).
+    /// Normalized app panel texts (chrome context).
     panel: Vec<String>,
+    /// Normalized producer board titles (corroborate band text only).
+    producer: Vec<String>,
 }
 
 fn title_like(n: &str) -> bool {
@@ -31,35 +39,42 @@ fn title_like(n: &str) -> bool {
 }
 
 impl Titles {
-    fn add(&mut self, text: &str, counted: bool) {
-        let n = normalize(text);
-        if !title_like(&n) {
-            return;
+    fn chrome_match(&self, n: &str, p: &ConsolidationParams) -> bool {
+        let near = |t: &String| difflib::ratio(n, t) >= p.fuzzy_threshold;
+        if self.panel.iter().any(near)
+            || self.prefixes.iter().any(|pre| n.starts_with(pre.as_str()))
+        {
+            return true;
         }
-        match elided(&n) {
-            Some(p) if p.len() >= 8 => self.prefixes.push(p),
-            Some(_) => {}
-            None if counted => {
-                let e = self.exact.entry(n).or_insert((0, text.trim().to_string()));
-                e.0 += 1;
-            }
-            None => self.panel.push(n),
-        }
+        elided(n).is_some_and(|op| op.len() >= 8 && self.panel.iter().any(|t| t.starts_with(&op)))
     }
 
-    /// Titles from every keyframe: the producer's board title, text entirely inside
-    /// the title band, and app panel text (matching only, never the board title).
+    /// Titles from every keyframe (see the type docs).
     pub(crate) fn collect(frames: &[BoardFrame], p: &ConsolidationParams) -> Self {
         let mut t = Self::default();
+        let mut producer: Vec<(String, String)> = Vec::new();
         for f in frames {
-            if let Some(bt) = &f.board_title {
-                t.add(bt, true);
-            }
             for h in &f.title_hints {
-                t.add(h, false);
+                let n = normalize(h);
+                if !title_like(&n) {
+                    continue;
+                }
+                match elided(&n) {
+                    Some(pre) if pre.len() >= 8 => t.prefixes.push(pre),
+                    Some(_) => {}
+                    None => t.panel.push(n.clone()),
+                }
             }
+            if let Some(bt) = &f.board_title {
+                producer.push((normalize(bt), bt.trim().to_string()));
+                t.producer.push(normalize(bt));
+            }
+        }
+        // Band text: counts inside the band, and whether it is ever read outside it.
+        let mut band: BTreeMap<String, (usize, usize, String)> = BTreeMap::new();
+        for f in frames {
             let Some(c) = canvas_of(f).0 else { continue };
-            let band = p.title_band_share * c.height;
+            let limit = p.title_band_share * c.height;
             let b = &f.board;
             let items = b
                 .nodes
@@ -68,16 +83,40 @@ impl Titles {
                 .chain(b.stickies.iter().map(|x| (&x.text, &x.bbox)))
                 .chain(b.other_visible_text.iter().map(|x| (&x.text, &x.bbox)));
             for (text, bb) in items {
-                if bb.y2 <= band {
-                    t.add(text, true);
+                let n = normalize(text);
+                if !title_like(&n) || elided(&n).is_some() {
+                    continue;
                 }
+                let e = band.entry(n).or_insert((0, 0, text.trim().to_string()));
+                if bb.y2 <= limit {
+                    e.0 += 1;
+                } else {
+                    e.1 += 1;
+                }
+            }
+        }
+        for (n, (inside, outside, display)) in band {
+            let persistent = inside >= 2 && inside >= outside;
+            let by_producer = t
+                .producer
+                .iter()
+                .any(|x| difflib::ratio(&n, x) >= p.fuzzy_threshold);
+            let corroborated = inside >= 1 && (by_producer || t.chrome_match(&n, p));
+            if persistent || corroborated {
+                t.exact.insert(n, (inside, display));
+            }
+        }
+        for (n, display) in producer {
+            if title_like(&n) {
+                let e = t.exact.entry(n).or_insert((0, display));
+                e.0 += 1;
             }
         }
         t
     }
 
-    /// True when an element is title bar text: inside the title band, or reading as
-    /// a known title (fuzzy, or by an elided prefix).
+    /// True when an element is title bar text: a corroborated title read inside the
+    /// title band, or chrome context (app panel text, an elided title prefix) anywhere.
     pub(crate) fn is_title(
         &self,
         f: &BoardFrame,
@@ -85,32 +124,20 @@ impl Titles {
         b: &BBox,
         p: &ConsolidationParams,
     ) -> bool {
-        if let Some(c) = canvas_of(f).0 {
-            if b.y2 <= p.title_band_share * c.height {
-                return true;
-            }
-        }
         let n = normalize(text);
         if !title_like(&n) {
             return false;
         }
-        let near = |t: &String| difflib::ratio(&n, t) >= p.fuzzy_threshold;
-        if self.exact.keys().any(near) || self.panel.iter().any(near) {
+        let in_band = canvas_of(f)
+            .0
+            .is_some_and(|c| b.y2 <= p.title_band_share * c.height);
+        if in_band && self.exact.contains_key(&n) {
             return true;
         }
-        let own_prefix = elided(&n);
-        self.prefixes.iter().any(|pre| n.starts_with(pre.as_str()))
-            || own_prefix.is_some_and(|op| {
-                op.len() >= 8
-                    && self
-                        .exact
-                        .keys()
-                        .chain(self.panel.iter())
-                        .any(|t| t.starts_with(&op))
-            })
+        self.chrome_match(&n, p)
     }
 
-    /// The most frequent full title, as written.
+    /// The most frequent corroborated title, as written.
     pub(crate) fn board_title(&self) -> Option<String> {
         self.exact
             .values()
@@ -120,10 +147,11 @@ impl Titles {
 }
 
 /// Fold fragments: a node or sticky whose text is a piece of a longer element of the
-/// same kind at the same place (a cut-off or split reading). Where the two share a
-/// registered cluster their positions must be close; otherwise the fragment must never
-/// be seen apart from the longer element in one keyframe. The longer element must be
-/// seen at least as often. Returns fragment track to target track.
+/// same kind at the same place (a cut-off or split reading). Folding needs positive
+/// geometric evidence (near each other in a keyframe that shows both, or in a shared
+/// registered cluster) and no evidence of being apart; pairs never compared are not
+/// folded. The longer element must be seen at least as often. Returns fragment track
+/// to target track.
 pub(crate) fn fold_fragments(tracks: &[Track]) -> HashMap<usize, usize> {
     let kind = |t: &Track| t.votes().kind();
     let mut out = HashMap::new();
@@ -142,34 +170,38 @@ pub(crate) fn fold_fragments(tracks: &[Track]) -> HashMap<usize, usize> {
             if frames_u.len() < frames_t.len() || !is_fragment_of(&text, &u.text()) {
                 continue;
             }
-            // Seen apart in one keyframe: a different element.
-            let apart = t.obs.iter().any(|a| {
-                u.obs.iter().any(|b| {
-                    a.frame == b.frame
-                        && match (a.raw_bbox, b.raw_bbox) {
-                            (Some(x), Some(y)) => box_distance(&x, &y) > y.width().max(y.height()),
-                            _ => false,
-                        }
-                })
-            });
-            if apart {
-                continue;
+            // Positive geometric evidence is required: the two are near each other
+            // in a keyframe that shows both, or in a registered cluster where both are
+            // placed. Seen apart anywhere, or never compared, they are different.
+            let (mut near, mut apart) = (false, false);
+            let mut judge = |x: &BBox, y: &BBox| {
+                let size = y.width().max(y.height());
+                let d = box_distance(x, y);
+                if d > size {
+                    apart = true;
+                } else if d <= 0.5 * size {
+                    near = true;
+                }
+            };
+            for a in &t.obs {
+                for b in u.obs.iter().filter(|b| b.frame == a.frame) {
+                    if let (Some(x), Some(y)) = (a.raw_bbox, b.raw_bbox) {
+                        judge(&x, &y);
+                    }
+                }
             }
-            // Registered positions, where both have them.
             let clusters: BTreeSet<usize> = t
                 .obs
                 .iter()
                 .filter(|o| o.bbox.is_some())
                 .map(|o| o.cluster)
                 .collect();
-            let placed: Vec<bool> = clusters
-                .iter()
-                .filter_map(|&c| {
-                    let (x, y) = (t.bbox_in(c)?, u.bbox_in(c)?);
-                    Some(box_distance(&x, &y) <= 0.5 * y.width().max(y.height()))
-                })
-                .collect();
-            if placed.iter().any(|v| !v) {
+            for c in clusters {
+                if let (Some(x), Some(y)) = (t.bbox_in(c), u.bbox_in(c)) {
+                    judge(&x, &y);
+                }
+            }
+            if apart || !near {
                 continue;
             }
             if best.is_none_or(|(_, n)| frames_u.len() > n) {
@@ -195,17 +227,21 @@ fn similar(a: &BBox, b: &BBox) -> bool {
     r(a.width(), b.width()) && r(a.height(), b.height())
 }
 
-fn count_lines(values: &mut [f64], tol: f64) -> u32 {
-    values.sort_by(f64::total_cmp);
-    let mut n = 0u32;
+/// Line index of each value: values sorted, a new line where the gap exceeds `tol`.
+fn line_index(values: &[f64], tol: f64) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..values.len()).collect();
+    order.sort_by(|a, b| values[*a].total_cmp(&values[*b]));
+    let mut out = vec![0usize; values.len()];
+    let mut line = 0usize;
     let mut last: Option<f64> = None;
-    for &v in values.iter() {
-        if last.is_none_or(|l| v - l > tol) {
-            n += 1;
+    for i in order {
+        if last.is_some_and(|l| values[i] - l > tol) {
+            line += 1;
         }
-        last = Some(v);
+        out[i] = line;
+        last = Some(values[i]);
     }
-    n
+    out
 }
 
 /// Derive sticky groups: in each keyframe, final stickies of similar size aligned in
@@ -218,7 +254,8 @@ pub(crate) fn derive_groups(
     frames: &[BoardFrame],
     final_sticky: &HashMap<usize, String>,
     min_cards: usize,
-) -> (Vec<StickyGroup>, Vec<usize>) {
+    excluded: &dyn Fn(usize) -> bool,
+) -> (Vec<StickyGroup>, Vec<(usize, String)>) {
     struct Cand {
         members: Vec<(usize, BBox)>,
         frame: usize,
@@ -285,14 +322,16 @@ pub(crate) fn derive_groups(
             .cmp(&a.members.len())
             .then(a.frame.cmp(&b.frame))
     });
+    // Components within one keyframe are disjoint, so candidates share cards only
+    // when two keyframes saw the same cards: those shared cards stay with the larger
+    // view already taken, and a candidate stands only on the cards no group holds
+    // yet (a new row or column seen later becomes its own group).
     let mut accepted: Vec<Cand> = Vec::new();
-    for c in cands {
-        let set: BTreeSet<usize> = c.members.iter().map(|m| m.0).collect();
-        let overlaps = accepted.iter().any(|a| {
-            let s: BTreeSet<usize> = a.members.iter().map(|m| m.0).collect();
-            2 * s.intersection(&set).count() >= set.len()
-        });
-        if !overlaps {
+    let mut taken: BTreeSet<usize> = BTreeSet::new();
+    for mut c in cands {
+        c.members.retain(|m| !taken.contains(&m.0));
+        if c.members.len() >= min_cards.max(2) {
+            taken.extend(c.members.iter().map(|m| m.0));
             accepted.push(c);
         }
     }
@@ -311,27 +350,28 @@ pub(crate) fn derive_groups(
             boxes.iter().map(|b| b.x2).fold(f64::NEG_INFINITY, f64::max),
             boxes.iter().map(|b| b.y2).fold(f64::NEG_INFINITY, f64::max),
         );
-        let rows = count_lines(
-            &mut boxes.iter().map(|b| center(b).1).collect::<Vec<_>>(),
+        // One clustering gives both the row and column counts and the member order.
+        let row_of = line_index(
+            &boxes.iter().map(|b| center(b).1).collect::<Vec<_>>(),
             0.5 * mh,
         );
-        let cols = count_lines(
-            &mut boxes.iter().map(|b| center(b).0).collect::<Vec<_>>(),
+        let col_of = line_index(
+            &boxes.iter().map(|b| center(b).0).collect::<Vec<_>>(),
             0.5 * mw,
         );
-        let mut members = c.members.clone();
-        members.sort_by(|a, b| {
-            let (ca, cb) = (center(&a.1), center(&b.1));
-            ((ca.1 / (0.5 * mh)).round())
-                .total_cmp(&(cb.1 / (0.5 * mh)).round())
-                .then(ca.0.total_cmp(&cb.0))
-        });
+        let rows = row_of.iter().max().map_or(0, |m| m + 1) as u32;
+        let cols = col_of.iter().max().map_or(0, |m| m + 1) as u32;
+        let mut order: Vec<usize> = (0..c.members.len()).collect();
+        order.sort_by_key(|&i| (row_of[i], col_of[i]));
+        let members: Vec<(usize, BBox)> = order.iter().map(|&i| c.members[i]).collect();
         let member_set: BTreeSet<usize> = members.iter().map(|m| m.0).collect();
         // Heading: nearest text just above the group, overlapping it horizontally.
         let heading = tracks
             .iter()
             .enumerate()
-            .filter(|(ti, t)| !member_set.contains(ti) && t.votes().kind() != ObsList::EdgeLabel)
+            .filter(|(ti, t)| {
+                !member_set.contains(ti) && !excluded(*ti) && t.votes().kind() != ObsList::EdgeLabel
+            })
             .filter_map(|(ti, t)| {
                 let b = t.obs.iter().find(|o| o.frame == c.frame)?.raw_bbox?;
                 let overlap = (b.x2.min(ext.x2) - b.x1.max(ext.x1)).max(0.0);
@@ -342,7 +382,7 @@ pub(crate) fn derive_groups(
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|x| x.0);
         if let Some(h) = heading {
-            headings.push(h);
+            headings.push((h, format!("group-{}", gi + 1)));
         }
         groups.push(StickyGroup {
             id: format!("group-{}", gi + 1),

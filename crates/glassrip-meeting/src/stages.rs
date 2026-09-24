@@ -746,12 +746,12 @@ impl Stage for BoardStateStage {
         "board_state"
     }
     fn version(&self) -> u32 {
-        1
+        2
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
             schema: BOARD_STATE,
-            version: Version::new(1, 0, 0),
+            version: Version::new(1, 1, 0),
         }
     }
     fn inputs(&self) -> Vec<InputDecl> {
