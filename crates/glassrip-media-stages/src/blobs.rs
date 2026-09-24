@@ -70,10 +70,31 @@ fn valid_ext(e: &str) -> bool {
     !e.is_empty() && e.len() <= 8 && e.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
-/// blake3 of a file, multithreaded and memory-mapped for large files.
+/// blake3 of a file, read in 8 MiB chunks (bounded memory, no memory map) and hashed on
+/// several threads per chunk.
 pub fn hash_file(path: &Path) -> io::Result<String> {
+    use std::io::Read;
+    const CHUNK: usize = 8 << 20;
     let mut h = blake3::Hasher::new();
-    h.update_mmap_rayon(path)?;
+    let mut f = fs_err::File::open(path)?;
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        let mut filled = 0;
+        while filled < CHUNK {
+            let n = f.read(&mut buf[filled..])?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        if filled == 0 {
+            break;
+        }
+        h.update_rayon(&buf[..filled]);
+        if filled < CHUNK {
+            break;
+        }
+    }
     Ok(h.finalize().to_hex().to_string())
 }
 
@@ -411,5 +432,17 @@ mod tests {
         let h = "a".repeat(64);
         let t = format!("x \"blake3\":\"{h}\" y \"blake3\":\"short\"");
         assert_eq!(referenced_hashes(&t), [h].into_iter().collect());
+    }
+
+    #[test]
+    fn chunked_hash_matches_one_shot() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("big.bin");
+        let data: Vec<u8> = (0..(8 << 20) + 12345).map(|i| (i % 251) as u8).collect();
+        fs_err::write(&p, &data).unwrap();
+        assert_eq!(
+            hash_file(&p).unwrap(),
+            blake3::hash(&data).to_hex().to_string()
+        );
     }
 }
