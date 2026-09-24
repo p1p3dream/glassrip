@@ -355,6 +355,11 @@ pub struct KeyframesConfig {
     /// sharpness merges regardless of content.
     #[garde(range(min = 0.0, max = 1.0))]
     pub merge_blur_ratio: f64,
+    /// `production`: the representative is the run frame nearest the run's temporal
+    /// center among frames within this share of the best sharpness (merged singletons
+    /// excluded). `prototype_compat` always takes the sharpest frame.
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub production_rep_sharpness_tolerance: f64,
 }
 
 impl Default for KeyframesConfig {
@@ -367,6 +372,7 @@ impl Default for KeyframesConfig {
             merge_min_ssim: 0.70,
             merge_max_changed_frac: 0.20,
             merge_blur_ratio: 0.35,
+            production_rep_sharpness_tolerance: 0.05,
         }
     }
 }

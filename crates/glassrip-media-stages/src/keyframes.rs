@@ -45,6 +45,8 @@ pub struct KeyframesParams {
     pub merge_max_changed_frac: f64,
     /// Merge: blur ratio against the median sharpness.
     pub merge_blur_ratio: f64,
+    /// `production`: representative sharpness tolerance (see [`central_representative`]).
+    pub rep_sharpness_tolerance: f64,
     /// Scoring (must match `features`).
     pub scoring: ScoringParams,
 }
@@ -60,6 +62,7 @@ impl KeyframesParams {
             merge_min_ssim: k.merge_min_ssim,
             merge_max_changed_frac: k.merge_max_changed_frac,
             merge_blur_ratio: k.merge_blur_ratio,
+            rep_sharpness_tolerance: k.production_rep_sharpness_tolerance,
             scoring,
         }
     }
@@ -279,7 +282,23 @@ impl KeyframesStage {
             return Err(StageError::Invalid(format!("cannot score frames: {e}")));
         }
         let end = end_s.max(times[n - 1]);
-        let kfs = segment::keyframes(&runs, &times, &sharp, end, &bounds);
+        let mut kfs = segment::keyframes(&runs, &times, &sharp, end, &bounds);
+        if production {
+            let merged_frames: std::collections::HashSet<usize> =
+                merges.iter().map(|m| m.frame).collect();
+            for kf in &mut kfs {
+                let r = central_representative(
+                    &kf.frames,
+                    &sharp,
+                    &times,
+                    &merged_frames,
+                    self.params.rep_sharpness_tolerance,
+                );
+                kf.rep_frame = r;
+                kf.t_rep = times[r];
+                kf.sharpness = sharp[r];
+            }
+        }
         let run_of: HashMap<usize, usize> = runs
             .iter()
             .enumerate()
@@ -338,6 +357,47 @@ impl KeyframesStage {
             })
             .collect())
     }
+}
+
+/// Production representative: among the run's own frames (merged singletons excluded
+/// unless nothing else is left) whose sharpness is within `tol` of the best, the one
+/// nearest the midpoint of those frames' time span (ties: sharper, then earlier). Avoids
+/// picking a transition frame at a run edge or a merged singleton from a neighboring state.
+pub fn central_representative(
+    run: &[usize],
+    sharp: &[f64],
+    times: &[f64],
+    merged: &std::collections::HashSet<usize>,
+    tol: f64,
+) -> usize {
+    let own: Vec<usize> = run
+        .iter()
+        .copied()
+        .filter(|i| !merged.contains(i))
+        .collect();
+    let pool = if own.is_empty() { run.to_vec() } else { own };
+    let best = pool
+        .iter()
+        .map(|&i| sharp[i])
+        .fold(f64::NEG_INFINITY, f64::max);
+    let lo = pool.iter().map(|&i| times[i]).fold(f64::INFINITY, f64::min);
+    let hi = pool
+        .iter()
+        .map(|&i| times[i])
+        .fold(f64::NEG_INFINITY, f64::max);
+    let mid = (lo + hi) / 2.0;
+    let mut cands: Vec<usize> = pool
+        .into_iter()
+        .filter(|&i| sharp[i] >= (1.0 - tol) * best)
+        .collect();
+    cands.sort_by(|&a, &b| {
+        (times[a] - mid)
+            .abs()
+            .total_cmp(&(times[b] - mid).abs())
+            .then(sharp[b].total_cmp(&sharp[a]))
+            .then(a.cmp(&b))
+    });
+    cands.first().copied().unwrap_or(run[0])
 }
 
 /// Splits each island frame out of its run into a run of its own. Returns the runs (in
@@ -418,7 +478,7 @@ impl Stage for KeyframesStage {
         "keyframes"
     }
     fn version(&self) -> u32 {
-        2
+        3
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
@@ -496,6 +556,27 @@ mod tests {
         assert_eq!(
             rejoin_islands(merged, &origin, &[2]),
             vec![vec![0, 1, 2, 3, 4], vec![5, 6]]
+        );
+    }
+
+    #[test]
+    fn representative_is_central_sharp_and_not_merged() {
+        let times: Vec<f64> = (0..6).map(|i| 2.0 * i as f64).collect();
+        // Frame 5 is the sharpest but a merged singleton; frames 0..5 are near-equal.
+        let sharp = [257.0, 240.0, 253.0, 255.0, 100.0, 300.0];
+        let merged = [5usize].into_iter().collect();
+        let r = central_representative(&[0, 1, 2, 3, 4, 5], &sharp, &times, &merged, 0.05);
+        // Own frames 0..4 span 0..8 s (mid 4 s); within 5% of 257: frames 0, 2, 3.
+        assert_eq!(r, 2);
+        // Only merged frames left: they are used.
+        assert_eq!(
+            central_representative(&[5], &sharp, &times, &merged, 0.05),
+            5
+        );
+        // Zero tolerance is the sharpest own frame.
+        assert_eq!(
+            central_representative(&[0, 1, 2, 3, 4, 5], &sharp, &times, &merged, 0.0),
+            0
         );
     }
 
