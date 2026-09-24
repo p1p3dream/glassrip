@@ -54,7 +54,9 @@ impl Default for OcrParams {
             min_text_height: 10,
             max_text_height: 80,
             rec_batch: 16,
-            cuda_mem_limit_mib: 1536,
+            // the detector needs about 2 GiB at 1920-wide frames; 1.5 GiB failed
+            // every frame on the reference meeting
+            cuda_mem_limit_mib: 3072,
         }
     }
 }

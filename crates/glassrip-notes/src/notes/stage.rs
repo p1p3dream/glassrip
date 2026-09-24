@@ -146,7 +146,7 @@ impl NotesStage {
             .map_err(Self::model_err)?
             .into_iter()
             .find(|m| same_model(&m.name, &p.text_model));
-        match &placement {
+        let refused = match &placement {
             Some(m) if m.size_vram < m.size && !p.allow_spill => Err(ErrorInfo::new(
                 ErrorCode::ModelRequest,
                 format!(
@@ -158,8 +158,11 @@ impl NotesStage {
                 ),
             )),
             None => Err(ErrorInfo::new(ErrorCode::ModelRequest, format!("text model {} did not load", p.text_model))),
-            _ => Ok(placement),
-        }
+            _ => return Ok(placement),
+        };
+        // a model that spilled to system memory only holds memory: unload it
+        let _ = self.backend.unload(&p.text_model).await;
+        refused
     }
 
     /// One schema-constrained call, parsed as a [`Draft`], with one retry on a parse failure.
@@ -833,6 +836,11 @@ impl Stage for NotesStage {
         ctx: &ItemContext,
         work: Self::Work,
     ) -> Result<MeetingNotes, ErrorInfo> {
-        self.run(&work, ctx).await
+        let out = self.run(&work, ctx).await;
+        if out.is_err() && self.params.unload_after {
+            // best effort, as on success: do not leave the text model resident
+            let _ = self.backend.unload(&self.params.text_model).await;
+        }
+        out
     }
 }

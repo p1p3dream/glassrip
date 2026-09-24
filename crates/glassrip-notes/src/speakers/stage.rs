@@ -77,6 +77,9 @@ struct Analysis {
 }
 
 /// `name_speakers`: `glassrip.transcript` (+ keyframes, OCR) to `glassrip.speakers`.
+///
+/// With visual cues the stage holds the OCR sessions (and their GPU memory)
+/// until it is dropped; drop it before GPU phase C so the text model fits.
 pub struct NameSpeakersStage {
     params: NameSpeakersParams,
     frames: Option<Arc<dyn FrameSource>>,
