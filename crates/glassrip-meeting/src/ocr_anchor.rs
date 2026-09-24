@@ -16,6 +16,12 @@
 //!   the reader's label box, or between the two nodes when there is none.
 //! - **Masking.** Every OCR text box is returned for masking, so label glyphs never
 //!   join a connector wherever the reader placed its boxes.
+//!
+//! OCR boxes come from the DB detector, which expands each text region by
+//! `area * unclip_ratio / perimeter` on every side (about 0.75 of the text height at
+//! the default ratio 1.5). Used as is, such a box covers an arrowhead drawn next to
+//! a label, so every OCR box is first shrunk back to its text core
+//! ([`glyph_box`]).
 
 use glassrip_vision::board::ValidatedBoard;
 use glassrip_vision::BBox;
@@ -42,6 +48,35 @@ pub struct OcrAnchorParams {
     /// Two words of four or more letters match when their similarity ratio
     /// ([`crate::difflib::ratio`]) reaches this (OCR misreads a letter or two).
     pub word_similarity: f64,
+    /// The OCR detector's box expansion ratio (DB `unclip_ratio`), undone by
+    /// [`glyph_box`]; 0 keeps OCR boxes as they are.
+    #[serde(default = "default_unclip_ratio")]
+    pub ocr_unclip_ratio: f64,
+}
+
+fn default_unclip_ratio() -> f64 {
+    1.5
+}
+
+/// The text core of a DB-detected box: the detector grew a region of `w x h` by
+/// `d = w h r / (2 (w + h))` on every side, so for the final `W x H` box `d` is
+/// the smaller root of `(8 + 4r) d^2 - 2 (1 + r)(W + H) d + r W H = 0`.
+pub fn glyph_box(b: &BBox, unclip_ratio: f64) -> BBox {
+    let (w, h, r) = (b.width(), b.height(), unclip_ratio);
+    if r <= 0.0 || w <= 0.0 || h <= 0.0 {
+        return *b;
+    }
+    let a = 8.0 + 4.0 * r;
+    let bb = 2.0 * (1.0 + r) * (w + h);
+    let disc = bb * bb - 4.0 * a * r * w * h;
+    if disc < 0.0 {
+        return *b;
+    }
+    let d = ((bb - disc.sqrt()) / (2.0 * a)).clamp(0.0, w.min(h) / 2.0 - 0.5);
+    if d <= 0.0 {
+        return *b;
+    }
+    BBox::new(b.x1 + d, b.y1 + d, b.x2 - d, b.y2 - d)
 }
 
 impl Default for OcrAnchorParams {
@@ -52,6 +87,7 @@ impl Default for OcrAnchorParams {
             min_text_cover: 0.5,
             min_shift_share: 0.15,
             word_similarity: 0.75,
+            ocr_unclip_ratio: default_unclip_ratio(),
         }
     }
 }
@@ -178,7 +214,7 @@ pub fn reanchor(board: &ValidatedBoard, ocr: &[TextAnchor], p: &OcrAnchorParams)
         .filter(|a| a.text.chars().filter(|c| c.is_alphanumeric()).count() >= 2)
         .map(|a| Span {
             words: words(&a.text),
-            bbox: a.bbox,
+            bbox: glyph_box(&a.bbox, p.ocr_unclip_ratio),
         })
         .filter(|s| !s.words.is_empty())
         .collect();
@@ -295,6 +331,34 @@ mod tests {
         }
     }
 
+    /// The fixtures below give text-core boxes: no unclip to undo.
+    fn tight() -> OcrAnchorParams {
+        OcrAnchorParams {
+            ocr_unclip_ratio: 0.0,
+            ..OcrAnchorParams::default()
+        }
+    }
+
+    #[test]
+    fn detector_boxes_shrink_back_to_their_text_core() {
+        // A 100 x 10 text core grown by d = 100 * 10 * 1.5 / 220 on each side.
+        let d = 1500.0 / 220.0;
+        let det = BBox::new(50.0 - d, 20.0 - d, 150.0 + d, 30.0 + d);
+        let g = glyph_box(&det, 1.5);
+        for (got, want) in [(g.x1, 50.0), (g.y1, 20.0), (g.x2, 150.0), (g.y2, 30.0)] {
+            assert!((got - want).abs() < 1e-6, "{g:?}");
+        }
+        assert_eq!(glyph_box(&det, 0.0), det);
+        // The shrunk label box leaves an arrowhead drawn just above the text
+        // unmasked; the detector's box would have covered it.
+        let label = [anchor("GRPC", det.x1, det.y1, det.x2, det.y2)];
+        let r = reanchor(&board(vec![], vec![]), &label, &OcrAnchorParams::default());
+        let head_tip = (100.0, 15.0);
+        let m = r.text_boxes[0];
+        assert!(head_tip.1 < m.y1, "{m:?}");
+        assert!(det.y1 < head_tip.1);
+    }
+
     fn board(nodes: Vec<BoardNode>, edges: Vec<BoardEdge>) -> ValidatedBoard {
         ValidatedBoard {
             nodes,
@@ -327,7 +391,7 @@ mod tests {
             anchor("Service", 168.0, 250.0, 232.0, 263.0),
             anchor("Other box", 600.0, 230.0, 680.0, 245.0),
         ];
-        let r = reanchor(&b, &ocr, &OcrAnchorParams::default());
+        let r = reanchor(&b, &ocr, &tight());
         assert_eq!(r.nodes_moved, 1);
         let m = r.board.nodes[0].bbox;
         let c = center(&m);
@@ -359,7 +423,7 @@ mod tests {
             // n2's word, but outside its search window.
             anchor("Queue", 900.0, 600.0, 950.0, 615.0),
         ];
-        let r = reanchor(&b, &ocr, &OcrAnchorParams::default());
+        let r = reanchor(&b, &ocr, &tight());
         assert_eq!(r.nodes_moved, 0);
         assert_eq!(r.board.nodes, b.nodes);
     }
@@ -376,7 +440,7 @@ mod tests {
         );
         // Only "Service" found, far below the reader's center: 7 of 34 characters.
         let ocr = vec![anchor("Service", 170.0, 250.0, 230.0, 262.0)];
-        let r = reanchor(&b, &ocr, &OcrAnchorParams::default());
+        let r = reanchor(&b, &ocr, &tight());
         assert_eq!(r.nodes_moved, 0);
     }
 
@@ -401,11 +465,7 @@ mod tests {
         ];
         // Reader label box 30 px off, and no label box at all.
         for lb in [Some(BBox::new(150.0, 180.0, 185.0, 192.0)), None] {
-            let r = reanchor(
-                &board(nodes.clone(), vec![edge(lb)]),
-                &ocr,
-                &OcrAnchorParams::default(),
-            );
+            let r = reanchor(&board(nodes.clone(), vec![edge(lb)]), &ocr, &tight());
             assert_eq!(r.labels_found, 1, "{lb:?}");
             assert_eq!(
                 r.board.edges[0].label_bbox,
