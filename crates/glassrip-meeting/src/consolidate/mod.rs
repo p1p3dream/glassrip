@@ -2039,7 +2039,8 @@ pub fn consolidate_with_probe(
         // Reader boxes that all coincide are no geometry, unless OCR placed what is
         // used (an unreliable reading keeps nothing else).
         let use_geometry = geo || placed.unreliable;
-        let has_ocr = !f.ocr_anchors.is_empty();
+        // OCR can vouch for names only where the OCR check runs.
+        let has_ocr = params.owner_geometry.enabled && !f.ocr_anchors.is_empty();
         let pad =
             |g: &BBox| owner_geometry::tag_box(g, placed.line, params.owner_geometry.tag_pad_lines);
         // OCR-first tags. A reader tag OCR read sits on its OCR text; in a keyframe

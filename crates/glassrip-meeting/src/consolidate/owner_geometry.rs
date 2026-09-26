@@ -363,8 +363,27 @@ pub fn place(
     let unreliable = located.len() >= p.min_located.max(1)
         && displaced as f64 >= p.displaced_share * located.len() as f64;
 
-    // Every name span, flagged when it lies in another element (its reader box or its
-    // located text) whose text mentions the name without being the name.
+    // OCR reads another word (3+ characters, not a name of `pid`) of `text` within two
+    // lines of `c`: the name is part of that text as written on the canvas.
+    let words_near = |c: (f64, f64), text: &str, pid: &str| {
+        let norm = normalize(text);
+        let words: Vec<&str> = norm
+            .split_whitespace()
+            .filter(|w| w.chars().count() >= 3 && names(w).as_deref() != Some(pid))
+            .collect();
+        ocr.iter().zip(&glyphs).any(|(a, g)| {
+            let dx = (g.x1 - c.0).max(c.0 - g.x2).max(0.0);
+            let dy = (g.y1 - c.1).max(c.1 - g.y2).max(0.0);
+            dx <= 2.0 * line
+                && dy <= 2.0 * line
+                && normalize(&a.text)
+                    .split_whitespace()
+                    .any(|w| words.contains(&w))
+        })
+    };
+    // Every name span, flagged when it lies in another element whose text mentions the
+    // name without being the name: inside the element's located text when OCR found
+    // it, else inside its reader box with more of its words read around the name.
     let spans_out: Vec<NameSpan> = name_spans
         .iter()
         .map(|(pid, g, text)| {
@@ -374,7 +393,7 @@ pub fn place(
             let mention = elements.iter().zip(&found).any(|(e, f)| {
                 let inside = match f {
                     Some(f) => in_margin(c, &f.text, line, line),
-                    None => in_window(c, &e.1, 0.0),
+                    None => in_window(c, &e.1, 0.0) && words_near(c, e.0, pid),
                 };
                 inside && names(e.0).as_deref() != Some(pid) && mentions(e.0, pid, names)
             });

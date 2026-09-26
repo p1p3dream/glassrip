@@ -3370,10 +3370,32 @@ fn a_name_mentioned_in_a_sticky_is_no_tag() {
         })
         .collect();
     let s = run(
-        frames_with_ocr(&specs, &|_| vec![("Avery", (1200.0, 300.0))]),
+        frames_with_ocr(&specs, &|_| {
+            vec![
+                ("Ask", (1200.0, 272.0)),
+                ("Avery", (1200.0, 300.0)),
+                ("about retention", (1200.0, 328.0)),
+            ]
+        }),
         &params(),
     );
     assert!(avery(&s).is_empty(), "{:#?}", s.owner_assignments);
+    // The same sticky's reader box thrown over a real tag elsewhere: OCR reads no
+    // word of the sticky around the name, so the tag stands.
+    let specs: Vec<Spec> = (0..4)
+        .map(|_| {
+            let mut s = base();
+            s.stickies = vec![("Ask Avery about retention", ABOVE_GATEWAY)];
+            s
+        })
+        .collect();
+    let s = run(
+        frames_with_ocr(&specs, &|_| vec![("Avery", ABOVE_GATEWAY)]),
+        &params(),
+    );
+    let a = avery(&s);
+    assert_eq!(a.len(), 1, "{a:#?}");
+    assert_eq!(a[0].target.texts(), vec!["Ingest Gateway"]);
 }
 
 #[test]

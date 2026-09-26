@@ -644,9 +644,17 @@ pub fn assign_with(
             if support < confirm && corroboration.is_none() && !final_hold {
                 continue;
             }
-            let at = run[first].t_start_s;
-            let opened_at = run[first].keyframe_id.clone();
-            let sight: Vec<OwnerSighting> = run.iter().map(|r| r.sighting.clone()).collect();
+            // Confirmed by a stretch: from its start. Opened on this keyframe alone
+            // (corroboration, final hold): from this keyframe, the run's last step.
+            let from = if support < confirm {
+                run.len() - 1
+            } else {
+                first
+            };
+            let at = run[from].t_start_s;
+            let opened_at = run[from].keyframe_id.clone();
+            let sight: Vec<OwnerSighting> =
+                run[from..].iter().map(|r| r.sighting.clone()).collect();
             // Where an open target being left was first read with the person named
             // nowhere since its last sighting, else `at`.
             let left_at = |o: &Open| {
@@ -902,9 +910,12 @@ pub fn collapse_edge_pairs(
         for (edge, a, b) in edges {
             let pa = group.iter().position(|s| s.target.as_ref() == Some(a));
             let pb = group.iter().position(|s| s.target.as_ref() == Some(b));
-            // Only two separate tags; one tag bridging both ends stays two node targets.
+            // Only two separate tags; one tag bridging both ends stays two node targets,
+            // and two placed tags are two physical tags ([`consolidate_tags`]).
             if let (Some(pa), Some(pb)) = (pa, pb) {
-                if group[pa].tag == group[pb].tag {
+                if group[pa].tag == group[pb].tag
+                    || (group[pa].place.is_some() && group[pb].place.is_some())
+                {
                     continue;
                 }
                 let mut merged = group[pa.min(pb)].clone();
@@ -1678,5 +1689,37 @@ mod tests {
         ];
         consolidate_tags(&mut w, 0.5);
         assert_eq!(run(&w)[0].valid_from_s, 0.0);
+    }
+
+    #[test]
+    fn a_final_hold_after_another_tag_opens_at_the_last_keyframe() {
+        // n2 read once at one place, then (last, long, OCR placed) at another place:
+        // the final hold opens at the last keyframe, not at the earlier sighting.
+        let mut v = vec![
+            at(s(0.0, Some(node("n1"))), 50.0, 50.0),
+            at(s(10.0, Some(node("n1"))), 51.0, 50.0),
+            at(s(50.0, Some(node("n2"))), 300.0, 300.0),
+            OwnerSighting {
+                t_end_s: 160.0,
+                anchor: AnchorKind::GeometryNode,
+                ocr_located: true,
+                ..at(s(100.0, Some(node("n2"))), 700.0, 700.0)
+            },
+        ];
+        consolidate_tags(&mut v, 0.5);
+        let a = assign(
+            "p1",
+            "Avery",
+            &v,
+            160.0,
+            &params(),
+            &NoCorroboration,
+            &|_, _, _| false,
+        );
+        let n2: Vec<_> = a.iter().filter(|x| x.target == node("n2")).collect();
+        assert_eq!(n2.len(), 1, "{a:#?}");
+        assert_eq!(n2[0].opened_by, OpenReason::FinalHold);
+        assert_eq!(n2[0].valid_from_s, 100.0);
+        assert_eq!(n2[0].sightings.len(), 1);
     }
 }
