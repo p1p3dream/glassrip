@@ -1508,6 +1508,12 @@ mod tests {
             "Tamsin owns billing. Quill reviews Ledger.",
             &v
         ));
+        // an unbroken run that straddles a clause boundary is two clauses
+        assert!(!covers(
+            "Tamsin reviews Ledger step",
+            "Quill asks Tamsin; reviews Ledger",
+            &v
+        ));
         let gold = "Post notes for the crew to use";
         assert!(covers(gold, "Post notes for the crew", &v));
         assert!(!covers(
