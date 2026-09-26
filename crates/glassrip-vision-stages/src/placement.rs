@@ -139,7 +139,7 @@ impl Default for MonitorConfig {
             poll_interval: Duration::from_secs(2),
             max_pause: Duration::from_secs(600),
             server_wait: Duration::from_secs(120),
-            num_ctx: 8192,
+            num_ctx: glassrip_vision::ollama::DEFAULT_NUM_CTX,
         }
     }
 }

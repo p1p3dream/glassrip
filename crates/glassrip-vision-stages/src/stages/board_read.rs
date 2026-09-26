@@ -87,11 +87,13 @@ impl Default for BoardReadParams {
     fn default() -> Self {
         Self {
             seed: 0,
-            num_ctx: 8192,
+            num_ctx: glassrip_vision::ollama::DEFAULT_NUM_CTX,
             // Dense boards (a 3x3 card grid plus stickies) truncated at 2,048
-            // output tokens; the budget is sized per request to fill num_ctx.
+            // output tokens, and dense real boards at 3,072 while still emitting
+            // valid JSON; the budget is sized per request to fill num_ctx, so
+            // this cap only takes effect when num_ctx leaves room for it.
             min_num_predict: 1024,
-            max_num_predict: 3072,
+            max_num_predict: 6144,
             ctx_headroom: 512,
             target_long_edge_px: BOARD_LONG_EDGE,
             min_long_edge_px: LOW_RES_THRESHOLD,
@@ -486,7 +488,9 @@ impl Stage for BoardReadStage {
         // 2: repetition guard and retry, and model-reply failures recurrent
         // instead of terminal (outputs of 1 may cache a failure as permanent).
         // 3: final repetition guard and settled-failure rules.
-        3
+        // 4: output budget up to 6,144 tokens (num_ctx 12,288); outputs of 3
+        // may cache a dense board as truncated.
+        4
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
@@ -652,7 +656,11 @@ mod tests {
 
     #[test]
     fn output_budget_fills_the_context() {
-        let p = BoardReadParams::default();
+        // A context too small for the cap: the budget is what it leaves.
+        let p = BoardReadParams {
+            num_ctx: 8192,
+            ..BoardReadParams::default()
+        };
         let img =
             |w, h| prepare_board_image(&DynamicImage::ImageRgb8(RgbImage::new(w, h))).unwrap();
         let opts = GenerationOptions {
@@ -669,6 +677,92 @@ mod tests {
             + glassrip_vision::ollama::MESSAGE_OVERHEAD_TOKENS
             + b;
         assert!(total + p.ctx_headroom <= p.num_ctx || b == p.min_num_predict);
+    }
+
+    fn full_hd_board_request() -> VisionRequest {
+        // The canvas shape of the dense boards that truncated at 3,072 tokens.
+        let img = prepare_board_image(&DynamicImage::ImageRgb8(RgbImage::new(1920, 1176))).unwrap();
+        board_read_request(
+            &img,
+            GenerationOptions {
+                seed: 0,
+                num_predict: 1,
+            },
+        )
+        .unwrap()
+    }
+
+    fn used_tokens(p: &BoardReadParams, r: &VisionRequest, budget: u32) -> u32 {
+        r.image.tokens()
+            + glassrip_vision::ollama::estimate_text_tokens(&r.prompt)
+            + glassrip_vision::ollama::MESSAGE_OVERHEAD_TOKENS
+            + budget
+            + p.ctx_headroom
+    }
+
+    #[test]
+    fn dense_boards_get_the_full_budget_within_the_context() {
+        let p = BoardReadParams::default();
+        assert_eq!(p.max_num_predict, 6144);
+        let r = full_hd_board_request();
+        let b = output_budget(&p, &r);
+        assert_eq!(
+            b, p.max_num_predict,
+            "the default context leaves room for the cap"
+        );
+        assert!(used_tokens(&p, &r, b) <= p.num_ctx);
+        // The largest image the sizing sends (square, token-capped) still fits.
+        let sq = prepare_board_image(&DynamicImage::ImageRgb8(RgbImage::new(4000, 4000))).unwrap();
+        let r = board_read_request(
+            &sq,
+            GenerationOptions {
+                seed: 0,
+                num_predict: 1,
+            },
+        )
+        .unwrap();
+        let b = output_budget(&p, &r);
+        assert!(b >= 3 * p.max_num_predict / 4, "{b}");
+        assert!(used_tokens(&p, &r, b) <= p.num_ctx, "{b}");
+    }
+
+    #[test]
+    fn the_old_context_cannot_reach_the_cap() {
+        // num_ctx 8,192 capped a full HD board below the old 3,072 limit (e2e
+        // runs showed 2,888): raising the cap alone would change nothing.
+        let p = BoardReadParams {
+            num_ctx: 8192,
+            ..BoardReadParams::default()
+        };
+        let b = output_budget(&p, &full_hd_board_request());
+        assert!(b < 3200, "{b}");
+    }
+
+    #[test]
+    fn stage_context_matches_the_run_config() {
+        assert_eq!(
+            BoardReadParams::default().num_ctx,
+            glassrip_core::config::Config::default().ollama.num_ctx
+        );
+        assert_eq!(
+            crate::placement::MonitorConfig::default().num_ctx,
+            BoardReadParams::default().num_ctx
+        );
+    }
+
+    #[test]
+    fn repetition_retry_keeps_the_guard_and_shrinks_the_budget() {
+        let p = BoardReadParams::default();
+        let mut r = full_hd_board_request();
+        r.options.num_predict = output_budget(&p, &r);
+        r.repetition_guard = Some(p.repetition);
+        let retry = repetition_retry(&p, &r);
+        assert_eq!(retry.repetition_guard, Some(p.repetition));
+        assert_eq!(retry.options.num_predict, 4608);
+        assert_eq!(
+            retry.sampling.repeat_penalty,
+            Some(p.repetition_retry_penalty)
+        );
     }
 
     #[test]

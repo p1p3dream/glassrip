@@ -145,7 +145,9 @@ impl Default for OllamaConfig {
             host: "http://localhost:11434".into(),
             request_timeout_s: 120,
             large_model_request_timeout_s: 400,
-            num_ctx: 8192,
+            // glassrip_vision::ollama::DEFAULT_NUM_CTX (a dense board read needs
+            // the image, the prompt, and a 6,144-token reply).
+            num_ctx: 12288,
             num_predict: 2048,
             keep_alive: "30m".into(),
             temperature: 0.0,
@@ -687,7 +689,7 @@ mod tests {
             (0.70, 0.20, 0.35)
         );
         assert_eq!(c.models.vision, "qwen2.5vl:7b");
-        assert_eq!(c.ollama.num_ctx, 8192);
+        assert_eq!(c.ollama.num_ctx, 12288);
         assert_eq!(c.ollama.num_predict, 2048);
         assert_eq!(c.ollama.host, "http://localhost:11434");
         assert_eq!(

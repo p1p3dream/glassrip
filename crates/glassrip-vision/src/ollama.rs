@@ -24,8 +24,10 @@ use crate::schema::parse_output_text;
 
 /// Default per-request timeout for 7b-class models.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-/// Default context window, used for every request in a run.
-pub const DEFAULT_NUM_CTX: u32 = 8192;
+/// Default context window, used for every request in a run. Sized for a dense
+/// board read: a 1920 px canvas plus the prompt measured up to about 5,400
+/// prompt tokens, which leaves a full 6,144-token reply and the headroom.
+pub const DEFAULT_NUM_CTX: u32 = 12288;
 /// Default server slot count for qwen2.5vl:7b with `OLLAMA_NUM_PARALLEL=4`.
 pub const DEFAULT_SLOTS: usize = 4;
 
