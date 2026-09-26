@@ -264,7 +264,9 @@ impl Stage for ClassifyStage {
         "classify"
     }
     fn version(&self) -> u32 {
-        1
+        // 2: model-reply failures recurrent instead of terminal (outputs of 1 may
+        // cache a failure as permanent).
+        2
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {

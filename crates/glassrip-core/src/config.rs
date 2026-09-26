@@ -617,7 +617,16 @@ pub struct RunnerConfig {
     /// Default per-item timeout, seconds (stages may override); absent means none.
     #[garde(inner(range(min = 0.001)))]
     pub item_timeout_s: Option<f64>,
+    /// A model-reply item failure (invalid, cut off, looping) settles as terminal
+    /// once it ends the item identically on this many consecutive runs; until
+    /// then every rerun retries it.
+    #[garde(range(min = 1))]
+    pub terminal_after_repeats: u32,
 }
+
+/// Consecutive identical runs that settle a recurrent failure by default: one
+/// retry on the next run, then the answer stands.
+pub const DEFAULT_TERMINAL_AFTER_REPEATS: u32 = 2;
 
 impl Default for RunnerConfig {
     fn default() -> Self {
@@ -625,6 +634,7 @@ impl Default for RunnerConfig {
             max_item_error_rate: 0.10,
             checkpoint_every: 16,
             item_timeout_s: None,
+            terminal_after_repeats: DEFAULT_TERMINAL_AFTER_REPEATS,
         }
     }
 }

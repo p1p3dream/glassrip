@@ -16,7 +16,7 @@
 //! A rerun after a crash or cancellation resumes from the partial file: items that
 //! already succeeded are not processed again, and failed items are retried.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -265,7 +265,16 @@ pub struct RunnerOptions {
     pub checkpoint_every: usize,
     /// Tool versions included in every cache key (glassrip version, Cargo.lock hash).
     pub tool_versions: BTreeMap<String, String>,
+    /// A [`recurrent`](ErrorInfo::recurrent) item failure becomes terminal once
+    /// it ends the item identically on this many consecutive runs (at least 1).
+    pub terminal_after_repeats: u32,
+    /// Items to recompute even when their stage's output is cached or their
+    /// failure is terminal, by stage name and item id. The rest of the stage is
+    /// restored, not recomputed (unlike a forced stage).
+    pub force_items: BTreeMap<String, BTreeSet<String>>,
 }
+
+pub use crate::config::DEFAULT_TERMINAL_AFTER_REPEATS;
 
 impl Default for RunnerOptions {
     fn default() -> Self {
@@ -283,6 +292,8 @@ impl RunnerOptions {
                 .and_then(|s| Duration::try_from_secs_f64(s).ok()),
             checkpoint_every: usize::try_from(cfg.checkpoint_every).unwrap_or(usize::MAX),
             tool_versions: BTreeMap::new(),
+            terminal_after_repeats: cfg.terminal_after_repeats,
+            force_items: BTreeMap::new(),
         }
     }
 }
@@ -497,6 +508,9 @@ struct CachedArtifact {
     content_hash: String,
     /// Bytes after the header line (the item lines), copied verbatim.
     body: Vec<u8>,
+    /// Failed items whose failure is not settled yet (recurrent, not terminal):
+    /// a rerun retries them and restores the rest.
+    unsettled: u64,
 }
 
 async fn run_with_timeout<T, F>(fut: F, timeout: Option<Duration>) -> Outcome<T>
@@ -692,13 +706,54 @@ impl Runner {
             .iter()
             .position(|b| *b == b'\n')
             .map_or(bytes.len(), |i| i + 1);
+        let unsettled = items
+            .iter()
+            .filter(|r| {
+                r.outcome
+                    .error
+                    .as_ref()
+                    .is_some_and(|e| !e.settled(self.repeats()))
+            })
+            .count() as u64;
         Ok(CachedArtifact {
+            unsettled,
             counts: Counts::of(&items),
             total: items.len() as u64,
             header,
             content_hash: recorded,
             body: bytes[header_len..].to_vec(),
         })
+    }
+
+    /// A cached output whose error rate exceeds the limit: restoring it fails
+    /// the stage.
+    fn over_limit(&self, c: &CachedArtifact) -> bool {
+        #[allow(clippy::cast_precision_loss)]
+        let rate = if c.total == 0 {
+            0.0
+        } else {
+            c.counts.error as f64 / c.total as f64
+        };
+        rate > self.opts.max_item_error_rate
+    }
+
+    /// Consecutive identical runs that settle a recurrent failure.
+    fn repeats(&self) -> u32 {
+        self.opts.terminal_after_repeats.max(1)
+    }
+
+    /// The item records of a cached output, when there is a valid one.
+    fn cached_records<S: Stage>(
+        &self,
+        name: &str,
+        key: &CacheKey,
+        req: &SchemaReq,
+    ) -> Option<Vec<Record<S::Output>>> {
+        let path = self.cache.get_path(name, key, OUTPUT_EXT).ok()??;
+        let bytes = fs_err::read(&path).ok()?;
+        jsonl::parse_bytes::<Record<S::Output>>(&path, &bytes, req)
+            .ok()
+            .map(|(_, items)| items)
     }
 
     /// Looks up the cache. A missing entry is a miss; an unreadable or corrupt entry
@@ -842,7 +897,15 @@ impl Runner {
         let output = stage.output();
         let req = SchemaReq::new(output.schema, output.version.major);
         match self.cache.get_path(stage.name(), &k.key, OUTPUT_EXT) {
-            Ok(Some(path)) => self.load_cached::<S>(&path, &req).is_ok(),
+            Ok(Some(path)) => {
+                self.opts
+                    .force_items
+                    .get(stage.name())
+                    .is_none_or(BTreeSet::is_empty)
+                    && self
+                        .load_cached::<S>(&path, &req)
+                        .is_ok_and(|c| c.unsettled == 0 && !self.over_limit(&c))
+            }
             _ => false,
         }
     }
@@ -910,46 +973,87 @@ impl Runner {
 
         let out_req = SchemaReq::new(output.schema, output.version.major);
 
+        // Items forced one by one: the rest of a cached output seeds the partial
+        // below instead of being restored as is.
+        let forced_items: HashSet<String> = if force {
+            HashSet::new()
+        } else {
+            self.opts
+                .force_items
+                .get(name)
+                .map(|ids| ids.iter().cloned().collect())
+                .unwrap_or_default()
+        };
+        let mut seed: Option<Vec<Record<S::Output>>> = None;
+
         // Cache hit: restore with a header rewritten for this run; item lines are
         // copied byte for byte, so the content hash is unchanged.
-        if !force {
-            if let Some(cached) = self.cache_lookup::<S>(name, &key, &out_req) {
-                let mut header = cached.header.clone();
-                header.restored_from = Some(RestoredFrom {
-                    run_id: std::mem::take(&mut header.run_id),
-                    cache_key: key.to_string(),
-                });
-                header.run_id = run_id.clone();
-                header.producer = producer.clone();
-                let line = jsonl::header_line(&header)?;
-                atomic::write_atomic_with(&out_path, |w| {
-                    w.write_all(&line)?;
-                    w.write_all(&cached.body)
-                })?;
-                let wall = started.elapsed().as_secs_f64();
-                let (counts, total, hash) = (cached.counts, cached.total, cached.content_hash);
-                let hash_text = hash.clone();
-                self.set_stage(name, version, |r| {
-                    r.status = StageStatus::Cached;
-                    r.content_hash = Some(hash_text);
-                    r.items_total = total;
-                    r.items_ok = counts.ok;
-                    r.items_error = counts.error;
-                    r.items_skipped = counts.skipped;
-                    r.finished_unix_s = Some(unix_now());
-                    r.wall_s = Some(wall);
-                })?;
-                info!(stage = name, key = %key, "restored from cache");
-                report.status = StageStatus::Cached;
-                report.content_hash = Some(hash);
-                report.items_total = total;
-                report.items_ok = counts.ok;
-                report.items_error = counts.error;
-                report.items_skipped = counts.skipped;
-                report.wall_s = wall;
-                report.output = Some(out_path);
-                return Ok(report);
+        // A cached output with unsettled or forced items seeds the partial instead.
+        let cached = if force {
+            None
+        } else {
+            self.cache_lookup::<S>(name, &key, &out_req)
+        };
+        let cached = match cached {
+            Some(c) if !forced_items.is_empty() || c.unsettled > 0 => {
+                info!(
+                    stage = name,
+                    key = %key,
+                    unsettled = c.unsettled,
+                    forced = forced_items.len(),
+                    "restoring cached items and retrying the unsettled or forced ones"
+                );
+                seed = self.cached_records::<S>(name, &key, &out_req);
+                None
             }
+            other => other,
+        };
+        if let Some(cached) = cached {
+            if self.over_limit(&cached) {
+                // Only settled failures are restored; they fail the stage as they
+                // did when they were recorded.
+                return Err(RunnerError::ErrorRateExceeded {
+                    stage: name.to_string(),
+                    errors: cached.counts.error,
+                    total: cached.total,
+                    threshold: self.opts.max_item_error_rate,
+                });
+            }
+            let mut header = cached.header.clone();
+            header.restored_from = Some(RestoredFrom {
+                run_id: std::mem::take(&mut header.run_id),
+                cache_key: key.to_string(),
+            });
+            header.run_id = run_id.clone();
+            header.producer = producer.clone();
+            let line = jsonl::header_line(&header)?;
+            atomic::write_atomic_with(&out_path, |w| {
+                w.write_all(&line)?;
+                w.write_all(&cached.body)
+            })?;
+            let wall = started.elapsed().as_secs_f64();
+            let (counts, total, hash) = (cached.counts, cached.total, cached.content_hash);
+            let hash_text = hash.clone();
+            self.set_stage(name, version, |r| {
+                r.status = StageStatus::Cached;
+                r.content_hash = Some(hash_text);
+                r.items_total = total;
+                r.items_ok = counts.ok;
+                r.items_error = counts.error;
+                r.items_skipped = counts.skipped;
+                r.finished_unix_s = Some(unix_now());
+                r.wall_s = Some(wall);
+            })?;
+            info!(stage = name, key = %key, "restored from cache");
+            report.status = StageStatus::Cached;
+            report.content_hash = Some(hash);
+            report.items_total = total;
+            report.items_ok = counts.ok;
+            report.items_error = counts.error;
+            report.items_skipped = counts.skipped;
+            report.wall_s = wall;
+            report.output = Some(out_path);
+            return Ok(report);
         }
 
         // Partial (resumable) store.
@@ -969,7 +1073,10 @@ impl Runner {
         let partial_exists = atomic::metadata_opt(&partial)
             .map_err(Self::io_err(&partial))?
             .is_some();
-        if force && partial_exists {
+        // A forced stage starts over; a cache seed is the newest state of the
+        // stage (a cached output always supersedes the partial it came from), so
+        // an older partial left by another run must not override it.
+        if (force || seed.is_some()) && partial_exists {
             fs_err::remove_file(&partial).map_err(Self::io_err(&partial))?;
         }
         let (writer, resumed) = match JsonlWriter::<Record<S::Output>>::open_resume(
@@ -1014,17 +1121,36 @@ impl Runner {
             }
             order.push(w.id.clone());
         }
-        let mut done: HashMap<String, Record<S::Output>> = resumed
-            .items
+        let mut resumed_items = resumed.items;
+        if resumed_items.is_empty() {
+            if let Some(seed) = seed.take() {
+                // A fresh partial starts from the cached output, so the items not
+                // forced are kept, not recomputed.
+                for r in seed {
+                    writer.append(&r)?;
+                    resumed_items.push(r);
+                }
+            }
+        }
+        for id in &forced_items {
+            if !ids.contains(id) {
+                warn!(stage = name, item = %id, "forced item is not planned by this stage");
+            }
+        }
+        let mut done: HashMap<String, Record<S::Output>> = resumed_items
             .into_iter()
             .filter(|r| ids.contains(&r.id))
             .map(|r| (r.id.clone(), r))
             .collect();
-        // A terminal failure is the item's deterministic answer (see
+        // A terminal failure is the item's settled answer (see
         // `ErrorInfo::terminal`): resume keeps it like a result. A forced stage
-        // removed its partial output above, so it retries everything.
+        // removed its partial output above, so it retries everything; a forced
+        // item is retried whatever its record says.
+        let repeats = self.repeats();
         let settled = |r: &Record<S::Output>| {
-            !r.outcome.is_error() || r.outcome.error.as_ref().is_some_and(|e| e.terminal)
+            !forced_items.contains(&r.id)
+                && (!r.outcome.is_error()
+                    || r.outcome.error.as_ref().is_some_and(|e| e.settled(repeats)))
         };
         let todo: Vec<WorkItem<S::Work>> = work
             .into_iter()
@@ -1071,10 +1197,26 @@ impl Runner {
             .buffer_unordered(stage.concurrency().max(1));
 
             while let Some((id, outcome)) = results.next().await {
-                let Some(outcome) = outcome else {
+                let Some(mut outcome) = outcome else {
                     cancelled = true;
                     continue;
                 };
+                // A recurrent failure counts the consecutive runs that ended the
+                // item the same way (the previous one is in the resumed partial)
+                // and settles only once it has recurred often enough.
+                if let Some(e) = outcome
+                    .error
+                    .as_mut()
+                    .filter(|e| e.recurrent && !e.terminal)
+                {
+                    let before = done
+                        .get(&id)
+                        .and_then(|r| r.outcome.error.as_ref())
+                        .filter(|p| p.recurrent && p.same_failure(e))
+                        .map_or(0, |p| p.occurrences.max(1));
+                    e.occurrences = before.saturating_add(1);
+                    e.terminal = e.occurrences >= repeats;
+                }
                 if let Some(e) = &outcome.error {
                     warn!(stage = name, item = %id, code = ?e.code, message = %e.message, "item failed");
                 }
@@ -1112,15 +1254,6 @@ impl Runner {
         } else {
             counts.error as f64 / total as f64
         };
-        if rate > self.opts.max_item_error_rate {
-            return Err(RunnerError::ErrorRateExceeded {
-                stage: name.to_string(),
-                errors: counts.error,
-                total,
-                threshold: self.opts.max_item_error_rate,
-            });
-        }
-
         // Finalize.
         let items: Vec<Record<S::Output>> = order.iter().filter_map(|id| done.remove(id)).collect();
         let hash = content_hash(
@@ -1130,21 +1263,70 @@ impl Runner {
             &items,
         )?;
         header.content_hash = Some(hash.clone());
+        // Plain retryable failures (transport, placement) keep the output out of
+        // the cache. Recurrent ones do not: the cached output carries their count
+        // to the next run, which retries only them (see the cache lookup above).
         let retryable = items
             .iter()
-            .filter(|r| r.outcome.error.as_ref().is_some_and(|e| !e.terminal))
+            .filter(|r| {
+                r.outcome
+                    .error
+                    .as_ref()
+                    .is_some_and(|e| !e.settled(repeats) && !e.recurrent)
+            })
             .count();
+        let unsettled = items
+            .iter()
+            .filter(|r| {
+                r.outcome
+                    .error
+                    .as_ref()
+                    .is_some_and(|e| !e.settled(repeats) && e.recurrent)
+            })
+            .count();
+        if rate > self.opts.max_item_error_rate {
+            // Cached all the same when nothing plainly retryable failed, so the
+            // next run (in any run directory) retries only the unsettled items
+            // and keeps counting their recurrences; a restored output over the
+            // limit fails the stage again (see the cache hit above).
+            if retryable == 0 {
+                let over = self
+                    .with_run(|r| r.partials_dir())
+                    .join(format!("{name}-{}.over-limit.jsonl", &key.as_str()[..16]));
+                jsonl::write_atomic(&over, &header, &items)?;
+                match self.cache.put_file(name, &key, OUTPUT_EXT, &over) {
+                    // The cache holds the stage's state now; the partial would only
+                    // go stale against it.
+                    Ok(_) => {
+                        drop(writer);
+                        fs_err::remove_file(&partial).map_err(Self::io_err(&partial))?;
+                    }
+                    Err(e) => warn!(stage = name, error = %e, "could not store output in cache"),
+                }
+                fs_err::remove_file(&over).map_err(Self::io_err(&over))?;
+            }
+            return Err(RunnerError::ErrorRateExceeded {
+                stage: name.to_string(),
+                errors: counts.error,
+                total,
+                threshold: self.opts.max_item_error_rate,
+            });
+        }
         jsonl::write_atomic(&out_path, &header, &items)?;
         drop(writer);
         if retryable == 0 {
             // Terminal failures are cached with the results: the cache key holds
             // everything that determines them (inputs, params, model digest), so a
-            // rerun restores them instead of asking again. `--force-stage` retries.
+            // rerun restores them instead of asking again. `--force-stage` or a
+            // forced item retries them. Unsettled recurrent failures are cached
+            // with their count; the next run retries only those items.
             if counts.error > 0 {
                 info!(
                     stage = name,
                     errors = counts.error,
-                    "caching output with terminal item failures; --force-stage retries them"
+                    unsettled,
+                    "caching output with item failures; unsettled ones are retried on the next run, \
+                     terminal ones by --force-stage or a forced item"
                 );
             }
             // A cache that cannot be written (read-only, full) costs a future
@@ -1209,6 +1391,12 @@ mod tests {
         fail: HashSet<usize>,
         /// Failing items whose failure is terminal (deterministic).
         terminal: HashSet<usize>,
+        /// Failing items whose failure is recurrent (a model reply).
+        recurrent: HashSet<usize>,
+        /// Varies the failure text (a different reply each run).
+        variant: u64,
+        /// Failures carry a fixed signature (one loop stopped at another byte).
+        signed: bool,
         slow: HashSet<usize>,
         cancel_at: Option<(usize, CancellationToken)>,
         offset: u64,
@@ -1276,7 +1464,7 @@ mod tests {
         }
         async fn process(&self, ctx: &ItemContext, i: usize) -> Result<u64, ErrorInfo> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let (fail, terminal, slow, cancel, offset) = {
+            let (fail, terminal, recurrent, variant, signed, slow, cancel, offset) = {
                 let b = self.behavior.lock().unwrap();
                 let cancel = b
                     .cancel_at
@@ -1286,6 +1474,9 @@ mod tests {
                 (
                     b.fail.contains(&i),
                     b.terminal.contains(&i),
+                    b.recurrent.contains(&i),
+                    b.variant,
+                    b.signed,
                     b.slow.contains(&i),
                     cancel,
                     b.offset,
@@ -1310,8 +1501,18 @@ mod tests {
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
             if fail {
-                let e = ErrorInfo::new(ErrorCode::Validation, format!("synthetic failure {i}"));
-                return Err(if terminal { e.terminal() } else { e });
+                let mut e = ErrorInfo::new(ErrorCode::Validation, format!("synthetic failure {i}"))
+                    .with_raw_text(format!("synthetic reply {variant}"));
+                if signed {
+                    e = e.with_signature("synthetic loop");
+                }
+                return Err(if terminal {
+                    e.terminal()
+                } else if recurrent {
+                    e.terminal_if_repeated()
+                } else {
+                    e
+                });
             }
             Ok(i as u64 * 10 + offset)
         }
@@ -1804,8 +2005,389 @@ mod tests {
         assert_eq!(env.cache.ls().unwrap().len(), 1);
     }
 
+    fn failed_record(r: &Runner, id: &str) -> ErrorInfo {
+        jsonl::read::<Record<u64>>(
+            &r.run_dir().artifact_path(SOURCE),
+            &SchemaReq::new(SOURCE, 1),
+        )
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|x| x.id == id)
+        .and_then(|x| x.outcome.error)
+        .unwrap()
+    }
+
+    /// Codex 6: one malformed model reply is not permanent. The next run, in a
+    /// fresh run directory, retries only that item; an identical second failure
+    /// settles it, and later runs restore it without asking again.
+    #[tokio::test]
+    async fn a_recurrent_failure_is_retried_next_run_and_settles_when_it_repeats() {
+        let env = env();
+        let source = SourceStage::new(10);
+        {
+            let mut b = source.behavior.lock().unwrap();
+            b.fail = [4].into();
+            b.recurrent = [4].into();
+        }
+        let mut r = runner(&env, "run-a", &Selection::default());
+        let rep = r.run_stage(&source).await.unwrap();
+        assert_eq!((rep.status, rep.items_error), (StageStatus::Ok, 1));
+        let e = failed_record(&r, "item-004");
+        assert!(e.recurrent && !e.terminal && e.occurrences == 1, "{e:?}");
+        assert!(
+            !r.cache_hit(&source),
+            "an unsettled failure needs the model"
+        );
+        drop(r);
+        assert_eq!(env.cache.ls().unwrap().len(), 1, "the rest is cached");
+
+        let mut r = runner(&env, "run-b", &Selection::default());
+        let rep = r.run_stage(&source).await.unwrap();
+        assert_eq!(
+            (
+                rep.status,
+                rep.items_ok,
+                rep.items_error,
+                rep.items_processed
+            ),
+            (StageStatus::Ok, 9, 1, 1),
+            "only the unsettled item is asked again"
+        );
+        let e = failed_record(&r, "item-004");
+        assert!(e.terminal && e.occurrences == 2, "{e:?}");
+        assert!(r.cache_hit(&source));
+        drop(r);
+        assert_eq!(source.calls(), 11);
+
+        let mut r = runner(&env, "run-c", &Selection::default());
+        let rep = r.run_stage(&source).await.unwrap();
+        assert_eq!((rep.status, rep.items_error), (StageStatus::Cached, 1));
+        assert_eq!(source.calls(), 11, "a settled failure is not asked again");
+    }
+
+    #[tokio::test]
+    async fn a_recurrent_failure_that_recovers_is_replaced() {
+        let env = env();
+        let source = SourceStage::new(10);
+        {
+            let mut b = source.behavior.lock().unwrap();
+            b.fail = [4].into();
+            b.recurrent = [4].into();
+        }
+        let mut r = runner(&env, "run-a", &Selection::default());
+        r.run_stage(&source).await.unwrap();
+        drop(r);
+        source.behavior.lock().unwrap().fail.clear();
+        let mut r = runner(&env, "run-b", &Selection::default());
+        let rep = r.run_stage(&source).await.unwrap();
+        assert_eq!(
+            (rep.items_ok, rep.items_error, rep.items_processed),
+            (10, 0, 1)
+        );
+        let mut r = runner(&env, "run-c", &Selection::default());
+        let rep = r.run_stage(&source).await.unwrap();
+        assert_eq!((rep.status, rep.items_ok), (StageStatus::Cached, 10));
+        assert_eq!(source.calls(), 11);
+    }
+
+    #[tokio::test]
+    async fn different_recurrent_failures_do_not_settle() {
+        let env = env();
+        let source = SourceStage::new(10);
+        {
+            let mut b = source.behavior.lock().unwrap();
+            b.fail = [4].into();
+            b.recurrent = [4].into();
+        }
+        for (k, run) in ["run-a", "run-b", "run-c"].into_iter().enumerate() {
+            source.behavior.lock().unwrap().variant = k as u64;
+            let mut r = runner(&env, run, &Selection::default());
+            r.run_stage(&source).await.unwrap();
+            let e = failed_record(&r, "item-004");
+            assert!(!e.terminal && e.occurrences == 1, "{run}: {e:?}");
+        }
+        assert_eq!(source.calls(), 12);
+    }
+
+    /// Codex review 5: one loop stopped at another byte (another chunking) is the
+    /// same failure by its signature, so it still settles.
+    #[tokio::test]
+    async fn one_loop_stopped_at_other_bytes_still_settles() {
+        let env = env();
+        let source = SourceStage::new(10);
+        {
+            let mut b = source.behavior.lock().unwrap();
+            b.fail = [4].into();
+            b.recurrent = [4].into();
+            b.signed = true;
+        }
+        for (k, run) in ["run-a", "run-b"].into_iter().enumerate() {
+            source.behavior.lock().unwrap().variant = k as u64;
+            let mut r = runner(&env, run, &Selection::default());
+            r.run_stage(&source).await.unwrap();
+        }
+        let mut r = runner(&env, "run-c", &Selection::default());
+        let rep = r.run_stage(&source).await.unwrap();
+        assert_eq!(rep.status, StageStatus::Cached);
+        let e = failed_record(&r, "item-004");
+        assert!(e.terminal && e.occurrences == 2, "{e:?}");
+        assert_eq!(source.calls(), 11);
+    }
+
+    /// Codex review 2: the recurrence threshold is not in the cache key, so a
+    /// raised threshold reopens failures settled under a lower one.
+    #[tokio::test]
+    async fn a_raised_threshold_reopens_settled_failures() {
+        let env = env();
+        let source = SourceStage::new(10);
+        {
+            let mut b = source.behavior.lock().unwrap();
+            b.fail = [4].into();
+            b.recurrent = [4].into();
+        }
+        for run in ["run-a", "run-b"] {
+            let mut r = runner(&env, run, &Selection::default());
+            r.run_stage(&source).await.unwrap();
+        }
+        assert_eq!(source.calls(), 11);
+        let opts = RunnerOptions {
+            terminal_after_repeats: 3,
+            ..RunnerOptions::default()
+        };
+        let mut r = runner_with(
+            &env,
+            "run-c",
+            &Selection::default(),
+            opts.clone(),
+            CancellationToken::new(),
+        );
+        assert!(!r.cache_hit(&source));
+        let rep = r.run_stage(&source).await.unwrap();
+        assert_eq!((rep.status, rep.items_processed), (StageStatus::Ok, 1));
+        let e = failed_record(&r, "item-004");
+        assert!(e.terminal && e.occurrences == 3, "{e:?}");
+        drop(r);
+        let mut r = runner_with(
+            &env,
+            "run-d",
+            &Selection::default(),
+            opts,
+            CancellationToken::new(),
+        );
+        assert!(r.cache_hit(&source));
+        assert_eq!(
+            r.run_stage(&source).await.unwrap().status,
+            StageStatus::Cached
+        );
+        assert_eq!(source.calls(), 12);
+    }
+
+    /// GLM review M3: over the error-rate limit, in a fresh run directory each
+    /// time (the CLI default), the failed item is retried alone and settles; the
+    /// rest is never recomputed.
+    #[tokio::test]
+    async fn over_the_error_rate_fresh_runs_retry_only_the_failure() {
+        let env = env();
+        let source = SourceStage::new(5);
+        {
+            let mut b = source.behavior.lock().unwrap();
+            b.fail = [2].into();
+            b.recurrent = [2].into();
+        }
+        for (run, calls) in [("run-a", 5), ("run-b", 6), ("run-c", 6)] {
+            let mut r = runner(&env, run, &Selection::default());
+            assert!(
+                matches!(
+                    r.run_stage(&source).await,
+                    Err(RunnerError::ErrorRateExceeded {
+                        errors: 1,
+                        total: 5,
+                        ..
+                    })
+                ),
+                "{run}"
+            );
+            assert_eq!(source.calls(), calls, "{run}");
+        }
+        // Once the item recovers (forced, since its failure settled), the stage
+        // passes and the rest is restored.
+        source.behavior.lock().unwrap().fail.clear();
+        let mut opts = RunnerOptions::default();
+        opts.force_items
+            .insert("source".into(), ["item-002".to_string()].into());
+        let mut r = runner_with(
+            &env,
+            "run-d",
+            &Selection::default(),
+            opts,
+            CancellationToken::new(),
+        );
+        let rep = r.run_stage(&source).await.unwrap();
+        assert_eq!((rep.items_ok, rep.items_processed), (5, 1));
+    }
+
+    /// Codex review round 2: a run directory's old partial does not override a
+    /// newer cached output that another run produced.
+    #[tokio::test]
+    async fn an_old_partial_never_overrides_a_newer_cache() {
+        let env = env();
+        let source = SourceStage::new(5);
+        {
+            // A settled failure plus a plain one: run-a keeps a partial, uncached.
+            let mut b = source.behavior.lock().unwrap();
+            b.fail = [2, 3].into();
+            b.terminal = [2].into();
+        }
+        let mut r = runner(&env, "run-a", &Selection::default());
+        assert!(r.run_stage(&source).await.is_err());
+        drop(r);
+        assert!(env.cache.ls().unwrap().is_empty());
+        // Another run, with the items recovered, caches a clean output.
+        source.behavior.lock().unwrap().fail.clear();
+        let mut r = runner(&env, "run-b", &Selection::default());
+        assert_eq!(r.run_stage(&source).await.unwrap().items_ok, 5);
+        drop(r);
+        // Back in run-a, forcing one item seeds from that cache, not from the old
+        // partial and its settled failure.
+        let mut opts = RunnerOptions::default();
+        opts.force_items
+            .insert("source".into(), ["item-004".to_string()].into());
+        let mut r = runner_with(
+            &env,
+            "run-a",
+            &Selection::default(),
+            opts,
+            CancellationToken::new(),
+        );
+        let rep = r.run_stage(&source).await.unwrap();
+        assert_eq!(
+            (rep.items_ok, rep.items_error, rep.items_processed),
+            (5, 0, 1)
+        );
+    }
+
+    /// Codex review round 2: a settled output over the limit is not a hit that
+    /// `cache_hit` promises and `run_stage` then refuses.
+    #[tokio::test]
+    async fn cache_hit_agrees_with_an_over_limit_restore() {
+        let env = env();
+        let source = SourceStage::new(5);
+        {
+            let mut b = source.behavior.lock().unwrap();
+            b.fail = [2].into();
+            b.terminal = [2].into();
+        }
+        let mut r = runner(&env, "run-a", &Selection::default());
+        assert!(r.run_stage(&source).await.is_err());
+        drop(r);
+        let mut r = runner(&env, "run-b", &Selection::default());
+        assert!(!r.cache_hit(&source));
+        assert!(matches!(
+            r.run_stage(&source).await,
+            Err(RunnerError::ErrorRateExceeded { .. })
+        ));
+        assert_eq!(source.calls(), 5, "the settled output is not recomputed");
+    }
+
+    /// Codex 6: a one-item stage over the error-rate limit used to keep its failed
+    /// partial on every resume. The item is retried, and settles only when the
+    /// same failure comes back.
+    #[tokio::test]
+    async fn a_one_item_stage_over_the_error_rate_retries_on_resume() {
+        let env = env();
+        let source = SourceStage::new(1);
+        {
+            let mut b = source.behavior.lock().unwrap();
+            b.fail = [0].into();
+            b.recurrent = [0].into();
+        }
+        for _ in 0..2 {
+            let mut r = runner(&env, "run-a", &Selection::default());
+            assert!(matches!(
+                r.run_stage(&source).await,
+                Err(RunnerError::ErrorRateExceeded { .. })
+            ));
+        }
+        assert_eq!(source.calls(), 2, "resume retried the failed item");
+        let mut r = runner(&env, "run-a", &Selection::default());
+        assert!(r.run_stage(&source).await.is_err());
+        assert_eq!(source.calls(), 2, "two identical failures settle it");
+        drop(r);
+
+        // Forcing the one item retries it without --force-stage.
+        source.behavior.lock().unwrap().fail.clear();
+        let mut opts = RunnerOptions::default();
+        opts.force_items
+            .insert("source".into(), ["item-000".to_string()].into());
+        let mut r = runner_with(
+            &env,
+            "run-a",
+            &Selection::default(),
+            opts,
+            CancellationToken::new(),
+        );
+        let rep = r.run_stage(&source).await.unwrap();
+        assert_eq!((rep.items_ok, rep.items_processed), (1, 1));
+        assert_eq!(source.calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn forcing_one_item_recomputes_only_that_item_of_a_cached_stage() {
+        let env = env();
+        let source = SourceStage::new(10);
+        {
+            let mut b = source.behavior.lock().unwrap();
+            b.fail = [4].into();
+            b.terminal = [4].into();
+        }
+        let mut r = runner(&env, "run-a", &Selection::default());
+        r.run_stage(&source).await.unwrap();
+        drop(r);
+        source.behavior.lock().unwrap().fail.clear();
+        let mut opts = RunnerOptions::default();
+        opts.force_items
+            .insert("source".into(), ["item-004".to_string()].into());
+        let mut r = runner_with(
+            &env,
+            "run-b",
+            &Selection::default(),
+            opts,
+            CancellationToken::new(),
+        );
+        assert!(
+            !r.cache_hit(&source),
+            "a forced item needs the stage to run"
+        );
+        let rep = r.run_stage(&source).await.unwrap();
+        assert_eq!(
+            (
+                rep.status,
+                rep.items_ok,
+                rep.items_error,
+                rep.items_processed
+            ),
+            (StageStatus::Ok, 10, 0, 1)
+        );
+        assert_eq!(source.calls(), 11);
+        let mut r = runner(&env, "run-c", &Selection::default());
+        let rep = r.run_stage(&source).await.unwrap();
+        assert_eq!((rep.status, rep.items_ok), (StageStatus::Cached, 10));
+    }
+
     #[test]
     fn cancellation_and_timeouts_are_never_terminal() {
+        for code in [ErrorCode::Timeout, ErrorCode::Cancelled] {
+            let e = ErrorInfo::new(code, "x").terminal_if_repeated();
+            assert!(!e.recurrent && !e.terminal, "{e:?}");
+        }
+        let json = serde_json::to_value(ErrorInfo::new(ErrorCode::Io, "x").terminal_if_repeated())
+            .unwrap();
+        assert_eq!(json.get("recurrent"), Some(&serde_json::Value::Bool(true)));
+        assert!(
+            json.get("occurrences").is_none(),
+            "absent when zero: {json}"
+        );
         assert!(
             ErrorInfo::new(ErrorCode::ModelRequest, "x")
                 .terminal()
