@@ -16,14 +16,20 @@
 //! - `repeats = count - max(supported, 1) + 1`: the copies that neither OCR nor a
 //!   single original explains, plus that original.
 //!
-//! A text is **repeated** when `repeats >= min_repeats` and either the list's
-//! excess copies (`repeats - 1`, summed over the texts that reach
-//! `min_repeats`; pairs and triples never count) make up at least
-//! `min_duplicate_share` of the list, or `repeats >= strong_repeats`. Two "API"
-//! boxes or three "TODO" stickies never reach `min_repeats`; four "TODO"
-//! stickies among a dozen notes stay under the share, however many other
-//! labels come in pairs; a row of identical cards that OCR reads at every card
-//! has no unexplained copies.
+//! A text is **repeated** when `repeats >= min_repeats` and the list's excess
+//! copies (`repeats - 1`, summed over the texts that reach `min_repeats` and are
+//! stacked or reach `strong_repeats`; pairs and triples never count) make up at
+//! least `min_duplicate_share` of the list, or when the text is **stacked** and
+//! `repeats >= strong_repeats`; copies side by side need both the share and
+//! `strong_repeats`. A text is stacked when at least
+//! `min_repeats` of its boxes each cover another box of the same text by
+//! [`STACK_OVERLAP`] of the smaller one (the stepped or piled copies a runaway
+//! reply writes); edges, which have no box, count as stacked. Two "API" boxes or
+//! three "TODO" stickies never reach `min_repeats`; four "TODO" stickies among a
+//! dozen notes stay under the share, however many other labels come in pairs; a
+//! row of identical cards is no copy of one card, whether OCR reads it or not,
+//! and eight "TODO" notes that OCR misses among twenty stay; a runaway grid of
+//! sixty stickies holding five texts does not.
 //!
 //! [`collapse`] reduces each repeated text to its best-supported items: every item
 //! backed by its own OCR span, or the first item when OCR backs none. Edges and
@@ -36,6 +42,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::board::{normalize, BoardReading, ElementList};
 use crate::geometry::BBox;
+
+/// Share of the smaller box that two boxes of one text must share for either
+/// to count as a copy stacked on the other.
+pub const STACK_OVERLAP: f64 = 0.5;
 
 /// Thresholds of the degenerate-reading rule.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -155,10 +165,26 @@ fn center_inside(span: &BBox, b: &BBox, margin: f64) -> bool {
 }
 
 /// Per item: backed by an OCR span of its own. Each span backs at most one item:
-/// the nearest (by box center) matching item whose grown box holds the span.
+/// the nearest (by box center) matching item whose grown box holds the span. A
+/// span that repeats an earlier one (same text, stacked boxes) and lies in the
+/// item that earlier span backed is a second reading of that item's text and
+/// backs nothing; a span in a box of its own still backs that box.
 fn supported(items: &[Item<'_>], anchors: &[(String, BBox)], margin: f64) -> Vec<bool> {
     let mut backed = vec![false; items.len()];
+    // Spans that backed an item: normalized text, box, the item.
+    let mut used: Vec<(String, &BBox, usize)> = Vec::new();
     for (s, sb) in anchors {
+        let ns = normalize(s);
+        let reread = used.iter().any(|(t, tb, i)| {
+            *t == ns
+                && stacked_pair(sb, tb)
+                && items[*i]
+                    .anchorable
+                    .is_some_and(|(_, b)| center_inside(sb, b, margin))
+        });
+        if reread {
+            continue;
+        }
         let best = items
             .iter()
             .enumerate()
@@ -171,9 +197,40 @@ fn supported(items: &[Item<'_>], anchors: &[(String, BBox)], margin: f64) -> Vec
             .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
         if let Some((i, _)) = best {
             backed[i] = true;
+            used.push((ns, sb, i));
         }
     }
     backed
+}
+
+/// Two well-formed boxes (positive width and height) cover each other by
+/// [`STACK_OVERLAP`] of the smaller one. A box without area piles on nothing.
+fn stacked_pair(a: &BBox, b: &BBox) -> bool {
+    let formed = |b: &BBox| b.x2 - b.x1 > 0.0 && b.y2 - b.y1 > 0.0;
+    if !(formed(a) && formed(b)) {
+        return false;
+    }
+    let w = a.x2.min(b.x2) - a.x1.max(b.x1);
+    let h = a.y2.min(b.y2) - a.y1.max(b.y1);
+    let area = |b: &BBox| (b.x2 - b.x1) * (b.y2 - b.y1);
+    w > 0.0 && h > 0.0 && w * h >= STACK_OVERLAP * area(a).min(area(b))
+}
+
+/// Items of one text whose box is stacked on another box of that text; every
+/// item when the list has no boxes (edges).
+fn stacked(items: &[Item<'_>], idx: &[usize]) -> usize {
+    let boxes: Vec<Option<&BBox>> = idx
+        .iter()
+        .map(|&i| items[i].anchorable.map(|(_, b)| b))
+        .collect();
+    (0..boxes.len())
+        .filter(|&a| match boxes[a] {
+            None => true,
+            Some(ba) => {
+                (0..boxes.len()).any(|b| b != a && boxes[b].is_some_and(|bb| stacked_pair(ba, bb)))
+            }
+        })
+        .count()
 }
 
 /// Groups of item indices by key, in order of first appearance.
@@ -209,18 +266,35 @@ fn list_repeats(
         let s = idx.iter().filter(|&&i| backed[i]).count();
         (idx.len() - s.max(1) + 1, s)
     };
-    let excess: usize = gs
+    let strong = |r: usize| p.strong_repeats > 0 && r >= p.strong_repeats;
+    // Per group: (repeats, supported, stacked, strong).
+    let judged: Vec<(usize, usize, bool, bool)> = gs
         .iter()
-        .map(|(_, idx)| repeats(idx).0)
-        .filter(|&r| r >= p.min_repeats)
-        .map(|r| r - 1)
+        .map(|(_, idx)| {
+            let (r, s) = repeats(idx);
+            let piled = r >= p.min_repeats && stacked(items, idx) >= p.min_repeats;
+            (r, s, piled, strong(r))
+        })
+        .collect();
+    let excess: usize = judged
+        .iter()
+        .filter(|(r, _, piled, strong)| *r >= p.min_repeats && (*piled || *strong))
+        .map(|(r, ..)| r - 1)
         .sum();
     let share = excess as f64 / n as f64;
     gs.into_iter()
-        .filter_map(|(key, idx)| {
-            let (r, s) = repeats(&idx);
-            let strong = p.strong_repeats > 0 && r >= p.strong_repeats;
-            if r < p.min_repeats || !(share >= p.min_duplicate_share || strong) {
+        .zip(judged)
+        .filter_map(|((key, idx), (r, s, piled, strong))| {
+            // Piled copies: the strong bound or the share. Copies side by side
+            // (a runaway grid, or a board's real identical notes that OCR
+            // missed): the strong bound and the share.
+            let shared = share >= p.min_duplicate_share;
+            let flagged = if piled {
+                strong || shared
+            } else {
+                strong && shared
+            };
+            if r < p.min_repeats || !flagged {
                 return None;
             }
             let mut keep: Vec<usize> = idx.iter().copied().filter(|&i| backed[i]).collect();
@@ -596,8 +670,64 @@ mod tests {
             anchors.push(span("Card", x, 100.0));
         }
         assert_eq!(detect(&r, &anchors, &p()), None);
-        // Without OCR the same row is six unexplained copies.
-        assert!(detect(&r, &[], &p()).is_some());
+        // Without OCR the row is still six cards side by side, not copies.
+        assert_eq!(detect(&r, &[], &p()), None);
+        let (after, done) = collapse(r.clone(), &[], &p());
+        assert_eq!(after, r);
+        assert!(done.is_empty());
+    }
+
+    #[test]
+    fn identical_cards_that_ocr_misses_keep_their_edges_and_owners() {
+        // Four separate "Card" boxes and two others, OCR silent: 3 excess of 6
+        // reaches the share, but the cards are side by side, not piled.
+        let mut r = reading();
+        r.nodes = distinct_nodes(2);
+        for i in 0..4 {
+            r.nodes
+                .push(node(&format!("c{i}"), "Card", f64::from(i) * 150.0, 300.0));
+        }
+        r.edges = (0..4).map(|i| edge("n1", &format!("c{i}"), "")).collect();
+        r.owner_tags = vec![OwnerTag {
+            name_raw: "Rowan".into(),
+            near: "c3".into(),
+            bbox: bb(450.0, 380.0),
+        }];
+        assert_eq!(detect(&r, &[], &p()), None);
+        let (after, done) = collapse(r.clone(), &[], &p());
+        assert_eq!(after, r);
+        assert!(done.is_empty());
+    }
+
+    #[test]
+    fn piled_copies_without_ocr_are_flagged_below_the_strong_bound() {
+        // Five copies stepped 10 px over one box among three real ones.
+        let mut r = reading();
+        r.nodes = distinct_nodes(3);
+        for k in 0..5 {
+            r.nodes.push(node(
+                &format!("c{k}"),
+                "Billing",
+                600.0 + f64::from(k) * 10.0,
+                400.0,
+            ));
+        }
+        let f = detect(&r, &[], &p()).expect("piled copies");
+        assert_eq!((f.repeated[0].count, f.repeated[0].list_len), (5, 8));
+        let (after, _) = collapse(r, &[], &p());
+        assert_eq!(after.nodes.len(), 4);
+        assert!(!stacked_pair(&bb(0.0, 0.0), &bb(60.0, 0.0)));
+        assert!(stacked_pair(&bb(0.0, 0.0), &bb(40.0, 0.0)));
+        // Equal boxes without area, or inverted, pile on nothing.
+        let dot = BBox::new(5.0, 5.0, 5.0, 5.0);
+        assert!(!stacked_pair(&dot, &dot));
+        let inverted = BBox {
+            x1: 100.0,
+            y1: 50.0,
+            x2: 0.0,
+            y2: 0.0,
+        };
+        assert!(!stacked_pair(&inverted, &inverted));
     }
 
     #[test]
@@ -852,6 +982,78 @@ mod tests {
         let anchors = vec![span("Gateway", 100.0, 100.0)];
         let f = detect(&r, &anchors, &p()).expect("degenerate");
         assert_eq!(f.repeated[0].supported, 1);
+    }
+
+    #[test]
+    fn a_text_ocr_read_twice_backs_one_copy() {
+        // Four piled copies of one box; OCR reports its one text twice.
+        let mut r = reading();
+        for k in 0..4 {
+            r.nodes.push(node(
+                &format!("n{k}"),
+                "Gateway",
+                100.0 + f64::from(k),
+                100.0,
+            ));
+        }
+        let twice = vec![span("Gateway", 100.0, 100.0), span("gateway", 101.0, 100.0)];
+        let f = detect(&r, &twice, &p()).expect("degenerate");
+        assert_eq!(f.repeated[0].supported, 1);
+        // Two separate spans of one text still back two boxes.
+        let apart = vec![span("Gateway", 100.0, 100.0), span("Gateway", 400.0, 100.0)];
+        let items = node_items(&r);
+        assert_eq!(
+            supported(&items, &apart, 0.25)
+                .iter()
+                .filter(|b| **b)
+                .count(),
+            1
+        );
+        r.nodes[3].bbox = bb(400.0, 100.0);
+        let items = node_items(&r);
+        assert_eq!(
+            supported(&items, &apart, 0.25)
+                .iter()
+                .filter(|b| **b)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn wide_spans_of_two_cards_back_both() {
+        // Two separate "Deploy" cards; OCR's wide spans overlap by more than
+        // half, but each span's center lies in its own card.
+        let mut r = reading();
+        r.nodes = vec![
+            node("a", "Deploy", 0.0, 0.0),
+            node("b", "Deploy", 110.0, 0.0),
+        ];
+        let spans = vec![
+            ("Deploy".to_string(), BBox::new(-100.0, 15.0, 200.0, 35.0)),
+            ("Deploy".to_string(), BBox::new(10.0, 15.0, 310.0, 35.0)),
+        ];
+        assert!(stacked_pair(&spans[0].1, &spans[1].1));
+        let items = node_items(&r);
+        assert_eq!(supported(&items, &spans, 0.25), vec![true, true]);
+    }
+
+    #[test]
+    fn eight_separate_todo_notes_that_ocr_misses_stay() {
+        // Eight "TODO" notes side by side among twenty, OCR silent: past the
+        // strong bound, but 7 excess of 20 is under the share.
+        let mut r = reading();
+        for i in 0..12 {
+            r.stickies
+                .push(sticky(&format!("Idea {i}"), f64::from(i) * 120.0, 0.0));
+        }
+        for i in 0..8 {
+            r.stickies.push(sticky("TODO", f64::from(i) * 120.0, 200.0));
+        }
+        assert_eq!(detect(&r, &[], &p()), None);
+        let (after, done) = collapse(r.clone(), &[], &p());
+        assert_eq!(after, r);
+        assert!(done.is_empty());
     }
 
     #[test]
