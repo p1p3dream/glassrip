@@ -224,9 +224,12 @@ fn meeting_suite_hand_computed() {
     // tolerance and fills the second slot. 3 speaker labels vs 2 people.
     assert_eq!(get("audio.hotword_wer"), 0.0);
     assert_eq!(get("audio.speaker_labels"), 3.0);
+    // Raw diarization: 3 labels for 2 people.
+    assert_eq!(get("audio.diarizer_label_error"), 1.0);
+    assert!(!m.contains_key("audio.speaker_label_error"), "retired key");
     // After name mapping: avery, jordan, and the unresolved S2 voice.
     assert_eq!(get("audio.speaker_identities"), 3.0);
-    assert_eq!(get("audio.speaker_label_error"), 1.0);
+    assert_eq!(get("audio.speaker_identity_error"), 1.0);
     // Speakers: 3 labels, 2 mapped people, both in the golden set.
     assert_eq!(get("speakers.labels"), 3.0);
     assert_eq!(get("speakers.distinct_people"), 2.0);
@@ -248,6 +251,57 @@ fn degraded_notes_fail_the_gate_and_missing_artifacts_are_reported() {
     assert_eq!(run.gate_failures.len(), 1);
     // Screens, board, speakers, and audio.
     assert_eq!(run.not_run.len(), 4, "{:?}", run.not_run);
+}
+
+/// Codex finding 8 end to end: a negated decision in the notes is not the decision.
+#[test]
+fn a_negated_decision_is_not_recalled() {
+    let score = |decision: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            schema::MEETING_NOTES,
+            vec![("meeting_notes", ra::notes("ok", &[decision], &[], &[]))],
+        );
+        run_meeting(&golden(), &RunArtifacts::scan(dir.path()).unwrap(), 2.0)
+            .unwrap()
+            .metrics["notes.decision.recall"]
+    };
+    assert_eq!(score("We decided to defer the importer."), 1.0);
+    assert_eq!(score("We decided not to defer the importer."), 0.0);
+    assert_eq!(score("Do not defer the importer"), 0.0);
+}
+
+/// Codex round-1 M5: without a speakers artifact there is no mapping, so the
+/// post-mapping target has no value to pass on.
+#[test]
+fn no_speaker_mapping_means_no_identity_metric() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        schema::TRANSCRIPT,
+        vec![
+            ("s1", ra::segment("s1", "S0", 0.0, 5.0, "hi", &[])),
+            ("s2", ra::segment("s2", "S1", 5.0, 9.0, "ok", &[])),
+        ],
+    );
+    let run = run_meeting(&golden(), &RunArtifacts::scan(dir.path()).unwrap(), 2.0).unwrap();
+    assert_eq!(run.metrics.get("audio.diarizer_label_error"), Some(&0.0));
+    assert!(!run.metrics.contains_key("audio.speaker_identity_error"));
+    assert!(run.not_run.iter().any(|n| n.contains("glassrip.speakers")));
+    // Codex round-2 M6: the skipped target fails the run, and so does an empty
+    // speakers artifact.
+    assert!(
+        run.gate_failures
+            .iter()
+            .any(|g| g.contains("speaker_identity_error not evaluated")),
+        "{:?}",
+        run.gate_failures
+    );
+    ra::write_artifact(dir.path(), schema::SPEAKERS, vec![]).unwrap();
+    let run = run_meeting(&golden(), &RunArtifacts::scan(dir.path()).unwrap(), 2.0).unwrap();
+    assert!(!run.metrics.contains_key("audio.speaker_identity_error"));
+    assert_eq!(run.gate_failures.len(), 1, "{:?}", run.gate_failures);
 }
 
 #[test]
@@ -468,13 +522,108 @@ fn nominal_grid_labels_join_where_their_frame_was_taken() {
             .unwrap()
             .metrics["screen.accuracy"]
     };
-    g.frame_clock = FrameClock::default();
+    let grid = FrameClock::PrototypeGrid {
+        interval_s: 2.0,
+        lead_s: 0.05,
+    };
+    g.clocks.screen_types = Some(grid);
     assert_eq!(score(&g), 1.0);
-    g.frame_clock = FrameClock::Pts;
+    g.clocks.screen_types = Some(FrameClock::Pts);
     assert_eq!(score(&g), 0.0);
-    // A golden without the field is on the prototype grid (spec 9.2).
+    // The legacy field still declares the screen clock.
+    g.clocks.screen_types = None;
+    g.frame_clock = Some(grid);
+    assert_eq!(score(&g), 1.0);
+    // A golden without any clock scores as before clocks existed (PTS), and the
+    // report says so.
     let mut v = serde_json::to_value(&g).unwrap();
     v.as_object_mut().unwrap().remove("frame_clock");
     let g: MeetingGolden = serde_json::from_value(v).unwrap();
-    assert_eq!(g.frame_clock, FrameClock::default());
+    g.validate().unwrap();
+    assert_eq!(score(&g), 0.0);
+    let run = run_meeting(&g, &RunArtifacts::scan(d).unwrap(), 2.0).unwrap();
+    assert!(
+        run.warnings.iter().any(|w| w.contains("screen_types")),
+        "{:?}",
+        run.warnings
+    );
+}
+
+/// Kimi finding 4, Codex round-1 M7 and M8: probes, assignment windows, moves,
+/// window bounds, and allowed events each join on their own declared clock, and
+/// never on the screen clock.
+#[test]
+fn owner_and_static_window_clocks_are_declared_per_section() {
+    use glassrip_eval::golden::FrameClock;
+    let owned = |from: f64| {
+        ra::board(
+            "w1",
+            true,
+            Some(60.0),
+            nodes(&[("a", "Ledger API"), ("q", "Orbit Queue")]),
+            vec![],
+            vec![],
+            vec![
+                ra::owner("Avery", "Avery", ra::on_node("a", "Ledger API"), 0.0, from),
+                ra::owner(
+                    "Avery",
+                    "Avery",
+                    ra::on_node("q", "Orbit Queue"),
+                    from,
+                    3600.0,
+                ),
+            ],
+            vec![ra::event("E1", "NodeAdded", 29.0)],
+        )
+    };
+    let metrics = |g: &MeetingGolden| {
+        let dir = tempfile::tempdir().unwrap();
+        ra::write_artifact(
+            dir.path(),
+            schema::BOARD_STATE,
+            vec![("b".into(), owned(32.0))],
+        )
+        .unwrap();
+        run_meeting(g, &RunArtifacts::scan(dir.path()).unwrap(), 2.0)
+            .unwrap()
+            .metrics
+    };
+    let grid = |interval_s: f64| FrameClock::PrototypeGrid {
+        interval_s,
+        lead_s: 0.0,
+    };
+    // Gold move at 30 (PTS), predicted at 32: inside the 2 s tolerance.
+    let mut g = golden();
+    let pts = metrics(&g);
+    assert_eq!(pts["owners.move_error_max_s"], 0.0);
+    assert_eq!(pts["owners.attribution"], 1.0);
+    // The screen clock never moves owner or window times.
+    g.frame_clock = Some(grid(5.0));
+    assert_eq!(metrics(&g), pts);
+    // Moves on a 5 s grid: the move names 30, content time 35; error 3 - 2.
+    g.clocks.owner_moves = Some(grid(5.0));
+    assert_eq!(metrics(&g)["owners.move_error_max_s"], 1.0);
+    // Probes on a 5 s grid (25 -> 30, 35 -> 40) while assignments stay on PTS: the
+    // probe at 30 now falls in avery's queue assignment, which the prediction only
+    // starts at 32.
+    g.clocks.owner_moves = None;
+    g.clocks.owner_probes = Some(grid(5.0));
+    assert_eq!(metrics(&g)["owners.attribution"], 0.5);
+    // Assignments shifted with their probes keep the same answer.
+    g.clocks.owner_assignments = Some(grid(5.0));
+    assert_eq!(metrics(&g)["owners.attribution"], 1.0);
+    // The static window 20..28 holds the event at 29 on PTS (29 <= 28 + 4 s
+    // tolerance). On a 10 s grid its bounds are 30..38, after the event.
+    assert_eq!(pts["events.false_change"], 1.0);
+    g.clocks.static_windows = Some(grid(10.0));
+    assert_eq!(metrics(&g)["events.false_change"], 0.0);
+    // Allowed events keep their own clock: an allowed NodeAdded at 29 on PTS
+    // absorbs the event inside a grid-named window; shifted with the window it
+    // would sit at 39, too far to absorb it.
+    g.clocks.static_windows = Some(grid(5.0));
+    g.static_windows[0].allowed_events =
+        serde_json::from_value(json!([{"kind": "node_added", "t_s": 29.0}])).unwrap();
+    assert_eq!(metrics(&g)["events.false_change"], 0.0);
+    g.clocks.allowed_events = Some(grid(10.0));
+    assert_eq!(metrics(&g)["events.false_change"], 1.0);
 }

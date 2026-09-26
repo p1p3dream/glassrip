@@ -315,7 +315,12 @@ async fn case_inner(ctx: &PipelineContext, case: &BoardCase) -> Result<PipelineO
         OcrConfig::default(),
         layout.clone(),
     );
-    let vocabulary = VocabularyStage::new(VocabularyParams::default());
+    // The same participants the live meeting run configures (src/meeting/run.rs),
+    // so the prompt vocabulary is authoritative on names here too.
+    let vocabulary = VocabularyStage::new(VocabularyParams {
+        participants: participants.clone(),
+        ..VocabularyParams::default()
+    });
     let classify = ClassifyStage::new(
         ClassifyParams {
             seed: ctx.seed,
