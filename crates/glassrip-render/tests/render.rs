@@ -343,7 +343,7 @@ fn a_crowded_board_lists_what_does_not_fit_below_it() {
     );
     let text = &r.svg_text[0].1;
     assert!(text.contains("Annotations without room on the board"));
-    assert!(text.contains("Annotation listed below the board"));
+    assert!(text.contains("Listed below the board"));
 }
 
 #[test]
@@ -359,7 +359,7 @@ fn a_normal_board_has_no_annotation_list() {
     assert!(r.warnings().is_empty());
     let text = &r.svg_text[0].1;
     assert!(!text.contains("Annotations without room"));
-    assert!(!text.contains("Annotation listed below"));
+    assert!(!text.contains("Listed below the board"));
 }
 
 /// Real defects stay failures: two cards on top of each other are not an

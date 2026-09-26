@@ -630,6 +630,26 @@ fn marker(n: usize, x: f64, y: f64) -> Pill {
     }
 }
 
+/// The point of a polyline nearest to `p`.
+fn nearest_on_path(pts: &[(f64, f64)], p: (f64, f64)) -> Option<(f64, f64)> {
+    pts.windows(2)
+        .map(|w| {
+            let (a, b) = (w[0], w[1]);
+            let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+            let len2 = dx * dx + dy * dy;
+            let t = if len2 > 0.0 {
+                (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            (a.0 + dx * t, a.1 + dy * t)
+        })
+        .min_by(|a, b| {
+            let d = |q: &(f64, f64)| (q.0 - p.0).powi(2) + (q.1 - p.1).powi(2);
+            d(a).total_cmp(&d(b))
+        })
+}
+
 /// A leader line.
 type Leader = (f64, f64, f64, f64);
 
@@ -709,6 +729,18 @@ impl Space<'_> {
             leader_clear(&l, taken).then_some((*r, Some(l)))
         })
     }
+}
+
+/// Where a leader line from a spot ends on its element.
+type Anchor = Box<dyn Fn(&R) -> (f64, f64)>;
+
+/// Spots for an owner pill: next to its element, further out (with a leader
+/// back to `anchor`), and for its marker when it has no room at all.
+struct OwnerSpots {
+    direct: Vec<R>,
+    ringed: Vec<R>,
+    anchor: Anchor,
+    marker: Vec<R>,
 }
 
 /// An annotation moved to the footnotes, waiting for its marker.
@@ -1174,18 +1206,25 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
     // to the footnotes below the board, marked by its number on the board.
     let zones_bottom = zones.iter().map(|z| z.r.bottom()).fold(0.0, f64::max);
     // stickies, the banner and panels start at or below this line
-    // (an edge label placed away from its path may reach below the cards)
+    // (the first sticky row starts 24 px lower; the banner or a panel starts
+    // right there when there are no stickies; an edge label placed away from
+    // its path may reach below the cards, and pushes them down)
+    let sticky_gap = if board.final_stickies().is_empty() {
+        0.0
+    } else {
+        24.0
+    };
     let labels_bottom = edges
         .iter()
-        .filter_map(|e| e.label.as_ref().map(|l| l.r.bottom() + 8.0))
+        .filter_map(|e| e.label.as_ref().map(|l| l.r.bottom()))
         .fold(0.0, f64::max);
     let annot_limit = channels_bottom
         .max(zones_bottom)
         .max(arch_bottom + ZONE_PAD_BOTTOM)
-        .max(labels_bottom);
+        .max(labels_bottom + 8.0 - sticky_gap);
     let space = Space {
         width,
-        limit: annot_limit,
+        limit: annot_limit + sticky_gap,
         segments: &segments,
     };
     let node_text: BTreeMap<&str, String> = nodes
@@ -1217,11 +1256,7 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
                 )
             });
             let what = sanitize_dashes(&target_text(&o.target));
-            // (direct spots, ringed spots, leader anchor, marker spots)
-            type Anchor = Box<dyn Fn(&R) -> (f64, f64)>;
-            let (direct, ringed, anchor, marker_spots): (Vec<R>, Vec<R>, Anchor, Vec<R>) = match &o
-                .target
-            {
+            let spots = match &o.target {
                 OwnerTarget::Node { .. } => {
                     let Some(r) = card_of.get(target.as_str()).copied() else {
                         continue;
@@ -1239,7 +1274,12 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
                     let anchor: Anchor = Box::new(move |p: &R| {
                         (p.cx().clamp(r.x, r.right()), p.cy().clamp(r.y, r.bottom()))
                     });
-                    (v, rings, anchor, around_card(&r, mw, mh))
+                    OwnerSpots {
+                        direct: v,
+                        ringed: rings,
+                        anchor,
+                        marker: around_card(&r, mw, mh),
+                    }
                 }
                 OwnerTarget::Edge { .. } => {
                     let Some((mx, my, horizontal)) = edge_anchor.get(target.as_str()).copied()
@@ -1265,10 +1305,26 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
                     v.extend(beside_path(&path, w, h));
                     let rings = ring_spots((mx, my), w, h, &[60.0, 90.0, 120.0, 160.0]);
                     let (mw, mh) = marker_size(pending.len() + 1);
-                    let anchor: Anchor = Box::new(move |_: &R| (mx, my));
-                    (v, rings, anchor, beside_path(&path, mw, mh))
+                    // the nearest point of the edge (not its middle, where a
+                    // label may sit on the line)
+                    let line = path.clone();
+                    let anchor: Anchor = Box::new(move |p: &R| {
+                        nearest_on_path(&line, (p.cx(), p.cy())).unwrap_or((mx, my))
+                    });
+                    OwnerSpots {
+                        direct: v,
+                        ringed: rings,
+                        anchor,
+                        marker: beside_path(&path, mw, mh),
+                    }
                 }
             };
+            let OwnerSpots {
+                direct,
+                ringed,
+                anchor,
+                marker: marker_spots,
+            } = spots;
             let Some((pr, lead)) = space.place(&direct, &ringed, anchor, &taken, &leaders) else {
                 let mut text = format!("Owner {name} of {what}");
                 if let Some(m) = &moved {
@@ -1691,7 +1747,7 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
         add("sticky", "Board sticky", 28.0);
     }
     if !pending.is_empty() {
-        add("marker", "Annotation listed below the board", 28.0);
+        add("marker", "Listed below the board", 28.0);
     }
     let lw = lx;
     let legend = Legend {
