@@ -626,7 +626,11 @@ impl Stage for BoardReadStage {
         // may cache a dense board as truncated.
         // 5: degenerate complete replies (one text at many places) retried
         // with a repeat penalty, then collapsed; outputs of 4 may hold them.
-        5
+        // 6: only texts at the repeat bound count towards the duplicate share,
+        // the share needs piled copies (a row of identical cards OCR misses is
+        // no copy), and an invalid retry reply fails the item; outputs of 5 may
+        // hold collapsed legitimate cards.
+        6
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
