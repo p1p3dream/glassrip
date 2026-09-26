@@ -5,24 +5,28 @@
 //! A predicted item matches a gold item when its similarity to the gold text or any
 //! alias is at least the threshold (default [`crate::text::SENTENCE_MATCH_DICE`],
 //! 0.6). Words are compared as claim words ([`crate::text::claim_words`]): stemmed,
-//! stopwords removed, participant spellings folded to one term, and marked with
-//! their polarity, so "ship weekly builds" and "do not ship weekly builds" share no
-//! word. A prediction scores against one gold phrasing only when
+//! stopwords removed, capitalized participant spellings folded to one term, and
+//! marked with their polarity (a negation governs the rest of its clause), so "ship
+//! weekly builds" and "do not ship weekly builds" share no word. A prediction scores
+//! against one gold phrasing only when
 //!
-//! - every key term of the phrasing (a known participant or entity name at any
-//!   position, a capitalized word after the first, an acronym, or an identifier;
-//!   [`crate::text::key_terms`]) appears in it: a decision about another person or
-//!   system is another decision, however similar the wording; and
+//! - every key term of the phrasing (a capitalized participant name or an entity
+//!   name at any position, a capitalized word after the first, an acronym, or an
+//!   identifier; [`crate::text::key_terms`]) appears in it: a decision about another
+//!   person or system is another decision, however similar the wording;
 //! - it states the phrasing's claim words with the same polarity
 //!   ([`crate::text::covers`]): all of them for a phrasing of up to five content
-//!   words or one without key terms, all but one per five words otherwise.
+//!   words or one without key terms, all but one per five words otherwise; and
+//! - it states none of them with the opposite polarity
+//!   ([`crate::text::contradicts`]).
 //!
 //! The similarity is then the larger of the claim-word Dice coefficient
 //! ([`crate::text::claim_dice`]), which rewards the same wording at the same length,
 //! and containment ([`crate::text::containment`]), which accepts a restatement
 //! inside a longer sentence ("The team decided to skip the importer step for now to
 //! focus on ..." for "skip the importer for now") when the prediction carries at
-//! most four times the gold's content words and keeps the gold words together.
+//! most four times as many content words as the gold (repeats counted) and keeps
+//! the gold words together.
 //! When the gold item names a person, the prediction must name the same person.
 //! Matching is one-to-one and greedy by score.
 

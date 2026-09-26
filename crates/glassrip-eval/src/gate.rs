@@ -44,11 +44,16 @@ pub enum Rule {
 
 /// The gate rule of a metric name; `None` when the metric is unclassified.
 pub fn rule_for(name: &str) -> Option<Rule> {
+    // `audio.speaker_label_error` is retired: it meant raw diarizer labels, then
+    // mapped identities, so a baseline under that key cannot be compared. Its
+    // meanings live on as `audio.diarizer_label_error` and
+    // `audio.speaker_identity_error`.
     const INFO: &[&str] = &[
         "cases",
         "screen.unconfirmed_labels",
         "audio.speaker_labels",
         "audio.speaker_identities",
+        "audio.speaker_label_error",
     ];
     if INFO.contains(&name) || name.starts_with("bench.") {
         return Some(Rule::Info);
@@ -91,7 +96,7 @@ pub fn rule_for(name: &str) -> Option<Rule> {
         "extra",
         "negative_hits",
         "negative_action_hits",
-        "speaker_label_error",
+        "diarizer_label_error",
         "speaker_identity_error",
         "hallucinated_spans",
         "truncated_cells",
@@ -333,6 +338,7 @@ mod tests {
             "audio.hotword_wer",
             "audio.speaker_labels",
             "audio.speaker_label_error",
+            "audio.diarizer_label_error",
             "audio.speaker_identities",
             "audio.speaker_identity_error",
             "bench.median_s",
@@ -361,5 +367,29 @@ mod tests {
         );
         assert_eq!(rule_for("bench.median_s"), Some(Rule::Info));
         assert_eq!(rule_for("screen.missed"), Some(Rule::LowerBetterCount));
+        assert_eq!(
+            rule_for("audio.diarizer_label_error"),
+            Some(Rule::LowerBetterCount)
+        );
+        assert_eq!(
+            rule_for("audio.speaker_identity_error"),
+            Some(Rule::LowerBetterCount)
+        );
+    }
+
+    /// Codex round-1 M6: a baseline under the retired key never fails a run whose
+    /// speaker metric changed meaning.
+    #[test]
+    fn retired_speaker_key_is_not_compared() {
+        let b = base(&[("audio.speaker_label_error", 0.0, 0.0)]);
+        let g = regression_gate(
+            &cur(&[
+                ("audio.diarizer_label_error", 1.0, 0.0),
+                ("audio.speaker_identity_error", 0.0, 0.0),
+            ]),
+            &b,
+            2.0,
+        );
+        assert!(g.is_empty(), "{g:?}");
     }
 }

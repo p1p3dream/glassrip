@@ -31,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{EvalError, Result};
 use crate::fixture::{BoardCase, DocsCase};
-use crate::golden::{ClockSection, FrameClock, MeetingGolden};
+use crate::golden::{ClockSection, MeetingGolden};
 use crate::metrics::audio::{hotword_wer, speaker_label_count, TimedWord};
 use crate::metrics::board::{
     is_chrome, score_board, BoardScore, Direction, GoldBoard, GoldSticky, NodeResolver, PredBoard,
@@ -670,32 +670,39 @@ pub fn speaker_identities(records: &[SpeakersRecord], segs: &[TranscriptSegment]
         .len()
 }
 
-/// Owner truth with every time moved from `clock` to PTS.
-fn owners_on_pts(o: &crate::golden::OwnerTruth, clock: FrameClock) -> crate::golden::OwnerTruth {
-    let t = |x: f64| clock.content_time(x);
-    let mut out = o.clone();
+/// Owner truth with each kind of time (probes, assignment windows, moves) moved from
+/// its declared clock to PTS.
+fn owners_on_pts(g: &MeetingGolden) -> crate::golden::OwnerTruth {
+    let probe = g.clock(ClockSection::OwnerProbes);
+    let window = g.clock(ClockSection::OwnerAssignments);
+    let moved = g.clock(ClockSection::OwnerMoves);
+    let mut out = g.owners.clone();
     for p in &mut out.probes_s {
-        *p = t(*p);
+        *p = probe.content_time(*p);
     }
     for a in &mut out.assignments {
-        a.valid_from_s = t(a.valid_from_s);
-        a.valid_to_s = a.valid_to_s.map(t);
+        a.valid_from_s = window.content_time(a.valid_from_s);
+        a.valid_to_s = a.valid_to_s.map(|t| window.content_time(t));
     }
     for m in &mut out.moves {
-        m.t_s = t(m.t_s);
+        m.t_s = moved.content_time(m.t_s);
     }
     out
 }
 
-/// Static windows with every time moved from `clock` to PTS.
-fn windows_on_pts(w: &[StaticWindow], clock: FrameClock) -> Vec<StaticWindow> {
-    w.iter()
+/// Static windows with their bounds and their allowed events each moved from its
+/// declared clock to PTS.
+fn windows_on_pts(g: &MeetingGolden) -> Vec<StaticWindow> {
+    let bounds = g.clock(ClockSection::StaticWindows);
+    let allowed = g.clock(ClockSection::AllowedEvents);
+    g.static_windows
+        .iter()
         .cloned()
         .map(|mut w| {
-            w.t_start_s = clock.content_time(w.t_start_s);
-            w.t_end_s = clock.content_time(w.t_end_s);
+            w.t_start_s = bounds.content_time(w.t_start_s);
+            w.t_end_s = bounds.content_time(w.t_end_s);
             for e in &mut w.allowed_events {
-                e.t_s = clock.content_time(e.t_s);
+                e.t_s = allowed.content_time(e.t_s);
             }
             w
         })
@@ -747,13 +754,14 @@ pub fn run_meeting(
     // Each section joins on the clock its golden declares (PTS unless declared).
     let screen_clock = golden.clock(ClockSection::ScreenTypes);
     let trap_clock = golden.clock(ClockSection::Traps);
-    let owner_clock = golden.clock(ClockSection::Owners);
-    let window_clock = golden.clock(ClockSection::StaticWindows);
     details.insert(
         "golden_clocks".into(),
         json!(ClockSection::ALL
             .iter()
-            .map(|s| (s.name(), golden.clock(*s)))
+            .map(|s| (
+                s.name(),
+                json!({"clock": golden.clock(*s), "declared": golden.declared_clock(*s).is_some()})
+            ))
             .collect::<BTreeMap<_, _>>()),
     );
 
@@ -888,7 +896,7 @@ pub fn run_meeting(
                 .as_ref()
                 .is_none_or(|ks| join_time(t, ks, tolerance_s).is_some())
         };
-        let gold_owners = owners_on_pts(&golden.owners, owner_clock);
+        let gold_owners = owners_on_pts(golden);
         let attr = owner_attribution(
             &gold_owners.assignments,
             &pred_assign,
@@ -908,7 +916,7 @@ pub fn run_meeting(
         details.insert("owner_probes".into(), json!(attr.probes));
         details.insert("owner_moves".into(), json!(moves));
 
-        let windows = windows_on_pts(&golden.static_windows, window_clock);
+        let windows = windows_on_pts(golden);
         let (n, offenders) = false_change_events(&windows, &events, EVENT_TOLERANCE_S);
         m.insert("events.false_change".into(), n as f64);
         details.insert("false_change_events".into(), json!(offenders));
@@ -1049,21 +1057,21 @@ pub fn run_meeting(
             // Raw diarization: distinct diarizer labels against the people.
             m.insert("audio.speaker_labels".into(), n as f64);
             m.insert(
-                "audio.speaker_label_error".into(),
+                "audio.diarizer_label_error".into(),
                 (n as f64 - people).abs(),
             );
             // After `name_speakers`: two labels mapped to one person are one
             // speaker, and speech nobody was named for is its own voice. Without a
-            // speakers artifact there is no mapping, so every label is an identity.
-            let identities = match &speakers {
-                Some(records) => speaker_identities(records, segs),
-                None => n,
-            };
-            m.insert("audio.speaker_identities".into(), identities as f64);
-            m.insert(
-                "audio.speaker_identity_error".into(),
-                (identities as f64 - people).abs(),
-            );
+            // speakers artifact nothing was mapped, so there is nothing to score
+            // (the speaker section is reported as not run).
+            if let Some(records) = &speakers {
+                let identities = speaker_identities(records, segs);
+                m.insert("audio.speaker_identities".into(), identities as f64);
+                m.insert(
+                    "audio.speaker_identity_error".into(),
+                    (identities as f64 - people).abs(),
+                );
+            }
             details.insert("hotwords".into(), json!(hw.per_word));
         }
         None => run

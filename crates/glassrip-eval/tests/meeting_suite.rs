@@ -225,7 +225,8 @@ fn meeting_suite_hand_computed() {
     assert_eq!(get("audio.hotword_wer"), 0.0);
     assert_eq!(get("audio.speaker_labels"), 3.0);
     // Raw diarization: 3 labels for 2 people.
-    assert_eq!(get("audio.speaker_label_error"), 1.0);
+    assert_eq!(get("audio.diarizer_label_error"), 1.0);
+    assert!(!m.contains_key("audio.speaker_label_error"), "retired key");
     // After name mapping: avery, jordan, and the unresolved S2 voice.
     assert_eq!(get("audio.speaker_identities"), 3.0);
     assert_eq!(get("audio.speaker_identity_error"), 1.0);
@@ -250,6 +251,25 @@ fn degraded_notes_fail_the_gate_and_missing_artifacts_are_reported() {
     assert_eq!(run.gate_failures.len(), 1);
     // Screens, board, speakers, and audio.
     assert_eq!(run.not_run.len(), 4, "{:?}", run.not_run);
+}
+
+/// Codex round-1 M5: without a speakers artifact there is no mapping, so the
+/// post-mapping target has no value to pass on.
+#[test]
+fn no_speaker_mapping_means_no_identity_metric() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        schema::TRANSCRIPT,
+        vec![
+            ("s1", ra::segment("s1", "S0", 0.0, 5.0, "hi", &[])),
+            ("s2", ra::segment("s2", "S1", 5.0, 9.0, "ok", &[])),
+        ],
+    );
+    let run = run_meeting(&golden(), &RunArtifacts::scan(dir.path()).unwrap(), 2.0).unwrap();
+    assert_eq!(run.metrics.get("audio.diarizer_label_error"), Some(&0.0));
+    assert!(!run.metrics.contains_key("audio.speaker_identity_error"));
+    assert!(run.not_run.iter().any(|n| n.contains("glassrip.speakers")));
 }
 
 #[test]
@@ -490,7 +510,8 @@ fn nominal_grid_labels_join_where_their_frame_was_taken() {
     assert_eq!(score(&g), 0.0);
 }
 
-/// Kimi finding 4: owner and static-window times join on their own declared clock,
+/// Kimi finding 4, Codex round-1 M7 and M8: probes, assignment windows, moves,
+/// window bounds, and allowed events each join on their own declared clock, and
 /// never on the screen clock.
 #[test]
 fn owner_and_static_window_clocks_are_declared_per_section() {
@@ -528,30 +549,42 @@ fn owner_and_static_window_clocks_are_declared_per_section() {
             .unwrap()
             .metrics
     };
-    let grid = FrameClock::PrototypeGrid {
-        interval_s: 5.0,
+    let grid = |interval_s: f64| FrameClock::PrototypeGrid {
+        interval_s,
         lead_s: 0.0,
     };
     // Gold move at 30 (PTS), predicted at 32: inside the 2 s tolerance.
     let mut g = golden();
     let pts = metrics(&g);
     assert_eq!(pts["owners.move_error_max_s"], 0.0);
+    assert_eq!(pts["owners.attribution"], 1.0);
     // The screen clock never moves owner or window times.
-    g.frame_clock = Some(grid);
-    assert_eq!(metrics(&g)["owners.move_error_max_s"], 0.0);
-    assert_eq!(
-        metrics(&g)["events.false_change"],
-        pts["events.false_change"]
-    );
-    // Owners on a 5 s grid: the move names 30, content time 35; error 3 - 2.
-    g.clocks.owners = Some(grid);
+    g.frame_clock = Some(grid(5.0));
+    assert_eq!(metrics(&g), pts);
+    // Moves on a 5 s grid: the move names 30, content time 35; error 3 - 2.
+    g.clocks.owner_moves = Some(grid(5.0));
     assert_eq!(metrics(&g)["owners.move_error_max_s"], 1.0);
+    // Probes on a 5 s grid (25 -> 30, 35 -> 40) while assignments stay on PTS: the
+    // probe at 30 now falls in avery's queue assignment, which the prediction only
+    // starts at 32.
+    g.clocks.owner_moves = None;
+    g.clocks.owner_probes = Some(grid(5.0));
+    assert_eq!(metrics(&g)["owners.attribution"], 0.5);
+    // Assignments shifted with their probes keep the same answer.
+    g.clocks.owner_assignments = Some(grid(5.0));
+    assert_eq!(metrics(&g)["owners.attribution"], 1.0);
     // The static window 20..28 holds the event at 29 on PTS (29 <= 28 + 4 s
-    // tolerance). On a 10 s grid the window is 30..38, after the event.
+    // tolerance). On a 10 s grid its bounds are 30..38, after the event.
     assert_eq!(pts["events.false_change"], 1.0);
-    g.clocks.static_windows = Some(FrameClock::PrototypeGrid {
-        interval_s: 10.0,
-        lead_s: 0.0,
-    });
+    g.clocks.static_windows = Some(grid(10.0));
     assert_eq!(metrics(&g)["events.false_change"], 0.0);
+    // Allowed events keep their own clock: an allowed NodeAdded at 29 on PTS
+    // absorbs the event inside a grid-named window; shifted with the window it
+    // would sit at 39, too far to absorb it.
+    g.clocks.static_windows = Some(grid(5.0));
+    g.static_windows[0].allowed_events =
+        serde_json::from_value(json!([{"kind": "node_added", "t_s": 29.0}])).unwrap();
+    assert_eq!(metrics(&g)["events.false_change"], 0.0);
+    g.clocks.allowed_events = Some(grid(10.0));
+    assert_eq!(metrics(&g)["events.false_change"], 1.0);
 }

@@ -14,7 +14,7 @@
 //! | `static_windows` | windows where only pans and zooms happen, with allowed real events |
 //! | `chrome_terms` | UI strings that must never become board content |
 //! | `transcript` | decisions, action items, open questions, negative action items, hotwords, speaker count |
-//! | `clocks` | per-section [`FrameClock`] (`screen_types`, `traps`, `owners`, `static_windows`); PTS unless declared |
+//! | `clocks` | per-section [`FrameClock`] ([`ClockSection`]); PTS unless declared |
 //!
 //! Authoring can use `screen_type_ranges` (inclusive `t_rep` ranges) instead of
 //! per-keyframe labels; the `golden_convert` example expands them against the
@@ -33,7 +33,7 @@ use crate::metrics::events::StaticWindow;
 use crate::metrics::notes::GoldItem;
 use crate::metrics::owners::{Assignment, Move, Target};
 use crate::metrics::screen::ScreenType;
-use crate::text::{claim_words, key_terms, Vocabulary};
+use crate::text::{claim_words, contradicts, key_terms, Vocabulary};
 
 /// Current golden format version.
 pub const GOLDEN_VERSION: u32 = 1;
@@ -177,41 +177,55 @@ impl FrameClock {
     }
 }
 
-/// A golden section whose times can be on a declared clock.
+/// A kind of golden time that can be on a declared clock. Each is declared on its
+/// own, because one golden can take them from different sources (a probe named by
+/// a grid frame, an assignment timed from the transcript).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClockSection {
     /// `screen_types[].t_rep_s`.
     ScreenTypes,
     /// `traps[]` times.
     Traps,
-    /// `owners`: probe times, assignment windows, move times.
-    Owners,
-    /// `static_windows[]` bounds and allowed event times.
+    /// `owners.probes_s`.
+    OwnerProbes,
+    /// `owners.assignments[]` validity windows.
+    OwnerAssignments,
+    /// `owners.moves[].t_s`.
+    OwnerMoves,
+    /// `static_windows[]` bounds.
     StaticWindows,
+    /// `static_windows[].allowed_events[].t_s`.
+    AllowedEvents,
 }
 
 impl ClockSection {
     /// Every section, in report order.
-    pub const ALL: [ClockSection; 4] = [
+    pub const ALL: [ClockSection; 7] = [
         Self::ScreenTypes,
         Self::Traps,
-        Self::Owners,
+        Self::OwnerProbes,
+        Self::OwnerAssignments,
+        Self::OwnerMoves,
         Self::StaticWindows,
+        Self::AllowedEvents,
     ];
 
-    /// Field name in the golden file.
+    /// Field name under `clocks`.
     pub fn name(self) -> &'static str {
         match self {
             Self::ScreenTypes => "screen_types",
             Self::Traps => "traps",
-            Self::Owners => "owners",
+            Self::OwnerProbes => "owner_probes",
+            Self::OwnerAssignments => "owner_assignments",
+            Self::OwnerMoves => "owner_moves",
             Self::StaticWindows => "static_windows",
+            Self::AllowedEvents => "allowed_events",
         }
     }
 }
 
-/// Per-section clocks. A section left out is on [`FrameClock::Pts`]. Transcript
-/// times (hotword windows, notes) are always PTS.
+/// Per-section clocks ([`ClockSection`]). A section left out is on
+/// [`FrameClock::Pts`]. Transcript times (hotword windows, notes) are always PTS.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GoldenClocks {
@@ -221,12 +235,21 @@ pub struct GoldenClocks {
     /// Clock of `traps`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traps: Option<FrameClock>,
-    /// Clock of `owners`.
+    /// Clock of `owners.probes_s`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owners: Option<FrameClock>,
-    /// Clock of `static_windows`.
+    pub owner_probes: Option<FrameClock>,
+    /// Clock of `owners.assignments` windows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_assignments: Option<FrameClock>,
+    /// Clock of `owners.moves`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_moves: Option<FrameClock>,
+    /// Clock of `static_windows` bounds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub static_windows: Option<FrameClock>,
+    /// Clock of `static_windows[].allowed_events`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_events: Option<FrameClock>,
 }
 
 impl GoldenClocks {
@@ -235,12 +258,16 @@ impl GoldenClocks {
         *self == Self::default()
     }
 
-    fn get(&self, s: ClockSection) -> Option<FrameClock> {
+    /// The clock a section declares, if any.
+    pub fn get(&self, s: ClockSection) -> Option<FrameClock> {
         match s {
             ClockSection::ScreenTypes => self.screen_types,
             ClockSection::Traps => self.traps,
-            ClockSection::Owners => self.owners,
+            ClockSection::OwnerProbes => self.owner_probes,
+            ClockSection::OwnerAssignments => self.owner_assignments,
+            ClockSection::OwnerMoves => self.owner_moves,
             ClockSection::StaticWindows => self.static_windows,
+            ClockSection::AllowedEvents => self.allowed_events,
         }
     }
 }
@@ -319,13 +346,18 @@ fn golden_err(message: impl Into<String>) -> EvalError {
 }
 
 impl MeetingGolden {
-    /// The clock of one section: its `clocks` entry, else (screen types and traps
-    /// only) the legacy `frame_clock`, else [`FrameClock::Pts`].
-    pub fn clock(&self, section: ClockSection) -> FrameClock {
+    /// The clock a section declares: its `clocks` entry, else (screen types and
+    /// traps only) the legacy `frame_clock`; `None` when undeclared.
+    pub fn declared_clock(&self, section: ClockSection) -> Option<FrameClock> {
         let legacy = matches!(section, ClockSection::ScreenTypes | ClockSection::Traps)
             .then_some(self.frame_clock)
             .flatten();
-        self.clocks.get(section).or(legacy).unwrap_or_default()
+        self.clocks.get(section).or(legacy)
+    }
+
+    /// The clock of one section: [`Self::declared_clock`], else [`FrameClock::Pts`].
+    pub fn clock(&self, section: ClockSection) -> FrameClock {
+        self.declared_clock(section).unwrap_or_default()
     }
 
     /// Participant and entity names for the notes matcher: every participant's
@@ -376,8 +408,12 @@ impl MeetingGolden {
             .chain(t.open_questions.iter().map(|i| ("open question", i)))
     }
 
-    /// Every alias of a notes item names what its text names: an alias without one of
-    /// the text's key terms would match a claim about another person or system.
+    /// Every alias of a notes item states the same claim about the same subject as
+    /// its text. An alias must name every participant the text names and, for each
+    /// other key term of the text, that term or another word of the same entity name
+    /// ("Ledger step" for "Ledger API step"); otherwise it would match a claim about
+    /// someone or something else. And no word the two share may flip polarity ("Ship
+    /// Ledger" is not an alias of "Do not ship Ledger").
     fn validate_notes_aliases(&self) -> Result<()> {
         let v = self.vocabulary();
         for (kind, item) in self.notes_items() {
@@ -385,9 +421,22 @@ impl MeetingGolden {
             for alias in &item.aliases {
                 let terms: BTreeSet<String> =
                     claim_words(alias, &v).into_iter().map(|w| w.term).collect();
-                if let Some(missing) = keys.iter().find(|k| !terms.contains(*k)) {
+                let unnamed = keys.iter().find(|k| {
+                    if k.starts_with('@') {
+                        !terms.contains(*k)
+                    } else {
+                        v.name_group(k).is_disjoint(&terms)
+                    }
+                });
+                if let Some(missing) = unnamed {
                     return Err(golden_err(format!(
                         "{kind} `{}`: alias `{alias}` does not name `{missing}`, so it would match a claim about someone or something else",
+                        item.text
+                    )));
+                }
+                if contradicts(&item.text, alias, &v) || contradicts(alias, &item.text, &v) {
+                    return Err(golden_err(format!(
+                        "{kind} `{}`: alias `{alias}` states a shared word with the opposite polarity",
                         item.text
                     )));
                 }
@@ -658,8 +707,10 @@ mod tests {
         let legacy: MeetingGolden = serde_json::from_value(v.clone()).unwrap();
         assert_eq!(legacy.clock(ClockSection::ScreenTypes), grid);
         assert_eq!(legacy.clock(ClockSection::Traps), grid);
-        assert_eq!(legacy.clock(ClockSection::Owners), FrameClock::Pts);
-        assert_eq!(legacy.clock(ClockSection::StaticWindows), FrameClock::Pts);
+        for s in &ClockSection::ALL[2..] {
+            assert_eq!(legacy.clock(*s), FrameClock::Pts, "{}", s.name());
+        }
+        assert_eq!(legacy.declared_clock(ClockSection::OwnerMoves), None);
         legacy.validate().unwrap();
         // both forms at once are ambiguous
         v["clocks"] = serde_json::json!({"screen_types": {"kind": "pts"}});
@@ -667,9 +718,12 @@ mod tests {
         assert!(both.validate().is_err());
         // per-section
         v.as_object_mut().unwrap().remove("frame_clock");
-        v["clocks"] = serde_json::json!({"owners": {"kind": "prototype_grid", "interval_s": 2.0}});
+        v["clocks"] =
+            serde_json::json!({"owner_probes": {"kind": "prototype_grid", "interval_s": 2.0}});
         let per: MeetingGolden = serde_json::from_value(v.clone()).unwrap();
-        assert_eq!(per.clock(ClockSection::Owners), grid);
+        assert_eq!(per.clock(ClockSection::OwnerProbes), grid);
+        assert_eq!(per.clock(ClockSection::OwnerAssignments), FrameClock::Pts);
+        assert_eq!(per.clock(ClockSection::OwnerMoves), FrameClock::Pts);
         assert_eq!(per.clock(ClockSection::ScreenTypes), FrameClock::Pts);
         per.validate().unwrap();
         // nonsense grids are rejected
@@ -702,6 +756,28 @@ mod tests {
         assert!(e.contains("does not name"), "{e}");
         // the Ledger API entity is named even without capitals
         g.transcript.decisions = vec![item("skip the Ledger step", &["the step is deferred"])];
+        assert!(g.validate().is_err());
+        g.transcript.decisions = vec![
+            item("Ship weekly builds", &[]),
+            item("skip the ledger step", &["ledger is deferred"]),
+        ];
+        g.validate().unwrap();
+        // Codex round-1 B1: an alias of the opposite claim is rejected.
+        g.transcript.decisions = vec![item("Do not ship Ledger", &["Ship Ledger"])];
+        let e = g.validate().unwrap_err().to_string();
+        assert!(e.contains("opposite polarity"), "{e}");
+        // Codex round-1 M10: an alias may shorten an entity name to one of its words,
+        // but not drop a second entity.
+        g.transcript.decisions = vec![item("Skip Ledger API step", &["Skip Ledger step"])];
+        g.validate().unwrap();
+        g.final_board.nodes.push(GoldNode {
+            id: "queue".into(),
+            text: "Orbit Queue".into(),
+            aliases: vec![],
+            bbox: None,
+            core: false,
+        });
+        g.transcript.decisions = vec![item("Move Ledger to Orbit", &["Move Ledger"])];
         assert!(g.validate().is_err());
         g.transcript.decisions = vec![
             item("Ship weekly builds", &[]),
