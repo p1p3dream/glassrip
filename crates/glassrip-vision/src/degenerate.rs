@@ -17,11 +17,13 @@
 //!   single original explains, plus that original.
 //!
 //! A text is **repeated** when `repeats >= min_repeats` and either the list's
-//! excess copies (`repeats - 1`, summed over its texts) make up at least
+//! excess copies (`repeats - 1`, summed over the texts that reach
+//! `min_repeats`; pairs and triples never count) make up at least
 //! `min_duplicate_share` of the list, or `repeats >= strong_repeats`. Two "API"
 //! boxes or three "TODO" stickies never reach `min_repeats`; four "TODO"
-//! stickies among a dozen notes stay under the share; a row of identical cards
-//! that OCR reads at every card has no unexplained copies.
+//! stickies among a dozen notes stay under the share, however many other
+//! labels come in pairs; a row of identical cards that OCR reads at every card
+//! has no unexplained copies.
 //!
 //! [`collapse`] reduces each repeated text to its best-supported items: every item
 //! backed by its own OCR span, or the first item when OCR backs none. Edges and
@@ -207,7 +209,12 @@ fn list_repeats(
         let s = idx.iter().filter(|&&i| backed[i]).count();
         (idx.len() - s.max(1) + 1, s)
     };
-    let excess: usize = gs.iter().map(|(_, idx)| repeats(idx).0 - 1).sum();
+    let excess: usize = gs
+        .iter()
+        .map(|(_, idx)| repeats(idx).0)
+        .filter(|&r| r >= p.min_repeats)
+        .map(|r| r - 1)
+        .sum();
     let share = excess as f64 / n as f64;
     gs.into_iter()
         .filter_map(|(key, idx)| {
@@ -559,6 +566,23 @@ mod tests {
         for i in 0..4 {
             r.stickies.push(sticky("TODO", f64::from(i) * 120.0, 200.0));
         }
+        assert_eq!(detect(&r, &[], &p()), None);
+    }
+
+    #[test]
+    fn four_todo_notes_among_paired_labels_pass() {
+        // Pairs never count towards the share: 3 excess copies of 12, not 7.
+        let mut r = reading();
+        for i in 0..4 {
+            r.stickies.push(sticky("TODO", f64::from(i) * 120.0, 0.0));
+        }
+        for (i, t) in ["Cache", "Queue", "Retry", "Owner?"].iter().enumerate() {
+            for j in 0..2 {
+                r.stickies
+                    .push(sticky(t, (i * 2 + j) as f64 * 120.0, 200.0));
+            }
+        }
+        assert_eq!(r.stickies.len(), 12);
         assert_eq!(detect(&r, &[], &p()), None);
     }
 

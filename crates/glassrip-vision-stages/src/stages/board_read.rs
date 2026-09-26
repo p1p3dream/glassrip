@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use glassrip_core::envelope::{ErrorCode, ErrorInfo};
+use glassrip_core::envelope::ErrorInfo;
 use glassrip_core::runner::{
     ArtifactSpec, InputDecl, ItemContext, KeyExtras, Stage, StageError, StageInputs, WorkItem,
 };
@@ -141,14 +141,14 @@ pub fn repetition_retry(p: &BoardReadParams, request: &VisionRequest) -> VisionR
     retry
 }
 
-/// A failed retry that is a recorded answer of the model (stopped at the output
-/// limit, stopped in a loop, or not valid under the schema), by a stable label;
-/// `None` for every other failure.
+/// A failed retry that the raw store records as the model's answer (stopped at
+/// the output limit or in a loop), by a stable label; `None` for every other
+/// failure, an invalid reply included (the store keeps no failed reply, so a
+/// replay could not take the same path).
 fn settled_retry_failure(f: &InferFailure) -> Option<&'static str> {
     match f {
         InferFailure::Truncated(_) => Some("output limit"),
         InferFailure::Repetition(..) => Some("repetition loop"),
-        InferFailure::Other(e) if e.code == ErrorCode::SchemaParse => Some("invalid reply"),
         InferFailure::Other(_) => None,
     }
 }
@@ -546,11 +546,11 @@ impl BoardReadStage {
                         sent = retry;
                         log.retried = true;
                     }
-                    // A retry the model answered badly (the raw store records
-                    // these, so replay reaches the same place) keeps the first
-                    // reply. Anything else (a timeout, the server, cancellation,
-                    // a replay without the record) fails the item, as the other
-                    // retries do.
+                    // A retry stopped at the output limit or in a loop (the raw
+                    // store records these, so replay reaches the same place)
+                    // keeps the first reply. Anything else (an invalid reply, a
+                    // timeout, the server, cancellation, a replay without the
+                    // record) fails the item, as the other retries do.
                     Err(f) => match settled_retry_failure(&f) {
                         Some(label) => {
                             tracing::warn!(
@@ -1043,16 +1043,14 @@ mod tests {
 
     #[test]
     fn only_recorded_retry_failures_keep_the_first_reply() {
+        use glassrip_core::envelope::ErrorCode;
         let info = |code| ErrorInfo::new(code, "x");
         assert_eq!(
             settled_retry_failure(&InferFailure::Truncated(info(ErrorCode::ModelRequest))),
             Some("output limit")
         );
-        assert_eq!(
-            settled_retry_failure(&InferFailure::Other(info(ErrorCode::SchemaParse))),
-            Some("invalid reply")
-        );
         for code in [
+            ErrorCode::SchemaParse,
             ErrorCode::Timeout,
             ErrorCode::Cancelled,
             ErrorCode::ModelRequest,

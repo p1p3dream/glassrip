@@ -356,8 +356,8 @@ pub struct DegenerateLog {
     /// `request_key`, `sampling`, and `num_predict` are the retry's. False when
     /// no retry was left (the reply already was a retry) or the retry failed.
     pub retried: bool,
-    /// How the retry failed (`output limit`, `repetition loop`, or `invalid
-    /// reply`: answers the raw store records); the first reply was kept.
+    /// How the retry failed (`output limit` or `repetition loop`: stops the raw
+    /// store records); the first reply was kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_error: Option<String>,
     /// Texts of the kept reply reduced to their best-supported copies (a warning:
