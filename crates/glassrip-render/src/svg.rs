@@ -101,11 +101,16 @@ impl SvgChecks {
     /// "this list is empty".
     pub fn failures(&self) -> Vec<String> {
         let mut out = Vec::new();
+        let layout = self.overlaps.iter().map(|o| format!("layout: {o}"));
+        let style = self.style_violations.iter().map(|v| format!("style: {v}"));
         if !self.parsed {
+            // the render checks need a parsed tree; layout and style do not
             out.push(format!(
                 "svg did not parse: {}",
                 self.parse_error.as_deref().unwrap_or("unknown error")
             ));
+            out.extend(layout);
+            out.extend(style);
             return out;
         }
         if let Some(e) = &self.parse_error {
@@ -125,8 +130,8 @@ impl SvgChecks {
                 self.text_rendered, self.text_nodes, self.font_faces
             ));
         }
-        out.extend(self.overlaps.iter().map(|o| format!("layout: {o}")));
-        out.extend(self.style_violations.iter().map(|v| format!("style: {v}")));
+        out.extend(layout);
+        out.extend(style);
         if self.png_bytes == 0 {
             out.push("png preview was not encoded".into());
         }
@@ -351,6 +356,34 @@ mod tests {
         assert_eq!(num(248.0), "248");
         assert_eq!(num(1.25), "1.2");
         assert_eq!(comment_safe("n--x->".into()), "n-x");
+    }
+
+    #[test]
+    fn an_unparsed_svg_still_reports_layout_and_style() {
+        let c = SvgChecks {
+            parsed: false,
+            parse_error: Some("bad xml".into()),
+            width: 0,
+            height: 0,
+            png_bytes: 0,
+            luma_std: 0.0,
+            nonblank: false,
+            text_nodes: 0,
+            text_rendered: 0,
+            font_faces: 1,
+            overlaps: vec!["card a overlaps card b".into()],
+            style_violations: vec!["uses <marker> (arrowheads must be polygons)".into()],
+            layout_method: "grid".into(),
+            ok: false,
+        };
+        assert_eq!(
+            c.failures(),
+            vec![
+                "svg did not parse: bad xml".to_string(),
+                "layout: card a overlaps card b".into(),
+                "style: uses <marker> (arrowheads must be polygons)".into(),
+            ]
+        );
     }
 
     #[test]
