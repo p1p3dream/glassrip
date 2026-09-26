@@ -1202,12 +1202,17 @@ impl Stage for BoardStateStage {
         // 8: owner sightings start from OCR name spans (reader tags corroborate only),
         // ambiguous edge or end-node geometry keeps the incumbent, and a tag panned out
         // of view is not absent.
-        8
+        // 9: a same-text node track whose boxes are no evidence of a second place
+        // (near the established node, or read on an unreliable reading or where OCR
+        // puts the text at the established node) is merged into it, with its edges and
+        // owner tags; node-majority tracks read as stickies as often, or carrying a
+        // sticky marker, with no connector are stickies.
+        9
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
             schema: BOARD_STATE,
-            version: Version::new(1, 3, 0),
+            version: Version::new(1, 4, 0),
         }
     }
     fn inputs(&self) -> Vec<InputDecl> {
