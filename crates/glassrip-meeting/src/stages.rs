@@ -1190,7 +1190,9 @@ impl Stage for BoardStateStage {
         // ink from a failed alignment is unknown.
         // 5: routed connectors traced on the canvas with other elements masked, owner
         // events carry structured targets, blank views chain through flat links.
-        5
+        // 6: an emptied corridor removes a connector only with evidence from its
+        // own traced stroke (a stroke that never joined its ends keeps it).
+        6
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {

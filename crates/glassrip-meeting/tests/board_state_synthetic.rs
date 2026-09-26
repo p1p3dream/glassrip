@@ -2697,3 +2697,98 @@ fn a_card_moved_off_a_rerouted_connector_does_not_remove_it() {
         "{e:?}"
     );
 }
+
+/// Corridor pixels as in [`Pixels`], with a stroke trace that joins the two ends
+/// only while `joined[i]` holds in keyframe `i` (ink `trace_ink[i]`).
+struct TracedPixels {
+    px: Pixels,
+    joined: Vec<bool>,
+    trace_ink: Vec<f64>,
+}
+
+impl RegionProbe for TracedPixels {
+    fn ink_share(&self, keyframe_id: &str, region: &BBox) -> Option<f64> {
+        self.px.ink_share(keyframe_id, region)
+    }
+    fn line_cover(
+        &self,
+        keyframe_id: &str,
+        a: (f64, f64),
+        b: (f64, f64),
+        half_width: f64,
+    ) -> Option<f64> {
+        self.px.line_cover(keyframe_id, a, b, half_width)
+    }
+    fn stroke_between(
+        &self,
+        keyframe_id: &str,
+        _a: &BBox,
+        _b: &BBox,
+        _region: &BBox,
+        _masks: &[BBox],
+        _ring: f64,
+    ) -> Option<StrokeTrace> {
+        let i: usize = keyframe_id.trim_start_matches("kf").parse().ok()?;
+        Some(StrokeTrace {
+            joined: *self.joined.get(i)?,
+            ink: *self.trace_ink.get(i)?,
+        })
+    }
+}
+
+/// Codex final round 3 MAJOR (Kimi N4): the straight corridor empties (an
+/// unrelated straight mark across it is erased) while the connector itself is a
+/// stroke the trace never saw join its ends (dashed, or occluded by a card read
+/// on its route). A trace that cannot tell does not confirm the corridor: the
+/// connector stays. A connector whose own trace joined and is gone is still
+/// removed.
+#[test]
+fn an_emptied_corridor_without_a_joined_trace_keeps_the_connector() {
+    let mut specs: Vec<Spec> = (0..9)
+        .map(|_| Spec {
+            ink: Some(0.01),
+            ..base()
+        })
+        .collect();
+    specs[5].ink = Some(0.2);
+    for s in specs.iter_mut().skip(5) {
+        s.edges.retain(|e| e.2 != "gRPC");
+    }
+    let mut line = vec![0.9; 9];
+    for v in line.iter_mut().skip(5) {
+        *v = 0.05;
+    }
+    let probe = |joined: Vec<bool>, trace_ink: Vec<f64>| TracedPixels {
+        px: Pixels {
+            line: line.clone(),
+            ink: vec![0.5; 9],
+        },
+        joined,
+        trace_ink,
+    };
+    let run_with = |p: &TracedPixels| {
+        consolidate_with_probe(
+            frames(&specs),
+            "board-1",
+            &params(),
+            &hooks(&NoCorroboration),
+            Some(p as &dyn RegionProbe),
+        )
+    };
+    let grpc = |s: &BoardStateItem| s.edges.iter().find(|e| e.label == "gRPC").cloned().unwrap();
+
+    // The trace never joins the ends: the corridor alone cannot remove it.
+    let e = grpc(&run_with(&probe(vec![false; 9], vec![0.2; 9])));
+    assert!(e.in_final, "{e:?}");
+    assert!(
+        e.lifetimes.iter().all(|l| l.removed_at_s.is_none()),
+        "{e:?}"
+    );
+
+    // Positive control: the trace joined through keyframe 4 and its ink fell.
+    let joined: Vec<bool> = (0..9).map(|i| i < 5).collect();
+    let ink: Vec<f64> = (0..9).map(|i| if i < 5 { 0.2 } else { 0.02 }).collect();
+    let e = grpc(&run_with(&probe(joined, ink)));
+    assert!(!e.in_final, "{e:?}");
+    assert_eq!(e.lifetimes.last().unwrap().removed_at_s, Some(100.0));
+}

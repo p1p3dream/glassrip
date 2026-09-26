@@ -167,6 +167,22 @@ pub trait RegionProbe: Send + Sync {
     }
 }
 
+/// What the pixels say about a connector's own traced stroke between the
+/// keyframe that read it and one that did not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Trace {
+    /// It joined the two boxes and no longer does, and its ink fell.
+    Gone,
+    /// It joined the two boxes and no longer does, without an ink drop.
+    Broken,
+    /// It still joins the two boxes.
+    Joined,
+    /// The probe traced nothing (no stroke tracing, or a degenerate region).
+    Untraced,
+    /// The pixels cannot tell (see `routed_trace`).
+    Inconclusive,
+}
+
 /// Result of [`RegionProbe::stroke_between`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StrokeTrace {
@@ -1538,13 +1554,17 @@ pub fn consolidate_with_probe(
         ))
     };
     // A connector between tracks `a` and `b` (read in keyframe `s`) traced on the
-    // pixels, whatever route it takes: `Some(true)` when the stroke that joined the
-    // two boxes in `s` no longer joins them in `f` and the ink it was traced
-    // through fell; `Some(false)` when it still joins them; `None` when the pixels
-    // cannot tell: no stroke traced in `s`, no common registration, an end read in
-    // `f` away from where `s` puts it (a moved card takes its connector along), a
-    // broken stroke without an ink drop, or any other element over the traced
-    // region added, removed, moved or left unread between the two keyframes (a
+    // pixels, whatever route it takes: `Trace::Gone` when the stroke that joined
+    // the two boxes in `s` no longer joins them in `f` and the ink it was traced
+    // through fell; `Trace::Broken` when it no longer joins them but the ink did
+    // not fall (ink added nearby); `Trace::Joined` when it still joins them;
+    // `Trace::Untraced` when the probe traces nothing in `s` at all (no stroke
+    // tracing, a degenerate region); `Trace::Inconclusive` when the pixels cannot
+    // tell: the stroke did not join the boxes in `s` (dashed, or occluded by a
+    // card read on its route), no common registration, an end read in `f` away
+    // from where `s` puts it (a moved card takes its connector along), or any
+    // other element over the traced region added, removed, moved or left unread
+    // between the two keyframes (a
     // card placed on a connector hides part of it, a card moved off it may let it
     // be rerouted through the place it left). The other elements are masked out at
     // their boxes in each keyframe, so an unchanged card between the ends neither
@@ -1563,18 +1583,24 @@ pub fn consolidate_with_probe(
     type Traced = Option<(StrokeTrace, BBox, f64)>;
     let traced: std::cell::RefCell<HashMap<(usize, usize, usize), Traced>> =
         std::cell::RefCell::new(HashMap::new());
-    let routed_gone = |a: usize, b: usize, s: usize, f: usize| -> Option<bool> {
-        let probe = probe?;
+    let routed_trace = |a: usize, b: usize, s: usize, f: usize| -> Trace {
+        let Some(probe) = probe else {
+            return Trace::Untraced;
+        };
         let (ta, tb) = (&tracks[a], &tracks[b]);
-        let (ba, bb) = (raw_at(ta, s)?, raw_at(tb, s)?);
-        let (t, k) = s_to_f(s, f)?;
+        let (Some(ba), Some(bb)) = (raw_at(ta, s), raw_at(tb, s)) else {
+            return Trace::Inconclusive;
+        };
+        let Some((t, k)) = s_to_f(s, f) else {
+            return Trace::Inconclusive;
+        };
         let center = |r: &BBox| ((r.x1 + r.x2) / 2.0, (r.y1 + r.y2) / 2.0);
         let inside =
             |c: (f64, f64), m: &BBox| c.0 >= m.x1 && c.0 <= m.x2 && c.1 >= m.y1 && c.1 <= m.y2;
         for (tr, bs) in [(ta, &ba), (tb, &bb)] {
             if let Some(r) = raw_at(tr, f) {
                 if !inside(center(&r), &map_bbox(&t, bs)) {
-                    return None;
+                    return Trace::Inconclusive;
                 }
             }
         }
@@ -1593,9 +1619,11 @@ pub fn consolidate_with_probe(
                 .stroke_between(&frames[s].keyframe_id, &ba, &bb, &region, &masks, ring)
                 .map(|x| (x, region, ring))
         });
-        let (before, region, ring) = before?;
+        let Some((before, region, ring)) = before else {
+            return Trace::Untraced;
+        };
         if !before.joined {
-            return None;
+            return Trace::Inconclusive;
         }
         // Every other element over the traced region is read in both keyframes at
         // the same place (within the band width).
@@ -1610,27 +1638,33 @@ pub fn consolidate_with_probe(
                 continue;
             }
             let (Some(ms), Some(rf)) = (at_s, at_f) else {
-                return None;
+                return Trace::Inconclusive;
             };
             let (cs, cf) = (center(&ms), center(&rf));
             if (cs.0 - cf.0).hypot(cs.1 - cf.1) > ring * k {
-                return None;
+                return Trace::Inconclusive;
             }
             masks.push(rf);
         }
-        let now = probe.stroke_between(
+        let Some(now) = probe.stroke_between(
             &frames[f].keyframe_id,
             &map_bbox(&t, &ba),
             &map_bbox(&t, &bb),
             &region_f,
             &masks,
             ring * k,
-        )?;
+        ) else {
+            return Trace::Inconclusive;
+        };
         if now.joined {
-            return Some(false);
+            return Trace::Joined;
         }
         let fell = now.ink <= before.ink - rp.min_ink_drop.max(rp.min_ink_drop_share * before.ink);
-        fell.then_some(true)
+        if fell {
+            Trace::Gone
+        } else {
+            Trace::Broken
+        }
     };
 
     let mut edges: Vec<EdgeState> = Vec::new();
@@ -1677,13 +1711,20 @@ pub fn consolidate_with_probe(
                 if !(present(ta) && present(tb)) {
                     return Visibility::Unknown;
                 }
-                // A corridor that emptied is confirmed by the traced stroke when it
-                // can speak: an unread straight mark erased across the corridor of
-                // a connector routed around it is not the connector.
-                let traced_gone = || last_read(f).and_then(|s| routed_gone(a, b, s, f));
+                // A corridor that emptied needs evidence about the connector
+                // itself: its own traced stroke gone, or broken (a straight
+                // connector erased while ink is added near it). A stroke still
+                // joined, or a trace that cannot tell (the stroke never joined
+                // the boxes in `s`, being dashed or occluded by a card read on
+                // its route, or the region changed around it), keeps the
+                // connector: an unread straight mark erased across the corridor
+                // of a connector routed around it is not the connector. Only a
+                // probe that traces nothing leaves the corridor to decide alone.
+                let trace =
+                    || last_read(f).map_or(Trace::Inconclusive, |s| routed_trace(a, b, s, f));
                 let gone = match verdict(f) {
                     Some(true) => false,
-                    Some(false) => traced_gone() != Some(false),
+                    Some(false) => matches!(trace(), Trace::Gone | Trace::Broken | Trace::Untraced),
                     None => {
                         let from = last_read(f).map_or(0, |s| s + 1);
                         let inked = (from..=f).any(|k| {
@@ -1694,7 +1735,7 @@ pub fn consolidate_with_probe(
                         // With pixels, the traced stroke must say the connector went
                         // (pixels that cannot tell keep it); without pixels, the board
                         // ink is all there is to go on.
-                        inked && (probe.is_none() || traced_gone() == Some(true))
+                        inked && (probe.is_none() || trace() == Trace::Gone)
                     }
                 };
                 if gone {
