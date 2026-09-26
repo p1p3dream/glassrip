@@ -13,7 +13,6 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use clap::Parser;
 use glassrip_core::cache::Cache;
@@ -162,9 +161,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let digest = replay.id().digest;
         (Arc::new(replay), Arc::new(StaticProbe), digest, None)
     } else {
-        let mut cfg = OllamaConfig::new(&args.host, &args.model, 8192);
+        let mut cfg = OllamaConfig::new(
+            &args.host,
+            &args.model,
+            glassrip_vision::ollama::DEFAULT_NUM_CTX,
+        );
         cfg.slots = args.slots;
-        cfg.request_timeout = Duration::from_secs(180);
+        cfg.request_timeout = glassrip_vision::ollama::DEFAULT_REQUEST_TIMEOUT;
         let ollama = Arc::new(OllamaBackend::new(cfg)?);
         let digest = ollama.resolve_digest().await?;
         let version = ollama.server_version().await.ok();

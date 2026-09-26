@@ -72,6 +72,7 @@ use glassrip_ocr::OcrConfig;
 use glassrip_render::markdown::MarkdownMeta;
 use glassrip_render::stage::RENDER_SCHEMA;
 use glassrip_render::{RenderParams, RenderResult, RenderStage};
+use glassrip_vision::degenerate::DegenerateParams;
 use glassrip_vision::VisionClient;
 use glassrip_vision_stages::layout::LayoutConfig;
 use glassrip_vision_stages::placement::{MonitorConfig, PlacementMonitor};
@@ -459,6 +460,12 @@ fn vision_stages(v: VisionBackends, cfg: &Config) -> Result<VisionStages, Meetin
             tiling_text_height_px: br.tiling_text_height_px,
             tile_grid: br.tile_grid,
             tile_overlap: br.tile_overlap,
+            degenerate: DegenerateParams {
+                min_repeats: br.degenerate_min_repeats as usize,
+                min_duplicate_share: br.degenerate_min_duplicate_share,
+                strong_repeats: br.degenerate_strong_repeats as usize,
+                ..DegenerateParams::default()
+            },
             ..BoardReadParams::default()
         },
         Arc::clone(&monitor),

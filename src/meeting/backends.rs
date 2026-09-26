@@ -472,7 +472,7 @@ mod tests {
         let c = Config::default();
         assert_eq!(
             request_timeout(&c, "qwen2.5vl:7b"),
-            Duration::from_secs(120)
+            Duration::from_secs(240)
         );
         assert_eq!(request_timeout(&c, "qwen3.6:27b"), Duration::from_secs(400));
     }
