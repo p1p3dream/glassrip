@@ -16,18 +16,20 @@
 //! - `repeats = count - max(supported, 1) + 1`: the copies that neither OCR nor a
 //!   single original explains, plus that original.
 //!
-//! A text is **repeated** when `repeats >= min_repeats` and either
-//! `repeats >= strong_repeats`, or the text is **stacked** and the list's excess
+//! A text is **repeated** when `repeats >= min_repeats` and the list's excess
 //! copies (`repeats - 1`, summed over the texts that reach `min_repeats` and are
 //! stacked or reach `strong_repeats`; pairs and triples never count) make up at
-//! least `min_duplicate_share` of the list. A text is stacked when at least
+//! least `min_duplicate_share` of the list, or when the text is **stacked** and
+//! `repeats >= strong_repeats`; copies side by side need both the share and
+//! `strong_repeats`. A text is stacked when at least
 //! `min_repeats` of its boxes each cover another box of the same text by
 //! [`STACK_OVERLAP`] of the smaller one (the stepped or piled copies a runaway
 //! reply writes); edges, which have no box, count as stacked. Two "API" boxes or
 //! three "TODO" stickies never reach `min_repeats`; four "TODO" stickies among a
 //! dozen notes stay under the share, however many other labels come in pairs; a
-//! row of identical cards is no copy of one card, whether OCR reads it or not
-//! (below `strong_repeats`, where only a runaway list lands).
+//! row of identical cards is no copy of one card, whether OCR reads it or not,
+//! and eight "TODO" notes that OCR misses among twenty stay; a runaway grid of
+//! sixty stickies holding five texts does not.
 //!
 //! [`collapse`] reduces each repeated text to its best-supported items: every item
 //! backed by its own OCR span, or the first item when OCR backs none. Edges and
@@ -164,16 +166,23 @@ fn center_inside(span: &BBox, b: &BBox, margin: f64) -> bool {
 
 /// Per item: backed by an OCR span of its own. Each span backs at most one item:
 /// the nearest (by box center) matching item whose grown box holds the span. A
-/// span that repeats an earlier one (same text, stacked boxes: OCR read one
-/// text twice) backs nothing.
+/// span that repeats an earlier one (same text, stacked boxes) and lies in the
+/// item that earlier span backed is a second reading of that item's text and
+/// backs nothing; a span in a box of its own still backs that box.
 fn supported(items: &[Item<'_>], anchors: &[(String, BBox)], margin: f64) -> Vec<bool> {
     let mut backed = vec![false; items.len()];
-    for (k, (s, sb)) in anchors.iter().enumerate() {
-        let (ns, earlier) = (normalize(s), &anchors[..k]);
-        if earlier
-            .iter()
-            .any(|(t, tb)| stacked_pair(sb, tb) && normalize(t) == ns)
-        {
+    // Spans that backed an item: normalized text, box, the item.
+    let mut used: Vec<(String, &BBox, usize)> = Vec::new();
+    for (s, sb) in anchors {
+        let ns = normalize(s);
+        let reread = used.iter().any(|(t, tb, i)| {
+            *t == ns
+                && stacked_pair(sb, tb)
+                && items[*i]
+                    .anchorable
+                    .is_some_and(|(_, b)| center_inside(sb, b, margin))
+        });
+        if reread {
             continue;
         }
         let best = items
@@ -188,21 +197,23 @@ fn supported(items: &[Item<'_>], anchors: &[(String, BBox)], margin: f64) -> Vec
             .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
         if let Some((i, _)) = best {
             backed[i] = true;
+            used.push((ns, sb, i));
         }
     }
     backed
 }
 
-/// Two boxes cover each other by [`STACK_OVERLAP`] of the smaller one (equal
-/// boxes always do, even without area).
+/// Two well-formed boxes (positive width and height) cover each other by
+/// [`STACK_OVERLAP`] of the smaller one. A box without area piles on nothing.
 fn stacked_pair(a: &BBox, b: &BBox) -> bool {
-    if a == b {
-        return true;
+    let formed = |b: &BBox| b.x2 - b.x1 > 0.0 && b.y2 - b.y1 > 0.0;
+    if !(formed(a) && formed(b)) {
+        return false;
     }
     let w = a.x2.min(b.x2) - a.x1.max(b.x1);
     let h = a.y2.min(b.y2) - a.y1.max(b.y1);
-    let smaller = (a.width() * a.height()).min(b.width() * b.height());
-    w > 0.0 && h > 0.0 && smaller > 0.0 && w * h >= STACK_OVERLAP * smaller
+    let area = |b: &BBox| (b.x2 - b.x1) * (b.y2 - b.y1);
+    w > 0.0 && h > 0.0 && w * h >= STACK_OVERLAP * area(a).min(area(b))
 }
 
 /// Items of one text whose box is stacked on another box of that text; every
@@ -274,7 +285,16 @@ fn list_repeats(
     gs.into_iter()
         .zip(judged)
         .filter_map(|((key, idx), (r, s, piled, strong))| {
-            if r < p.min_repeats || !(strong || (piled && share >= p.min_duplicate_share)) {
+            // Piled copies: the strong bound or the share. Copies side by side
+            // (a runaway grid, or a board's real identical notes that OCR
+            // missed): the strong bound and the share.
+            let shared = share >= p.min_duplicate_share;
+            let flagged = if piled {
+                strong || shared
+            } else {
+                strong && shared
+            };
+            if r < p.min_repeats || !flagged {
                 return None;
             }
             let mut keep: Vec<usize> = idx.iter().copied().filter(|&i| backed[i]).collect();
@@ -698,10 +718,16 @@ mod tests {
         assert_eq!(after.nodes.len(), 4);
         assert!(!stacked_pair(&bb(0.0, 0.0), &bb(60.0, 0.0)));
         assert!(stacked_pair(&bb(0.0, 0.0), &bb(40.0, 0.0)));
-        assert!(stacked_pair(
-            &BBox::new(5.0, 5.0, 5.0, 5.0),
-            &BBox::new(5.0, 5.0, 5.0, 5.0)
-        ));
+        // Equal boxes without area, or inverted, pile on nothing.
+        let dot = BBox::new(5.0, 5.0, 5.0, 5.0);
+        assert!(!stacked_pair(&dot, &dot));
+        let inverted = BBox {
+            x1: 100.0,
+            y1: 50.0,
+            x2: 0.0,
+            y2: 0.0,
+        };
+        assert!(!stacked_pair(&inverted, &inverted));
     }
 
     #[test]
@@ -992,6 +1018,42 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn wide_spans_of_two_cards_back_both() {
+        // Two separate "Deploy" cards; OCR's wide spans overlap by more than
+        // half, but each span's center lies in its own card.
+        let mut r = reading();
+        r.nodes = vec![
+            node("a", "Deploy", 0.0, 0.0),
+            node("b", "Deploy", 110.0, 0.0),
+        ];
+        let spans = vec![
+            ("Deploy".to_string(), BBox::new(-100.0, 15.0, 200.0, 35.0)),
+            ("Deploy".to_string(), BBox::new(10.0, 15.0, 310.0, 35.0)),
+        ];
+        assert!(stacked_pair(&spans[0].1, &spans[1].1));
+        let items = node_items(&r);
+        assert_eq!(supported(&items, &spans, 0.25), vec![true, true]);
+    }
+
+    #[test]
+    fn eight_separate_todo_notes_that_ocr_misses_stay() {
+        // Eight "TODO" notes side by side among twenty, OCR silent: past the
+        // strong bound, but 7 excess of 20 is under the share.
+        let mut r = reading();
+        for i in 0..12 {
+            r.stickies
+                .push(sticky(&format!("Idea {i}"), f64::from(i) * 120.0, 0.0));
+        }
+        for i in 0..8 {
+            r.stickies.push(sticky("TODO", f64::from(i) * 120.0, 200.0));
+        }
+        assert_eq!(detect(&r, &[], &p()), None);
+        let (after, done) = collapse(r.clone(), &[], &p());
+        assert_eq!(after, r);
+        assert!(done.is_empty());
     }
 
     #[test]

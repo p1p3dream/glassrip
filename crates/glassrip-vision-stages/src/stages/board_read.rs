@@ -629,9 +629,12 @@ impl Stage for BoardReadStage {
         // 6: only texts at the repeat bound count towards the duplicate share,
         // the share needs piled copies (a row of identical cards OCR misses is
         // no copy), an OCR text read twice backs one copy, and an invalid retry
-        // reply fails the item; outputs of 5 may
-        // hold collapsed legitimate cards.
-        6
+        // reply fails the item; outputs of 5 may hold collapsed legitimate
+        // cards.
+        // 7: copies side by side need the strong bound and the share, and an
+        // OCR text read twice only counts once within one box; outputs of 6
+        // may hold collapsed separate notes or wrongly supported copies.
+        7
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
