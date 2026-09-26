@@ -253,6 +253,25 @@ fn degraded_notes_fail_the_gate_and_missing_artifacts_are_reported() {
     assert_eq!(run.not_run.len(), 4, "{:?}", run.not_run);
 }
 
+/// Codex finding 8 end to end: a negated decision in the notes is not the decision.
+#[test]
+fn a_negated_decision_is_not_recalled() {
+    let score = |decision: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            schema::MEETING_NOTES,
+            vec![("meeting_notes", ra::notes("ok", &[decision], &[], &[]))],
+        );
+        run_meeting(&golden(), &RunArtifacts::scan(dir.path()).unwrap(), 2.0)
+            .unwrap()
+            .metrics["notes.decision.recall"]
+    };
+    assert_eq!(score("We decided to defer the importer."), 1.0);
+    assert_eq!(score("We decided not to defer the importer."), 0.0);
+    assert_eq!(score("Do not defer the importer"), 0.0);
+}
+
 /// Codex round-1 M5: without a speakers artifact there is no mapping, so the
 /// post-mapping target has no value to pass on.
 #[test]
@@ -270,6 +289,19 @@ fn no_speaker_mapping_means_no_identity_metric() {
     assert_eq!(run.metrics.get("audio.diarizer_label_error"), Some(&0.0));
     assert!(!run.metrics.contains_key("audio.speaker_identity_error"));
     assert!(run.not_run.iter().any(|n| n.contains("glassrip.speakers")));
+    // Codex round-2 M6: the skipped target fails the run, and so does an empty
+    // speakers artifact.
+    assert!(
+        run.gate_failures
+            .iter()
+            .any(|g| g.contains("speaker_identity_error not evaluated")),
+        "{:?}",
+        run.gate_failures
+    );
+    ra::write_artifact(dir.path(), schema::SPEAKERS, vec![]).unwrap();
+    let run = run_meeting(&golden(), &RunArtifacts::scan(dir.path()).unwrap(), 2.0).unwrap();
+    assert!(!run.metrics.contains_key("audio.speaker_identity_error"));
+    assert_eq!(run.gate_failures.len(), 1, "{:?}", run.gate_failures);
 }
 
 #[test]
@@ -502,12 +534,11 @@ fn nominal_grid_labels_join_where_their_frame_was_taken() {
     g.clocks.screen_types = None;
     g.frame_clock = Some(grid);
     assert_eq!(score(&g), 1.0);
-    // A golden without any clock scores exactly as before clocks existed (PTS).
+    // A golden with screen labels must say which clock they are on.
     let mut v = serde_json::to_value(&g).unwrap();
     v.as_object_mut().unwrap().remove("frame_clock");
     let g: MeetingGolden = serde_json::from_value(v).unwrap();
-    g.validate().unwrap();
-    assert_eq!(score(&g), 0.0);
+    assert!(g.validate().is_err());
 }
 
 /// Kimi finding 4, Codex round-1 M7 and M8: probes, assignment windows, moves,

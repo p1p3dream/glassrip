@@ -126,9 +126,10 @@ pub struct Trap {
 /// `t + INTERVAL`. A label at nominal `t` then describes what was on screen just
 /// before `t + INTERVAL`, while the pipeline's keyframes carry true PTS times, so the
 /// join maps the label there. Whether a golden's times are grid names is a property
-/// of how that golden was authored, never of the eval: every section is on
-/// [`FrameClock::Pts`] (the eval's behavior before clocks existed) unless the golden
-/// declares otherwise ([`GoldenClocks`]).
+/// of how that golden was authored, never of the eval: a golden with screen labels
+/// or traps must declare their clock (those times have had two defaults), and every
+/// other section is on [`FrameClock::Pts`], the only way it was ever scored, unless
+/// the golden declares otherwise ([`GoldenClocks`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FrameClock {
@@ -224,8 +225,10 @@ impl ClockSection {
     }
 }
 
-/// Per-section clocks ([`ClockSection`]). A section left out is on
-/// [`FrameClock::Pts`]. Transcript times (hotword windows, notes) are always PTS.
+/// Per-section clocks ([`ClockSection`]). `screen_types` and `traps` must be declared
+/// when those sections have times (or through the legacy `frame_clock`); any other
+/// section left out is on [`FrameClock::Pts`]. Transcript times (hotword windows,
+/// notes) are always PTS.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GoldenClocks {
@@ -410,9 +413,10 @@ impl MeetingGolden {
 
     /// Every alias of a notes item states the same claim about the same subject as
     /// its text. An alias must name every participant the text names and, for each
-    /// other key term of the text, that term or another word of the same entity name
-    /// ("Ledger step" for "Ledger API step"); otherwise it would match a claim about
-    /// someone or something else. And no word the two share may flip polarity ("Ship
+    /// other key term of the text, that term or a word of the same entity name that
+    /// no other entity shares ("Ledger step" for "Ledger API step", never "Orbit
+    /// Queue" for "Ledger Queue"); otherwise it would match a claim about someone or
+    /// something else. And no word the two share may flip polarity ("Ship
     /// Ledger" is not an alias of "Do not ship Ledger").
     fn validate_notes_aliases(&self) -> Result<()> {
         let v = self.vocabulary();
@@ -425,7 +429,7 @@ impl MeetingGolden {
                     if k.starts_with('@') {
                         !terms.contains(*k)
                     } else {
-                        v.name_group(k).is_disjoint(&terms)
+                        !v.names(k, &terms)
                     }
                 });
                 if let Some(missing) = unnamed {
@@ -491,6 +495,20 @@ impl MeetingGolden {
         }
         if let Some(c) = self.frame_clock {
             c.validate("frame_clock")?;
+        }
+        // Frame-named times have had two defaults (PTS, then the prototype grid), so
+        // any default would silently re-score some golden: they must say which.
+        for (section, present) in [
+            (ClockSection::ScreenTypes, !self.screen_types.is_empty()),
+            (ClockSection::Traps, !self.traps.is_empty()),
+        ] {
+            if present && self.declared_clock(section).is_none() {
+                return Err(golden_err(format!(
+                    "{} has times but no declared clock; set clocks.{} to {{\"kind\": \"pts\"}} or {{\"kind\": \"prototype_grid\", \"interval_s\": ...}}",
+                    section.name(),
+                    section.name()
+                )));
+            }
         }
         for section in ClockSection::ALL {
             self.clock(section).validate(section.name())?;
@@ -732,6 +750,43 @@ mod tests {
         assert!(bad.validate().is_err());
     }
 
+    /// Kimi round-1 B1, Codex round-1 m11: screen labels and traps have had two
+    /// default clocks, so a golden with either must declare which it uses.
+    #[test]
+    fn frame_named_sections_must_declare_a_clock() {
+        let mut g = minimal();
+        g.screen_type_ranges.clear();
+        g.screen_types.push(ScreenLabel {
+            t_rep_s: 6.0,
+            screen_type: ScreenType::Whiteboard,
+            confirmed: true,
+        });
+        g.validate().unwrap();
+        g.clocks.screen_types = None;
+        let e = g.validate().unwrap_err().to_string();
+        assert!(
+            e.contains("screen_types has times but no declared clock"),
+            "{e}"
+        );
+        g.frame_clock = Some(FrameClock::PrototypeGrid {
+            interval_s: 2.0,
+            lead_s: 0.05,
+        });
+        g.validate().unwrap();
+        g.frame_clock = None;
+        g.clocks.screen_types = Some(FrameClock::Pts);
+        g.traps.push(Trap {
+            t_rep_s: Some(8.0),
+            t_from_s: None,
+            t_to_s: None,
+            kind: "sidebar_chrome".into(),
+            note: "synthetic".into(),
+        });
+        assert!(g.validate().is_err(), "traps need a clock too");
+        g.clocks.traps = Some(FrameClock::Pts);
+        g.validate().unwrap();
+    }
+
     /// Kimi finding 2: an alias that drops the name of its item is rejected.
     #[test]
     fn aliases_must_name_what_the_item_names() {
@@ -779,6 +834,16 @@ mod tests {
         });
         g.transcript.decisions = vec![item("Move Ledger to Orbit", &["Move Ledger"])];
         assert!(g.validate().is_err());
+        // Codex round-2 M4: a word two entities share does not name either one.
+        g.final_board.nodes.push(GoldNode {
+            id: "lq".into(),
+            text: "Ledger Queue".into(),
+            aliases: vec![],
+            bbox: None,
+            core: false,
+        });
+        g.transcript.decisions = vec![item("Move the ledger queue", &["Move the Orbit Queue"])];
+        assert!(g.validate().is_err());
         g.transcript.decisions = vec![
             item("Ship weekly builds", &[]),
             item("skip the ledger step", &["ledger is deferred"]),
@@ -797,7 +862,10 @@ mod tests {
             sources: vec![],
             duration_s: None,
             frame_clock: None,
-            clocks: GoldenClocks::default(),
+            clocks: GoldenClocks {
+                screen_types: Some(FrameClock::Pts),
+                ..GoldenClocks::default()
+            },
             participants: vec![
                 Participant {
                     person_id: "avery".into(),

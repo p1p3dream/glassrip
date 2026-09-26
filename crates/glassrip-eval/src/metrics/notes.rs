@@ -327,6 +327,9 @@ mod tests {
         assert_eq!(score_items(&gold, &pred, 0.6, &none()).0.tp, 0);
         let pred = vec![p("We ship builds after the review", None)];
         assert_eq!(score_items(&gold, &pred, 0.6, &none()).0.tp, 1);
+        // Codex round-2 B1: repeating one distractor does not score through Dice.
+        let pred = vec![p(&format!("ship builds {}", "lunch ".repeat(18)), None)];
+        assert_eq!(score_items(&gold, &pred, 0.6, &none()).0.tp, 0);
     }
 
     #[test]

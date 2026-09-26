@@ -1062,15 +1062,27 @@ pub fn run_meeting(
             );
             // After `name_speakers`: two labels mapped to one person are one
             // speaker, and speech nobody was named for is its own voice. Without a
-            // speakers artifact nothing was mapped, so there is nothing to score
-            // (the speaker section is reported as not run).
-            if let Some(records) = &speakers {
-                let identities = speaker_identities(records, segs);
-                m.insert("audio.speaker_identities".into(), identities as f64);
-                m.insert(
-                    "audio.speaker_identity_error".into(),
-                    (identities as f64 - people).abs(),
-                );
+            // mapping (no speakers artifact, or one with no label or segment
+            // records) there is nothing to score, and the 9.3 target cannot pass
+            // by being skipped: the run fails.
+            let mapping = speakers.as_ref().filter(|records| {
+                records
+                    .iter()
+                    .any(|r| matches!(r, SpeakersRecord::Label(_) | SpeakersRecord::Segment(_)))
+            });
+            match mapping {
+                Some(records) => {
+                    let identities = speaker_identities(records, segs);
+                    m.insert("audio.speaker_identities".into(), identities as f64);
+                    m.insert(
+                        "audio.speaker_identity_error".into(),
+                        (identities as f64 - people).abs(),
+                    );
+                }
+                None if !segs.is_empty() => run.gate_failures.push(
+                    "audio.speaker_identity_error not evaluated: the transcript has speech but glassrip.speakers holds no name mapping".into(),
+                ),
+                None => {}
             }
             details.insert("hotwords".into(), json!(hw.per_word));
         }
