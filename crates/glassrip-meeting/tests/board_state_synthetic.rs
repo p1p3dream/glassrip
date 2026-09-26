@@ -1957,3 +1957,157 @@ fn the_final_window_stays_inside_its_contiguous_run() {
     assert_eq!(w.keyframe_ids, vec!["kf05", "kf06"]);
     assert_eq!(w.start_s, 100.0);
 }
+
+#[test]
+fn a_routed_connector_is_not_removed_by_ink_added_elsewhere() {
+    // The corridor never held a straight line (a routed connector) and a sticky is
+    // added elsewhere at keyframe 5 (board ink 0.2). The ink around the edge's
+    // ends did not fall: the reader left the edge out.
+    let mut specs: Vec<Spec> = (0..9)
+        .map(|_| Spec {
+            ink: Some(0.01),
+            ..base()
+        })
+        .collect();
+    specs[5].ink = Some(0.2);
+    for s in specs.iter_mut().skip(5) {
+        s.edges.retain(|e| e.2 != "gRPC");
+        s.stickies.push(("Corner note", (1500.0, 850.0)));
+    }
+    let grpc = |s: &BoardStateItem| s.edges.iter().find(|e| e.label == "gRPC").cloned().unwrap();
+    let px = Pixels {
+        line: vec![0.1; 9],
+        ink: vec![0.3; 9],
+    };
+    let e = grpc(&run_probed(frames(&specs), &params(), &px));
+    assert!(e.in_final, "{e:?}");
+    // The same board ink with the ink around the ends falling: erased.
+    let mut ink = vec![0.3; 9];
+    for v in ink.iter_mut().skip(5) {
+        *v = 0.25;
+    }
+    let px = Pixels {
+        line: vec![0.1; 9],
+        ink,
+    };
+    let e = grpc(&run_probed(frames(&specs), &params(), &px));
+    assert!(!e.in_final, "{e:?}");
+}
+
+#[test]
+fn erasing_the_only_element_is_a_removal() {
+    // A board holding one sticky; from keyframe 4 the canvas is empty, so the
+    // later views read nothing and cannot be registered.
+    let specs: Vec<Spec> = (0..8)
+        .map(|i| Spec {
+            nodes: vec![],
+            edges: vec![],
+            stickies: if i < 4 {
+                vec![("Beta milestone in March", (800.0, 450.0))]
+            } else {
+                vec![]
+            },
+            ..base()
+        })
+        .collect();
+    let mut fr = frames(&specs);
+    for f in &mut fr {
+        f.board.other_visible_text.clear();
+    }
+    let only = |s: &BoardStateItem| s.stickies.first().cloned().unwrap();
+    assert!(only(&run(fr.clone(), &params())).in_final, "control");
+    let mut ink = vec![0.6; 8];
+    for v in ink.iter_mut().skip(4) {
+        *v = 0.0;
+    }
+    let px = Pixels {
+        line: vec![0.0; 8],
+        ink,
+    };
+    let s = only(&run_probed(fr.clone(), &params(), &px));
+    assert!(!s.in_final, "{s:?}");
+    assert_eq!(s.lifetimes.last().unwrap().removed_at_s, Some(80.0));
+    // OCR still reads the card's text on the "blank" canvas: not a removal.
+    for f in fr.iter_mut().skip(4) {
+        f.ocr_anchors.push(TextAnchor {
+            text: "Beta milestone".into(),
+            bbox: BBox::new(760.0, 440.0, 840.0, 460.0),
+        });
+    }
+    assert!(only(&run_probed(fr, &params(), &px)).in_final);
+}
+
+/// Pixels of one straight connector between two fixed points: a corridor query
+/// covers it only when its ends are within the corridor's half width of the
+/// connector's (a real corridor covers a line anywhere inside it).
+struct OneLine {
+    a: (f64, f64),
+    b: (f64, f64),
+}
+
+impl RegionProbe for OneLine {
+    fn ink_share(&self, _keyframe_id: &str, _region: &BBox) -> Option<f64> {
+        Some(0.3)
+    }
+    fn line_cover(
+        &self,
+        _keyframe_id: &str,
+        a: (f64, f64),
+        b: (f64, f64),
+        half_width: f64,
+    ) -> Option<f64> {
+        let near = |p: (f64, f64), q: (f64, f64)| (p.0 - q.0).hypot(p.1 - q.1) <= half_width;
+        Some(if near(a, self.a) && near(b, self.b) {
+            0.95
+        } else {
+            0.0
+        })
+    }
+}
+
+#[test]
+fn reader_box_jitter_does_not_erase_a_drawn_connector() {
+    // From keyframe 5 the reader places Queue and Ledger Store 30 px lower and
+    // leaves their connector out, while the board ink changes elsewhere. The
+    // corridor is measured where the edge was read, mapped into each keyframe, so
+    // it stays on the drawn line.
+    let mut specs: Vec<Spec> = (0..9)
+        .map(|_| Spec {
+            ink: Some(0.01),
+            ..base()
+        })
+        .collect();
+    specs[5].ink = Some(0.2);
+    for s in specs.iter_mut().skip(5) {
+        s.edges.retain(|e| e.2 != "gRPC");
+        for n in &mut s.nodes {
+            if n.0 == "n2" || n.0 == "n3" {
+                n.2 .1 += 30.0;
+            }
+        }
+    }
+    let t = Similarity::IDENTITY;
+    let (q, l) = (
+        bbox_at(&t, (700.0, 220.0), 90.0, 40.0),
+        bbox_at(&t, (1200.0, 200.0), 90.0, 40.0),
+    );
+    let c = |b: &BBox| ((b.x1 + b.x2) / 2.0, (b.y1 + b.y2) / 2.0);
+    let line = OneLine {
+        a: glassrip_meeting::pixel_direction::exit_point(&q, c(&l)),
+        b: glassrip_meeting::pixel_direction::exit_point(&l, c(&q)),
+    };
+    let s = consolidate_with_probe(
+        frames(&specs),
+        "board-1",
+        &params(),
+        &hooks(&NoCorroboration),
+        Some(&line as &dyn RegionProbe),
+    );
+    let e = s.edges.iter().find(|e| e.label == "gRPC").unwrap();
+    assert!(e.in_final, "{e:?}");
+    // The jittered boxes alone put a corridor 30 px off the line (more than its
+    // 20 px half width): measuring there would have read the line as gone.
+    let moved = bbox_at(&t, (700.0, 250.0), 90.0, 40.0);
+    let off = line.line_cover("kf05", c(&moved), c(&l), 20.0).unwrap();
+    assert_eq!(off, 0.0);
+}

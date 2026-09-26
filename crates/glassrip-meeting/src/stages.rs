@@ -792,10 +792,11 @@ pub struct CropSource {
     pub canvas: Option<CanvasDims>,
 }
 
-/// [`RegionProbe`] over the canvas crops, each loaded on first use.
+/// [`RegionProbe`] over the canvas crops, each loaded on first use. At most
+/// [`CropProbe::MAX_LOADED`] decoded canvases are kept (least recently used out).
 pub struct CropProbe {
     sources: HashMap<String, CropSource>,
-    loaded: Mutex<HashMap<String, Option<Arc<ProbeCanvas>>>>,
+    loaded: Mutex<Vec<(String, Option<Arc<ProbeCanvas>>)>>,
 }
 
 impl std::fmt::Debug for CropProbe {
@@ -808,25 +809,41 @@ impl std::fmt::Debug for CropProbe {
 
 impl CropProbe {
     /// Probe over `sources` (by keyframe id).
+    /// Decoded canvases kept at once. Probes query the keyframe that last read an
+    /// item and the one missing it, so a small working set suffices.
+    pub const MAX_LOADED: usize = 16;
+
     pub fn new(sources: HashMap<String, CropSource>) -> Self {
         Self {
             sources,
-            loaded: Mutex::new(HashMap::new()),
+            loaded: Mutex::new(Vec::new()),
         }
     }
 
     fn canvas(&self, keyframe_id: &str) -> Option<Arc<ProbeCanvas>> {
-        let mut loaded = self.loaded.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(c) = loaded.get(keyframe_id) {
-            return c.clone();
+        {
+            let mut loaded = self.loaded.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(i) = loaded.iter().position(|(k, _)| k == keyframe_id) {
+                let hit = loaded.remove(i);
+                let c = hit.1.clone();
+                loaded.push(hit);
+                return c;
+            }
         }
+        // Decode outside the lock. An unreadable crop gives no pixel evidence
+        // (never removal evidence).
         let c = self.sources.get(keyframe_id).and_then(|s| {
-            // An unreadable crop gives no pixel evidence (never removal evidence).
             load_canvas(&s.path, s.crop)
                 .ok()
                 .map(|img| Arc::new(ProbeCanvas::new(img, s.canvas)))
         });
-        loaded.insert(keyframe_id.to_string(), c.clone());
+        let mut loaded = self.loaded.lock().unwrap_or_else(PoisonError::into_inner);
+        if !loaded.iter().any(|(k, _)| k == keyframe_id) {
+            loaded.push((keyframe_id.to_string(), c.clone()));
+            if loaded.len() > Self::MAX_LOADED {
+                loaded.remove(0);
+            }
+        }
         c
     }
 }
