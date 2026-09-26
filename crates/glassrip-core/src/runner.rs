@@ -725,6 +725,18 @@ impl Runner {
         })
     }
 
+    /// A cached output whose error rate exceeds the limit: restoring it fails
+    /// the stage.
+    fn over_limit(&self, c: &CachedArtifact) -> bool {
+        #[allow(clippy::cast_precision_loss)]
+        let rate = if c.total == 0 {
+            0.0
+        } else {
+            c.counts.error as f64 / c.total as f64
+        };
+        rate > self.opts.max_item_error_rate
+    }
+
     /// Consecutive identical runs that settle a recurrent failure.
     fn repeats(&self) -> u32 {
         self.opts.terminal_after_repeats.max(1)
@@ -892,7 +904,7 @@ impl Runner {
                     .is_none_or(BTreeSet::is_empty)
                     && self
                         .load_cached::<S>(&path, &req)
-                        .is_ok_and(|c| c.unsettled == 0)
+                        .is_ok_and(|c| c.unsettled == 0 && !self.over_limit(&c))
             }
             _ => false,
         }
@@ -997,13 +1009,7 @@ impl Runner {
             other => other,
         };
         if let Some(cached) = cached {
-            #[allow(clippy::cast_precision_loss)]
-            let rate = if cached.total == 0 {
-                0.0
-            } else {
-                cached.counts.error as f64 / cached.total as f64
-            };
-            if rate > self.opts.max_item_error_rate {
+            if self.over_limit(&cached) {
                 // Only settled failures are restored; they fail the stage as they
                 // did when they were recorded.
                 return Err(RunnerError::ErrorRateExceeded {
@@ -1067,7 +1073,10 @@ impl Runner {
         let partial_exists = atomic::metadata_opt(&partial)
             .map_err(Self::io_err(&partial))?
             .is_some();
-        if force && partial_exists {
+        // A forced stage starts over; a cache seed is the newest state of the
+        // stage (a cached output always supersedes the partial it came from), so
+        // an older partial left by another run must not override it.
+        if (force || seed.is_some()) && partial_exists {
             fs_err::remove_file(&partial).map_err(Self::io_err(&partial))?;
         }
         let (writer, resumed) = match JsonlWriter::<Record<S::Output>>::open_resume(
@@ -1285,8 +1294,14 @@ impl Runner {
                     .with_run(|r| r.partials_dir())
                     .join(format!("{name}-{}.over-limit.jsonl", &key.as_str()[..16]));
                 jsonl::write_atomic(&over, &header, &items)?;
-                if let Err(e) = self.cache.put_file(name, &key, OUTPUT_EXT, &over) {
-                    warn!(stage = name, error = %e, "could not store output in cache");
+                match self.cache.put_file(name, &key, OUTPUT_EXT, &over) {
+                    // The cache holds the stage's state now; the partial would only
+                    // go stale against it.
+                    Ok(_) => {
+                        drop(writer);
+                        fs_err::remove_file(&partial).map_err(Self::io_err(&partial))?;
+                    }
+                    Err(e) => warn!(stage = name, error = %e, "could not store output in cache"),
                 }
                 fs_err::remove_file(&over).map_err(Self::io_err(&over))?;
             }
@@ -2210,6 +2225,69 @@ mod tests {
         );
         let rep = r.run_stage(&source).await.unwrap();
         assert_eq!((rep.items_ok, rep.items_processed), (5, 1));
+    }
+
+    /// Codex review round 2: a run directory's old partial does not override a
+    /// newer cached output that another run produced.
+    #[tokio::test]
+    async fn an_old_partial_never_overrides_a_newer_cache() {
+        let env = env();
+        let source = SourceStage::new(5);
+        {
+            // A settled failure plus a plain one: run-a keeps a partial, uncached.
+            let mut b = source.behavior.lock().unwrap();
+            b.fail = [2, 3].into();
+            b.terminal = [2].into();
+        }
+        let mut r = runner(&env, "run-a", &Selection::default());
+        assert!(r.run_stage(&source).await.is_err());
+        drop(r);
+        assert!(env.cache.ls().unwrap().is_empty());
+        // Another run, with the items recovered, caches a clean output.
+        source.behavior.lock().unwrap().fail.clear();
+        let mut r = runner(&env, "run-b", &Selection::default());
+        assert_eq!(r.run_stage(&source).await.unwrap().items_ok, 5);
+        drop(r);
+        // Back in run-a, forcing one item seeds from that cache, not from the old
+        // partial and its settled failure.
+        let mut opts = RunnerOptions::default();
+        opts.force_items
+            .insert("source".into(), ["item-004".to_string()].into());
+        let mut r = runner_with(
+            &env,
+            "run-a",
+            &Selection::default(),
+            opts,
+            CancellationToken::new(),
+        );
+        let rep = r.run_stage(&source).await.unwrap();
+        assert_eq!(
+            (rep.items_ok, rep.items_error, rep.items_processed),
+            (5, 0, 1)
+        );
+    }
+
+    /// Codex review round 2: a settled output over the limit is not a hit that
+    /// `cache_hit` promises and `run_stage` then refuses.
+    #[tokio::test]
+    async fn cache_hit_agrees_with_an_over_limit_restore() {
+        let env = env();
+        let source = SourceStage::new(5);
+        {
+            let mut b = source.behavior.lock().unwrap();
+            b.fail = [2].into();
+            b.terminal = [2].into();
+        }
+        let mut r = runner(&env, "run-a", &Selection::default());
+        assert!(r.run_stage(&source).await.is_err());
+        drop(r);
+        let mut r = runner(&env, "run-b", &Selection::default());
+        assert!(!r.cache_hit(&source));
+        assert!(matches!(
+            r.run_stage(&source).await,
+            Err(RunnerError::ErrorRateExceeded { .. })
+        ));
+        assert_eq!(source.calls(), 5, "the settled output is not recomputed");
     }
 
     /// Codex 6: a one-item stage over the error-rate limit used to keep its failed

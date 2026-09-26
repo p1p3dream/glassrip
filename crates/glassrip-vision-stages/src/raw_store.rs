@@ -256,48 +256,66 @@ impl VisionBackend for RecordingBackend {
 /// digest, from another repetition guard policy, or a stored repetition stop the
 /// current guard would not make, is refused as incompatible (re-record it) rather
 /// than replayed. [`VisionBackend::id`] reports the store's digest (or every digest
-/// of a mixed store), so stage cache keys built from it tell stores apart.
+/// of a mixed store) with a fingerprint of its records, so stage cache keys built
+/// from it tell two stores apart even under one model digest.
 pub struct ReplayBackend {
     model: String,
     store: RawStore,
-    /// Reported by `id`.
+    /// Reported by `id`: model digest and store fingerprint.
     id_digest: Option<String>,
+    /// Fingerprint of the store's records when opened.
+    fingerprint: Option<String>,
     /// The digest every served record must carry, once known.
     pinned: Mutex<Option<Option<String>>>,
 }
 
 /// Distinct digests of the records in `store` (unreadable entries are skipped:
-/// serving them reports the error).
-fn store_digests(store: &RawStore) -> std::collections::BTreeSet<Option<String>> {
-    let mut out = std::collections::BTreeSet::new();
+/// serving them reports the error), and a fingerprint of the store's contents.
+fn scan_store(store: &RawStore) -> (std::collections::BTreeSet<Option<String>>, Option<String>) {
+    let mut digests = std::collections::BTreeSet::new();
+    let mut files: Vec<(String, [u8; 32])> = Vec::new();
     let Ok(prefixes) = fs_err::read_dir(store.dir()) else {
-        return out;
+        return (digests, None);
     };
     for prefix in prefixes.flatten() {
-        let Ok(files) = fs_err::read_dir(prefix.path()) else {
+        let Ok(entries) = fs_err::read_dir(prefix.path()) else {
             continue;
         };
-        for file in files.flatten() {
+        for file in entries.flatten() {
             let path = file.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            if let Some(entry) = fs_err::read(&path)
-                .ok()
-                .and_then(|b| serde_json::from_slice::<RecordedResponse>(&b).ok())
-            {
-                out.insert(entry.digest);
+            let Ok(bytes) = fs_err::read(&path) else {
+                continue;
+            };
+            if let Ok(entry) = serde_json::from_slice::<RecordedResponse>(&bytes) {
+                digests.insert(entry.digest);
             }
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            files.push((name, *blake3::hash(&bytes).as_bytes()));
         }
     }
-    out
+    if files.is_empty() {
+        return (digests, None);
+    }
+    files.sort();
+    let mut h = blake3::Hasher::new();
+    for (name, hash) in &files {
+        h.update(name.as_bytes());
+        h.update(hash);
+    }
+    (digests, Some(h.finalize().to_hex()[..16].to_string()))
 }
 
 impl ReplayBackend {
     /// Replay `store`, learning its model digest from its records.
     pub fn new(model: impl Into<String>, store: RawStore) -> Self {
-        let digests = store_digests(&store);
-        let (id_digest, pinned) = match digests.len() {
+        let (digests, fingerprint) = scan_store(&store);
+        let (digest, pinned) = match digests.len() {
             0 => (None, None),
             1 => {
                 let only = digests.into_iter().next().flatten();
@@ -318,8 +336,19 @@ impl ReplayBackend {
         Self {
             model: model.into(),
             store,
-            id_digest,
+            id_digest: Self::identity(digest.as_deref(), fingerprint.as_deref()),
+            fingerprint,
             pinned: Mutex::new(pinned),
+        }
+    }
+
+    /// The digest `id` reports: the model digest and the store's fingerprint, so
+    /// two stores never look like one model (stage cache keys are built from it).
+    fn identity(digest: Option<&str>, fingerprint: Option<&str>) -> Option<String> {
+        match (digest, fingerprint) {
+            (None, None) => None,
+            (d, Some(fp)) => Some(format!("{}+store:{fp}", d.unwrap_or("none"))),
+            (Some(d), None) => Some(d.to_string()),
         }
     }
 
@@ -328,7 +357,7 @@ impl ReplayBackend {
     pub fn with_digest(mut self, digest: impl Into<String>) -> Self {
         let digest = digest.into();
         *self.pinned.lock().unwrap_or_else(PoisonError::into_inner) = Some(Some(digest.clone()));
-        self.id_digest = Some(digest);
+        self.id_digest = Self::identity(Some(&digest), self.fingerprint.as_deref());
         self
     }
 
@@ -693,10 +722,19 @@ mod tests {
             .infer(request(1), CancellationToken::new())
             .await
             .unwrap();
-        assert_eq!(
-            ReplayBackend::new("m", store).id().digest.as_deref(),
-            Some("d")
-        );
+        let a = ReplayBackend::new("m", store.clone()).id().digest.unwrap();
+        assert!(a.starts_with("d+store:"), "{a}");
+        // Codex review round 2: another store under the same digest, holding
+        // another answer, is another identity.
+        let dir2 = tempfile::tempdir().unwrap();
+        let other = RawStore::new(dir2.path());
+        let mut entry = store.get(&request_key("m", &request(1))).unwrap().unwrap();
+        entry.response.raw_text = "{\"n\": 4}".into();
+        entry.response.json = json!({"n": 4});
+        other.put(&entry).unwrap();
+        let b = ReplayBackend::new("m", other).id().digest.unwrap();
+        assert!(b.starts_with("d+store:"), "{b}");
+        assert_ne!(a, b);
     }
 
     fn guarded(seed: u64) -> VisionRequest {
@@ -789,7 +827,10 @@ mod tests {
         store.put(&entry).unwrap();
 
         let replay = ReplayBackend::new("m", store.clone());
-        assert_eq!(replay.id().digest.as_deref(), Some("mixed:d,d-retagged"));
+        assert!(replay
+            .id()
+            .digest
+            .is_some_and(|d| d.starts_with("mixed:d,d-retagged+store:")));
         replay
             .infer(request(1), CancellationToken::new())
             .await
@@ -799,7 +840,10 @@ mod tests {
             "model digest d-retagged",
         );
         let pinned = ReplayBackend::new("m", store).with_digest("d-retagged");
-        assert_eq!(pinned.id().digest.as_deref(), Some("d-retagged"));
+        assert!(pinned
+            .id()
+            .digest
+            .is_some_and(|d| d.starts_with("d-retagged+store:")));
         expect_incompatible(
             pinned.infer(request(1), CancellationToken::new()).await,
             "model digest d,",
