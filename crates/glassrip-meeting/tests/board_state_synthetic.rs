@@ -5,7 +5,8 @@ use glassrip_meeting::artifacts::{CanvasDims, EdgeDirectionItem, EdgeEvidence};
 use glassrip_meeting::consolidate::events::EventKind;
 use glassrip_meeting::consolidate::events::SuppressReason;
 use glassrip_meeting::consolidate::owners::{
-    AnchorKind, Corroboration, Corroborator, MoveQuery, NoCorroboration, OpenReason, OwnerTarget,
+    AnchorKind, Corroboration, Corroborator, MoveQuery, NameRead, NoCorroboration, OpenReason,
+    OwnerTarget,
 };
 use glassrip_meeting::consolidate::{
     consolidate, consolidate_with_probe, split_boards, BoardFrame, BoardStateItem, CanvasSource,
@@ -3164,4 +3165,249 @@ fn a_connector_missed_before_a_zoom_out_is_not_added_when_a_traced_stroke_shows_
     // pixels: both ends were in view, so a new connector.
     assert!(http_added(&probed(false)));
     assert!(http_added(&run(frames(&specs), &params())));
+}
+
+/// OCR spans of a spec's nodes and of the given names (reference places), mapped into
+/// the reading's coordinates; spans leaving the canvas are dropped.
+fn ocr_for(s: &Spec, names: &[(&str, (f64, f64))]) -> Vec<TextAnchor> {
+    s.nodes
+        .iter()
+        .map(|(_, text, c)| (text.as_str(), *c))
+        .chain(names.iter().copied())
+        .map(|(text, c)| TextAnchor {
+            text: text.to_string(),
+            bbox: bbox_at(&s.t, c, 60.0, 12.0),
+        })
+        .filter(|a| a.bbox.x1 >= 0.0 && a.bbox.y1 >= 0.0 && a.bbox.x2 <= W && a.bbox.y2 <= H)
+        .collect()
+}
+
+/// Frames of `specs` with OCR from `names_of(keyframe index)`.
+fn frames_with_ocr(
+    specs: &[Spec],
+    names_of: &dyn Fn(usize) -> Vec<(&'static str, (f64, f64))>,
+) -> Vec<BoardFrame> {
+    let mut fr = frames(specs);
+    for (i, f) in fr.iter_mut().enumerate() {
+        f.ocr_anchors = ocr_for(&specs[i], &names_of(i));
+    }
+    fr
+}
+
+/// Above Ingest Gateway, above Ledger Store, on the Ingest Gateway to Queue connector,
+/// and under Report Builder.
+const ABOVE_GATEWAY: (f64, f64) = (200.0, 120.0);
+const ABOVE_LEDGER: (f64, f64) = (1200.0, 120.0);
+const ON_HTTP_EDGE: (f64, f64) = (450.0, 205.0);
+const UNDER_REPORT: (f64, f64) = (700.0, 745.0);
+
+#[test]
+fn ocr_reads_a_tag_the_reader_missed() {
+    let specs: Vec<Spec> = (0..4).map(|_| base()).collect();
+    let s = run(
+        frames_with_ocr(&specs, &|_| vec![("Avery", ABOVE_GATEWAY)]),
+        &params(),
+    );
+    let a = avery(&s);
+    assert_eq!(a.len(), 1, "{a:#?}");
+    assert_eq!(a[0].target.texts(), vec!["Ingest Gateway"]);
+    assert_eq!((a[0].valid_from_s, a[0].valid_to_s), (0.0, 80.0));
+    assert!(a[0].sightings.iter().all(|x| x.name_read == NameRead::Ocr));
+}
+
+#[test]
+fn reader_tags_alone_open_nothing_where_ocr_reads_the_board() {
+    // The reader tags Avery in every keyframe; OCR reads the board but no name.
+    let specs: Vec<Spec> = (0..4)
+        .map(|_| {
+            let mut s = base();
+            s.owners.push(("Avery", ABOVE_GATEWAY, ""));
+            s
+        })
+        .collect();
+    let s = run(frames_with_ocr(&specs, &|_| vec![]), &params());
+    assert!(avery(&s).is_empty(), "{:#?}", s.owner_assignments);
+    // Without any OCR there is nothing to check against: the reader's tags count.
+    let s = run(frames(&specs), &params());
+    assert_eq!(avery(&s).len(), 1);
+}
+
+#[test]
+fn a_misplaced_reader_tag_follows_its_ocr_text() {
+    // The reader puts Avery's tag above Ledger Store; OCR reads it above Ingest Gateway.
+    let specs: Vec<Spec> = (0..4)
+        .map(|_| {
+            let mut s = base();
+            s.owners.push(("Avery", ABOVE_LEDGER, ""));
+            s
+        })
+        .collect();
+    let s = run(
+        frames_with_ocr(&specs, &|_| vec![("Avery", ABOVE_GATEWAY)]),
+        &params(),
+    );
+    let a = avery(&s);
+    assert_eq!(a.len(), 1, "{a:#?}");
+    assert_eq!(a[0].target.texts(), vec!["Ingest Gateway"]);
+}
+
+#[test]
+fn a_misspelled_ocr_name_resolves_to_its_participant() {
+    let specs: Vec<Spec> = (0..3).map(|_| base()).collect();
+    let s = run(
+        frames_with_ocr(&specs, &|_| vec![("Averry", ABOVE_GATEWAY)]),
+        &params(),
+    );
+    let a = avery(&s);
+    assert_eq!(a.len(), 1, "{a:#?}");
+    assert_eq!(a[0].name_raw, "Averry");
+    assert_eq!(a[0].target.texts(), vec!["Ingest Gateway"]);
+    // A name no participant is close to is not a tag.
+    let s = run(
+        frames_with_ocr(&specs, &|_| vec![("Morgan", ABOVE_GATEWAY)]),
+        &params(),
+    );
+    assert!(s.owner_assignments.is_empty());
+}
+
+#[test]
+fn an_edge_tag_does_not_jump_to_the_adjacent_node() {
+    // Avery's tag sits on the Ingest Gateway to Queue connector. In keyframes 2 and 3
+    // the reader draws Queue's box wider, reaching the tag: those views alone anchor
+    // it beside Queue. It is the same tag at the same place: the edge is kept.
+    let specs: Vec<Spec> = (0..6).map(|_| base()).collect();
+    let mut fr = frames_with_ocr(&specs, &|_| vec![("Avery", ON_HTTP_EDGE)]);
+    for f in &mut fr[2..4] {
+        for n in &mut f.board.nodes {
+            if n.local_id == "n2" {
+                n.bbox.x1 = 500.0;
+            }
+        }
+    }
+    let s = run(fr, &params());
+    let a = avery(&s);
+    assert_eq!(a.len(), 1, "{a:#?}");
+    assert_eq!(a[0].target.texts(), vec!["Ingest Gateway", "Queue"]);
+    assert!(a[0].moved_from.is_none());
+    assert_eq!((a[0].valid_from_s, a[0].valid_to_s), (0.0, 120.0));
+    assert!(a[0]
+        .sightings
+        .iter()
+        .any(|x| x.keyframe_id == "kf02" && x.anchor == AnchorKind::Registered));
+    assert!(s.events.iter().all(|e| e.kind != EventKind::OwnerMoved));
+}
+
+#[test]
+fn an_ocr_tag_moved_to_another_node_is_a_move() {
+    let specs: Vec<Spec> = (0..6).map(|_| base()).collect();
+    let s = run(
+        frames_with_ocr(&specs, &|i| {
+            vec![("Avery", if i < 3 { ABOVE_GATEWAY } else { ABOVE_LEDGER })]
+        }),
+        &params(),
+    );
+    let a = avery(&s);
+    assert_eq!(a.len(), 2, "{a:#?}");
+    assert_eq!(a[0].target.texts(), vec!["Ingest Gateway"]);
+    assert_eq!((a[0].valid_from_s, a[0].valid_to_s), (0.0, 60.0));
+    assert_eq!(a[1].target.texts(), vec!["Ledger Store"]);
+    assert_eq!(a[1].valid_from_s, 60.0);
+    assert!(a[1]
+        .moved_from
+        .as_ref()
+        .is_some_and(|m| m.texts() == vec!["Ingest Gateway"]));
+}
+
+#[test]
+fn a_tag_panned_out_of_view_is_not_absent() {
+    // Avery owns Ingest Gateway and Report Builder. Keyframes 2 and 3 pan the view so
+    // Report Builder sits at the bottom edge and its tag below it is cut off.
+    let panned = Similarity {
+        scale: 1.0,
+        angle: 0.0,
+        tx: 0.0,
+        ty: 200.0,
+    };
+    let specs: Vec<Spec> = (0..6)
+        .map(|i| Spec {
+            t: if (2..4).contains(&i) {
+                panned
+            } else {
+                Similarity::IDENTITY
+            },
+            ..base()
+        })
+        .collect();
+    let s = run(
+        frames_with_ocr(&specs, &|_| {
+            vec![("Avery", ABOVE_GATEWAY), ("Avery", UNDER_REPORT)]
+        }),
+        &params(),
+    );
+    assert!(s
+        .registration
+        .iter()
+        .all(|r| r.registration.mode != RegistrationMode::TextOnly));
+    let a = avery(&s);
+    let report: Vec<_> = a
+        .iter()
+        .filter(|x| x.target.texts() == vec!["Report Builder"])
+        .collect();
+    assert_eq!(report.len(), 1, "{a:#?}");
+    assert_eq!((report[0].valid_from_s, report[0].valid_to_s), (0.0, 120.0));
+    assert_eq!(a.len(), 2, "{a:#?}");
+}
+
+#[test]
+fn a_name_mentioned_in_a_sticky_is_no_tag() {
+    // A sticky under Ledger Store says "Ask Avery about retention"; OCR reads the
+    // name on its own line inside it.
+    let specs: Vec<Spec> = (0..4)
+        .map(|_| {
+            let mut s = base();
+            s.stickies = vec![("Ask Avery about retention", (1200.0, 300.0))];
+            s
+        })
+        .collect();
+    let s = run(
+        frames_with_ocr(&specs, &|_| vec![("Avery", (1200.0, 300.0))]),
+        &params(),
+    );
+    assert!(avery(&s).is_empty(), "{:#?}", s.owner_assignments);
+}
+
+#[test]
+fn a_reader_tag_ocr_does_not_see_where_it_reads_the_name_is_dropped() {
+    // The reader sees two Avery tags throughout (above Ingest Gateway and above Ledger
+    // Store); OCR reads the one above Ingest Gateway, and the one above Ledger Store
+    // only from keyframe 4. The reader's extra tag is not evidence: Ledger Store opens
+    // when OCR reads it, not before.
+    let specs: Vec<Spec> = (0..6)
+        .map(|_| {
+            let mut s = base();
+            s.owners.push(("Avery", ABOVE_GATEWAY, ""));
+            s.owners.push(("Avery", ABOVE_LEDGER, ""));
+            s
+        })
+        .collect();
+    let s = run(
+        frames_with_ocr(&specs, &|i| {
+            let mut v = vec![("Avery", ABOVE_GATEWAY)];
+            if i >= 4 {
+                v.push(("Avery", ABOVE_LEDGER));
+            }
+            v
+        }),
+        &params(),
+    );
+    let a = avery(&s);
+    let ledger: Vec<_> = a
+        .iter()
+        .filter(|x| x.target.texts() == vec!["Ledger Store"])
+        .collect();
+    assert_eq!(ledger.len(), 1, "{a:#?}");
+    assert_eq!(ledger[0].valid_from_s, 80.0);
+    assert!(a
+        .iter()
+        .any(|x| x.target.texts() == vec!["Ingest Gateway"] && x.valid_from_s == 0.0));
 }

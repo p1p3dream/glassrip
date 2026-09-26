@@ -1199,12 +1199,15 @@ impl Stage for BoardStateStage {
         // 7: owner geometry on OCR positions (unreliable readings keep only what
         // OCR placed), a strong last-keyframe sighting opens, absence evidence dates
         // moves, and additions revealed by a registered pan or zoom are suppressed.
-        7
+        // 8: owner sightings start from OCR name spans (reader tags corroborate only),
+        // ambiguous edge or end-node geometry keeps the incumbent, and a tag panned out
+        // of view is not absent.
+        8
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
             schema: BOARD_STATE,
-            version: Version::new(1, 2, 0),
+            version: Version::new(1, 3, 0),
         }
     }
     fn inputs(&self) -> Vec<InputDecl> {
