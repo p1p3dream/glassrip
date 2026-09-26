@@ -21,11 +21,17 @@
 //! Per person, keyframes with at least one target are replayed in time order
 //! ([`assign`]): a target opens after `confirm_keyframes` consecutive such keyframes
 //! show it, or after one that a [`Corroborator`] confirms (for example a transcript
-//! cue); an open target closes after `confirm_keyframes` consecutive such keyframes
-//! lack it. An opening at the moment another target of the same person closes is a
-//! move. Keyframes where the person appears without a target are neutral. Backfill
-//! over earlier untargeted sightings is off by default; when enabled it is recorded
-//! separately (`backfill_from_s`) and never counts toward opening.
+//! cue), or after one strong sighting that no later keyframe can confirm: in the last
+//! board keyframe, held for at least `final_hold_min_s`, anchored by geometry with
+//! the tag and its target both placed on OCR text ([`OpenReason::FinalHold`]). A
+//! single sighting anywhere else never opens. An open target closes after
+//! `confirm_keyframes` consecutive such keyframes lack it. An opening at the moment
+//! another target of the same person closes is a move; so is an opening while another
+//! open target was read, since its last sighting, in a keyframe where the person's
+//! name appears nowhere ([`assign_with`]): that target closes there. Keyframes where
+//! the person appears without a target are neutral. Backfill over earlier untargeted
+//! sightings is off by default; when enabled it is recorded separately
+//! (`backfill_from_s`) and never counts toward opening.
 
 use std::collections::BTreeMap;
 
@@ -98,6 +104,8 @@ pub enum OpenReason {
     ConsistentKeyframes,
     /// One keyframe plus corroboration.
     Corroborated,
+    /// One OCR-placed geometric sighting in the last board keyframe, held long.
+    FinalHold,
 }
 
 /// One owner-tag sighting.
@@ -120,6 +128,10 @@ pub struct OwnerSighting {
     /// yields two sightings with the same index.
     #[serde(default)]
     pub tag: u32,
+    /// The tag and its target were both placed on OCR text in this keyframe (since
+    /// board_state 1.2.0).
+    #[serde(default)]
+    pub ocr_located: bool,
 }
 
 /// A move or opening that a corroborator may confirm.
@@ -218,6 +230,9 @@ pub struct OwnerParams {
     pub confirm_keyframes: usize,
     /// Record a backfilled interval over earlier untargeted sightings.
     pub backfill_untargeted: bool,
+    /// Shortest last board keyframe, in seconds, whose single strong sighting opens
+    /// ([`OpenReason::FinalHold`]); infinite disables it.
+    pub final_hold_min_s: f64,
 }
 
 /// Sightings of one person in one keyframe.
@@ -244,10 +259,12 @@ fn by_keyframe(sightings: &[OwnerSighting]) -> Vec<KeySight<'_>> {
         }
         if let Some(k) = out.last_mut() {
             match &s.target {
-                Some(t) if !k.targets.iter().any(|x| x.target.as_ref() == Some(t)) => {
-                    k.targets.push(s)
-                }
-                Some(_) => {}
+                Some(t) => match k.targets.iter().position(|x| x.target.as_ref() == Some(t)) {
+                    None => k.targets.push(s),
+                    // Keep the strongest sighting of a target.
+                    Some(i) if s.ocr_located && !k.targets[i].ocr_located => k.targets[i] = s,
+                    Some(_) => {}
+                },
                 None => k.untargeted.push(s),
             }
         }
@@ -300,6 +317,32 @@ pub fn assign(
     params: &OwnerParams,
     corroborator: &dyn Corroborator,
     visible: &dyn Fn(&str, &OwnerTarget) -> bool,
+) -> Vec<OwnerAssignment> {
+    assign_with(
+        person_id,
+        display_name,
+        sightings,
+        timeline_end_s,
+        params,
+        corroborator,
+        visible,
+        &|_, _, _| None,
+    )
+}
+
+/// [`assign`] with absence evidence: `absent(target, after_s, before_s)` is the start
+/// of the first keyframe starting in `[after_s, before_s)` that read `target` while
+/// the person's name appears nowhere in it (no tag, no OCR text), if any.
+#[allow(clippy::too_many_arguments)]
+pub fn assign_with(
+    person_id: &str,
+    display_name: &str,
+    sightings: &[OwnerSighting],
+    timeline_end_s: f64,
+    params: &OwnerParams,
+    corroborator: &dyn Corroborator,
+    visible: &dyn Fn(&str, &OwnerTarget) -> bool,
+    absent: &dyn Fn(&OwnerTarget, f64, f64) -> Option<f64>,
 ) -> Vec<OwnerAssignment> {
     let confirm = params.confirm_keyframes.max(1);
     let keys = by_keyframe(sightings);
@@ -379,7 +422,22 @@ pub fn assign(
             } else {
                 None
             };
-            if run.len() < confirm && corroboration.is_none() {
+            // One strong sighting that no later keyframe can confirm or contradict.
+            let final_hold = run.len() < confirm
+                && corroboration.is_none()
+                && k.t_end_s >= timeline_end_s - 1e-9
+                && k.t_end_s - k.t_start_s >= params.final_hold_min_s
+                && k.targets.iter().any(|s| {
+                    s.target.as_ref() == Some(&t)
+                        && s.ocr_located
+                        && matches!(
+                            s.anchor,
+                            AnchorKind::GeometryNode
+                                | AnchorKind::GeometryEdge
+                                | AnchorKind::GeometryBridge
+                        )
+                });
+            if run.len() < confirm && corroboration.is_none() && !final_hold {
                 continue;
             }
             let first = run[0];
@@ -416,6 +474,25 @@ pub fn assign(
                     done.push(close(o, person_id, display_name, at));
                 }
             }
+            // An open target read, since its last sighting, where the person's name
+            // appears nowhere was left: a move, closed where it was first seen empty.
+            if moved_from.is_none() {
+                let left = open
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, o)| {
+                        let last = o.sightings.last().map_or(o.from_s, |s| s.t_end_s);
+                        absent(&o.target, last, at)
+                            .filter(|x| *x >= o.from_s && *x <= at)
+                            .map(|x| (i, x))
+                    })
+                    .min_by(|a, b| a.1.total_cmp(&b.1));
+                if let Some((pos, x)) = left {
+                    let o = open.remove(pos);
+                    moved_from = Some(o.target.clone());
+                    done.push(close(o, person_id, display_name, x));
+                }
+            }
             let backfill_from_s = if !ever_opened && params.backfill_untargeted {
                 presence.first().map(|p| p.t_start_s).filter(|s| *s < at)
             } else {
@@ -429,6 +506,8 @@ pub fn assign(
                 opened_at: first.keyframe_id.to_string(),
                 opened_by: if corroboration.is_some() {
                     OpenReason::Corroborated
+                } else if final_hold {
+                    OpenReason::FinalHold
                 } else {
                     OpenReason::ConsistentKeyframes
                 },
@@ -567,6 +646,7 @@ mod tests {
             },
             target,
             tag: 0,
+            ocr_located: false,
         }
     }
 
@@ -574,6 +654,7 @@ mod tests {
         OwnerParams {
             confirm_keyframes: 2,
             backfill_untargeted: false,
+            final_hold_min_s: 30.0,
         }
     }
 
@@ -872,5 +953,89 @@ mod tests {
         assert_eq!(a.len(), 2, "{a:#?}");
         assert_eq!(a[0].valid_to_s, 20.0);
         assert_eq!(a[1].moved_from, Some(node("n1")));
+    }
+
+    fn strong(t: f64, end: f64, target: OwnerTarget) -> OwnerSighting {
+        OwnerSighting {
+            t_end_s: end,
+            anchor: AnchorKind::GeometryNode,
+            ocr_located: true,
+            ..s(t, Some(target))
+        }
+    }
+
+    #[test]
+    fn a_strong_sighting_in_a_long_last_keyframe_moves_the_owner() {
+        // n1 held; the last keyframe (100 to 160 s) shows the tag on n2, placed on OCR.
+        // n1 was read at 80 s with the person's name nowhere on the canvas.
+        let v = [
+            s(0.0, Some(node("n1"))),
+            s(10.0, Some(node("n1"))),
+            strong(100.0, 160.0, node("n2")),
+        ];
+        let absent = |t: &OwnerTarget, after: f64, before: f64| {
+            (t == &node("n1") && after <= 80.0 && 80.0 < before).then_some(80.0)
+        };
+        // n1 is out of view in the last keyframe.
+        let vis = |kf: &str, t: &OwnerTarget| !(kf == "kf100" && t == &node("n1"));
+        let a = assign_with(
+            "p1",
+            "Avery",
+            &v,
+            160.0,
+            &params(),
+            &NoCorroboration,
+            &vis,
+            &absent,
+        );
+        assert_eq!(a.len(), 2, "{a:#?}");
+        assert_eq!((a[0].valid_from_s, a[0].valid_to_s), (0.0, 80.0));
+        assert_eq!(a[1].target, node("n2"));
+        assert_eq!(a[1].opened_by, OpenReason::FinalHold);
+        assert_eq!(a[1].moved_from, Some(node("n1")));
+        assert_eq!(a[1].valid_from_s, 100.0);
+        // Without the absence the old target is kept: n2 is an added target.
+        let b = assign("p1", "Avery", &v, 160.0, &params(), &NoCorroboration, &vis);
+        assert_eq!(b.len(), 2);
+        assert!(b
+            .iter()
+            .all(|x| x.moved_from.is_none() && x.valid_at(150.0)));
+    }
+
+    #[test]
+    fn one_strong_sighting_opens_nothing_unless_it_is_last_long_and_located() {
+        let base = [s(0.0, Some(node("n1"))), s(10.0, Some(node("n1")))];
+        let run = |last: OwnerSighting, end: f64| {
+            let mut v = base.to_vec();
+            v.push(last);
+            assign(
+                "p1",
+                "Avery",
+                &v,
+                end,
+                &params(),
+                &NoCorroboration,
+                &|_, _| false,
+            )
+        };
+        // Mid-meeting: a later keyframe exists (timeline ends after it).
+        assert_eq!(run(strong(100.0, 160.0, node("n2")), 400.0).len(), 1);
+        // Last but short.
+        assert_eq!(run(strong(100.0, 110.0, node("n2")), 110.0).len(), 1);
+        // Last and long but not placed on OCR.
+        let unplaced = OwnerSighting {
+            ocr_located: false,
+            ..strong(100.0, 160.0, node("n2"))
+        };
+        assert_eq!(run(unplaced, 160.0).len(), 1);
+        // Last and long but only the reader's `near`.
+        let near = OwnerSighting {
+            anchor: AnchorKind::Near,
+            ..strong(100.0, 160.0, node("n2"))
+        };
+        assert_eq!(run(near, 160.0).len(), 1);
+        let a = run(strong(100.0, 160.0, node("n2")), 160.0);
+        assert_eq!(a.len(), 2);
+        assert_eq!(a[1].opened_by, OpenReason::FinalHold);
     }
 }

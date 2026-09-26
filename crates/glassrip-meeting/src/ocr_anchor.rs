@@ -184,15 +184,81 @@ fn locate(
     reach: (f64, f64),
     sim: f64,
 ) -> Option<(BBox, f64)> {
+    locate_used(spans, text, window, anchor, reach, sim).map(|(b, c, _)| (b, c))
+}
+
+/// Every occurrence of `text` among the OCR spans (in the spans' coordinates), as
+/// `(glyph box union, share of the text covered)`, nearest to `anchor` first. Each span
+/// belongs to at most one occurrence; occurrences covering less than
+/// `p.min_text_cover` of the text are dropped.
+pub fn locate_text_groups(
+    ocr: &[TextAnchor],
+    text: &str,
+    anchor: (f64, f64),
+    reach: (f64, f64),
+    p: &OcrAnchorParams,
+) -> Vec<(BBox, f64)> {
+    let spans = usable_spans(ocr, p);
+    let everywhere = BBox::new(
+        f64::MIN / 4.0,
+        f64::MIN / 4.0,
+        f64::MAX / 4.0,
+        f64::MAX / 4.0,
+    );
+    let mut left: Vec<&Span> = spans.iter().collect();
+    let mut out = Vec::new();
+    while let Some((u, cover, used)) =
+        locate_used(&left, text, &everywhere, anchor, reach, p.word_similarity)
+    {
+        if used.is_empty() {
+            break;
+        }
+        if cover >= p.min_text_cover {
+            out.push((u, cover));
+        }
+        let mut i = 0;
+        left.retain(|_| {
+            let keep = !used.contains(&i);
+            i += 1;
+            keep
+        });
+    }
+    out
+}
+
+fn usable_spans(ocr: &[TextAnchor], p: &OcrAnchorParams) -> Vec<Span> {
+    ocr.iter()
+        .filter(|a| a.bbox.is_well_formed())
+        .filter(|a| a.text.chars().filter(|c| c.is_alphanumeric()).count() >= 2)
+        .map(|a| Span {
+            words: words(&a.text),
+            bbox: glyph_box(&a.bbox, p.ocr_unclip_ratio),
+        })
+        .filter(|s| !s.words.is_empty())
+        .collect()
+}
+
+/// [`locate`], also returning the indexes (into `spans`) of the grouped spans, and
+/// of every candidate span the group made redundant (same words, within reach).
+fn locate_used(
+    spans: &[&Span],
+    text: &str,
+    window: &BBox,
+    anchor: (f64, f64),
+    reach: (f64, f64),
+    sim: f64,
+) -> Option<(BBox, f64, Vec<usize>)> {
     let target = words(text);
     if target.is_empty() {
         return None;
     }
-    let cands: Vec<(&Span, Vec<usize>)> = spans
+    // (index into `spans`, span, matched target words)
+    let cands: Vec<(usize, &Span, Vec<usize>)> = spans
         .iter()
         .copied()
-        .filter(|s| inside(center(&s.bbox), window))
-        .filter_map(|s| matched_words(&s.words, &target, sim).map(|m| (s, m)))
+        .enumerate()
+        .filter(|(_, s)| inside(center(&s.bbox), window))
+        .filter_map(|(i, s)| matched_words(&s.words, &target, sim).map(|m| (i, s, m)))
         .collect();
     let dist = |b: &BBox, p: (f64, f64)| {
         let c = center(b);
@@ -200,20 +266,22 @@ fn locate(
     };
     let seed = cands
         .iter()
-        .min_by(|a, b| dist(&a.0.bbox, anchor).total_cmp(&dist(&b.0.bbox, anchor)))?;
-    let sc = center(&seed.0.bbox);
-    let mut order: Vec<&(&Span, Vec<usize>)> = cands
+        .min_by(|a, b| dist(&a.1.bbox, anchor).total_cmp(&dist(&b.1.bbox, anchor)))?;
+    let sc = center(&seed.1.bbox);
+    let mut order: Vec<&(usize, &Span, Vec<usize>)> = cands
         .iter()
-        .filter(|(s, _)| {
+        .filter(|(_, s, _)| {
             let c = center(&s.bbox);
             (c.0 - sc.0).abs() <= reach.0 && (c.1 - sc.1).abs() <= reach.1
         })
         .collect();
-    order.sort_by(|a, b| dist(&a.0.bbox, sc).total_cmp(&dist(&b.0.bbox, sc)));
+    order.sort_by(|a, b| dist(&a.1.bbox, sc).total_cmp(&dist(&b.1.bbox, sc)));
     let mut covered: Vec<usize> = Vec::new();
     let mut boxes: Vec<BBox> = Vec::new();
-    for (s, m) in order {
-        if m.iter().all(|i| covered.contains(i)) {
+    let mut used: Vec<usize> = Vec::new();
+    for (i, s, m) in order {
+        used.push(*i);
+        if m.iter().all(|w| covered.contains(w)) {
             continue;
         }
         covered.extend(m.iter().copied());
@@ -223,7 +291,7 @@ fn locate(
     covered.dedup();
     let total: usize = target.iter().map(|w| w.chars().count()).sum();
     let got: usize = covered.iter().map(|&i| target[i].chars().count()).sum();
-    union(&boxes).map(|u| (u, got as f64 / total.max(1) as f64))
+    union(&boxes).map(|u| (u, got as f64 / total.max(1) as f64, used))
 }
 
 /// Distance from `p` to the segment `a`-`b`.
@@ -248,16 +316,7 @@ fn box_distance(p: (f64, f64), b: &BBox) -> f64 {
 /// Move node and label boxes of `board` onto their OCR text. `ocr` must share the
 /// board's coordinate space.
 pub fn reanchor(board: &ValidatedBoard, ocr: &[TextAnchor], p: &OcrAnchorParams) -> Reanchored {
-    let spans: Vec<Span> = ocr
-        .iter()
-        .filter(|a| a.bbox.is_well_formed())
-        .filter(|a| a.text.chars().filter(|c| c.is_alphanumeric()).count() >= 2)
-        .map(|a| Span {
-            words: words(&a.text),
-            bbox: glyph_box(&a.bbox, p.ocr_unclip_ratio),
-        })
-        .filter(|s| !s.words.is_empty())
-        .collect();
+    let spans: Vec<Span> = usable_spans(ocr, p);
     let mut out = Reanchored {
         board: board.clone(),
         nodes_moved: 0,

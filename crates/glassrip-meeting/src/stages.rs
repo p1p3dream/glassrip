@@ -1196,12 +1196,15 @@ impl Stage for BoardStateStage {
         // 6: an emptied corridor removes a connector only with evidence from its
         // own traced stroke (a stroke that never joined its ends, or that a
         // tracing probe could not trace, keeps it).
-        6
+        // 7: owner geometry on OCR positions (unreliable readings keep only what
+        // OCR placed), a strong last-keyframe sighting opens, absence evidence dates
+        // moves, and additions revealed by a registered pan or zoom are suppressed.
+        7
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
             schema: BOARD_STATE,
-            version: Version::new(1, 1, 0),
+            version: Version::new(1, 2, 0),
         }
     }
     fn inputs(&self) -> Vec<InputDecl> {

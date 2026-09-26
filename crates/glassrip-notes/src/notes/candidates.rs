@@ -1210,6 +1210,7 @@ mod tests {
             target: None,
             anchor: glassrip_meeting::consolidate::owners::AnchorKind::GeometryNode,
             tag: 0,
+            ocr_located: false,
         }
     }
 
