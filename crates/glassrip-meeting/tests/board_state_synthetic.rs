@@ -3085,3 +3085,58 @@ fn pixels_tell_a_missed_element_revealed_by_a_pan_from_one_drawn_during_it() {
         .collect();
     assert!(added.contains(&"Cache".to_string()) && added.contains(&"Spare".to_string()));
 }
+
+/// Pixels that show every straight connector drawn and say nothing about boxes.
+struct LinesDrawn;
+
+impl RegionProbe for LinesDrawn {
+    fn ink_share(&self, _: &str, _: &BBox) -> Option<f64> {
+        None
+    }
+    fn line_cover(&self, _: &str, _: (f64, f64), _: (f64, f64), _: f64) -> Option<f64> {
+        Some(0.9)
+    }
+}
+
+#[test]
+fn a_connector_missed_before_a_zoom_out_is_not_added_when_pixels_show_it() {
+    // Both ends of the HTTP edge are in the zoomed view from the start, but the
+    // reader only lists the edge after the zoom-out.
+    let zoomed = Similarity {
+        scale: 1.3,
+        angle: 0.0,
+        tx: 0.0,
+        ty: 0.0,
+    };
+    let specs: Vec<Spec> = (0..6)
+        .map(|i| {
+            let mut s = Spec {
+                t: if i < 3 { zoomed } else { Similarity::IDENTITY },
+                ink: Some(0.2),
+                ..base()
+            };
+            if i < 3 {
+                s.edges.retain(|e| e.2 != "HTTP");
+            }
+            s
+        })
+        .collect();
+    let http_added = |s: &BoardStateItem| {
+        s.events.iter().any(|e| {
+            e.kind == EventKind::EdgeAdded && e.detail.contains("Ingest Gateway") && !e.baseline
+        })
+    };
+    let s = consolidate_with_probe(
+        frames(&specs),
+        "board-1",
+        &params(),
+        &hooks(&NoCorroboration),
+        Some(&LinesDrawn as &dyn RegionProbe),
+    );
+    assert!(!http_added(&s), "{:#?}", s.events);
+    assert!(s.suppressed_events.iter().any(|x| {
+        x.reason == SuppressReason::RevealedByView && x.event.kind == EventKind::EdgeAdded
+    }));
+    // Without pixels, both ends were in view: a new connector.
+    assert!(http_added(&run(frames(&specs), &params())));
+}

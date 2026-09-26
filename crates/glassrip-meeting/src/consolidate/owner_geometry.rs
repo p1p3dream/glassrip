@@ -280,7 +280,15 @@ pub fn place(
             .filter(|(si, (spid, _))| spid == pid && !span_used[*si])
             .map(|(si, _)| si)
             .collect();
-        if tags_left == 1 && spans_left.len() == 1 {
+        // A name inside another element's box is a mention in its text, unless that
+        // element is itself read as the name.
+        let on_other = |si: usize| {
+            let c = center(&name_spans[si].1);
+            elements
+                .iter()
+                .any(|e| in_window(c, &e.1, 0.0) && names(e.0).as_deref() != Some(pid))
+        };
+        if tags_left == 1 && spans_left.len() == 1 && !on_other(spans_left[0]) {
             tag_found[ti] = Some(Found {
                 text: name_spans[spans_left[0]].1,
                 local: false,
@@ -483,6 +491,23 @@ mod tests {
         let ocr = [anchor("Avery", b(600.0, 500.0, 660.0, 520.0))];
         let t = place(&r, &tags, &ocr, &names, 0.0, &tight()).tags[0].unwrap();
         assert!(t.ocr && (t.bbox.x1 - 580.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn a_name_mentioned_in_another_element_is_not_the_tag() {
+        let mut r = board(vec![]);
+        r.stickies.push(Sticky {
+            text: "ask Avery about retention".into(),
+            color: StickyColor::Yellow,
+            bbox: b(580.0, 480.0, 760.0, 540.0),
+        });
+        let tags = [TagIn {
+            bbox: b(100.0, 100.0, 200.0, 200.0),
+            person: Some("p-avery"),
+        }];
+        let ocr = [anchor("Avery", b(600.0, 500.0, 660.0, 520.0))];
+        let t = place(&r, &tags, &ocr, &names, 0.0, &tight()).tags[0].unwrap();
+        assert!(!t.ocr && t.bbox == tags[0].bbox);
     }
 
     #[test]

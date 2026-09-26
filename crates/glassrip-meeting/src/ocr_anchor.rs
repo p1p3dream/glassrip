@@ -238,8 +238,7 @@ fn usable_spans(ocr: &[TextAnchor], p: &OcrAnchorParams) -> Vec<Span> {
         .collect()
 }
 
-/// [`locate`], also returning the indexes (into `spans`) of the grouped spans, and
-/// of every candidate span the group made redundant (same words, within reach).
+/// [`locate`], also returning the indexes (into `spans`) of the grouped spans.
 fn locate_used(
     spans: &[&Span],
     text: &str,
@@ -280,10 +279,11 @@ fn locate_used(
     let mut boxes: Vec<BBox> = Vec::new();
     let mut used: Vec<usize> = Vec::new();
     for (i, s, m) in order {
-        used.push(*i);
+        // A span adding no words is another copy of the text: not this occurrence's.
         if m.iter().all(|w| covered.contains(w)) {
             continue;
         }
+        used.push(*i);
         covered.extend(m.iter().copied());
         boxes.push(s.bbox);
     }
@@ -489,6 +489,24 @@ mod tests {
             ocr_unclip_ratio: 0.0,
             ..OcrAnchorParams::default()
         }
+    }
+
+    #[test]
+    fn a_second_copy_of_a_text_nearby_is_its_own_occurrence() {
+        let ocr = [
+            anchor("Queue", 100.0, 100.0, 160.0, 120.0),
+            anchor("Queue", 180.0, 100.0, 240.0, 120.0),
+            anchor("Ledger", 100.0, 300.0, 160.0, 320.0),
+            anchor("Store", 100.0, 322.0, 160.0, 342.0),
+        ];
+        let p = tight();
+        assert_eq!(
+            locate_text_groups(&ocr, "Queue", (130.0, 110.0), (200.0, 40.0), &p).len(),
+            2
+        );
+        let g = locate_text_groups(&ocr, "Ledger Store", (130.0, 310.0), (200.0, 40.0), &p);
+        assert_eq!(g.len(), 1);
+        assert!((g[0].1 - 1.0).abs() < 1e-9);
     }
 
     #[test]

@@ -389,15 +389,21 @@ pub fn assign_with(
             }
             pending.entry(t.clone()).or_default().push(k);
         }
-        // Closings by sustained absence.
+        // Closings by sustained absence (`closed_now` keeps the first missing
+        // keyframe, which a move opening there matches); an earlier keyframe that read
+        // the target with the person named nowhere dates the close.
         let mut closed_now: Vec<(OwnerTarget, f64)> = Vec::new();
         let mut i = 0;
         while i < open.len() {
             if open[i].missing.len() >= confirm {
                 let at = open[i].missing[0].t_start_s;
                 let o = open.remove(i);
+                let last = o.sightings.last().map_or(o.from_s, |s| s.t_end_s);
+                let to = absent(&o.target, last, at)
+                    .filter(|x| *x >= o.from_s)
+                    .unwrap_or(at);
                 closed_now.push((o.target.clone(), at));
-                done.push(close(o, person_id, display_name, at));
+                done.push(close(o, person_id, display_name, to));
             } else {
                 i += 1;
             }
@@ -447,6 +453,14 @@ pub fn assign_with(
                 .filter_map(|ks| ks.targets.iter().find(|s| s.target.as_ref() == Some(&t)))
                 .map(|s| (*s).clone())
                 .collect();
+            // Where an open target being left was first read with the person named
+            // nowhere since its last sighting, else `at`.
+            let left_at = |o: &Open<'_>| {
+                let last = o.sightings.last().map_or(o.from_s, |s| s.t_end_s);
+                absent(&o.target, last, at)
+                    .filter(|x| *x >= o.from_s && *x <= at)
+                    .unwrap_or(at)
+            };
             // A corroborated move closes the target being left now.
             let mut moved_from = closed_now
                 .iter()
@@ -458,8 +472,9 @@ pub fn assign_with(
                     .position(|o| Some(&o.target) == leaving.as_ref())
                 {
                     let o = open.remove(pos);
+                    let to = left_at(&o);
                     moved_from = Some(o.target.clone());
-                    done.push(close(o, person_id, display_name, at));
+                    done.push(close(o, person_id, display_name, to));
                 }
             }
             // A target that was visible but untagged from the start of this run was
@@ -470,8 +485,9 @@ pub fn assign_with(
                     .position(|o| o.missing.first().is_some_and(|m| m.t_start_s <= at + 1e-9))
                 {
                     let o = open.remove(pos);
+                    let to = left_at(&o);
                     moved_from = Some(o.target.clone());
-                    done.push(close(o, person_id, display_name, at));
+                    done.push(close(o, person_id, display_name, to));
                 }
             }
             // An open target read, since its last sighting, where the person's name
@@ -1037,5 +1053,32 @@ mod tests {
         let a = run(strong(100.0, 160.0, node("n2")), 160.0);
         assert_eq!(a.len(), 2);
         assert_eq!(a[1].opened_by, OpenReason::FinalHold);
+    }
+
+    #[test]
+    fn a_move_is_dated_by_the_earliest_absence_whichever_rule_closes_it() {
+        // n1 held; read at 40 s with the person named nowhere; n2 tagged at 60 and 80 s
+        // while n1 is still read (the visible-but-untagged rule closes it).
+        let v = seq(&["n1", "n1"])
+            .into_iter()
+            .chain([s(60.0, Some(node("n2"))), s(80.0, Some(node("n2")))])
+            .collect::<Vec<_>>();
+        let absent = |t: &OwnerTarget, after: f64, before: f64| {
+            (t == &node("n1") && after <= 40.0 && 40.0 < before).then_some(40.0)
+        };
+        let a = assign_with(
+            "p1",
+            "Avery",
+            &v,
+            200.0,
+            &params(),
+            &NoCorroboration,
+            &|_, _| true,
+            &absent,
+        );
+        assert_eq!(a.len(), 2, "{a:#?}");
+        assert_eq!(a[0].valid_to_s, 40.0);
+        assert_eq!(a[1].valid_from_s, 60.0);
+        assert_eq!(a[1].moved_from, Some(node("n1")));
     }
 }

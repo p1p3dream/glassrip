@@ -2127,10 +2127,20 @@ pub fn consolidate_with_probe(
         .enumerate()
         .map(|(i, f)| (f.keyframe_id.as_str(), i))
         .collect();
+    // Tracks that stand for another one (single imprecise readings of it).
+    let mut echoes: HashMap<usize, Vec<usize>> = HashMap::new();
+    for ti in 0..tracks.len() {
+        let u = owner_track(ti);
+        if u != ti {
+            echoes.entry(u).or_default().push(ti);
+        }
+    }
     let seen = |ti: usize, kf: &str| {
-        frame_of_kf
-            .get(kf)
-            .is_some_and(|fi| tracks[ti].obs.iter().any(|o| o.frame == *fi))
+        frame_of_kf.get(kf).is_some_and(|fi| {
+            std::iter::once(&ti)
+                .chain(echoes.get(&ti).into_iter().flatten())
+                .any(|&t| tracks[t].obs.iter().any(|o| o.frame == *fi))
+        })
     };
     let target_visible = |kf: &str, t: &OwnerTarget| match t {
         OwnerTarget::Node { node_id, .. } => track_of_id
@@ -2346,12 +2356,38 @@ pub fn consolidate_with_probe(
     };
     let revealed =
         |ti: usize, f: usize| view_changed_into(f) && !shown_empty_before(&tracks[ti], f);
+    // An edge first read after a view change came into view when an end was not in
+    // the previous view, or when, both ends read there, the pixels show its
+    // connector already drawn between them.
     let revealed_edge = |key: (usize, usize), f: usize| {
-        view_changed_into(f)
-            && ![key.0, key.1].iter().all(|&ti| {
-                tracks[ti].obs.iter().any(|o| o.frame == f - 1)
-                    || shown_empty_before(&tracks[ti], f)
-            })
+        if !view_changed_into(f) {
+            return false;
+        }
+        let before = |ti: usize| {
+            tracks[ti]
+                .obs
+                .iter()
+                .find(|o| o.frame == f - 1)
+                .and_then(|o| o.raw_bbox)
+        };
+        if ![key.0, key.1]
+            .iter()
+            .all(|&ti| before(ti).is_some() || shown_empty_before(&tracks[ti], f))
+        {
+            return true;
+        }
+        let rp = &params.region_probe;
+        let drawn = match (probe, before(key.0), before(key.1)) {
+            (Some(probe), Some(a), Some(b)) => {
+                let c = |x: &BBox| ((x.x1 + x.x2) / 2.0, (x.y1 + x.y2) / 2.0);
+                let hw = (rp.corridor_half_width_share * a.height().min(b.height())).max(3.0);
+                probe
+                    .line_cover(&frames[f - 1].keyframe_id, c(&a), c(&b), hw)
+                    .is_some_and(|cover| cover >= rp.min_line_cover)
+            }
+            _ => false,
+        };
+        drawn
     };
     let offer_added = |gate: &mut EventGate, e: BoardEvent, is_revealed: bool| {
         if !e.baseline && is_revealed {
