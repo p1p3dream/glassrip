@@ -96,6 +96,44 @@ pub struct SvgChecks {
     pub ok: bool,
 }
 
+impl SvgChecks {
+    /// Every failed check, naming the elements involved. `ok` is exactly
+    /// "this list is empty".
+    pub fn failures(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.parsed {
+            out.push(format!(
+                "svg did not parse: {}",
+                self.parse_error.as_deref().unwrap_or("unknown error")
+            ));
+            return out;
+        }
+        if let Some(e) = &self.parse_error {
+            out.push(format!("svg render: {e}"));
+        }
+        if !self.nonblank {
+            out.push(format!(
+                "rendering is blank (luma std {:.1} <= 5)",
+                self.luma_std
+            ));
+        }
+        if self.text_nodes == 0 {
+            out.push("no text elements".into());
+        } else if self.text_rendered * 10 < self.text_nodes * 9 {
+            out.push(format!(
+                "only {} of {} text elements rendered glyphs ({} font faces)",
+                self.text_rendered, self.text_nodes, self.font_faces
+            ));
+        }
+        out.extend(self.overlaps.iter().map(|o| format!("layout: {o}")));
+        out.extend(self.style_violations.iter().map(|v| format!("style: {v}")));
+        if self.png_bytes == 0 {
+            out.push("png preview was not encoded".into());
+        }
+        out
+    }
+}
+
 fn count_text(g: &usvg::Group, total: &mut usize, rendered: &mut usize) {
     for n in g.children() {
         match n {
@@ -300,13 +338,7 @@ pub fn validate_svg(svg: &str, scene: &Scene, fonts: &FontConfig) -> (SvgChecks,
     checks.nonblank = checks.luma_std > 5.0;
     let png = pixmap.encode_png().ok();
     checks.png_bytes = png.as_ref().map_or(0, Vec::len);
-    checks.ok = checks.parsed
-        && checks.nonblank
-        && checks.text_nodes > 0
-        && checks.text_rendered * 10 >= checks.text_nodes * 9
-        && checks.overlaps.is_empty()
-        && checks.style_violations.is_empty()
-        && checks.png_bytes > 0;
+    checks.ok = checks.failures().is_empty();
     (checks, png)
 }
 

@@ -290,7 +290,10 @@ async fn failed_validation_fails_the_item_when_strict() {
         "{e}"
     );
     if let Some(r) = recs.first() {
-        assert_eq!(r.outcome.error.clone().unwrap().code, ErrorCode::Validation);
+        let err = r.outcome.error.clone().unwrap();
+        assert_eq!(err.code, ErrorCode::Validation);
+        // the message names the failed check, not only that validation failed
+        assert!(err.message.contains("text elements"), "{}", err.message);
     }
     // the same failure with strict off is recorded but does not fail the item
     let (errors, recs) = run_render_stage(RenderParams {
@@ -299,7 +302,15 @@ async fn failed_validation_fails_the_item_when_strict() {
     })
     .await;
     assert_eq!(errors, Ok(0));
-    assert!(!recs[0].outcome.result.clone().unwrap().ok);
+    let result = recs[0].outcome.result.clone().unwrap();
+    assert!(!result.ok);
+    let failures = result.failures();
+    assert!(
+        failures
+            .iter()
+            .any(|f| f.starts_with("svg ") && f.contains("text elements")),
+        "{failures:?}"
+    );
 }
 
 #[test]

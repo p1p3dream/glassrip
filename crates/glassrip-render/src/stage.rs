@@ -47,6 +47,34 @@ impl Default for RenderParams {
     }
 }
 
+/// Failures listed in a validation error message before the rest are counted.
+pub const MAX_LISTED_FAILURES: usize = 12;
+
+/// The validation error message: every failed check (the first
+/// [`MAX_LISTED_FAILURES`], then a count), so the run log says what failed.
+pub fn failure_message(failures: &[String]) -> String {
+    let mut msg = String::from("render validation failed");
+    if failures.is_empty() {
+        return msg;
+    }
+    msg.push_str(": ");
+    msg.push_str(
+        &failures
+            .iter()
+            .take(MAX_LISTED_FAILURES)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; "),
+    );
+    if failures.len() > MAX_LISTED_FAILURES {
+        msg.push_str(&format!(
+            "; and {} more",
+            failures.len() - MAX_LISTED_FAILURES
+        ));
+    }
+    msg
+}
+
 /// `render`: meeting notes and board state to markdown and SVG.
 pub struct RenderStage {
     params: RenderParams,
@@ -139,10 +167,31 @@ impl Stage for RenderStage {
             let detail =
                 serde_json::to_string(&(&result.markdown, &result.svg)).unwrap_or_default();
             return Err(
-                ErrorInfo::new(ErrorCode::Validation, "render validation failed")
+                ErrorInfo::new(ErrorCode::Validation, failure_message(&result.failures()))
                     .with_raw_text(detail),
             );
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failure_message_lists_checks_and_counts_the_rest() {
+        assert_eq!(failure_message(&[]), "render validation failed");
+        let one = failure_message(&["svg b1: layout: card a overlaps card b".into()]);
+        assert_eq!(
+            one,
+            "render validation failed: svg b1: layout: card a overlaps card b"
+        );
+        let many: Vec<String> = (0..MAX_LISTED_FAILURES + 3)
+            .map(|i| format!("f{i}"))
+            .collect();
+        let m = failure_message(&many);
+        assert!(m.contains("f0; f1") && m.ends_with("; and 3 more"), "{m}");
+        assert!(!m.contains(&format!("f{MAX_LISTED_FAILURES}")));
     }
 }

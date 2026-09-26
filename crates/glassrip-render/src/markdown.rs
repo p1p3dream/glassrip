@@ -471,13 +471,7 @@ pub fn check_markdown(md: &str, files: &BTreeSet<String>) -> MarkdownChecks {
         }
     }
     let dashes = md.contains('\u{2014}') || md.contains('\u{2013}');
-    let ok = tables_expected == tables_parsed
-        && bad_rows.is_empty()
-        && empty_links == 0
-        && missing.is_empty()
-        && !dashes
-        && headings > 0;
-    MarkdownChecks {
+    let mut checks = MarkdownChecks {
         tables_expected,
         tables_parsed,
         bad_rows,
@@ -486,7 +480,39 @@ pub fn check_markdown(md: &str, files: &BTreeSet<String>) -> MarkdownChecks {
         missing_targets: missing,
         headings,
         dashes,
-        ok,
+        ok: false,
+    };
+    checks.ok = checks.failures().is_empty();
+    checks
+}
+
+impl MarkdownChecks {
+    /// Every failed check, naming the rows and links involved. `ok` is exactly
+    /// "this list is empty".
+    pub fn failures(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.tables_parsed != self.tables_expected {
+            out.push(format!(
+                "{} of {} tables parsed",
+                self.tables_parsed, self.tables_expected
+            ));
+        }
+        out.extend(self.bad_rows.iter().map(|r| format!("table {r}")));
+        if self.empty_links > 0 {
+            out.push(format!("{} links with an empty target", self.empty_links));
+        }
+        out.extend(
+            self.missing_targets
+                .iter()
+                .map(|t| format!("link target {t} is not a rendered file")),
+        );
+        if self.dashes {
+            out.push("contains an em or en dash".into());
+        }
+        if self.headings == 0 {
+            out.push("no headings".into());
+        }
+        out
     }
 }
 

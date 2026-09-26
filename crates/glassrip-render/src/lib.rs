@@ -74,6 +74,27 @@ pub struct RenderResult {
     pub ok: bool,
 }
 
+impl RenderResult {
+    /// Every failed validation check, prefixed with where it failed
+    /// (`markdown` or `svg <board id>`).
+    pub fn failures(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .markdown
+            .failures()
+            .into_iter()
+            .map(|f| format!("markdown: {f}"))
+            .collect();
+        for (board, c) in &self.svg {
+            out.extend(
+                c.failures()
+                    .into_iter()
+                    .map(|f| format!("svg {board}: {f}")),
+            );
+        }
+        out
+    }
+}
+
 fn write(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), RenderError> {
     let path = dir.join(name);
     let err = |e: std::io::Error| RenderError::Write {
