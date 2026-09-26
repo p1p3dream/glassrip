@@ -761,80 +761,81 @@ pub fn light_allowance(gold_words: usize) -> usize {
 
 /// Whether a prediction that leaves out `missing` of `total` distinct gold claim
 /// words, `light` of them excusable light words (already capped at
-/// [`light_allowance`]), states enough of the claim: the light words are excused on
-/// top of [`allowed_missing`], but the omissions never exceed the larger of the two
-/// allowances, so they do not stack (a six-word keyed claim is never stated by three
-/// of its words).
+/// [`light_allowance`]), states enough of the claim: either the omissions fit
+/// [`allowed_missing`], or every omission is an excused light word. The two
+/// allowances never mix, so a substituted word cannot ride on the general allowance
+/// while a light word rides on the other.
 fn enough_stated(total: usize, missing: usize, light: usize, keyed: bool) -> bool {
-    let base = allowed_missing(total, keyed);
-    missing <= base + light && missing <= base.max(light_allowance(total))
+    missing <= allowed_missing(total, keyed) || missing <= light
 }
 
-/// True when `pred` puts no word at all where the omitted gold word `w` stood, so
-/// the omission is a drop and not a substitution. The gold words before `w` are
-/// aligned to the prediction left to right (earliest in-order occurrence), the gold
-/// words after it right to left (latest in-order occurrence); the slot is the gap
-/// between the two aligned sides, or, with aligned words on one side only, from
-/// that side to the end (or from the start) of its clause. "post the notes for the
-/// crew" leaves the slot of "to use" empty; "post the notes for the crew to delete"
-/// fills it, and so does an extra copy of another gold word ("skip Ledger dashboard
-/// for dashboard migration" for "skip Ledger step for dashboard migration"). Sides
-/// that cross (a reordered prediction) leave no slot to judge, so nothing is excused.
+/// True when `unit` (a prediction's clauses, or one retraction unit) states the gold
+/// claim around the omitted gold word `w` with no word at all in its place, so the
+/// omission is a drop and not a substitution. The gold words before `w` are aligned
+/// to the prediction left to right (earliest in-order occurrence), the gold words
+/// after it right to left (latest in-order occurrence); with `either_polarity` a
+/// gold word aligns in either polarity (for judging a retraction). The aligned words
+/// must form one unbroken run inside one clause, with nothing after the run when
+/// `w` comes after every aligned word (nothing before it when it comes first). So a
+/// claim assembled from several clauses ("Tamsin owns billing. Quill reviews
+/// Ledger." for "Tamsin reviews Ledger step"), a word anywhere inside the claim
+/// ("post the notes to delete for the crew"), a following sentence ("post the notes
+/// for the crew. They delete them"), and an extra copy of another gold word ("skip
+/// Ledger dashboard for dashboard migration" for "skip Ledger step for dashboard
+/// migration") all excuse nothing; "post the notes for the crew" excuses the "to
+/// use" of "post the notes for the crew to use". Words before the run are context
+/// ("after review, post the notes for the crew"). Sides that cross (a reordered
+/// prediction) excuse nothing.
 fn slot_is_empty(
     g: &[ClaimWord],
     w: &ClaimWord,
-    clauses: &[Vec<ClaimWord>],
+    unit: &[Vec<ClaimWord>],
+    either_polarity: bool,
     vocab: &Vocabulary,
 ) -> bool {
-    let flat: Vec<(usize, &ClaimWord)> = clauses
+    let flat: Vec<(usize, &ClaimWord)> = unit
         .iter()
         .enumerate()
         .flat_map(|(c, ws)| ws.iter().map(move |x| (c, x)))
         .collect();
     let states = |gw: &ClaimWord, k: usize| {
-        stated(
-            gw,
-            &std::collections::BTreeSet::from([flat[k].1.clone()]),
-            vocab,
-        )
+        let one = std::collections::BTreeSet::from([flat[k].1.clone()]);
+        stated(gw, &one, vocab) || (either_polarity && stated(&flip(gw), &one, vocab))
     };
     let Some(i) = g.iter().position(|x| x == w) else {
         return false;
     };
-    let mut prev = None;
+    let mut before = Vec::new();
     let mut cursor = 0;
     for gw in &g[..i] {
         if let Some(k) = (cursor..flat.len()).find(|&k| states(gw, k)) {
-            prev = Some(k);
+            before.push(k);
             cursor = k + 1;
         }
     }
-    let mut next = None;
+    let mut after = Vec::new();
     let mut cursor = flat.len();
     for gw in g[i + 1..].iter().rev() {
         if let Some(k) = (0..cursor).rev().find(|&k| states(gw, k)) {
-            next = Some(k);
+            after.push(k);
             cursor = k;
         }
     }
-    let range = match (prev, next) {
-        (Some(a), Some(b)) if a < b => a + 1..b,
-        (Some(a), None) => {
-            let clause = flat[a].0;
-            let end = flat
-                .iter()
-                .rposition(|(c, _)| *c == clause)
-                .map_or(a + 1, |e| e + 1);
-            a + 1..end
+    after.reverse();
+    if let (Some(&a), Some(&b)) = (before.last(), after.first()) {
+        if a >= b {
+            return false;
         }
-        (None, Some(b)) => {
-            let clause = flat[b].0;
-            let start = flat.iter().position(|(c, _)| *c == clause).unwrap_or(b);
-            start..b
-        }
-        _ => return false,
+    }
+    let run: Vec<usize> = before.iter().chain(&after).copied().collect();
+    let (Some(&first), Some(&last)) = (run.first(), run.last()) else {
+        return false;
     };
-    range.is_empty()
+    let unbroken = run.windows(2).all(|p| p[1] == p[0] + 1);
+    let one_clause = flat[first].0 == flat[last].0;
+    let nothing_after = !after.is_empty() || last + 1 == flat.len();
+    let nothing_before = !before.is_empty() || first == 0;
+    unbroken && one_clause && nothing_after && nothing_before
 }
 
 /// Distinct gold claim words (same term and polarity) found in the prediction, and
@@ -954,7 +955,7 @@ const REPORTING_WORDS: &[&str] = &[
 /// segment and does not.
 fn clause_retracts(
     gw: &[ClaimWord],
-    keyed: bool,
+    keys: &std::collections::BTreeSet<String>,
     anchors: &[&ClaimWord],
     unit: &[ClaimWord],
     contrast_ok: bool,
@@ -1001,11 +1002,19 @@ fn clause_retracts(
         return false;
     }
     // Light gold words the unit leaves out count as retracted, as far as [`covers`]
-    // would excuse them, so dropping "to use" from a retraction does not turn it
-    // into a restatement.
+    // would excuse them (dropped from the negated restatement that starts at `lo`,
+    // not substituted, not key terms), so dropping "to use" from a retraction does
+    // not turn it into a restatement.
     let light_skip: BTreeSet<&ClaimWord> = g
         .iter()
-        .filter(|w| !flipped(w) && !kept(w) && is_light(&w.term) && !anchors.contains(w))
+        .filter(|w| {
+            !flipped(w)
+                && !kept(w)
+                && is_light(&w.term)
+                && !anchors.contains(w)
+                && !keys.contains(&w.term)
+                && slot_is_empty(gw, w, &[unit[lo..].to_vec()], true, vocab)
+        })
         .take(light_allowance(g.len()))
         .copied()
         .collect();
@@ -1035,7 +1044,8 @@ fn clause_retracts(
     }
     let retracted = |w: &ClaimWord| flipped(w) || kept(w);
     let missing = g.iter().filter(|w| !retracted(w)).count();
-    anchors.iter().all(|w| retracted(w)) && enough_stated(g.len(), missing, light_skip.len(), keyed)
+    anchors.iter().all(|w| retracted(w))
+        && enough_stated(g.len(), missing, light_skip.len(), !keys.is_empty())
 }
 
 /// True when `pred` states some gold claim word only with the opposite polarity
@@ -1058,16 +1068,15 @@ pub fn contradicts(gold: &str, pred: &str, vocab: &Vocabulary) -> bool {
         return true;
     }
     let keys = key_terms(gold, vocab);
-    let keyed = !keys.is_empty();
     let anchors = protected_words(&gw, &keys, vocab);
     claim_segments(pred, vocab).iter().any(|segments| {
         let clause = segments.concat();
         let single = segments.len() == 1;
-        clause_retracts(&gw, keyed, &anchors, &clause, single, vocab)
+        clause_retracts(&gw, &keys, &anchors, &clause, single, vocab)
             || (!single
                 && segments
                     .iter()
-                    .any(|s| clause_retracts(&gw, keyed, &anchors, s, true, vocab)))
+                    .any(|s| clause_retracts(&gw, &keys, &anchors, s, true, vocab)))
     })
 }
 
@@ -1117,7 +1126,7 @@ pub fn covers(gold: &str, pred: &str, vocab: &Vocabulary) -> bool {
             is_light(&w.term)
                 && !keys.contains(&w.term)
                 && !protected.contains(w)
-                && slot_is_empty(&g, w, &clauses, vocab)
+                && slot_is_empty(&g, w, &clauses, false, vocab)
         })
         .count()
         .min(light_allowance(ng));
@@ -1375,7 +1384,9 @@ mod tests {
         assert!(key_terms(gold, &v).is_empty(), "an unkeyed gold");
         // a trailing purpose clause of a light verb dropped
         assert!(covers(gold, "Post the notes and slides for the crew", &v));
-        assert!(covers(
+        assert!(covers(gold, "Post the notes and slides for the crew.", &v));
+        // anything after the claim, even in another clause, fills the slot
+        assert!(!covers(
             gold,
             "Post notes and slides for the crew, as agreed",
             &v
@@ -1438,6 +1449,22 @@ mod tests {
             "Post the slides for the crew twice",
             &v
         ));
+        // Kimi round-1 MINOR: a substitute moved inside the claim, and (the price of
+        // closing that) a modifier inside the claim, excuse nothing; context before
+        // the claim does not matter
+        let gold = "Post the notes for the crew to use";
+        assert!(!covers(gold, "Post the notes to delete for the crew", &v));
+        assert!(!covers(gold, "Post the updated notes for the crew", &v));
+        assert!(covers(
+            gold,
+            "Post the updated notes for the crew to use",
+            &v
+        ));
+        assert!(covers(
+            gold,
+            "After review, post the notes for the crew",
+            &v
+        ));
     }
 
     /// Codex round-3 M2: the light allowance does not stack with the general one.
@@ -1451,6 +1478,70 @@ mod tests {
         assert!(!enough_stated(6, 3, 2, true));
         assert!(!enough_stated(5, 2, 1, false));
         assert!(enough_stated(5, 1, 1, false));
+        // Codex round-4 M5: a substituted light word does not ride on the general
+        // allowance while another light word is excused
+        assert!(!enough_stated(6, 2, 1, true));
+        assert!(!covers(
+            gold,
+            "Defer Ledger rollout for dashboard migration",
+            &v
+        ));
+        assert!(covers(
+            gold,
+            "Defer the Ledger rollout for dashboard migration work",
+            &v
+        ));
+    }
+
+    /// Codex round-4 M1 and M2: a claim assembled from several clauses, or followed
+    /// by another action, excuses no light word.
+    #[test]
+    fn light_words_are_excused_only_inside_one_clause_with_nothing_after() {
+        let v = names();
+        assert!(covers(
+            "Tamsin reviews Ledger step",
+            "Tamsin reviews Ledger",
+            &v
+        ));
+        assert!(!covers(
+            "Tamsin reviews Ledger step",
+            "Tamsin owns billing. Quill reviews Ledger.",
+            &v
+        ));
+        let gold = "Post notes for the crew to use";
+        assert!(covers(gold, "Post notes for the crew", &v));
+        assert!(!covers(
+            gold,
+            "Post notes for the crew. They will delete the notes.",
+            &v
+        ));
+    }
+
+    /// Codex round-4 M3 and M4: a retraction skips a light word only when it drops
+    /// it (not when it substitutes for it), and never skips a key term.
+    #[test]
+    fn a_retraction_skips_only_dropped_non_key_light_words() {
+        let v = names();
+        let gold = "Skip Ledger step for dashboard migration";
+        let pred = "Skip Ledger step for dashboard migration. Do not skip Ledger dashboard for dashboard migration.";
+        assert!(!contradicts(gold, pred, &v));
+        assert!(!contradicts(
+            gold,
+            "Skip Ledger step for dashboard migration. Do not skip Ledger rollout for dashboard migration.",
+            &v
+        ));
+        assert!(contradicts(
+            gold,
+            "Skip Ledger step for dashboard migration. Do not skip Ledger for dashboard migration.",
+            &v
+        ));
+        let gold = "Approve Phase 2 migration";
+        assert!(key_terms(gold, &v).contains("phas"));
+        assert!(!contradicts(
+            gold,
+            "Approve Phase 2 migration. Do not approve 2 migration.",
+            &v
+        ));
     }
 
     /// The light-word allowance is bounded: one per three gold words.
