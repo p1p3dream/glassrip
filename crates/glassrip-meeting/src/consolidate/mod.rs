@@ -1880,7 +1880,7 @@ pub fn consolidate_with_probe(
     // A node read once with the text of an established node, at an imprecise place,
     // is that node (see `echo_of_established`): owner targets follow it there.
     let owner_track = |ti: usize| -> usize {
-        if !echo_of_established(ti, &tracks[ti]) {
+        if tracks[ti].votes().kind() != ObsList::Node || !echo_of_established(ti, &tracks[ti]) {
             return ti;
         }
         let seen = tracks[ti].frames();
@@ -2357,8 +2357,9 @@ pub fn consolidate_with_probe(
     let revealed =
         |ti: usize, f: usize| view_changed_into(f) && !shown_empty_before(&tracks[ti], f);
     // An edge first read after a view change came into view when an end was not in
-    // the previous view, or when, both ends read there, the pixels show its
-    // connector already drawn between them.
+    // the previous view, or when, both ends read there, a traced stroke already
+    // joined them there (straight-corridor ink proves no connection, and a probe
+    // that does not trace leaves the edge added).
     let revealed_edge = |key: (usize, usize), f: usize| {
         if !view_changed_into(f) {
             return false;
@@ -2377,17 +2378,24 @@ pub fn consolidate_with_probe(
             return true;
         }
         let rp = &params.region_probe;
-        let drawn = match (probe, before(key.0), before(key.1)) {
-            (Some(probe), Some(a), Some(b)) => {
-                let c = |x: &BBox| ((x.x1 + x.x2) / 2.0, (x.y1 + x.y2) / 2.0);
-                let hw = (rp.corridor_half_width_share * a.height().min(b.height())).max(3.0);
+        match (probe, before(key.0), before(key.1)) {
+            (Some(probe), Some(ba), Some(bb)) if probe.traces() => {
+                let p = f - 1;
+                let ring = (rp.corridor_half_width_share * ba.height().min(bb.height())).max(3.0);
+                let margin = rp.stroke_margin_share * ba.height().max(bb.height());
+                let region = BBox::new(
+                    ba.x1.min(bb.x1) - margin,
+                    ba.y1.min(bb.y1) - margin,
+                    ba.x2.max(bb.x2) + margin,
+                    ba.y2.max(bb.y2) + margin,
+                );
+                let masks: Vec<BBox> = others(key.0, key.1).filter_map(|x| raw_at(x, p)).collect();
                 probe
-                    .line_cover(&frames[f - 1].keyframe_id, c(&a), c(&b), hw)
-                    .is_some_and(|cover| cover >= rp.min_line_cover)
+                    .stroke_between(&frames[p].keyframe_id, &ba, &bb, &region, &masks, ring)
+                    .is_some_and(|t| t.joined)
             }
             _ => false,
-        };
-        drawn
+        }
     };
     let offer_added = |gate: &mut EventGate, e: BoardEvent, is_revealed: bool| {
         if !e.baseline && is_revealed {

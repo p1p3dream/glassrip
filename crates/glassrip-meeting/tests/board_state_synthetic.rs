@@ -3086,20 +3086,40 @@ fn pixels_tell_a_missed_element_revealed_by_a_pan_from_one_drawn_during_it() {
     assert!(added.contains(&"Cache".to_string()) && added.contains(&"Spare".to_string()));
 }
 
-/// Pixels that show every straight connector drawn and say nothing about boxes.
-struct LinesDrawn;
+/// Pixels whose traced strokes join every pair of boxes (`joined`), and whose
+/// straight corridors are all inked; nothing about boxes.
+struct Strokes {
+    joined: bool,
+}
 
-impl RegionProbe for LinesDrawn {
+impl RegionProbe for Strokes {
     fn ink_share(&self, _: &str, _: &BBox) -> Option<f64> {
         None
     }
     fn line_cover(&self, _: &str, _: (f64, f64), _: (f64, f64), _: f64) -> Option<f64> {
         Some(0.9)
     }
+    fn stroke_between(
+        &self,
+        _: &str,
+        _: &BBox,
+        _: &BBox,
+        _: &BBox,
+        _: &[BBox],
+        _: f64,
+    ) -> Option<StrokeTrace> {
+        Some(StrokeTrace {
+            joined: self.joined,
+            ink: 0.1,
+        })
+    }
+    fn traces(&self) -> bool {
+        true
+    }
 }
 
 #[test]
-fn a_connector_missed_before_a_zoom_out_is_not_added_when_pixels_show_it() {
+fn a_connector_missed_before_a_zoom_out_is_not_added_when_a_traced_stroke_shows_it() {
     // Both ends of the HTTP edge are in the zoomed view from the start, but the
     // reader only lists the edge after the zoom-out.
     let zoomed = Similarity {
@@ -3126,17 +3146,22 @@ fn a_connector_missed_before_a_zoom_out_is_not_added_when_pixels_show_it() {
             e.kind == EventKind::EdgeAdded && e.detail.contains("Ingest Gateway") && !e.baseline
         })
     };
-    let s = consolidate_with_probe(
-        frames(&specs),
-        "board-1",
-        &params(),
-        &hooks(&NoCorroboration),
-        Some(&LinesDrawn as &dyn RegionProbe),
-    );
+    let probed = |joined: bool| {
+        consolidate_with_probe(
+            frames(&specs),
+            "board-1",
+            &params(),
+            &hooks(&NoCorroboration),
+            Some(&Strokes { joined } as &dyn RegionProbe),
+        )
+    };
+    let s = probed(true);
     assert!(!http_added(&s), "{:#?}", s.events);
     assert!(s.suppressed_events.iter().any(|x| {
         x.reason == SuppressReason::RevealedByView && x.event.kind == EventKind::EdgeAdded
     }));
-    // Without pixels, both ends were in view: a new connector.
+    // No stroke joined the ends before (corridor ink alone proves nothing), or no
+    // pixels: both ends were in view, so a new connector.
+    assert!(http_added(&probed(false)));
     assert!(http_added(&run(frames(&specs), &params())));
 }
