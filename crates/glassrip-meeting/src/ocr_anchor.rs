@@ -7,13 +7,19 @@
 //! other end. OCR boxes are pixel-accurate, so they locate the text of each node and
 //! label:
 //!
-//! - **Nodes.** The OCR spans of a node's words near its reader box are grouped
-//!   around the span closest to the box. When they cover enough of the node's text
-//!   and their center is displaced from the box center by more than a share of the
-//!   box size, the box is translated onto them (keeping its size, grown to contain
-//!   them). Smaller offsets are left to the outline snap.
+//! - **Nodes.** Each OCR span belongs to at most one node: among the nodes whose
+//!   text it matches and whose search window holds it, the one whose reader box is
+//!   nearest. A node's own spans are grouped around the one closest to its box,
+//!   each further span adding words the group does not have yet (two boxes both
+//!   named "Service" never pool their spans). When the group covers enough of the
+//!   node's text, does not sit on another node's box, and is displaced from the box
+//!   center by more than a share of the box size, the box is translated onto it
+//!   (keeping its size, grown to contain it). Smaller offsets are left to the
+//!   outline snap.
 //! - **Edge labels.** The label box becomes the OCR box of the label text found near
-//!   the reader's label box, or between the two nodes when there is none.
+//!   the reader's label box, or, when there is none, in the corridor between the two
+//!   nodes (a repeated short label elsewhere around them is another connector's).
+//!   Spans that belong to a node are never a label.
 //! - **Masking.** Every OCR text box is returned for masking, so label glyphs never
 //!   join a connector wherever the reader placed its boxes.
 //!
@@ -128,6 +134,10 @@ fn union(boxes: &[BBox]) -> Option<BBox> {
     })
 }
 
+fn dist2(a: (f64, f64), b: (f64, f64)) -> f64 {
+    (a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)
+}
+
 fn inside(p: (f64, f64), b: &BBox) -> bool {
     p.0 >= b.x1 && p.0 <= b.x2 && p.1 >= b.y1 && p.1 <= b.y2
 }
@@ -161,11 +171,13 @@ fn matched_words(span: &[String], target: &[String], sim: f64) -> Option<Vec<usi
     Some(hit)
 }
 
-/// Spans of `text` near `window`, grouped around the one closest to `anchor`
-/// (within `reach` of it on each axis), and the share of `text`'s characters they
-/// cover.
+/// Spans of `text` near `window`, grouped around the one closest to `anchor`, and
+/// the share of `text`'s characters they cover. Spans join the group in order of
+/// distance from the seed, within `reach` of it on each axis, and only when they add
+/// words the group does not cover yet: a second copy of the same text is another
+/// element's.
 fn locate(
-    spans: &[Span],
+    spans: &[&Span],
     text: &str,
     window: &BBox,
     anchor: (f64, f64),
@@ -178,31 +190,59 @@ fn locate(
     }
     let cands: Vec<(&Span, Vec<usize>)> = spans
         .iter()
+        .copied()
         .filter(|s| inside(center(&s.bbox), window))
         .filter_map(|s| matched_words(&s.words, &target, sim).map(|m| (s, m)))
         .collect();
-    let dist = |b: &BBox| {
+    let dist = |b: &BBox, p: (f64, f64)| {
         let c = center(b);
-        (c.0 - anchor.0).powi(2) + (c.1 - anchor.1).powi(2)
+        (c.0 - p.0).powi(2) + (c.1 - p.1).powi(2)
     };
     let seed = cands
         .iter()
-        .min_by(|a, b| dist(&a.0.bbox).total_cmp(&dist(&b.0.bbox)))?;
+        .min_by(|a, b| dist(&a.0.bbox, anchor).total_cmp(&dist(&b.0.bbox, anchor)))?;
     let sc = center(&seed.0.bbox);
-    let group: Vec<&(&Span, Vec<usize>)> = cands
+    let mut order: Vec<&(&Span, Vec<usize>)> = cands
         .iter()
         .filter(|(s, _)| {
             let c = center(&s.bbox);
             (c.0 - sc.0).abs() <= reach.0 && (c.1 - sc.1).abs() <= reach.1
         })
         .collect();
-    let mut covered: Vec<usize> = group.iter().flat_map(|(_, m)| m.iter().copied()).collect();
+    order.sort_by(|a, b| dist(&a.0.bbox, sc).total_cmp(&dist(&b.0.bbox, sc)));
+    let mut covered: Vec<usize> = Vec::new();
+    let mut boxes: Vec<BBox> = Vec::new();
+    for (s, m) in order {
+        if m.iter().all(|i| covered.contains(i)) {
+            continue;
+        }
+        covered.extend(m.iter().copied());
+        boxes.push(s.bbox);
+    }
     covered.sort_unstable();
     covered.dedup();
     let total: usize = target.iter().map(|w| w.chars().count()).sum();
     let got: usize = covered.iter().map(|&i| target[i].chars().count()).sum();
-    let boxes: Vec<BBox> = group.iter().map(|(s, _)| s.bbox).collect();
     union(&boxes).map(|u| (u, got as f64 / total.max(1) as f64))
+}
+
+/// Distance from `p` to the segment `a`-`b`.
+fn segment_distance(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let l2 = dx * dx + dy * dy;
+    let t = if l2 > 0.0 {
+        (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / l2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (p.0 - (a.0 + t * dx)).hypot(p.1 - (a.1 + t * dy))
+}
+
+/// Distance from `p` to box `b` (0 inside).
+fn box_distance(p: (f64, f64), b: &BBox) -> f64 {
+    let dx = (b.x1 - p.0).max(p.0 - b.x2).max(0.0);
+    let dy = (b.y1 - p.1).max(p.1 - b.y2).max(0.0);
+    dx.hypot(dy)
 }
 
 /// Move node and label boxes of `board` onto their OCR text. `ocr` must share the
@@ -227,15 +267,43 @@ pub fn reanchor(board: &ValidatedBoard, ocr: &[TextAnchor], p: &OcrAnchorParams)
     if !p.enabled || spans.is_empty() {
         return out;
     }
-    for n in &mut out.board.nodes {
+    // One owner per span: the matching node whose reader box is nearest.
+    let owner: Vec<Option<usize>> = spans
+        .iter()
+        .map(|s| {
+            let c = center(&s.bbox);
+            board
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.bbox.width() > 0.0 && n.bbox.height() > 0.0)
+                .filter(|(_, n)| inside(c, &grow(&n.bbox, p.search_share)))
+                .filter(|(_, n)| {
+                    matched_words(&s.words, &words(&n.text), p.word_similarity).is_some()
+                })
+                .min_by(|a, b| {
+                    (box_distance(c, &a.1.bbox), dist2(c, center(&a.1.bbox)))
+                        .partial_cmp(&(box_distance(c, &b.1.bbox), dist2(c, center(&b.1.bbox))))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(i, _)| i)
+        })
+        .collect();
+    for (ni, n) in out.board.nodes.iter_mut().enumerate() {
         let b = n.bbox;
         let (w, h) = (b.width(), b.height());
         if w <= 0.0 || h <= 0.0 {
             continue;
         }
+        let own: Vec<&Span> = spans
+            .iter()
+            .zip(&owner)
+            .filter(|(_, o)| **o == Some(ni))
+            .map(|(s, _)| s)
+            .collect();
         let window = grow(&b, p.search_share);
         let Some((u, cover)) = locate(
-            &spans,
+            &own,
             &n.text,
             &window,
             center(&b),
@@ -245,6 +313,15 @@ pub fn reanchor(board: &ValidatedBoard, ocr: &[TextAnchor], p: &OcrAnchorParams)
             continue;
         };
         if cover < p.min_text_cover {
+            continue;
+        }
+        // Text that sits on another node's box is that node's.
+        let on_other = board
+            .nodes
+            .iter()
+            .enumerate()
+            .any(|(j, m)| j != ni && inside(center(&u), &m.bbox) && !inside(center(&u), &b));
+        if on_other {
             continue;
         }
         let (bc, uc) = (center(&b), center(&u));
@@ -266,6 +343,12 @@ pub fn reanchor(board: &ValidatedBoard, ocr: &[TextAnchor], p: &OcrAnchorParams)
         nodes.iter().find(|n| n.local_id == id).map(|n| n.bbox)
     };
     let nodes = out.board.nodes.clone();
+    let free: Vec<&Span> = spans
+        .iter()
+        .zip(&owner)
+        .filter(|(_, o)| o.is_none())
+        .map(|(s, _)| s)
+        .collect();
     for e in &mut out.board.edges {
         let label = clean_label(&e.label);
         if label.is_empty() {
@@ -276,29 +359,39 @@ pub fn reanchor(board: &ValidatedBoard, ocr: &[TextAnchor], p: &OcrAnchorParams)
         };
         let (sc, dc) = (center(&s), center(&d));
         let mid = ((sc.0 + dc.0) / 2.0, (sc.1 + dc.1) / 2.0);
-        // Near the reader's label box when there is one, else anywhere around the
-        // two nodes (closest to their midpoint).
-        let (window, anchor) = match e.label_bbox {
+        // Near the reader's label box when there is one, else in the corridor
+        // between the two nodes (closest to their midpoint).
+        let (window, anchor, cands) = match e.label_bbox {
             Some(l) if l.is_well_formed() => {
                 let pad = l.width().max(l.height());
                 (
                     BBox::new(l.x1 - pad, l.y1 - pad, l.x2 + pad, l.y2 + pad),
                     center(&l),
+                    free.clone(),
                 )
             }
-            _ => (
-                BBox::new(
-                    s.x1.min(d.x1) - 20.0,
-                    s.y1.min(d.y1) - 20.0,
-                    s.x2.max(d.x2) + 20.0,
-                    s.y2.max(d.y2) + 20.0,
-                ),
-                mid,
-            ),
+            _ => {
+                let across = (0.5 * s.height().max(d.height())).max(20.0);
+                let corridor: Vec<&Span> = free
+                    .iter()
+                    .copied()
+                    .filter(|x| segment_distance(center(&x.bbox), sc, dc) <= across)
+                    .collect();
+                (
+                    BBox::new(
+                        s.x1.min(d.x1) - 20.0,
+                        s.y1.min(d.y1) - 20.0,
+                        s.x2.max(d.x2) + 20.0,
+                        s.y2.max(d.y2) + 20.0,
+                    ),
+                    mid,
+                    corridor,
+                )
+            }
         };
         // Label words on one line or two stacked lines.
         let reach = (window.width(), window.height() / 2.0);
-        if let Some((u, cover)) = locate(&spans, &label, &window, anchor, reach, p.word_similarity)
+        if let Some((u, cover)) = locate(&cands, &label, &window, anchor, reach, p.word_similarity)
         {
             if cover >= p.min_text_cover {
                 e.label_bbox = Some(u);
@@ -487,5 +580,72 @@ mod tests {
         };
         assert_eq!(reanchor(&b, &ocr, &off).board, b);
         assert_eq!(reanchor(&b, &[], &OcrAnchorParams::default()).board, b);
+    }
+
+    #[test]
+    fn two_boxes_with_the_same_word_never_pool_their_text() {
+        // Two neighbouring boxes both read "Service", each text centered in its
+        // box. Pooling the spans would pull the first box halfway to the second.
+        let a = BBox::new(100.0, 100.0, 260.0, 160.0);
+        let b = BBox::new(280.0, 100.0, 400.0, 160.0);
+        let board_ = board(
+            vec![node("n1", "Service", a), node("n2", "Service", b)],
+            vec![],
+        );
+        let ocr = vec![
+            anchor("Service", 155.0, 123.0, 205.0, 137.0),
+            anchor("Service", 315.0, 123.0, 365.0, 137.0),
+        ];
+        let r = reanchor(&board_, &ocr, &tight());
+        assert_eq!(r.nodes_moved, 0, "{:?}", r.board.nodes);
+        assert_eq!(r.board.nodes[0].bbox, a);
+        assert_eq!(r.board.nodes[1].bbox, b);
+    }
+
+    #[test]
+    fn text_on_another_box_is_not_this_box_s_anchor() {
+        // "Queue" is read only inside the "Orders" box (a note written on it): the
+        // "Queue" box does not jump onto another node.
+        let q = BBox::new(100.0, 100.0, 200.0, 150.0);
+        let o = BBox::new(230.0, 100.0, 330.0, 150.0);
+        let board_ = board(
+            vec![node("n1", "Queue", q), node("n2", "Orders", o)],
+            vec![],
+        );
+        let ocr = vec![anchor("Queue", 260.0, 118.0, 300.0, 132.0)];
+        let r = reanchor(&board_, &ocr, &tight());
+        assert_eq!(r.nodes_moved, 0);
+        assert_eq!(r.board.nodes[0].bbox, q);
+    }
+
+    #[test]
+    fn a_label_without_a_reader_box_is_found_on_its_own_connector() {
+        // Diagonal connector n1 -> n2 labelled "yes" a quarter of the way along; a
+        // second "yes" (another connector's) sits nearer the midpoint but off this
+        // connector's corridor.
+        let n1 = BBox::new(100.0, 100.0, 200.0, 150.0);
+        let n2 = BBox::new(500.0, 300.0, 600.0, 350.0);
+        let edge = BoardEdge {
+            src: "n1".into(),
+            dst: "n2".into(),
+            label: "yes".into(),
+            label_bbox: None,
+            style: EdgeStyle::Solid,
+            conf: 0.9,
+        };
+        let board_ = board(
+            vec![node("n1", "Start", n1), node("n2", "Finish", n2)],
+            vec![edge],
+        );
+        let ocr = vec![
+            anchor("yes", 235.0, 168.0, 265.0, 182.0),
+            anchor("yes", 315.0, 133.0, 345.0, 147.0),
+        ];
+        let r = reanchor(&board_, &ocr, &tight());
+        assert_eq!(r.labels_found, 1);
+        assert_eq!(
+            r.board.edges[0].label_bbox,
+            Some(BBox::new(235.0, 168.0, 265.0, 182.0))
+        );
     }
 }
