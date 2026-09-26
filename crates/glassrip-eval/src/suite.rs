@@ -754,6 +754,7 @@ pub fn run_meeting(
         }
     }
     run.warnings.extend(golden.clock_warnings());
+    run.warnings.extend(golden.name_warnings());
     let m = &mut run.metrics;
     // Each section joins on the clock its golden declares (PTS unless declared).
     let screen_clock = golden.clock(ClockSection::ScreenTypes);

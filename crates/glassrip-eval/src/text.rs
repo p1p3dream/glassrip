@@ -303,8 +303,9 @@ enum Token {
 
 /// Splits text into words and clause boundaries. A word is a run of letters, digits,
 /// `_`, and apostrophes (`don't`, `order_svc`); a `.` or `,` between two digits stays
-/// inside it (`2.5`, `1,000`). A `.` between other letters or digits separates two
-/// words without ending the clause (`ledger.py`, `builds.not`). Every other
+/// inside it (`2.5`, `1,000`). A `.` before a lower-case letter or a digit separates
+/// two words without ending the clause (`ledger.py`, `builds.not`); before a capital
+/// it ends a sentence whose space was dropped (`builds.We`). Every other
 /// character separates words, so `don't-ship` is `don't` and `ship`; each of
 /// `, ; : . ! ?` outside a word is a clause boundary (`builds,not` ends a clause
 /// before `not`). Curly apostrophes count as `'`; quotes around a word are dropped.
@@ -335,8 +336,9 @@ fn tokenize(text: &str) -> Vec<Token> {
         let numeric_mark = (c == '.' || c == ',')
             && at(prev, char::is_ascii_digit)
             && at(next, char::is_ascii_digit);
-        let joining_dot =
-            c == '.' && at(prev, |c| c.is_alphanumeric()) && at(next, |c| c.is_alphanumeric());
+        let joining_dot = c == '.'
+            && at(prev, |c| c.is_alphanumeric())
+            && at(next, |c| c.is_lowercase() || c.is_ascii_digit());
         if word_char || numeric_mark {
             cur.push(c);
         } else {
@@ -357,8 +359,8 @@ fn is_function_word(lower: &str) -> bool {
 
 /// Whether the word at `i` may name a participant. It must be capitalized; a word
 /// that is also a function word ("Will", "May") is read as the function word where
-/// it opens a sentence and another function word follows ("Will we ship?"), and as
-/// a name otherwise ("Will moves the dashboard", "Will Park ships").
+/// it opens a sentence or clause and another function word follows ("Will we
+/// ship?", "yes, Will we ship?"), and as a name otherwise ("Will moves the dashboard", "Will Park ships").
 fn may_name(tokens: &[Token], i: usize) -> bool {
     let Some(Token::Word(w)) = tokens.get(i) else {
         return false;
@@ -369,7 +371,7 @@ fn may_name(tokens: &[Token], i: usize) -> bool {
     if !is_function_word(&w.to_lowercase()) {
         return true;
     }
-    let opens = i == 0 || matches!(tokens[i - 1], Token::Boundary(c) if ".!?".contains(c));
+    let opens = i == 0 || matches!(tokens[i - 1], Token::Boundary(_));
     let next_function = match tokens.get(i + 1) {
         Some(Token::Word(n)) => is_function_word(&n.to_lowercase()) || is_negation(n),
         _ => true,
@@ -388,24 +390,43 @@ fn may_name(tokens: &[Token], i: usize) -> bool {
 /// prediction states "Tamsin". Entity words are key terms in any case.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Vocabulary {
-    /// Normalized participant name word to its canonical term (`@<person_id>`).
-    people: BTreeMap<String, String>,
+    /// Normalized participant name word to the canonical ids (`<person_id>`) of the
+    /// participants it names; more than one when two participants share it.
+    people: BTreeMap<String, std::collections::BTreeSet<String>>,
     /// Stemmed words of each entity name.
     entities: Vec<std::collections::BTreeSet<String>>,
 }
 
 impl Vocabulary {
-    /// Adds a participant: every word of two or more characters of each name maps to
-    /// `@person_id`.
+    /// Adds a participant: every word of two or more characters of each name names
+    /// `person_id`. A word two participants share ("Tam" for Tam Ly and for Tamsin)
+    /// becomes one ambiguous term that names neither alone ([`Self::ambiguous_names`]).
     pub fn add_person<'a>(&mut self, person_id: &str, names: impl IntoIterator<Item = &'a str>) {
-        let canon = format!("@{}", normalize_label(person_id).replace(' ', "_"));
+        let id = normalize_label(person_id).replace(' ', "_");
         for name in names {
             for w in normalize_label(name).split(' ') {
                 if w.chars().count() >= 2 {
-                    self.people.insert(w.to_string(), canon.clone());
+                    self.people
+                        .entry(w.to_string())
+                        .or_default()
+                        .insert(id.clone());
                 }
             }
         }
+    }
+
+    /// Name words shared by two or more participants, with the participants.
+    pub fn ambiguous_names(&self) -> Vec<String> {
+        self.people
+            .iter()
+            .filter(|(_, ids)| ids.len() > 1)
+            .map(|(w, ids)| {
+                format!(
+                    "name word `{w}` belongs to {}; alone it names none of them",
+                    ids.iter().cloned().collect::<Vec<_>>().join(" and ")
+                )
+            })
+            .collect()
     }
 
     /// Adds an entity name (a board label, a hotword): each of its content words is a
@@ -421,9 +442,14 @@ impl Vocabulary {
         }
     }
 
-    /// The participant term of a normalized word, when the word was capitalized.
-    fn person(&self, word: &str, capitalized: bool) -> Option<&String> {
-        capitalized.then(|| self.people.get(word)).flatten()
+    /// The participant term of a normalized word (`@<id>`, or `@<id>|<id>` for a
+    /// shared word), when the word may name someone ([`may_name`]).
+    fn person(&self, word: &str, name_ok: bool) -> Option<String> {
+        let ids = self.people.get(word).filter(|_| name_ok)?;
+        Some(format!(
+            "@{}",
+            ids.iter().cloned().collect::<Vec<_>>().join("|")
+        ))
     }
 
     /// True when the term names a known participant or entity.
@@ -471,7 +497,7 @@ fn word_terms(word: &str, name_ok: bool, vocab: &Vocabulary) -> Vec<String> {
         .split(' ')
         .filter(|p| !p.is_empty())
         .filter_map(|p| match vocab.person(p, name_ok) {
-            Some(t) => Some(t.clone()),
+            Some(t) => Some(t),
             None => (!STOPWORDS.contains(&p)).then(|| stem(p)),
         })
         .collect()
@@ -482,29 +508,41 @@ fn word_terms(word: &str, name_ok: bool, vocab: &Vocabulary) -> Vec<String> {
 /// of its clause: a clause boundary or a clause word ("but", "instead"), so "we
 /// can't not ship" affirms. Stopwords and clause words are dropped.
 pub fn claim_words(text: &str, vocab: &Vocabulary) -> Vec<ClaimWord> {
+    claim_clauses(text, vocab).concat()
+}
+
+/// [`claim_words`] split into clauses (at clause boundaries and clause words).
+pub fn claim_clauses(text: &str, vocab: &Vocabulary) -> Vec<Vec<ClaimWord>> {
     let tokens = tokenize(text);
-    let mut out = Vec::new();
+    let mut clauses: Vec<Vec<ClaimWord>> = vec![Vec::new()];
     let mut negated = false;
     for (i, token) in tokens.iter().enumerate() {
-        let Token::Word(w) = token else {
-            negated = false;
-            continue;
+        let new_clause = match token {
+            Token::Boundary(_) => true,
+            Token::Word(w) => CLAUSE_WORDS.contains(&w.to_lowercase().as_str()),
         };
-        if CLAUSE_WORDS.contains(&w.to_lowercase().as_str()) {
+        if new_clause {
             negated = false;
+            if clauses.last().is_some_and(|c| !c.is_empty()) {
+                clauses.push(Vec::new());
+            }
             continue;
         }
+        let Token::Word(w) = token else { continue };
         if is_negation(w) {
             negated = !negated;
             continue;
         }
-        out.extend(
-            word_terms(w, may_name(&tokens, i), vocab)
-                .into_iter()
-                .map(|term| ClaimWord { term, negated }),
-        );
+        if let Some(clause) = clauses.last_mut() {
+            clause.extend(
+                word_terms(w, may_name(&tokens, i), vocab)
+                    .into_iter()
+                    .map(|term| ClaimWord { term, negated }),
+            );
+        }
     }
-    out
+    clauses.retain(|c| !c.is_empty());
+    clauses
 }
 
 /// Stemmed content words (normalized, [`STOPWORDS`] removed), deduplicated.
@@ -545,13 +583,21 @@ pub fn key_terms(text: &str, vocab: &Vocabulary) -> std::collections::BTreeSet<S
     out
 }
 
-/// Every key term of `gold` ([`key_terms`]) appears among the content words of `pred`.
+/// Every key term of `gold` ([`key_terms`]) is named by the content words of `pred`:
+/// a participant by the same term, an entity word by itself or by a word of the same
+/// entity that no other entity shares ([`Vocabulary::names`]).
 pub fn key_terms_present(gold: &str, pred: &str, vocab: &Vocabulary) -> bool {
     let p: std::collections::BTreeSet<String> = claim_words(pred, vocab)
         .into_iter()
         .map(|w| w.term)
         .collect();
-    key_terms(gold, vocab).iter().all(|k| p.contains(k))
+    key_terms(gold, vocab).iter().all(|k| {
+        if k.starts_with('@') {
+            p.contains(k)
+        } else {
+            vocab.names(k, &p)
+        }
+    })
 }
 
 /// Gold claim words a prediction may leave out and still state the claim: none for a
@@ -559,8 +605,8 @@ pub fn key_terms_present(gold: &str, pred: &str, vocab: &Vocabulary) -> bool {
 /// six to ten, two for eleven to fifteen, and so on. A short claim is its words
 /// ("skip the Ledger step" is not stated by "the Ledger step was hard"), and a
 /// phrasing without key terms has nothing else to pin its subject. Key terms can
-/// never be left out ([`key_terms_present`]), nor can the phrasing's first content
-/// word (its head: a sentence-initial name, or the verb of an imperative), and a
+/// never be left out ([`key_terms_present`]), nor can the phrasing's head (its first
+/// content word) or its predicate (its first content word that is not a name), and a
 /// word stated with the opposite polarity is a contradiction, not an omission
 /// ([`contradicts`]).
 pub fn allowed_missing(gold_words: usize, has_key_terms: bool) -> usize {
@@ -581,31 +627,73 @@ fn polar_overlap(g: &[ClaimWord], p: &[ClaimWord]) -> (usize, usize, usize) {
 
 /// True when `pred` states some gold claim word only with the opposite polarity
 /// (gold "ship weekly builds" and "we will not ship; weekly builds stay" disagree on
-/// "ship", whatever else they share), or negates the gold's head anywhere ("ship
-/// weekly builds; do not ship weekly builds" retracts the claim). A negated word
-/// other than the head may sit beside the affirmed claim ("ship weekly builds, not
-/// nightly builds").
+/// "ship", whatever else they share), or when one of its clauses states the gold
+/// claim with the opposite polarity: the flipped head plus as many flipped gold words
+/// as [`covers`] needs ("ship weekly builds; do not ship weekly builds" retracts the
+/// claim). A clause that negates the head about something else does not ("we don't
+/// ship nightly builds; we ship weekly builds").
 pub fn contradicts(gold: &str, pred: &str, vocab: &Vocabulary) -> bool {
-    let p: std::collections::BTreeSet<ClaimWord> = claim_words(pred, vocab).into_iter().collect();
-    let g = claim_words(gold, vocab);
+    let g: std::collections::BTreeSet<ClaimWord> = claim_words(gold, vocab).into_iter().collect();
+    let Some(head) = claim_words(gold, vocab).into_iter().next() else {
+        return false;
+    };
     let flip = |w: &ClaimWord| ClaimWord {
         term: w.term.clone(),
         negated: !w.negated,
     };
-    let only_flipped = g.iter().any(|w| p.contains(&flip(w)) && !p.contains(w));
-    let head_retracted = g.first().is_some_and(|h| p.contains(&flip(h)));
-    only_flipped || head_retracted
+    let p: std::collections::BTreeSet<ClaimWord> = claim_words(pred, vocab).into_iter().collect();
+    if g.iter().any(|w| p.contains(&flip(w)) && !p.contains(w)) {
+        return true;
+    }
+    let keyed = !key_terms(gold, vocab).is_empty();
+    let need = g.len() - allowed_missing(g.len(), keyed);
+    claim_clauses(pred, vocab).iter().any(|clause| {
+        let c: std::collections::BTreeSet<&ClaimWord> = clause.iter().collect();
+        c.contains(&flip(&head)) && g.iter().filter(|w| c.contains(&flip(w))).count() >= need
+    })
 }
 
-/// True when `pred` states the head (first content word) of `gold` and enough of its
-/// other claim words with the same polarity ([`allowed_missing`]), and contradicts
-/// none of them ([`contradicts`]).
+/// True when `pred` states a gold claim word: the same term with the same polarity,
+/// or, for an entity word, a word of the same entity that no other entity shares
+/// ([`Vocabulary::names`]) with the same polarity.
+fn stated(w: &ClaimWord, p: &std::collections::BTreeSet<ClaimWord>, vocab: &Vocabulary) -> bool {
+    if p.contains(w) {
+        return true;
+    }
+    if w.term.starts_with('@') || !vocab.is_name(&w.term) {
+        return false;
+    }
+    let same: std::collections::BTreeSet<String> = p
+        .iter()
+        .filter(|x| x.negated == w.negated)
+        .map(|x| x.term.clone())
+        .collect();
+    vocab.names(&w.term, &same)
+}
+
+/// True when `pred` states the protected words of `gold` (its head, the first
+/// content word, and its predicate, the first content word that is not a name or
+/// key term) and enough of its other claim words with the same polarity
+/// ([`allowed_missing`]), and contradicts none of them ([`contradicts`]).
 pub fn covers(gold: &str, pred: &str, vocab: &Vocabulary) -> bool {
-    let (g, p) = (claim_words(gold, vocab), claim_words(pred, vocab));
-    let (inter, ng, _) = polar_overlap(&g, &p);
-    let keyed = !key_terms(gold, vocab).is_empty();
-    let head_stated = g.first().is_some_and(|h| p.contains(h));
-    head_stated && ng - inter <= allowed_missing(ng, keyed) && !contradicts(gold, pred, vocab)
+    let g = claim_words(gold, vocab);
+    let p: std::collections::BTreeSet<ClaimWord> = claim_words(pred, vocab).into_iter().collect();
+    let gs: std::collections::BTreeSet<&ClaimWord> = g.iter().collect();
+    let keys = key_terms(gold, vocab);
+    let head = g.first();
+    let predicate = g
+        .iter()
+        .find(|w| !vocab.is_name(&w.term) && !keys.contains(&w.term));
+    let protected_stated = head
+        .into_iter()
+        .chain(predicate)
+        .all(|w| stated(w, &p, vocab));
+    let inter = gs.iter().filter(|w| stated(w, &p, vocab)).count();
+    let ng = gs.len();
+    ng > 0
+        && protected_stated
+        && ng - inter <= allowed_missing(ng, !keys.is_empty())
+        && !contradicts(gold, pred, vocab)
 }
 
 /// Dice coefficient of polar claim words ([`claim_words`]): shared distinct words over
@@ -950,6 +1038,99 @@ mod tests {
         ));
         assert!(key_terms("Will Park ships weekly builds", &v).contains("@will"));
         assert!(key_terms("ask Will about the builds", &v).contains("@will"));
+        // Kimi round-2 minor: after a comma too.
+        assert!(key_terms("yes, Will we ask about the builds?", &v).is_empty());
+    }
+
+    /// Kimi round-2 M1 with Codex round-2 B2: a clause that restates the negated
+    /// claim retracts it; a clause that negates the head about something else does
+    /// not.
+    #[test]
+    fn retraction_is_a_clause_that_negates_the_claim() {
+        let v = Vocabulary::default();
+        assert!(!covers(
+            "ship weekly builds",
+            "ship weekly builds; do not ship weekly builds",
+            &v
+        ));
+        assert!(covers(
+            "ship weekly builds",
+            "we don't ship nightly builds; we ship weekly builds",
+            &v
+        ));
+        assert!(covers(
+            "do not ship weekly builds",
+            "we do not ship weekly builds; we ship nightly builds",
+            &v
+        ));
+        // Kimi round-2 minor: a sentence whose space was dropped still ends.
+        assert!(covers(
+            "ship nightly builds",
+            "We will not ship weekly builds.We ship nightly builds",
+            &v
+        ));
+    }
+
+    /// Kimi round-2 M2: the predicate of a long gold that opens with a name is never
+    /// the omitted word.
+    #[test]
+    fn the_predicate_is_never_the_omitted_word() {
+        let v = names();
+        let gold = "Tamsin moves the importer retries to the dashboard backlog this sprint";
+        assert!(!covers(
+            gold,
+            "Tamsin complained about the importer retries, the dashboard backlog, and this sprint",
+            &v
+        ));
+        assert!(covers(
+            gold,
+            "Tamsin moves the importer retries to the dashboard backlog",
+            &v
+        ));
+    }
+
+    /// Kimi round-2 M3: a name word two participants share names neither alone.
+    #[test]
+    fn shared_name_words_name_neither_participant() {
+        let mut v = Vocabulary::default();
+        v.add_person("tam_ly", ["Tam Ly"]);
+        v.add_person("tamsin", ["Tamsin Reed", "Tam"]);
+        assert_eq!(v.ambiguous_names().len(), 1, "{:?}", v.ambiguous_names());
+        let gold = "Tamsin argued for weekly builds";
+        assert!(!key_terms_present(
+            gold,
+            "Tam Ly argued for weekly builds",
+            &v
+        ));
+        assert!(key_terms_present(
+            gold,
+            "Tamsin Reed argued for weekly builds",
+            &v
+        ));
+    }
+
+    /// Kimi round-2 M4: a distinctive word of an entity names it in a prediction,
+    /// as it does in an alias.
+    #[test]
+    fn a_distinctive_entity_word_names_the_entity() {
+        let mut v = Vocabulary::default();
+        v.add_entity("Ledger API");
+        assert!(key_terms_present(
+            "fix the api retries",
+            "fix the Ledger retries",
+            &v
+        ));
+        assert!(covers(
+            "fix the api retries",
+            "we will fix the Ledger retries",
+            &v
+        ));
+        v.add_entity("Ledger Queue");
+        assert!(!key_terms_present(
+            "fix the api retries",
+            "fix the Ledger retries",
+            &v
+        ));
     }
 
     /// Codex round-1 M3: the one-word allowance of a long gold never admits the gold's

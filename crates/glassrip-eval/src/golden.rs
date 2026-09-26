@@ -406,6 +406,16 @@ impl MeetingGolden {
         v
     }
 
+    /// Warnings for name words two participants share: the notes matcher reads such
+    /// a word as naming neither participant alone ([`Vocabulary::ambiguous_names`]).
+    pub fn name_warnings(&self) -> Vec<String> {
+        self.vocabulary()
+            .ambiguous_names()
+            .into_iter()
+            .map(|w| format!("golden participants: {w}"))
+            .collect()
+    }
+
     /// Notes items whose phrasings carry no key term. They are matched strictly
     /// (every claim word, [`crate::text::allowed_missing`]); listed in the report so
     /// an author can see which items rely on wording alone.
