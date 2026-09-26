@@ -143,7 +143,9 @@ impl Default for OllamaConfig {
     fn default() -> Self {
         Self {
             host: "http://localhost:11434".into(),
-            request_timeout_s: 120,
+            // glassrip_vision::ollama::DEFAULT_REQUEST_TIMEOUT (a full
+            // 6,144-token board reply takes up to about 100 s).
+            request_timeout_s: 240,
             large_model_request_timeout_s: 400,
             // glassrip_vision::ollama::DEFAULT_NUM_CTX (a dense board read needs
             // the image, the prompt, and a 6,144-token reply).
@@ -697,7 +699,7 @@ mod tests {
                 c.ollama.request_timeout_s,
                 c.ollama.large_model_request_timeout_s
             ),
-            (120, 400)
+            (240, 400)
         );
         assert_eq!(c.runner.max_item_error_rate, 0.10);
         assert_eq!(c.eval.private_fixtures, None);

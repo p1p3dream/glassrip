@@ -748,6 +748,16 @@ mod tests {
             crate::placement::MonitorConfig::default().num_ctx,
             BoardReadParams::default().num_ctx
         );
+        // A full reply fits the 7b request timeout at 40 tokens per second
+        // (below the 60 to 100 measured with four parallel slots).
+        let timeout = glassrip_core::config::Config::default()
+            .ollama
+            .request_timeout_s;
+        assert_eq!(
+            timeout,
+            glassrip_vision::ollama::DEFAULT_REQUEST_TIMEOUT.as_secs()
+        );
+        assert!(timeout * 40 >= u64::from(BoardReadParams::default().max_num_predict));
     }
 
     #[test]

@@ -162,7 +162,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let digest = replay.id().digest;
         (Arc::new(replay), Arc::new(StaticProbe), digest, None)
     } else {
-        let mut cfg = OllamaConfig::new(&args.host, &args.model, 8192);
+        let mut cfg = OllamaConfig::new(
+            &args.host,
+            &args.model,
+            glassrip_vision::ollama::DEFAULT_NUM_CTX,
+        );
         cfg.slots = args.slots;
         cfg.request_timeout = Duration::from_secs(180);
         let ollama = Arc::new(OllamaBackend::new(cfg)?);
