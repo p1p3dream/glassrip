@@ -210,13 +210,40 @@ pub struct Alignment {
     pub phase: Option<PhaseShift>,
     /// Whether ECC itself converged.
     pub ecc_ok: bool,
+    /// Both images are one flat color ([`is_flat`]): there is nothing to align on,
+    /// and every warp gives the same comparison, so the identity is exact even
+    /// though neither method ran (`method` stays [`AlignMethod::Failed`]).
+    pub flat: bool,
 }
 
 impl Alignment {
-    /// True unless alignment failed.
+    /// True unless alignment failed; two flat images count as aligned.
     pub fn ok(&self) -> bool {
-        self.method != AlignMethod::Failed
+        self.method != AlignMethod::Failed || self.flat
     }
+}
+
+/// Largest standard deviation (gray levels) of a blurred alignment image that
+/// counts as one flat color. Compression noise on a flat fill stays far under it
+/// after the prefilter; drawn content of any size raises it.
+pub const FLAT_MAX_STD: f64 = 1.0;
+
+/// True when `p` is one flat color: no structure for phase correlation or ECC.
+/// A pair where only one side is flat still fails alignment: a view that went
+/// blank cannot be told from a pan or cut to empty canvas.
+pub fn is_flat(p: &Plane<f32>) -> bool {
+    if p.data.is_empty() {
+        return false;
+    }
+    let n = p.data.len() as f64;
+    let mean = p.data.iter().map(|&v| f64::from(v)).sum::<f64>() / n;
+    let var = p
+        .data
+        .iter()
+        .map(|&v| (f64::from(v) - mean).powi(2))
+        .sum::<f64>()
+        / n;
+    var.is_finite() && var.sqrt() <= FLAT_MAX_STD
 }
 
 fn plausible(m: &Affine, w: usize, h: usize, p: &AlignParams) -> bool {
@@ -232,9 +259,23 @@ fn plausible(m: &Affine, w: usize, h: usize, p: &AlignParams) -> bool {
 }
 
 /// Aligns `input` to `template`: phase correlation, then ECC from that start, then the
-/// translation alone, else failure.
+/// translation alone, else failure. Two same-size flat images ([`is_flat`]) align as
+/// the identity without either method (both would fail on them); a pair where only
+/// one image is flat fails.
 pub fn align(template: &Plane<f32>, input: &Plane<f32>, p: &AlignParams) -> Alignment {
     let (w, h) = (template.width, template.height);
+    let (flat_t, flat_i) = (is_flat(template), is_flat(input));
+    if flat_t || flat_i {
+        // Two flat images: nothing to align, the identity is exact. One flat image:
+        // any fit to it is spurious (noise the phase normalization amplifies).
+        return Alignment {
+            warp: IDENTITY,
+            method: AlignMethod::Failed,
+            phase: None,
+            ecc_ok: false,
+            flat: flat_t && flat_i && (input.width, input.height) == (w, h),
+        };
+    }
     let phase = phase_correlate(template, input);
     let trusted = phase.filter(|s| {
         s.response >= p.min_phase_response
@@ -249,6 +290,7 @@ pub fn align(template: &Plane<f32>, input: &Plane<f32>, p: &AlignParams) -> Alig
             method: AlignMethod::Ecc,
             phase,
             ecc_ok: true,
+            flat: false,
         };
     }
     match trusted {
@@ -257,12 +299,14 @@ pub fn align(template: &Plane<f32>, input: &Plane<f32>, p: &AlignParams) -> Alig
             method: AlignMethod::PhaseTranslation,
             phase,
             ecc_ok: ecc.ok(),
+            flat: false,
         },
         None => Alignment {
             warp: IDENTITY,
             method: AlignMethod::Failed,
             phase,
             ecc_ok: ecc.ok(),
+            flat: false,
         },
     }
 }
@@ -622,6 +666,59 @@ mod tests {
         p
     }
 
+    /// A flat fill with faint deterministic noise (well under a gray level).
+    fn flat(w: usize, h: usize, v: f32) -> Plane<f32> {
+        let mut p = Plane::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                *p.get_mut(x, y) = v + 0.3 * (((x * 7 + y * 13) % 5) as f32 - 2.0) / 2.0;
+            }
+        }
+        p
+    }
+
+    #[test]
+    fn two_flat_frames_align_as_the_identity_and_measure_no_change() {
+        let (a, b) = (flat(160, 96, 240.0), flat(160, 96, 240.0));
+        let p = ScoreParams::default();
+        let al = align(&a, &b, &p.align);
+        assert!(al.ok() && al.flat && al.warp == IDENTITY, "{al:?}");
+        let s = pair_score(&a, &b, &p);
+        assert!(s.ssim > 0.99 && s.changed_frac == 0.0, "{s:?}");
+        let ink = |align: Plane<f32>| InkFrame {
+            mask: Plane::new(320, 192),
+            align,
+        };
+        let c = ink_change(&ink(a), &ink(b), &p.align);
+        assert!(c.measured(), "{c:?}");
+        assert_eq!(c.value, 0.0);
+    }
+
+    #[test]
+    fn a_view_that_goes_flat_stays_unmeasured() {
+        // Content to an empty canvas: an erasure or a pan to empty space, and two
+        // frames cannot say which. The ink change stays the failure value.
+        let (a, b) = (texture(160, 96, 0.0, 0.0), flat(160, 96, 240.0));
+        assert!(!is_flat(&a) && is_flat(&b));
+        let p = AlignParams::default();
+        assert!(!align(&a, &b, &p).ok());
+        assert!(!align(&b, &a, &p).ok());
+        let mut mask = Plane::new(320, 192);
+        for x in 100..200 {
+            *mask.get_mut(x, 90) = 255;
+        }
+        let c = ink_change(
+            &InkFrame { mask, align: a },
+            &InkFrame {
+                mask: Plane::new(320, 192),
+                align: b,
+            },
+            &p,
+        );
+        assert!(!c.measured(), "{c:?}");
+        assert_eq!(c.value, 1.0);
+    }
+
     #[test]
     fn phase_correlation_finds_translation_sign() {
         let a = texture(160, 96, 0.0, 0.0);
@@ -760,11 +857,18 @@ mod tests {
     }
 
     #[test]
-    fn flat_images_fail_alignment_and_count_as_changed() {
+    fn flat_images_of_different_colors_count_as_changed() {
+        // Nothing to align on: the identity stands in (no method ran), and the
+        // pair still differs everywhere.
         let a = Plane::filled(64, 48, 10.0f32);
         let b = Plane::filled(64, 48, 200.0f32);
         let s = pair_score(&a, &b, &ScoreParams::default());
         assert_eq!(s.alignment.method, AlignMethod::Failed);
+        assert!(s.alignment.ok() && s.alignment.flat);
+        assert!(s.ssim < 0.1 && s.changed_frac == 1.0, "{s:?}");
+        // Against a textured frame a flat one does not align at all.
+        let s = pair_score(&texture(64, 48, 0.0, 0.0), &b, &ScoreParams::default());
+        assert!(!s.alignment.ok());
         assert_eq!((s.ssim, s.changed_frac), (0.0, 1.0));
     }
 

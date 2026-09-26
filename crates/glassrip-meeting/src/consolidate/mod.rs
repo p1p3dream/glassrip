@@ -143,6 +143,38 @@ pub trait RegionProbe: Send + Sync {
         b: (f64, f64),
         half_width: f64,
     ) -> Option<f64>;
+    /// Traces ink from box `a` to box `b` inside `region`, whatever route it
+    /// takes: ink inside the two boxes and inside every box of `masks` (the other
+    /// elements read there) is ignored, and a connector must reach the band of
+    /// width `ring` around each box. `None` without pixels, for a degenerate
+    /// region, or when the two bands touch (nothing to trace between them).
+    fn stroke_between(
+        &self,
+        _keyframe_id: &str,
+        _a: &BBox,
+        _b: &BBox,
+        _region: &BBox,
+        _masks: &[BBox],
+        _ring: f64,
+    ) -> Option<StrokeTrace> {
+        None
+    }
+    /// `Some(true)` when the keyframe's whole canvas is one flat color (no drawn
+    /// content, not even faint marks: near-zero luminance spread); `None` without
+    /// pixels.
+    fn uniform(&self, _keyframe_id: &str) -> Option<bool> {
+        None
+    }
+}
+
+/// Result of [`RegionProbe::stroke_between`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StrokeTrace {
+    /// Connected ink (small gaps bridged) runs from the band around one box to
+    /// the band around the other.
+    pub joined: bool,
+    /// Share of the region holding ink outside the ignored boxes.
+    pub ink: f64,
 }
 
 /// Thresholds for [`RegionProbe`] evidence. Every comparison is between the same
@@ -168,7 +200,8 @@ pub struct RegionProbeParams {
     /// without a neighboring established element (references always are).
     pub min_registration_inliers: usize,
     /// A routed connector (no corridor verdict) is removed on board ink only when
-    /// the ink share of its ends' union region fell by at least this much...
+    /// its traced stroke no longer joins its ends and the unmasked ink share of
+    /// the traced region fell by at least this much...
     #[serde(default = "default_min_ink_drop")]
     pub min_ink_drop: f64,
     /// ...and by at least this share of its previous value.
@@ -178,6 +211,15 @@ pub struct RegionProbeParams {
     /// is gone, even when the blank view cannot be registered.
     #[serde(default = "default_blank_canvas_share")]
     pub blank_canvas_share: f64,
+    /// A routed connector is traced inside the ends' union box grown by this share
+    /// of the taller end box on every side (a connector routed around a card
+    /// leaves the union box).
+    #[serde(default = "default_stroke_margin_share")]
+    pub stroke_margin_share: f64,
+}
+
+fn default_stroke_margin_share() -> f64 {
+    1.5
 }
 
 fn default_min_ink_drop() -> f64 {
@@ -204,6 +246,7 @@ impl Default for RegionProbeParams {
             min_ink_drop: default_min_ink_drop(),
             min_ink_drop_share: default_min_ink_drop_share(),
             blank_canvas_share: default_blank_canvas_share(),
+            stroke_margin_share: default_stroke_margin_share(),
         }
     }
 }
@@ -1098,8 +1141,40 @@ pub fn consolidate_with_probe(
         // The blank view must be the same view: every board keyframe since the
         // last sighting was compared with its predecessor on aligned ink (a pan
         // or a cut the aligner cannot follow leaves the ink unknown), and the ink
-        // changed on the way.
-        let chain: Vec<Option<f64>> = (s + 1..=f).map(|k| frames[k].ink_change).collect();
+        // changed on the way. A flat canvas cannot be aligned at all, so a link
+        // into a confidently blank keyframe from the keyframe right before it
+        // (nothing between them) is measured from the pixels instead: blank to
+        // blank is no change; content to blank is a full change only right after
+        // the track's last sighting, and only when the view there was still (the
+        // track read at the same place in the keyframe before). A view that was
+        // moving when the canvas went blank is a pan to empty canvas as far as
+        // anything here can tell, and keeps the track.
+        let kid = |k: usize| frames[k].keyframe_id.as_str();
+        let adjacent =
+            |k: usize| k > 0 && frames[k - 1].keyframe_index + 1 == frames[k].keyframe_index;
+        let still_at_s = || {
+            let at = |k: usize| t.obs.iter().find(|o| o.frame == k).and_then(|o| o.raw_bbox);
+            let (Some(now), Some(prev)) = (at(s), s.checked_sub(1).and_then(at)) else {
+                return false;
+            };
+            let tol = (0.1 * now.width().min(now.height())).max(2.0);
+            adjacent(s)
+                && ((now.x1 + now.x2) - (prev.x1 + prev.x2)).abs() / 2.0 <= tol
+                && ((now.y1 + now.y2) - (prev.y1 + prev.y2)).abs() / 2.0 <= tol
+        };
+        let link = |k: usize| -> Option<f64> {
+            if let Some(x) = frames[k].ink_change {
+                return Some(x);
+            }
+            if probe.uniform(kid(k)) != Some(true) || !adjacent(k) {
+                return None;
+            }
+            match probe.uniform(kid(k - 1))? {
+                true => Some(0.0),
+                false => (k == s + 1 && still_at_s()).then_some(1.0),
+            }
+        };
+        let chain: Vec<Option<f64>> = (s + 1..=f).map(link).collect();
         if !chain.iter().all(Option::is_some)
             || !chain
                 .iter()
@@ -1449,9 +1524,9 @@ pub fn consolidate_with_probe(
         (t.scale.is_finite() && t.scale > 0.0).then_some((t, t.scale))
     };
     // The straight corridor between the boxes of tracks `a` and `b` as read in
-    // keyframe `s` (both read there): its two ends, half width, and the union of
-    // the two boxes, in `s` coordinates.
-    type Corridor = ((f64, f64), (f64, f64), f64, BBox);
+    // keyframe `s` (both read there): its two ends and half width, in `s`
+    // coordinates.
+    type Corridor = ((f64, f64), (f64, f64), f64);
     let corridor_geom = |a: &Track, b: &Track, s: usize| -> Option<Corridor> {
         let raw = |t: &Track| t.obs.iter().find(|o| o.frame == s).and_then(|o| o.raw_bbox);
         let (ba, bb) = (raw(a)?, raw(b)?);
@@ -1461,35 +1536,78 @@ pub fn consolidate_with_probe(
         );
         let half =
             (params.region_probe.corridor_half_width_share * ba.height().min(bb.height())).max(3.0);
-        let union = BBox::new(
-            ba.x1.min(bb.x1),
-            ba.y1.min(bb.y1),
-            ba.x2.max(bb.x2),
-            ba.y2.max(bb.y2),
-        );
-        Some((exit_point(&ba, cb), exit_point(&bb, ca), half, union))
+        Some((exit_point(&ba, cb), exit_point(&bb, ca), half))
     };
-    // Pixel measures of the edge between `a` and `b`, read in keyframe `s` and
-    // missing in `f`: the corridor's line cover and the ink share of the ends'
-    // union region, each measured on the same board pixels in both keyframes (the
-    // geometry is taken where the edge was read and mapped into `f`, so reader box
-    // jitter in `f` does not move the corridor). `((cover_s, cover_f), (ink_s,
-    // ink_f))`; `None` without pixels or a common registration.
-    type EdgePixels = ((f64, f64), (f64, f64));
-    let edge_pixels = |a: &Track, b: &Track, s: usize, f: usize| -> Option<EdgePixels> {
+    // The straight corridor's line cover of the edge between `a` and `b`, read in
+    // keyframe `s` and missing in `f`, measured on the same board pixels in both
+    // keyframes (the geometry is taken where the edge was read and mapped into
+    // `f`, so reader box jitter in `f` does not move the corridor).
+    // `(cover_s, cover_f)`; `None` without pixels or a common registration.
+    let edge_cover = |a: &Track, b: &Track, s: usize, f: usize| -> Option<(f64, f64)> {
         let probe = probe?;
-        let (p, q, half, union) = corridor_geom(a, b, s)?;
+        let (p, q, half) = corridor_geom(a, b, s)?;
         let (t, k) = s_to_f(s, f)?;
         let (ks, kf) = (&frames[s].keyframe_id, &frames[f].keyframe_id);
-        let cover = (
+        Some((
             probe.line_cover(ks, p, q, half)?,
             probe.line_cover(kf, t.apply(p), t.apply(q), half * k)?,
+        ))
+    };
+    // A routed connector between `a` and `b` (read in keyframe `s`) traced on the
+    // pixels, whatever route it takes: `Some(true)` when the stroke that joined the
+    // two boxes in `s` no longer joins them in `f` and the ink it was traced
+    // through fell; `Some(false)` when it still joins them; `None` when the pixels
+    // cannot tell (no stroke traced in `s`, no common registration, or an end read
+    // in `f` away from where `s` puts it: a moved card takes its connector along).
+    // Every other element read in `s` is masked out in both keyframes, so a card
+    // between the ends, changed or not, neither vetoes nor fakes the erasure, and
+    // an unread mark erased near the ends does not break a stroke that is still
+    // drawn.
+    let routed_gone = |a: &Track, b: &Track, s: usize, f: usize| -> Option<bool> {
+        let probe = probe?;
+        let raw =
+            |t: &Track, k: usize| t.obs.iter().find(|o| o.frame == k).and_then(|o| o.raw_bbox);
+        let (ba, bb) = (raw(a, s)?, raw(b, s)?);
+        let (t, k) = s_to_f(s, f)?;
+        for (tr, bs) in [(a, &ba), (b, &bb)] {
+            if let Some(r) = raw(tr, f) {
+                let m = map_bbox(&t, bs);
+                let c = ((r.x1 + r.x2) / 2.0, (r.y1 + r.y2) / 2.0);
+                if !(c.0 >= m.x1 && c.0 <= m.x2 && c.1 >= m.y1 && c.1 <= m.y2) {
+                    return None;
+                }
+            }
+        }
+        let rp = &params.region_probe;
+        let ring = (rp.corridor_half_width_share * ba.height().min(bb.height())).max(3.0);
+        let margin = rp.stroke_margin_share * ba.height().max(bb.height());
+        let region = BBox::new(
+            ba.x1.min(bb.x1) - margin,
+            ba.y1.min(bb.y1) - margin,
+            ba.x2.max(bb.x2) + margin,
+            ba.y2.max(bb.y2) + margin,
         );
-        let ink = (
-            probe.ink_share(ks, &union)?,
-            probe.ink_share(kf, &map_bbox(&t, &union))?,
-        );
-        Some((cover, ink))
+        let masks: Vec<BBox> = tracks
+            .iter()
+            .filter(|x| !std::ptr::eq(*x, a) && !std::ptr::eq(*x, b))
+            .filter_map(|x| raw(x, s))
+            .collect();
+        let before =
+            probe.stroke_between(&frames[s].keyframe_id, &ba, &bb, &region, &masks, ring)?;
+        if !before.joined {
+            return None;
+        }
+        let mapped: Vec<BBox> = masks.iter().map(|m| map_bbox(&t, m)).collect();
+        let now = probe.stroke_between(
+            &frames[f].keyframe_id,
+            &map_bbox(&t, &ba),
+            &map_bbox(&t, &bb),
+            &map_bbox(&t, &region),
+            &mapped,
+            ring * k,
+        )?;
+        let fell = now.ink <= before.ink - rp.min_ink_drop.max(rp.min_ink_drop_share * before.ink);
+        Some(!now.joined && fell)
     };
 
     let mut edges: Vec<EdgeState> = Vec::new();
@@ -1498,50 +1616,24 @@ pub fn consolidate_with_probe(
     for (&(a, b), list) in &edge_obs {
         let seen: Vec<usize> = list.iter().map(|o| o.frame).collect();
         let (ta, tb) = (&tracks[a], &tracks[b]);
-        // Pixel verdict for keyframe `f` against the last keyframe that read the
+        // Pixel verdict for keyframe `f` against the last keyframe `s` that read the
         // edge: `Some(true)` the straight line is still drawn, `Some(false)` it is
-        // gone, `None` when the corridor cannot tell.
-        // With pixels but no corridor verdict (a routed connector), `local_drop`
-        // says whether the ink of the ends' union region fell with nothing else
-        // read inside it: board ink added elsewhere, or another element erased
-        // between the ends, never removes the edge.
+        // gone, `None` when the corridor cannot tell (a routed connector leaves it).
         let rp = &params.region_probe;
-        let verdict = |f: usize| -> (Option<bool>, Option<bool>) {
-            let Some(s) = seen.iter().rev().find(|&&s| s < f).copied() else {
-                return (None, None);
-            };
-            let Some(((before, now), (ink_s, ink_f))) = edge_pixels(ta, tb, s, f) else {
-                return (None, None);
-            };
-            // Another element read inside the ends' union region could account
-            // for a drop there: the region cannot speak for the connector.
-            let crowded = corridor_geom(ta, tb, s).is_some_and(|(_, _, _, u)| {
-                tracks.iter().enumerate().any(|(i, t)| {
-                    i != a
-                        && i != b
-                        && t.obs.iter().any(|o| {
-                            o.frame == s
-                                && o.raw_bbox.is_some_and(|r| {
-                                    let c = ((r.x1 + r.x2) / 2.0, (r.y1 + r.y2) / 2.0);
-                                    c.0 >= u.x1 && c.0 <= u.x2 && c.1 >= u.y1 && c.1 <= u.y2
-                                })
-                        })
-                })
-            });
-            let local_drop =
-                !crowded && ink_f <= ink_s - (rp.min_ink_drop).max(rp.min_ink_drop_share * ink_s);
+        let last_read = |f: usize| seen.iter().rev().find(|&&s| s < f).copied();
+        let verdict = |f: usize| -> Option<bool> {
+            let (before, now) = edge_cover(ta, tb, last_read(f)?, f)?;
             if before < rp.min_line_cover {
-                return (None, Some(local_drop));
+                return None;
             }
             let ratio = now / before;
-            let drawn = if ratio >= rp.still_drawn_ratio {
+            if ratio >= rp.still_drawn_ratio {
                 Some(true)
             } else if ratio <= rp.gone_ratio {
                 Some(false)
             } else {
                 None
-            };
-            (drawn, Some(local_drop))
+            }
         };
         let ivs = intervals(
             &seen,
@@ -1562,15 +1654,21 @@ pub fn consolidate_with_probe(
                 if !(present(ta) && present(tb)) {
                     return Visibility::Unknown;
                 }
-                let (drawn, local_drop) = verdict(f);
-                let gone = drawn.map(|d| !d).unwrap_or_else(|| {
-                    let from = seen.iter().rev().find(|&&s| s < f).map_or(0, |&s| s + 1);
+                let gone = verdict(f).map(|d| !d).unwrap_or_else(|| {
+                    let from = last_read(f).map_or(0, |s| s + 1);
                     let inked = (from..=f).any(|k| {
                         frames[k]
                             .ink_change
                             .is_some_and(|x| x >= params.ink_event_threshold)
                     });
-                    inked && local_drop.unwrap_or(true)
+                    // With pixels, the traced stroke must say the connector went
+                    // (pixels that cannot tell keep it); without pixels, the board
+                    // ink is all there is to go on.
+                    inked
+                        && match last_read(f) {
+                            Some(s) if probe.is_some() => routed_gone(ta, tb, s, f) == Some(true),
+                            _ => probe.is_none(),
+                        }
                 });
                 if gone {
                     Visibility::Visible
@@ -1978,6 +2076,8 @@ pub fn consolidate_with_probe(
         detail,
         ink_change: frames[f].ink_change,
         baseline: f == 0,
+        owner_target: None,
+        owner_from: None,
     };
     for &ti in &order {
         if lifted.contains(&ti) {
@@ -2044,12 +2144,16 @@ pub fn consolidate_with_probe(
         } else {
             EventKind::OwnerAssigned
         };
-        gate.offer(event(
-            kind,
-            f,
-            &a.person_id,
-            format!("{} -> {}", a.display_name, a.target.texts().join(" - ")),
-        ));
+        gate.offer(BoardEvent {
+            owner_target: Some(a.target.clone()),
+            owner_from: a.moved_from.clone(),
+            ..event(
+                kind,
+                f,
+                &a.person_id,
+                format!("{} -> {}", a.display_name, a.target.texts().join(" - ")),
+            )
+        });
     }
     let (events, suppressed_events) = gate.finish();
     // Lifted tracks leave the node and sticky lists.
