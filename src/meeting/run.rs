@@ -926,6 +926,9 @@ pub async fn run_meeting(
         .into_iter()
         .find_map(|r| r.outcome.result);
         if let Some(r) = result {
+            for w in r.warnings() {
+                tracing::warn!(warning = %w, "render moved an annotation below the board");
+            }
             outcome.outputs = r.files.iter().map(|f| out_dir.join(&f.name)).collect();
         }
     }

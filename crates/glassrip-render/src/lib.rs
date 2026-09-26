@@ -93,6 +93,15 @@ impl RenderResult {
         }
         out
     }
+
+    /// Every warning (annotations moved below a board for want of room),
+    /// prefixed with the board (`svg <board id>`). Warnings never fail a render.
+    pub fn warnings(&self) -> Vec<String> {
+        self.svg
+            .iter()
+            .flat_map(|(board, c)| c.warnings.iter().map(move |w| format!("svg {board}: {w}")))
+            .collect()
+    }
 }
 
 fn write(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), RenderError> {

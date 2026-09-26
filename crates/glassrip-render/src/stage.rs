@@ -108,7 +108,10 @@ impl Stage for RenderStage {
         // cache, see `cacheable`).
         // 4: edge owners slide along their edge; validation errors list the
         // failed checks.
-        4
+        // 5: an annotation with no room on the board (owner, note, badge, edge
+        // label) is listed below it with a numbered marker and a warning
+        // instead of failing validation; more spots and leader lines first.
+        5
     }
     /// The markdown, SVG and PNG files are the stage's output and live outside
     /// the run directory: a cache hit would restore the artifact without

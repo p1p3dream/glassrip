@@ -92,6 +92,10 @@ pub struct SvgChecks {
     pub style_violations: Vec<String>,
     /// Layout method.
     pub layout_method: String,
+    /// Annotations with no room on the board, listed below it instead
+    /// (warnings: they do not fail validation).
+    #[serde(default)]
+    pub warnings: Vec<String>,
     /// All checks passed.
     pub ok: bool,
 }
@@ -306,6 +310,7 @@ pub fn validate_svg(svg: &str, scene: &Scene, fonts: &FontConfig) -> (SvgChecks,
         overlaps: overlaps(scene),
         style_violations: style_violations(svg),
         layout_method: scene.layout_method.to_string(),
+        warnings: scene.degraded.clone(),
         ok: false,
     };
     let tree = match usvg::Tree::from_str(svg, &opt) {
@@ -374,6 +379,7 @@ mod tests {
             overlaps: vec!["card a overlaps card b".into()],
             style_violations: vec!["uses <marker> (arrowheads must be polygons)".into()],
             layout_method: "grid".into(),
+            warnings: vec!["no room on the board, listed below it as note 1: x".into()],
             ok: false,
         };
         assert_eq!(
