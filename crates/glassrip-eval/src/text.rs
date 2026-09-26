@@ -759,14 +759,27 @@ pub fn light_allowance(gold_words: usize) -> usize {
     gold_words / 3
 }
 
-/// True when `pred` puts no word of its own where the omitted gold word `w` stood,
-/// so the omission is a drop and not a substitution. The slot is the stretch of the
-/// prediction between its statements of the nearest stated gold words before and
-/// after `w` (in gold order); with a stated neighbour on one side only, it runs from
-/// that neighbour to the end (or from the start) of the neighbour's clause. "post
-/// the notes for the crew" leaves the slot of "to use" empty; "post the notes for
-/// the crew to delete" fills it. A word of its own is any word that is not a gold
-/// word in either polarity (contradictions are [`contradicts`]'s business).
+/// Whether a prediction that leaves out `missing` of `total` distinct gold claim
+/// words, `light` of them excusable light words (already capped at
+/// [`light_allowance`]), states enough of the claim: the light words are excused on
+/// top of [`allowed_missing`], but the omissions never exceed the larger of the two
+/// allowances, so they do not stack (a six-word keyed claim is never stated by three
+/// of its words).
+fn enough_stated(total: usize, missing: usize, light: usize, keyed: bool) -> bool {
+    let base = allowed_missing(total, keyed);
+    missing <= base + light && missing <= base.max(light_allowance(total))
+}
+
+/// True when `pred` puts no word at all where the omitted gold word `w` stood, so
+/// the omission is a drop and not a substitution. The gold words before `w` are
+/// aligned to the prediction left to right (earliest in-order occurrence), the gold
+/// words after it right to left (latest in-order occurrence); the slot is the gap
+/// between the two aligned sides, or, with aligned words on one side only, from
+/// that side to the end (or from the start) of its clause. "post the notes for the
+/// crew" leaves the slot of "to use" empty; "post the notes for the crew to delete"
+/// fills it, and so does an extra copy of another gold word ("skip Ledger dashboard
+/// for dashboard migration" for "skip Ledger step for dashboard migration"). Sides
+/// that cross (a reordered prediction) leave no slot to judge, so nothing is excused.
 fn slot_is_empty(
     g: &[ClaimWord],
     w: &ClaimWord,
@@ -778,19 +791,34 @@ fn slot_is_empty(
         .enumerate()
         .flat_map(|(c, ws)| ws.iter().map(move |x| (c, x)))
         .collect();
-    let single = |x: &ClaimWord| std::collections::BTreeSet::from([x.clone()]);
-    let at = |gw: &ClaimWord| flat.iter().position(|(_, x)| stated(gw, &single(x), vocab));
-    let own = |x: &ClaimWord| {
-        !g.iter()
-            .any(|gw| stated(gw, &single(x), vocab) || stated(&flip(gw), &single(x), vocab))
+    let states = |gw: &ClaimWord, k: usize| {
+        stated(
+            gw,
+            &std::collections::BTreeSet::from([flat[k].1.clone()]),
+            vocab,
+        )
     };
     let Some(i) = g.iter().position(|x| x == w) else {
         return false;
     };
-    let prev = g[..i].iter().rev().find_map(at);
-    let next = g[i + 1..].iter().find_map(at);
+    let mut prev = None;
+    let mut cursor = 0;
+    for gw in &g[..i] {
+        if let Some(k) = (cursor..flat.len()).find(|&k| states(gw, k)) {
+            prev = Some(k);
+            cursor = k + 1;
+        }
+    }
+    let mut next = None;
+    let mut cursor = flat.len();
+    for gw in g[i + 1..].iter().rev() {
+        if let Some(k) = (0..cursor).rev().find(|&k| states(gw, k)) {
+            next = Some(k);
+            cursor = k;
+        }
+    }
     let range = match (prev, next) {
-        (Some(a), Some(b)) => a.min(b) + 1..a.max(b),
+        (Some(a), Some(b)) if a < b => a + 1..b,
         (Some(a), None) => {
             let clause = flat[a].0;
             let end = flat
@@ -804,9 +832,9 @@ fn slot_is_empty(
             let start = flat.iter().position(|(c, _)| *c == clause).unwrap_or(b);
             start..b
         }
-        (None, None) => return false,
+        _ => return false,
     };
-    flat[range].iter().all(|(_, x)| !own(x))
+    range.is_empty()
 }
 
 /// Distinct gold claim words (same term and polarity) found in the prediction, and
@@ -926,7 +954,7 @@ const REPORTING_WORDS: &[&str] = &[
 /// segment and does not.
 fn clause_retracts(
     gw: &[ClaimWord],
-    need: usize,
+    keyed: bool,
     anchors: &[&ClaimWord],
     unit: &[ClaimWord],
     contrast_ok: bool,
@@ -1006,8 +1034,8 @@ fn clause_retracts(
         return false;
     }
     let retracted = |w: &ClaimWord| flipped(w) || kept(w);
-    anchors.iter().all(|w| retracted(w))
-        && g.iter().filter(|w| retracted(w)).count() + light_skip.len() >= need
+    let missing = g.iter().filter(|w| !retracted(w)).count();
+    anchors.iter().all(|w| retracted(w)) && enough_stated(g.len(), missing, light_skip.len(), keyed)
 }
 
 /// True when `pred` states some gold claim word only with the opposite polarity
@@ -1030,16 +1058,16 @@ pub fn contradicts(gold: &str, pred: &str, vocab: &Vocabulary) -> bool {
         return true;
     }
     let keys = key_terms(gold, vocab);
-    let need = g.len() - allowed_missing(g.len(), !keys.is_empty());
+    let keyed = !keys.is_empty();
     let anchors = protected_words(&gw, &keys, vocab);
     claim_segments(pred, vocab).iter().any(|segments| {
         let clause = segments.concat();
         let single = segments.len() == 1;
-        clause_retracts(&gw, need, &anchors, &clause, single, vocab)
+        clause_retracts(&gw, keyed, &anchors, &clause, single, vocab)
             || (!single
                 && segments
                     .iter()
-                    .any(|s| clause_retracts(&gw, need, &anchors, s, true, vocab)))
+                    .any(|s| clause_retracts(&gw, keyed, &anchors, s, true, vocab)))
     })
 }
 
@@ -1093,8 +1121,7 @@ pub fn covers(gold: &str, pred: &str, vocab: &Vocabulary) -> bool {
         })
         .count()
         .min(light_allowance(ng));
-    missing.len() - excused <= allowed_missing(ng, !keys.is_empty())
-        && !contradicts(gold, pred, vocab)
+    enough_stated(ng, missing.len(), excused, !keys.is_empty()) && !contradicts(gold, pred, vocab)
 }
 
 /// Dice coefficient of polar claim words ([`claim_words`]): shared distinct words over
@@ -1391,6 +1418,39 @@ mod tests {
             "Tamsin the importer retries",
             &v
         ));
+    }
+
+    /// Codex round-3 M1: an extra copy of another gold word in the dropped word's
+    /// place is a substitution, not a drop.
+    #[test]
+    fn a_repeated_gold_word_cannot_fill_the_slot() {
+        let v = names();
+        let gold = "Skip Ledger step for dashboard migration";
+        assert!(covers(gold, "Skip Ledger for dashboard migration", &v));
+        assert!(!covers(
+            gold,
+            "Skip Ledger dashboard for dashboard migration",
+            &v
+        ));
+        // a word of its own after the dropped word's neighbours, in the same clause
+        assert!(!covers(
+            "Post the slides for the crew to use",
+            "Post the slides for the crew twice",
+            &v
+        ));
+    }
+
+    /// Codex round-3 M2: the light allowance does not stack with the general one.
+    #[test]
+    fn omission_allowances_do_not_stack() {
+        let v = names();
+        let gold = "Defer the Ledger step for dashboard migration work";
+        assert!(!covers(gold, "Defer Ledger dashboard", &v));
+        assert!(covers(gold, "Defer Ledger dashboard migration", &v));
+        assert!(enough_stated(6, 2, 2, true));
+        assert!(!enough_stated(6, 3, 2, true));
+        assert!(!enough_stated(5, 2, 1, false));
+        assert!(enough_stated(5, 1, 1, false));
     }
 
     /// The light-word allowance is bounded: one per three gold words.
