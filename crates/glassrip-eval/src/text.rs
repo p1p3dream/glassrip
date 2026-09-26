@@ -784,8 +784,11 @@ fn enough_stated(total: usize, missing: usize, light: usize, keyed: bool) -> boo
 /// Ledger dashboard for dashboard migration" for "skip Ledger step for dashboard
 /// migration") all excuse nothing; "post the notes for the crew" excuses the "to
 /// use" of "post the notes for the crew to use". Words before the run are context
-/// ("after review, post the notes for the crew"). Sides that cross (a reordered
-/// prediction) excuse nothing.
+/// ("after review, post the notes for the crew"). A reordered prediction excuses
+/// nothing: a gold word stated in the unit but not in gold order ("Quill reviews
+/// Tamsin" for "Tamsin reviews the Quill work", "The crew met. Post the notes." for
+/// "post the notes for the crew step") ends the check, and only gold words absent
+/// from the unit are passed over.
 fn slot_is_empty(
     g: &[ClaimWord],
     w: &ClaimWord,
@@ -805,20 +808,31 @@ fn slot_is_empty(
     let Some(i) = g.iter().position(|x| x == w) else {
         return false;
     };
+    // A gold word absent from the unit is skipped (it is already an omission); one
+    // stated there but out of order means a reordered claim, which excuses nothing.
+    let anywhere = |gw: &ClaimWord| (0..flat.len()).any(|k| states(gw, k));
     let mut before = Vec::new();
     let mut cursor = 0;
     for gw in &g[..i] {
-        if let Some(k) = (cursor..flat.len()).find(|&k| states(gw, k)) {
-            before.push(k);
-            cursor = k + 1;
+        match (cursor..flat.len()).find(|&k| states(gw, k)) {
+            Some(k) => {
+                before.push(k);
+                cursor = k + 1;
+            }
+            None if anywhere(gw) => return false,
+            None => {}
         }
     }
     let mut after = Vec::new();
     let mut cursor = flat.len();
     for gw in g[i + 1..].iter().rev() {
-        if let Some(k) = (0..cursor).rev().find(|&k| states(gw, k)) {
-            after.push(k);
-            cursor = k;
+        match (0..cursor).rev().find(|&k| states(gw, k)) {
+            Some(k) => {
+                after.push(k);
+                cursor = k;
+            }
+            None if anywhere(gw) => return false,
+            None => {}
         }
     }
     after.reverse();
@@ -1003,8 +1017,13 @@ fn clause_retracts(
     }
     // Light gold words the unit leaves out count as retracted, as far as [`covers`]
     // would excuse them (dropped from the negated restatement that starts at `lo`,
-    // not substituted, not key terms), so dropping "to use" from a retraction does
-    // not turn it into a restatement.
+    // neutral adverbs aside, not substituted, not key terms), so dropping "to use"
+    // from a retraction does not turn it into a restatement.
+    let restatement: Vec<ClaimWord> = unit[lo..]
+        .iter()
+        .filter(|x| !NEUTRAL_ADVERBS.iter().any(|a| stem(a) == x.term))
+        .cloned()
+        .collect();
     let light_skip: BTreeSet<&ClaimWord> = g
         .iter()
         .filter(|w| {
@@ -1013,7 +1032,7 @@ fn clause_retracts(
                 && is_light(&w.term)
                 && !anchors.contains(w)
                 && !keys.contains(&w.term)
-                && slot_is_empty(gw, w, &[unit[lo..].to_vec()], true, vocab)
+                && slot_is_empty(gw, w, std::slice::from_ref(&restatement), true, vocab)
         })
         .take(light_allowance(g.len()))
         .copied()
@@ -1521,6 +1540,38 @@ mod tests {
             "Post notes for the crew. They will delete the notes.",
             &v
         ));
+    }
+
+    /// Kimi round-2 M1: a gold word stated out of order is a reordered claim, not a
+    /// word to pass over, so the dropped light word is not excused.
+    #[test]
+    fn a_reordered_claim_excuses_no_light_word() {
+        let v = names();
+        assert!(covers(
+            "Tamsin reviews the Quill work",
+            "Tamsin reviews the Quill",
+            &v
+        ));
+        assert!(!covers(
+            "Tamsin reviews the Quill work",
+            "Quill reviews Tamsin",
+            &v
+        ));
+        assert!(!covers(
+            "Post the notes for the crew step",
+            "The crew met. Post the notes.",
+            &v
+        ));
+        assert!(!covers(
+            "Get the part and get the piece",
+            "Get the part",
+            &v
+        ));
+        // Kimi round-2 MINOR: a trailing neutral adverb does not hide a retraction
+        let gold = "Post the notes and slides for the crew to use";
+        let pred = "Post the notes and slides for the crew. We won't post the notes and slides for the crew anymore.";
+        assert!(contradicts(gold, pred, &v));
+        assert!(!covers(gold, pred, &v));
     }
 
     /// Codex round-4 M3 and M4: a retraction skips a light word only when it drops
