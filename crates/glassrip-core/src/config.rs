@@ -456,6 +456,18 @@ pub struct BoardReadConfig {
     /// Tile overlap fraction.
     #[garde(range(min = 0.0, max = 0.5))]
     pub tile_overlap: f64,
+    /// A complete reply is degenerate when one list repeats a text this many
+    /// times beyond what OCR explains (the original included); under 2
+    /// disables the rule. A degenerate reply is retried once with a repeat
+    /// penalty, then kept with its repeated texts collapsed.
+    #[garde(range(max = 80))]
+    pub degenerate_min_repeats: u32,
+    /// ...when the list's unexplained copies make up at least this share of it...
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub degenerate_min_duplicate_share: f64,
+    /// ...or at any share from this many copies (0: no such bound).
+    #[garde(range(max = 80))]
+    pub degenerate_strong_repeats: u32,
 }
 
 impl Default for BoardReadConfig {
@@ -467,6 +479,10 @@ impl Default for BoardReadConfig {
             tiling_text_height_px: 14.0,
             tile_grid: 2,
             tile_overlap: 0.12,
+            // glassrip_vision::degenerate::DegenerateParams::default()
+            degenerate_min_repeats: 4,
+            degenerate_min_duplicate_share: 0.5,
+            degenerate_strong_repeats: 8,
         }
     }
 }

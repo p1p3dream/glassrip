@@ -339,6 +339,31 @@ pub struct RequestLog {
     /// Output budget of the request that produced the reading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_predict: Option<u32>,
+    /// A complete reply listed one text at many places (see
+    /// `glassrip_vision::degenerate`). Replay rebuilds the same retry and the
+    /// same collapse from this and the recorded replies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degenerate: Option<DegenerateLog>,
+}
+
+/// What the degenerate-reading rule did for one request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DegenerateLog {
+    /// The repeated texts of the first complete reply.
+    pub finding: glassrip_vision::degenerate::DegenerateFinding,
+    /// The repeat-penalty retry answered, and the reading is its reply;
+    /// `request_key`, `sampling`, and `num_predict` are the retry's. False when
+    /// no retry was left (the reply already was a retry) or the retry failed.
+    pub retried: bool,
+    /// How the retry failed (`output limit`, `repetition loop`, or `invalid
+    /// reply`: answers the raw store records); the first reply was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_error: Option<String>,
+    /// Texts of the kept reply reduced to their best-supported copies (a warning:
+    /// the reading was still degenerate). Empty when the retry came back sound.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collapsed: Vec<glassrip_vision::degenerate::CollapsedText>,
 }
 
 /// Model identity.

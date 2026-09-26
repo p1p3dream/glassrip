@@ -8,6 +8,7 @@
 pub mod backend;
 pub mod board;
 pub mod classify;
+pub mod degenerate;
 pub mod error;
 pub mod geometry;
 pub mod image_prep;

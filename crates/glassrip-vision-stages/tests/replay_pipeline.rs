@@ -345,6 +345,7 @@ async fn record_then_replay_vision_branch() {
     for (_, r) in &readings {
         assert_eq!(r.requests.len(), 1);
         assert!(store.get(&r.requests[0].request_key).unwrap().is_some());
+        assert_eq!(r.requests[0].degenerate, None, "a sound board is untouched");
     }
 
     let validated: Vec<(String, BoardValidateItem)> = read(&live, artifacts::BOARD_VALIDATE);
@@ -701,4 +702,176 @@ async fn a_regular_row_cut_at_the_limit_takes_the_budget_retry() {
         assert_eq!(a.result, b.result);
         assert_eq!(a.requests[0].request_key, b.requests[0].request_key);
     }
+}
+
+/// Scripted model whose board reads come back complete and valid but list the
+/// one real box six times under fresh ids (stepped boxes), with an edge to each
+/// copy. The repeat-penalty retry answers as `retry` says.
+struct DegenerateModel {
+    retry: RetryReply,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum RetryReply {
+    /// The normal one-box answer.
+    Clean,
+    /// The same degenerate answer.
+    Degenerate,
+    /// Stopped at the output limit.
+    Truncated,
+}
+
+fn degenerate_board(w: f64, h: f64) -> serde_json::Value {
+    let mut nodes = vec![json!({"local_id": "n1", "text": "Ledger",
+        "bbox_2d": [0.05 * w, 0.05 * h, 0.2 * w, 0.15 * h], "conf": 0.9})];
+    let mut edges = Vec::new();
+    for k in 0..6 {
+        let dx = f64::from(k) * 4.0;
+        nodes.push(
+            json!({"local_id": format!("n{}", k + 2), "text": "Order Service",
+            "bbox_2d": [0.3 * w + dx, 0.3 * h, 0.5 * w + dx, 0.45 * h], "conf": 0.9}),
+        );
+        edges.push(
+            json!({"src": "n1", "dst": format!("n{}", k + 2), "label": "",
+            "label_bbox_2d": [0, 0, 0, 0], "style": "solid", "conf": 0.8}),
+        );
+    }
+    json!({"nodes": nodes, "edges": edges, "stickies": [], "owner_tags": [],
+           "other_visible_text": [], "confidence": 0.7})
+}
+
+#[async_trait]
+impl VisionBackend for DegenerateModel {
+    fn id(&self) -> BackendId {
+        ScriptedModel.id()
+    }
+    async fn preflight(&self) -> glassrip_vision::Result<Placement> {
+        Err(VisionError::Config("unused".into()))
+    }
+    async fn infer(
+        &self,
+        request: VisionRequest,
+        cancel: CancellationToken,
+    ) -> glassrip_vision::Result<RawResponse> {
+        let board = request.schema.json()["properties"]["nodes"].is_object();
+        let retry = request.sampling.repeat_penalty.is_some();
+        if board && retry && self.retry == RetryReply::Truncated {
+            return Err(VisionError::Truncated {
+                num_predict: request.options.num_predict,
+                eval_count: Some(request.options.num_predict),
+                raw_text: "{\"nodes\": [".into(),
+            });
+        }
+        if board && (!retry || self.retry == RetryReply::Degenerate) {
+            let value = degenerate_board(
+                f64::from(request.image.width()),
+                f64::from(request.image.height()),
+            );
+            request.schema.validate(&value).unwrap();
+            return Ok(RawResponse {
+                raw_text: value.to_string(),
+                json: value,
+                prompt_eval_count: Some(request.image.tokens() + 900),
+                eval_count: Some(400),
+                durations: Durations::default(),
+                attempts: 1,
+                repaired: false,
+                done_reason: Some("stop".into()),
+            });
+        }
+        ScriptedModel.infer(request, cancel).await
+    }
+}
+
+async fn degenerate_reads_retry_then_collapse_and_replay(retry: RetryReply) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_inputs(root);
+    let store = RawStore::new(root.join("raw"));
+    let live = root.join("live");
+    let (monitor, _) = run_branch(
+        root,
+        &live,
+        Arc::new(RecordingBackend::new(
+            Arc::new(DegenerateModel { retry }),
+            store.clone(),
+        )),
+    )
+    .await;
+    // 3 classify + 2 degenerate board reads + 2 penalized retries.
+    assert_eq!(monitor.completed(), 7);
+    let readings: Vec<(String, BoardReadingItem)> = read(&live, artifacts::BOARD_READING);
+    assert_eq!(readings.len(), 2);
+    let params = BoardReadParams::default();
+    for (_, r) in &readings {
+        let log = &r.requests[0];
+        let d = log
+            .degenerate
+            .as_ref()
+            .expect("the degenerate reply is logged");
+        let rep = &d.finding.repeated[0];
+        assert_eq!((rep.text.as_str(), rep.count), ("order service", 6));
+        if retry == RetryReply::Truncated {
+            assert!(!d.retried, "{d:?}");
+            assert_eq!(d.retry_error.as_deref(), Some("output limit"));
+            assert_eq!(log.sampling.repeat_penalty, None, "the first reply is kept");
+        } else {
+            assert!(d.retried && d.retry_error.is_none(), "{d:?}");
+            assert_eq!(
+                log.sampling.repeat_penalty,
+                Some(params.repetition_retry_penalty),
+                "the reading is the retry's"
+            );
+        }
+        assert_eq!(log.repetition, None);
+        assert!(!log.compact_retry);
+        let copies = r
+            .result
+            .nodes
+            .iter()
+            .filter(|n| n.text == "Order Service")
+            .count();
+        assert_eq!(copies, 1);
+        if retry != RetryReply::Clean {
+            assert_eq!(d.collapsed.len(), 1, "{d:?}");
+            assert_eq!((d.collapsed[0].before, d.collapsed[0].after), (6, 1));
+            // Six edges to the copies are one edge to the kept box.
+            assert_eq!(r.result.nodes.len(), 2);
+            assert_eq!(r.result.edges.len(), 1);
+        } else {
+            assert!(d.collapsed.is_empty(), "{d:?}");
+            assert_eq!(r.result.nodes.len(), 1);
+        }
+    }
+
+    // Replay rebuilds the same retry and the same collapse without a model.
+    let replay = root.join("replay");
+    run_branch(
+        root,
+        &replay,
+        Arc::new(ReplayBackend::new("scripted-vl", store)),
+    )
+    .await;
+    let again_read: Vec<(String, BoardReadingItem)> = read(&replay, artifacts::BOARD_READING);
+    assert_eq!(again_read.len(), 2);
+    for ((_, a), (_, b)) in again_read.iter().zip(&readings) {
+        assert_eq!(a.result, b.result);
+        assert_eq!(a.requests[0].request_key, b.requests[0].request_key);
+        assert_eq!(a.requests[0].degenerate, b.requests[0].degenerate);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn degenerate_reads_take_the_repeat_penalty_retry_and_replay() {
+    degenerate_reads_retry_then_collapse_and_replay(RetryReply::Clean).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn still_degenerate_reads_are_collapsed_and_replay() {
+    degenerate_reads_retry_then_collapse_and_replay(RetryReply::Degenerate).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_degenerate_retry_keeps_the_first_reply_and_replays() {
+    degenerate_reads_retry_then_collapse_and_replay(RetryReply::Truncated).await;
 }
