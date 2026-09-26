@@ -11,8 +11,9 @@
 //! against one gold phrasing only when
 //!
 //! - every key term of the phrasing (a capitalized participant name or an entity
-//!   name at any position, a capitalized word after the first, an acronym, or an
-//!   identifier; [`crate::text::key_terms`]) appears in it: a decision about another
+//!   name at any position, a capitalized word after the first, an acronym, an
+//!   identifier, or a number, written in digits or as a number word;
+//!   [`crate::text::key_terms`]) appears in it: a decision about another
 //!   person or system is another decision, however similar the wording;
 //! - it states the phrasing's claim words with the same polarity
 //!   ([`crate::text::covers`]): all of them for a phrasing of up to five content

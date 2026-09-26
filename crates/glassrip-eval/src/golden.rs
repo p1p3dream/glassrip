@@ -853,6 +853,8 @@ mod tests {
                 "ship weekly builds; we never ship weekly builds",
             ),
         ] {
+            // the repaired direction on its own: the alias retracts the text
+            assert!(contradicts(text, alias, &g.vocabulary()), "{alias}");
             g.transcript.decisions = vec![item(text, &[alias])];
             let e = g.validate().unwrap_err().to_string();
             assert!(e.contains("opposite polarity"), "{alias}: {e}");
