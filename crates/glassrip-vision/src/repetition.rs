@@ -8,10 +8,12 @@
 //!
 //! - **a templated run**: at least [`RepetitionParams::min_templated_run`]
 //!   consecutive items that are identical once their numbers are removed, whose
-//!   numbers change by the same non-zero step from item to item, whose *place*
-//!   (the JSON numbers: boxes, confidences) does not move, and whose changed ids
-//!   mostly name nothing that another array declares. That is one element
-//!   restated under new labels, not a new element;
+//!   numbers change by the same non-zero step from item to item, and whose *place*
+//!   (the JSON numbers: boxes, confidences) does not move. That is one element
+//!   restated under new labels, not a new element. An item without a box (an
+//!   unlabelled edge) has no place to compare, so its run counts only when its
+//!   new ids mostly name nothing that another array already read declares; before
+//!   any such array has been read, the run cannot be judged and is let through;
 //! - **a runaway run**: at least [`RepetitionParams::min_spatial_run`] such items
 //!   whose place does step evenly. A real row of evenly spaced cards is regular
 //!   too, so coordinates in arithmetic progression are never a loop by themselves;
@@ -353,66 +355,97 @@ pub fn detect(text: &str, p: &RepetitionParams) -> Option<RepetitionFinding> {
             .get(w)
             .is_some_and(|s| s.iter().any(|a| *a != arr))
     };
-    // Consecutive items of one array with one shape and a constant, non-zero step
-    // between their number vectors.
-    let mut run = 1usize;
-    let mut step: Option<(Vec<f64>, Vec<f64>)> = None;
-    let mut ungrounded = 0usize;
-    for w in parsed.windows(2) {
-        let ((aa, a), (ba, b)) = (&w[0], &w[1]);
-        let same = aa == ba
-            && a.shape == b.shape
-            && a.place.len() == b.place.len()
-            && a.label.len() == b.label.len();
-        let d = same.then(|| (diff(&b.place, &a.place), diff(&b.label, &a.label)));
-        let moved = d
-            .as_ref()
-            .is_some_and(|(dp, dl)| nonzero(dp) || nonzero(dl));
-        let continues = match (&d, &step) {
-            (Some((dp, dl)), Some((sp, sl))) if moved => same_step(dp, sp) && same_step(dl, sl),
-            _ => false,
-        };
-        // New ids in this item that no other array declares.
-        let fabricated = b
-            .words
-            .iter()
-            .any(|x| !a.words.contains(x) && !declared_elsewhere(x, *ba));
-        if continues {
-            run += 1;
-            ungrounded += usize::from(fabricated);
-        } else if moved {
-            run = 2;
-            step = d;
-            ungrounded = usize::from(fabricated);
-        } else {
-            run = 1;
-            step = None;
-            ungrounded = 0;
+    // Arrays whose items carry ids: only once another one has been read can an
+    // undeclared id be told from one declared later in the reply.
+    let id_arrays: HashSet<usize> = parsed
+        .iter()
+        .filter(|(_, s)| !s.words.is_empty())
+        .map(|(a, _)| *a)
+        .collect();
+    // Items grouped by array, in order: objects of a nested array are read before
+    // the item that holds them closes, so a flat sequence would interleave them.
+    let mut groups: Vec<(usize, Vec<&Scan>)> = Vec::new();
+    for (arr, sc) in &parsed {
+        match groups.iter_mut().find(|(a, _)| a == arr) {
+            Some((_, g)) => g.push(sc),
+            None => groups.push((*arr, vec![sc])),
         }
-        let Some((sp, _)) = &step else { continue };
-        let stays = !nonzero(sp);
-        let transitions = run - 1;
-        let kind = if stays
-            && p.min_templated_run >= 2
-            && run >= p.min_templated_run
-            && ungrounded * 2 >= transitions
-        {
-            Some(RepetitionKind::Templated)
-        } else if !stays && p.min_spatial_run >= 2 && run >= p.min_spatial_run {
-            Some(RepetitionKind::Runaway)
-        } else {
-            None
-        };
-        if let Some(kind) = kind {
-            return Some(RepetitionFinding {
-                kind,
-                repeats: run,
-                pattern: truncate(&b.shape, 160),
-                at_bytes,
-            });
+    }
+    for (arr, group) in &groups {
+        let arr = *arr;
+        let others_declare = id_arrays.iter().any(|a| *a != arr);
+        // Consecutive items with one shape and a constant, non-zero step between
+        // their number vectors.
+        let mut run = 1usize;
+        let mut step: Option<(Vec<f64>, Vec<f64>)> = None;
+        let mut ungrounded = 0usize;
+        for w in group.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let same = a.shape == b.shape
+                && a.place.len() == b.place.len()
+                && a.label.len() == b.label.len();
+            let d = same.then(|| (diff(&b.place, &a.place), diff(&b.label, &a.label)));
+            let moved = d
+                .as_ref()
+                .is_some_and(|(dp, dl)| nonzero(dp) || nonzero(dl));
+            let continues = match (&d, &step) {
+                (Some((dp, dl)), Some((sp, sl))) if moved => same_step(dp, sp) && same_step(dl, sl),
+                _ => false,
+            };
+            // New ids in this item that no other array declares.
+            let fabricated = b
+                .words
+                .iter()
+                .any(|x| !a.words.contains(x) && !declared_elsewhere(x, arr));
+            if continues {
+                run += 1;
+                ungrounded += usize::from(fabricated);
+            } else if moved {
+                run = 2;
+                step = d;
+                ungrounded = usize::from(fabricated);
+            } else {
+                run = 1;
+                step = None;
+                ungrounded = 0;
+            }
+            let Some((sp, _)) = &step else { continue };
+            let stays = !nonzero(sp);
+            let transitions = run - 1;
+            // A located item (a pixel box) that stays put is one element restated,
+            // whatever its ids. An item without a box (an unlabelled edge) is a
+            // relation: it is a loop only when its new ids name nothing that the
+            // other arrays read so far declare, and only once one has been read.
+            let restated = if located(&b.place) {
+                true
+            } else {
+                others_declare && ungrounded * 2 >= transitions
+            };
+            let kind =
+                if stays && p.min_templated_run >= 2 && run >= p.min_templated_run && restated {
+                    Some(RepetitionKind::Templated)
+                } else if !stays && p.min_spatial_run >= 2 && run >= p.min_spatial_run {
+                    Some(RepetitionKind::Runaway)
+                } else {
+                    None
+                };
+            if let Some(kind) = kind {
+                return Some(RepetitionFinding {
+                    kind,
+                    repeats: run,
+                    pattern: truncate(&b.shape, 160),
+                    at_bytes,
+                });
+            }
         }
     }
     None
+}
+
+/// True when the item has a place in pixels: a number past the `[0, 1]` range of
+/// confidences (an absent box is written `[0, 0, 0, 0]`).
+fn located(place: &[f64]) -> bool {
+    place.iter().any(|v| v.abs() > 1.0)
 }
 
 /// Incremental check for a streaming client: re-runs [`detect`] once at least
@@ -613,6 +646,63 @@ mod tests {
             .collect();
         let f = detect(&board(&nodes, &[], false), &RepetitionParams::default()).unwrap();
         assert_eq!(f.kind, RepetitionKind::Templated);
+    }
+
+    /// Codex review 1: a reply that lists a chain of unlabelled edges before the
+    /// nodes that declare them is not cut while the nodes are still to come.
+    #[test]
+    fn edges_read_before_their_nodes_are_not_cut() {
+        let p = RepetitionParams::default();
+        let chain: Vec<String> = (1..8).map(|k| edge(k, k + 1, "", [0; 4])).collect();
+        let text = format!("{{\"edges\": [{}", chain.join(", "));
+        assert_eq!(detect(&text, &p), None);
+        let nodes: Vec<String> = (1..=8)
+            .map(|k| {
+                node(
+                    k,
+                    &format!(
+                        "Stage {}",
+                        ["A", "B", "C", "D", "E", "F", "G", "H"][k as usize - 1]
+                    ),
+                    90 * k,
+                    60,
+                )
+            })
+            .collect();
+        let whole = format!(
+            "{{\"edges\": [{}], \"nodes\": [{}]}}",
+            chain.join(", "),
+            nodes.join(", ")
+        );
+        assert_eq!(detect(&whole, &p), None);
+        // Once a node list has been read, the same edges past it are judged.
+        let loop_edges: Vec<String> = (40..50).map(|k| edge(k, k + 1, "", [0; 4])).collect();
+        let text = format!(
+            "{{\"nodes\": [{}], \"edges\": [{}",
+            nodes.join(", "),
+            loop_edges.join(", ")
+        );
+        assert_eq!(
+            detect(&text, &p).map(|f| f.kind),
+            Some(RepetitionKind::Templated)
+        );
+    }
+
+    /// Codex review 6: objects of a nested array do not break the run of the items
+    /// that hold them.
+    #[test]
+    fn nested_objects_do_not_hide_a_loop() {
+        let items: Vec<String> = (15..30)
+            .map(|k| {
+                format!(
+                    "{{\"src\": \"n{k}\", \"dst\": \"n{}\", \"label\": \"Relay\", \"label_bbox_2d\": [1340, 320, 1420, 390], \"extra\": [{{\"x\": 0}}]}}",
+                    k + 1
+                )
+            })
+            .collect();
+        let text = board(&real_nodes(), &items, false);
+        let f = detect(&text, &RepetitionParams::default()).unwrap();
+        assert_eq!((f.kind, f.repeats), (RepetitionKind::Templated, 6));
     }
 
     #[test]

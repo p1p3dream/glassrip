@@ -391,7 +391,7 @@ impl BoardReadStage {
                     .as_deref()
                     .and_then(|t| detect(t, &self.params.repetition))
                 {
-                    Some(f) => Err(InferFailure::Repetition(e, f)),
+                    Some(f) => Err(InferFailure::Repetition(e, Box::new(f))),
                     None => Err(InferFailure::Truncated(e)),
                 }
             }
@@ -413,7 +413,7 @@ impl BoardReadStage {
                 key = request_key(&self.model, &retry);
                 sent = retry.clone();
                 let message = format!("after the repetition retry ({finding})");
-                repetition = Some(finding);
+                repetition = Some(*finding);
                 self.monitor
                     .infer_typed_detailed::<BoardReadOutput>(retry, cancel)
                     .await

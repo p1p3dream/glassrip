@@ -250,25 +250,76 @@ impl VisionBackend for RecordingBackend {
 
 /// Serves recorded responses; never contacts a server.
 ///
-/// Every record served in one replay must come from one model digest: the
-/// expected one ([`ReplayBackend::with_digest`]) or, without it, the first one
-/// served. A record from another digest, from another repetition guard policy, or
-/// a stored repetition stop the current guard would not make, is refused as
-/// incompatible (re-record it) rather than replayed.
+/// Every record served in one replay must come from one model digest (no digest
+/// counts as one value): the one given with [`ReplayBackend::with_digest`], else
+/// the store's only digest, else the first one served. A record from another
+/// digest, from another repetition guard policy, or a stored repetition stop the
+/// current guard would not make, is refused as incompatible (re-record it) rather
+/// than replayed. [`VisionBackend::id`] reports the store's digest (or every digest
+/// of a mixed store), so stage cache keys built from it tell stores apart.
 pub struct ReplayBackend {
     model: String,
     store: RawStore,
-    expected_digest: Option<String>,
-    seen_digest: Mutex<Option<String>>,
+    /// Reported by `id`.
+    id_digest: Option<String>,
+    /// The digest every served record must carry, once known.
+    pinned: Mutex<Option<Option<String>>>,
+}
+
+/// Distinct digests of the records in `store` (unreadable entries are skipped:
+/// serving them reports the error).
+fn store_digests(store: &RawStore) -> std::collections::BTreeSet<Option<String>> {
+    let mut out = std::collections::BTreeSet::new();
+    let Ok(prefixes) = fs_err::read_dir(store.dir()) else {
+        return out;
+    };
+    for prefix in prefixes.flatten() {
+        let Ok(files) = fs_err::read_dir(prefix.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if let Some(entry) = fs_err::read(&path)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<RecordedResponse>(&b).ok())
+            {
+                out.insert(entry.digest);
+            }
+        }
+    }
+    out
 }
 
 impl ReplayBackend {
+    /// Replay `store`, learning its model digest from its records.
     pub fn new(model: impl Into<String>, store: RawStore) -> Self {
+        let digests = store_digests(&store);
+        let (id_digest, pinned) = match digests.len() {
+            0 => (None, None),
+            1 => {
+                let only = digests.into_iter().next().flatten();
+                (only.clone(), Some(only))
+            }
+            _ => (
+                Some(format!(
+                    "mixed:{}",
+                    digests
+                        .iter()
+                        .map(|d| d.as_deref().unwrap_or("none"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )),
+                None,
+            ),
+        };
         Self {
             model: model.into(),
             store,
-            expected_digest: None,
-            seen_digest: Mutex::new(None),
+            id_digest,
+            pinned: Mutex::new(pinned),
         }
     }
 
@@ -276,11 +327,8 @@ impl ReplayBackend {
     #[must_use]
     pub fn with_digest(mut self, digest: impl Into<String>) -> Self {
         let digest = digest.into();
-        *self
-            .seen_digest
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(digest.clone());
-        self.expected_digest = Some(digest);
+        *self.pinned.lock().unwrap_or_else(PoisonError::into_inner) = Some(Some(digest.clone()));
+        self.id_digest = Some(digest);
         self
     }
 
@@ -307,28 +355,22 @@ impl ReplayBackend {
                 ),
             ));
         }
-        if let Some(d) = &entry.digest {
-            let mut seen = self
-                .seen_digest
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            match seen.as_ref() {
-                Some(s) if s != d => {
-                    return Err(Self::incompatible(
-                        key,
-                        format!("recorded with model digest {d}, this replay uses {s}"),
-                    ));
-                }
-                Some(_) => {}
-                None => *seen = Some(d.clone()),
-            }
-        } else if let Some(want) = &self.expected_digest {
-            return Err(Self::incompatible(
+        let mut pinned = self.pinned.lock().unwrap_or_else(PoisonError::into_inner);
+        match pinned.as_ref() {
+            Some(want) if *want != entry.digest => Err(Self::incompatible(
                 key,
-                format!("recorded without a model digest, this replay expects {want}"),
-            ));
+                format!(
+                    "recorded with model digest {}, this replay uses {}",
+                    entry.digest.as_deref().unwrap_or("(none)"),
+                    want.as_deref().unwrap_or("(none)")
+                ),
+            )),
+            Some(_) => Ok(()),
+            None => {
+                *pinned = Some(entry.digest.clone());
+                Ok(())
+            }
         }
-        Ok(())
     }
 }
 
@@ -338,7 +380,7 @@ impl VisionBackend for ReplayBackend {
         BackendId {
             backend: "replay".into(),
             model: self.model.clone(),
-            digest: self.expected_digest.clone(),
+            digest: self.id_digest.clone(),
             server_version: None,
         }
     }
@@ -524,7 +566,7 @@ mod tests {
 
     /// One edge restated under new ids until stopped.
     fn looping_text() -> String {
-        let mut s = String::from("{\"edges\": [");
+        let mut s = String::from("{\"nodes\": [{\"local_id\": \"n1\"}], \"edges\": [");
         for k in 15..25 {
             s.push_str(&format!(
                 "{{\"src\": \"n{k}\", \"dst\": \"n{}\", \"label\": \"Relay\"}}, ",
@@ -583,6 +625,78 @@ mod tests {
             }
             other => panic!("expected a replayed repetition stop, got {other:?}"),
         }
+    }
+
+    /// `Fixed` with no model digest.
+    struct NoDigest;
+
+    #[async_trait]
+    impl VisionBackend for NoDigest {
+        fn id(&self) -> BackendId {
+            BackendId {
+                digest: None,
+                ..Fixed.id()
+            }
+        }
+        async fn preflight(&self) -> glassrip_vision::Result<Placement> {
+            Err(VisionError::Config("unused".into()))
+        }
+        async fn infer(
+            &self,
+            r: VisionRequest,
+            c: CancellationToken,
+        ) -> glassrip_vision::Result<RawResponse> {
+            Fixed.infer(r, c).await
+        }
+    }
+
+    /// Codex review 3: a record without a digest is a digest of its own, not a
+    /// wildcard.
+    #[tokio::test]
+    async fn records_without_a_digest_do_not_mix_with_digested_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RawStore::new(dir.path());
+        RecordingBackend::new(Arc::new(NoDigest), store.clone())
+            .infer(request(1), CancellationToken::new())
+            .await
+            .unwrap();
+        RecordingBackend::new(Arc::new(Fixed), store.clone())
+            .infer(request(2), CancellationToken::new())
+            .await
+            .unwrap();
+        let replay = ReplayBackend::new("m", store.clone());
+        replay
+            .infer(request(1), CancellationToken::new())
+            .await
+            .unwrap();
+        expect_incompatible(
+            replay.infer(request(2), CancellationToken::new()).await,
+            "this replay uses (none)",
+        );
+        expect_incompatible(
+            ReplayBackend::new("m", store)
+                .with_digest("d")
+                .infer(request(1), CancellationToken::new())
+                .await,
+            "model digest (none)",
+        );
+    }
+
+    /// Codex review 4: the replay backend reports the store's digest, so stage
+    /// cache keys built from `id()` tell two stores apart.
+    #[tokio::test]
+    async fn the_replay_backend_reports_the_store_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RawStore::new(dir.path());
+        assert_eq!(ReplayBackend::new("m", store.clone()).id().digest, None);
+        RecordingBackend::new(Arc::new(Fixed), store.clone())
+            .infer(request(1), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            ReplayBackend::new("m", store).id().digest.as_deref(),
+            Some("d")
+        );
     }
 
     fn guarded(seed: u64) -> VisionRequest {
@@ -675,6 +789,7 @@ mod tests {
         store.put(&entry).unwrap();
 
         let replay = ReplayBackend::new("m", store.clone());
+        assert_eq!(replay.id().digest.as_deref(), Some("mixed:d,d-retagged"));
         replay
             .infer(request(1), CancellationToken::new())
             .await

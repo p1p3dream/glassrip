@@ -394,6 +394,11 @@ pub struct ErrorInfo {
     /// the runner for [`recurrent`](Self::recurrent) failures.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub occurrences: u32,
+    /// What makes two recurrent failures the same when their text may differ (a
+    /// loop stopped at another byte of the same generation): compared instead of
+    /// the message and raw text when both failures carry one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -411,7 +416,14 @@ impl ErrorInfo {
             terminal: false,
             recurrent: false,
             occurrences: 0,
+            signature: None,
         }
+    }
+
+    /// Sets the [`signature`](Self::signature).
+    pub fn with_signature(mut self, signature: impl Into<String>) -> Self {
+        self.signature = Some(signature.into());
+        self
     }
 
     /// Adds raw text.
@@ -435,10 +447,21 @@ impl ErrorInfo {
         self
     }
 
-    /// Same failure as `other` for counting recurrences: code, message, and raw
-    /// text all equal.
+    /// Same failure as `other` for counting recurrences: equal codes, and equal
+    /// signatures when both have one, else equal messages and raw texts.
     pub fn same_failure(&self, other: &ErrorInfo) -> bool {
-        self.code == other.code && self.message == other.message && self.raw_text == other.raw_text
+        self.code == other.code
+            && match (&self.signature, &other.signature) {
+                (Some(a), Some(b)) => a == b,
+                _ => self.message == other.message && self.raw_text == other.raw_text,
+            }
+    }
+
+    /// Settled under a recurrence threshold of `repeats`: terminal, and, when
+    /// recurrent, seen on at least `repeats` consecutive runs (a threshold raised
+    /// since the failure was recorded reopens it).
+    pub fn settled(&self, repeats: u32) -> bool {
+        self.terminal && !(self.recurrent && self.occurrences < repeats)
     }
 }
 

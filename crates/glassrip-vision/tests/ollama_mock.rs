@@ -857,7 +857,9 @@ async fn guarded_requests_stream_and_forward_sampling_overrides() {
 #[tokio::test]
 async fn a_looping_stream_is_stopped_before_it_ends() {
     let server = MockServer::start().await;
-    let mut pieces: Vec<String> = vec!["{\"edges\": [".into()];
+    // A node list, then edges stepping into ids it never declared.
+    let mut pieces: Vec<String> =
+        vec!["{\"nodes\": [{\"local_id\": \"n1\", \"text\": \"Api\"}], \"edges\": [".into()];
     for k in 0..40 {
         pieces.push(format!(
             "{{\"src\": \"n{k}\", \"dst\": \"n{}\", \"label\": \"Relay\", \"style\": \"solid\"}},",

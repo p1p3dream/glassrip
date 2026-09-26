@@ -181,7 +181,10 @@ pub enum InferFailure {
     Truncated(ErrorInfo),
     /// The reply fell into a repetition loop and was stopped. The caller may retry
     /// with a repeat penalty (see `board_read`).
-    Repetition(ErrorInfo, glassrip_vision::repetition::RepetitionFinding),
+    Repetition(
+        ErrorInfo,
+        Box<glassrip_vision::repetition::RepetitionFinding>,
+    ),
     /// Any other failure.
     Other(ErrorInfo),
 }
@@ -484,7 +487,9 @@ impl PlacementMonitor {
         let (value, raw) = result.map_err(|e| {
             let info = vision_error_info(&e);
             match e {
-                VisionError::Repetition { finding, .. } => InferFailure::Repetition(info, finding),
+                VisionError::Repetition { finding, .. } => {
+                    InferFailure::Repetition(info, Box::new(finding))
+                }
                 e if e.is_truncated() => InferFailure::Truncated(info),
                 _ => InferFailure::Other(info),
             }
@@ -597,11 +602,19 @@ pub fn vision_error_info(e: &VisionError) -> ErrorInfo {
         VisionError::Decode { .. } => {
             ErrorInfo::new(ErrorCode::SchemaParse, e.to_string()).terminal_if_repeated()
         }
-        VisionError::Truncated { raw_text, .. } | VisionError::Repetition { raw_text, .. } => {
+        VisionError::Truncated { raw_text, .. } => {
             ErrorInfo::new(ErrorCode::ModelRequest, e.to_string())
                 .with_raw_text(raw_text.clone())
                 .terminal_if_repeated()
         }
+        // A streamed loop stops wherever a check falls, which depends on how the
+        // reply was chunked: the loop's kind and item pattern identify it.
+        VisionError::Repetition {
+            raw_text, finding, ..
+        } => ErrorInfo::new(ErrorCode::ModelRequest, e.to_string())
+            .with_raw_text(raw_text.clone())
+            .with_signature(format!("repetition:{:?}:{}", finding.kind, finding.pattern))
+            .terminal_if_repeated(),
         VisionError::Image(_)
         | VisionError::ImageTooManyTokens { .. }
         | VisionError::ContextOverflow { .. } => {
