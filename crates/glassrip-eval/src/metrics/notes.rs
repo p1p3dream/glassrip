@@ -12,7 +12,8 @@
 //!
 //! - every key term of the phrasing (a capitalized participant name or an entity
 //!   name at any position, a capitalized word after the first, an acronym, an
-//!   identifier, or a number, written in digits or as a number word;
+//!   identifier, or a number in digits or as a single number word ("thirty" is
+//!   "30"; compounds such as "twenty five" are not folded);
 //!   [`crate::text::key_terms`]) appears in it: a decision about another
 //!   person or system is another decision, however similar the wording;
 //! - it states the phrasing's claim words with the same polarity

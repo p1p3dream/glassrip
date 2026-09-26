@@ -530,17 +530,22 @@ fn number_word(lower: &str) -> Option<&'static str> {
         .map(|(_, d)| *d)
 }
 
-/// The comparison terms of one word: a numeric literal whole (`2.5` stays `2.5`,
-/// `1,000` is `1000`, so "two or five" never states "2.5"), participant terms where
+/// The comparison terms of one word: a word with a decimal point or digit grouping
+/// whole (`2.5` and `v2.5` stay one term, `1,000` is `1000`, a plain decimal drops
+/// trailing zeros so `3.0` is `3`; "two or five" never states "2.5"), participant terms where
 /// [`Vocabulary`] knows the name and the word may name someone ([`may_name`]),
 /// digits of number words ([`NUMBER_WORDS`]), stems of the other non-stopword parts.
 fn word_terms(word: &str, name_ok: bool, vocab: &Vocabulary) -> Vec<String> {
-    if word.chars().any(|c| c.is_ascii_digit())
-        && word
-            .chars()
-            .all(|c| c.is_ascii_digit() || c == '.' || c == ',')
-    {
-        return vec![word.replace(',', "")];
+    // [`tokenize`] keeps a `.` or `,` inside a word only between two digits.
+    if word.contains(['.', ',']) {
+        let mut literal = word.to_lowercase().replace(',', "");
+        if literal.chars().all(|c| c.is_ascii_digit() || c == '.') && literal.contains('.') {
+            literal = literal
+                .trim_end_matches('0')
+                .trim_end_matches('.')
+                .to_string();
+        }
+        return vec![literal];
     }
     normalize_label(word)
         .split(' ')
@@ -565,33 +570,62 @@ pub fn claim_words(text: &str, vocab: &Vocabulary) -> Vec<ClaimWord> {
 
 /// [`claim_words`] split into clauses (at clause boundaries and clause words).
 pub fn claim_clauses(text: &str, vocab: &Vocabulary) -> Vec<Vec<ClaimWord>> {
+    claim_segments(text, vocab)
+        .into_iter()
+        .map(|segments| segments.concat())
+        .collect()
+}
+
+/// [`claim_clauses`] with each clause split further at "and" into coordinated
+/// segments ("Tamsin ships weekly builds and Quill reviews them"). A negation keeps
+/// its scope across "and" ("do not ship weekly builds and nightly builds" negates
+/// both); only [`contradicts`] looks at segments.
+fn claim_segments(text: &str, vocab: &Vocabulary) -> Vec<Vec<Vec<ClaimWord>>> {
     let tokens = tokenize(text);
-    let mut clauses: Vec<Vec<ClaimWord>> = vec![Vec::new()];
+    let mut clauses: Vec<Vec<Vec<ClaimWord>>> = vec![vec![Vec::new()]];
     let mut negated = false;
     for (i, token) in tokens.iter().enumerate() {
+        let lower = match token {
+            Token::Word(w) => w.to_lowercase(),
+            Token::Boundary(_) => String::new(),
+        };
         let new_clause = match token {
             Token::Boundary(_) => true,
-            Token::Word(w) => CLAUSE_WORDS.contains(&w.to_lowercase().as_str()),
+            Token::Word(_) => CLAUSE_WORDS.contains(&lower.as_str()),
         };
         if new_clause {
             negated = false;
-            if clauses.last().is_some_and(|c| !c.is_empty()) {
-                clauses.push(Vec::new());
+            if clauses
+                .last()
+                .is_some_and(|c| c.iter().any(|s| !s.is_empty()))
+            {
+                clauses.push(vec![Vec::new()]);
             }
             continue;
         }
         let Token::Word(w) = token else { continue };
+        if lower == "and" {
+            if let Some(clause) = clauses.last_mut() {
+                if clause.last().is_some_and(|s| !s.is_empty()) {
+                    clause.push(Vec::new());
+                }
+            }
+            continue;
+        }
         if is_negation(w) {
             negated = !negated;
             continue;
         }
-        if let Some(clause) = clauses.last_mut() {
-            clause.extend(
+        if let Some(segment) = clauses.last_mut().and_then(|c| c.last_mut()) {
+            segment.extend(
                 word_terms(w, may_name(&tokens, i), vocab)
                     .into_iter()
                     .map(|term| ClaimWord { term, negated }),
             );
         }
+    }
+    for clause in &mut clauses {
+        clause.retain(|s| !s.is_empty());
     }
     clauses.retain(|c| !c.is_empty());
     clauses
@@ -702,53 +736,89 @@ fn protected_words<'a>(
     head.into_iter().chain(predicate).collect()
 }
 
-/// True when `pred` states some gold claim word only with the opposite polarity
-/// (gold "ship weekly builds" and "we will not ship; weekly builds stay" disagree on
-/// "ship", whatever else they share), or when one of its clauses restates the gold
-/// claim retracted.
-///
-/// In one clause of a prediction, a gold word is *flipped* when the clause states it
-/// with the opposite polarity, and *kept* when the clause states it with the gold's
-/// polarity before its first negated word (the arguments a negation follows:
-/// "Tamsin" in "Tamsin does not ship weekly builds", "Tamsin's weekly builds" in
-/// "Tamsin's weekly builds do not ship"). The clause retracts the claim when some
-/// gold word is flipped, the claim's protected words (head and predicate,
-/// [`covers`]) are flipped or kept, and
+/// In one unit of a prediction (a clause, or an "and" segment of one,
+/// [`claim_segments`]), a gold word is *flipped* when the unit states it with the
+/// opposite polarity, and *kept* when the unit states it with the gold's polarity
+/// before its first negated word (the arguments a negation follows: "Tamsin" in
+/// "Tamsin does not ship weekly builds", "Tamsin's weekly builds" in "Tamsin's
+/// weekly builds do not ship"). An entity word is kept through a sibling word of the
+/// same entity ([`Vocabulary::names`]) only where the sibling ends its run of
+/// non-gold words ("the Ledger does not ship" keeps "Ledger API"; "the Ledger Queue
+/// does not ship" does not). A unit that names no participant or entity inherits
+/// the gold's participants ("she does not ship weekly builds" after "Tamsin ships
+/// weekly builds"). The unit retracts the claim when some gold word is flipped, no
+/// word of its own stands between its flipped gold words ("Tamsin doesn't ship
+/// nightly builds" is about other builds), the claim's protected words (head and
+/// predicate, [`covers`]) are flipped or kept, and
 ///
 /// - when no gold word is both flipped and kept, the flipped and kept words together
 ///   number as many as [`covers`] needs, in any order ("weekly builds do not ship on
-///   Friday" retracts "weekly builds ship on Friday");
-/// - when some gold word is both (the clause affirms and then negates it), every gold
-///   word from the first flipped one in gold order onward is flipped and every one
-///   before it is kept, with nothing left out ("ship weekly builds.not ship weekly
-///   builds" retracts "ship weekly builds"; "Tamsin ships weekly builds after review
-///   and not after audit" and "Tamsin ships weekly builds and doesn't ship nightly
-///   builds" do not).
+///   Friday" retracts "weekly builds ship on Friday"). The one-word allowance of a
+///   long gold applies only when no word of the unit's own follows its flipped gold
+///   words: a retraction may be broader than the claim ("Tamsin's weekly builds do
+///   not ship to QA" retracts "Tamsin ships weekly release builds to QA") but not
+///   about something else ("... do not ship to staging" does not);
+/// - when some gold word is both (the unit affirms and then negates it), and
+///   `contrast_ok` (the unit is a single segment), every gold word from the first
+///   flipped one in gold order onward is flipped and every one before it is kept,
+///   with nothing left out ("ship weekly builds.not ship weekly builds" retracts
+///   "ship weekly builds"). A whole clause of several segments never retracts this
+///   way: its segments are judged one by one, so "Tamsin ships weekly builds and
+///   doesn't ship nightly builds" and "... for review and Quill does not review
+///   audit" do not retract.
 ///
-/// A clause that negates the predicate about something else does not retract ("we
-/// don't ship nightly builds; we ship weekly builds"). Entity words match through
-/// [`Vocabulary::names`].
+/// A unit that negates the predicate about something else does not retract ("we
+/// don't ship nightly builds; we ship weekly builds"). Polarity is lexical: a
+/// negation governs the rest of its clause, so an embedded affirmation under a
+/// negation ("nobody doubts Tamsin ships weekly builds") reads as a retraction.
 fn clause_retracts(
     gw: &[ClaimWord],
     need: usize,
     anchors: &[&ClaimWord],
-    clause: &[ClaimWord],
+    unit: &[ClaimWord],
+    contrast_ok: bool,
     vocab: &Vocabulary,
 ) -> bool {
     use std::collections::BTreeSet;
-    let all: BTreeSet<ClaimWord> = clause.iter().cloned().collect();
-    let before_negation = clause
-        .iter()
-        .position(|w| w.negated)
-        .unwrap_or(clause.len());
-    let prefix: BTreeSet<ClaimWord> = clause[..before_negation].iter().cloned().collect();
+    let g: BTreeSet<&ClaimWord> = gw.iter().collect();
+    let all: BTreeSet<ClaimWord> = unit.iter().cloned().collect();
+    let before_negation = unit.iter().position(|w| w.negated).unwrap_or(unit.len());
+    let single = |x: &ClaimWord| BTreeSet::from([x.clone()]);
+    let gold_term = |x: &ClaimWord| {
+        g.iter()
+            .any(|w| stated(w, &single(x), vocab) || stated(&flip(w), &single(x), vocab))
+    };
+    let names_nothing = unit.iter().all(|x| !vocab.is_name(&x.term));
     let flipped = |w: &ClaimWord| stated(&flip(w), &all, vocab);
-    let kept = |w: &ClaimWord| stated(w, &prefix, vocab);
+    let kept = |w: &ClaimWord| {
+        let prefix = &unit[..before_negation];
+        if prefix.contains(w) || (names_nothing && w.term.starts_with('@') && !w.negated) {
+            return true;
+        }
+        if w.term.starts_with('@') || !vocab.is_name(&w.term) {
+            return false;
+        }
+        prefix.iter().enumerate().any(|(i, x)| {
+            x.negated == w.negated
+                && vocab.names(&w.term, &BTreeSet::from([x.term.clone()]))
+                && prefix.get(i + 1).is_none_or(gold_term)
+        })
+    };
     let Some(first) = gw.iter().position(flipped) else {
         return false;
     };
-    let g: BTreeSet<&ClaimWord> = gw.iter().collect();
+    let flips_gold = |x: &ClaimWord| g.iter().any(|w| stated(&flip(w), &single(x), vocab));
+    let flip_at: Vec<usize> = (0..unit.len()).filter(|&j| flips_gold(&unit[j])).collect();
+    let (Some(&lo), Some(&hi)) = (flip_at.first(), flip_at.last()) else {
+        return false;
+    };
+    if !unit[lo..=hi].iter().all(gold_term) {
+        return false;
+    }
     if g.iter().any(|w| flipped(w) && kept(w)) {
+        if !contrast_ok {
+            return false;
+        }
         let subject: BTreeSet<&ClaimWord> = gw[..first].iter().collect();
         return g.iter().all(|w| {
             if subject.contains(w) {
@@ -758,15 +828,21 @@ fn clause_retracts(
             }
         });
     }
+    let need = if unit[hi + 1..].iter().all(gold_term) {
+        need
+    } else {
+        g.len()
+    };
     let retracted = |w: &ClaimWord| flipped(w) || kept(w);
     anchors.iter().all(|w| retracted(w)) && g.iter().filter(|w| retracted(w)).count() >= need
 }
 
 /// True when `pred` states some gold claim word only with the opposite polarity
 /// (gold "ship weekly builds" and "we will not ship; weekly builds stay" disagree on
-/// "ship", whatever else they share), or when one of its clauses restates the gold
-/// claim retracted ([`clause_retracts`]), whichever word the gold opens with:
-/// "Tamsin does not ship weekly builds" retracts "Tamsin ships weekly builds".
+/// "ship", whatever else they share), or when one of its clauses, or an "and"
+/// segment of one, restates the gold claim retracted ([`clause_retracts`]),
+/// whichever word the gold opens with: "Tamsin does not ship weekly builds" retracts
+/// "Tamsin ships weekly builds".
 pub fn contradicts(gold: &str, pred: &str, vocab: &Vocabulary) -> bool {
     use std::collections::BTreeSet;
     let gw = claim_words(gold, vocab);
@@ -783,9 +859,15 @@ pub fn contradicts(gold: &str, pred: &str, vocab: &Vocabulary) -> bool {
     let keys = key_terms(gold, vocab);
     let need = g.len() - allowed_missing(g.len(), !keys.is_empty());
     let anchors = protected_words(&gw, &keys, vocab);
-    claim_clauses(pred, vocab)
-        .iter()
-        .any(|clause| clause_retracts(&gw, need, &anchors, clause, vocab))
+    claim_segments(pred, vocab).iter().any(|segments| {
+        let clause = segments.concat();
+        let single = segments.len() == 1;
+        clause_retracts(&gw, need, &anchors, &clause, single, vocab)
+            || (!single
+                && segments
+                    .iter()
+                    .any(|s| clause_retracts(&gw, need, &anchors, s, true, vocab)))
+    })
 }
 
 /// True when `pred` states a gold claim word: the same term with the same polarity,
@@ -1338,6 +1420,43 @@ mod tests {
             "Tamsin ships weekly builds and then Tamsin does not ship weekly builds",
             &v
         ));
+        // Codex r2eval round 2 BLOCKER: a reordered retraction joined by "and"
+        assert!(!covers(
+            gold,
+            "Tamsin ships weekly builds and Tamsin's weekly builds do not ship",
+            &v
+        ));
+        // a coordinated subject still retracts
+        assert!(!covers(
+            gold,
+            "Tamsin ships weekly builds; Tamsin and Quill do not ship weekly builds",
+            &v
+        ));
+        // Kimi r2eval round 1 MAJOR 3: a pronoun subject inherits the participant
+        assert!(!covers(
+            gold,
+            "Tamsin ships weekly builds; she does not ship weekly builds",
+            &v
+        ));
+        // Kimi r2eval round 1 MAJOR 4: object-fronted and passive retractions
+        let none = Vocabulary::default();
+        assert!(!covers(
+            "ship weekly builds",
+            "ship weekly builds; the weekly builds do not ship",
+            &none
+        ));
+        assert!(!covers(
+            gold,
+            "Tamsin ships weekly builds; weekly builds are not shipped by Tamsin",
+            &v
+        ));
+        // a broader retraction of a long gold, within its one-word allowance
+        let gold = "Tamsin ships weekly release builds to QA";
+        assert!(!covers(
+            gold,
+            "Tamsin ships weekly release builds to QA; Tamsin's weekly builds do not ship to QA",
+            &v
+        ));
     }
 
     /// The anchored retraction rule stays narrow: a clause that negates the
@@ -1369,6 +1488,42 @@ mod tests {
         let pred = "Tamsin ships weekly builds after review and not after audit";
         assert!(!contradicts(gold, pred, &v));
         assert!(covers(gold, pred, &v));
+        // Codex r2eval round 2 MAJOR: the allowance does not let a negation about
+        // something else ("after audit") retract the claim ("after review").
+        for (gold, pred) in [
+            (
+                "Tamsin ships weekly builds after review",
+                "Tamsin ships weekly builds after review; Tamsin's weekly builds do not ship after audit",
+            ),
+            (
+                "Tamsin ships weekly release builds to QA",
+                "Tamsin ships weekly release builds to QA; Tamsin's weekly builds do not ship to staging",
+            ),
+            // a coordinated side action by someone else
+            (
+                "Tamsin ships weekly builds for review",
+                "Tamsin ships weekly builds for review and Quill does not review audit",
+            ),
+            // Kimi r2eval round 1 BLOCKER 1 and MINOR 6: a word of the unit's own
+            // between the flipped gold words makes it about something else
+            (
+                "Tamsin ships builds",
+                "Tamsin ships builds; Tamsin doesn't ship nightly builds",
+            ),
+            (
+                "Tamsin ships weekly builds to the staging cluster",
+                "Tamsin ships weekly builds to the staging cluster; Tamsin does not ship weekly builds to the prod cluster",
+            ),
+            // Kimi r2eval round 1 MAJOR 2: a sibling word inside another entity's
+            // name does not keep the gold entity
+            (
+                "Ledger API ships weekly builds",
+                "Ledger API ships weekly builds; the Ledger Queue does not ship weekly builds",
+            ),
+        ] {
+            assert!(!contradicts(gold, pred, &v), "{pred}");
+            assert!(covers(gold, pred, &v), "{pred}");
+        }
     }
 
     /// GLM final M11: number words and digits compare equal and both key the claim.
@@ -1402,6 +1557,12 @@ mod tests {
         ));
         assert!(covers("wait 2.5 seconds", "we wait 2.5 seconds", &v));
         assert!(covers("keep 1,000 builds", "keep 1000 builds", &v));
+        // Codex r2eval round 2: a version stays one term; a plain decimal drops
+        // trailing zeros
+        assert!(!covers("Ship v2.5 builds", "Ship v2 or 5 builds", &v));
+        assert!(covers("Ship v2.5 builds", "we ship v2.5 builds", &v));
+        assert!(covers("wait 3.0 seconds", "wait 3 seconds", &v));
+        assert!(!covers("wait 3.5 seconds", "wait 3 seconds", &v));
     }
 
     /// Codex round-1 M4: a participant name is a name where it is capitalized, even
