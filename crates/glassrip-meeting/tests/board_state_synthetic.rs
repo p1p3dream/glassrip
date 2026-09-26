@@ -5,7 +5,7 @@ use glassrip_meeting::artifacts::{CanvasDims, EdgeDirectionItem, EdgeEvidence};
 use glassrip_meeting::consolidate::events::EventKind;
 use glassrip_meeting::consolidate::events::SuppressReason;
 use glassrip_meeting::consolidate::owners::{
-    AnchorKind, Corroboration, Corroborator, MoveQuery, NoCorroboration, OwnerTarget,
+    AnchorKind, Corroboration, Corroborator, MoveQuery, NoCorroboration, OpenReason, OwnerTarget,
 };
 use glassrip_meeting::consolidate::{
     consolidate, consolidate_with_probe, split_boards, BoardFrame, BoardStateItem, CanvasSource,
@@ -2801,4 +2801,367 @@ fn an_emptied_corridor_without_a_joined_trace_keeps_the_connector() {
     let e = grpc(&run_with(&probe(joined, ink)));
     assert!(!e.in_final, "{e:?}");
     assert_eq!(e.lifetimes.last().unwrap().removed_at_s, Some(100.0));
+}
+
+/// OCR spans of the fictional nodes (and optional name tags) at their true places.
+fn true_ocr(names: &[(&str, (f64, f64))]) -> Vec<TextAnchor> {
+    NODES
+        .iter()
+        .map(|(_, text, c)| (*text, *c))
+        .chain(names.iter().copied())
+        .map(|(text, c)| TextAnchor {
+            text: text.to_string(),
+            bbox: BBox::new(c.0 - 60.0, c.1 - 12.0, c.0 + 60.0, c.1 + 12.0),
+        })
+        .collect()
+}
+
+/// A reading whose node boxes collapsed into one strip along the top, laid out left to
+/// right in list order, with the owner tag read in that strip too.
+fn collapse_nodes(f: &mut BoardFrame, tag_at: (f64, f64)) {
+    for (i, n) in f.board.nodes.iter_mut().enumerate() {
+        let x = 10.0 + 190.0 * i as f64;
+        n.bbox = BBox::new(x, 5.0, x + 180.0, 45.0);
+    }
+    for o in &mut f.board.owner_tags {
+        o.bbox = BBox::new(
+            tag_at.0 - 30.0,
+            tag_at.1 - 20.0,
+            tag_at.0 + 30.0,
+            tag_at.1 + 20.0,
+        );
+    }
+}
+
+fn avery(s: &BoardStateItem) -> Vec<&glassrip_meeting::consolidate::owners::OwnerAssignment> {
+    s.owner_assignments
+        .iter()
+        .filter(|a| a.person_id == "p-avery")
+        .collect()
+}
+
+/// Avery beside Ingest Gateway for four keyframes, then a keyframe with no tag at all
+/// (Ingest Gateway read and on OCR), then a long last keyframe whose reading collapsed
+/// every node box into one strip; OCR places the tag beside Ledger Store.
+fn end_move_frames(ocr_in_last: bool) -> Vec<BoardFrame> {
+    let mut specs: Vec<Spec> = (0..6).map(|_| base()).collect();
+    for s in specs.iter_mut().take(4) {
+        s.owners.push(("Avery", (200.0, 120.0), ""));
+    }
+    // The last view no longer shows Ingest Gateway.
+    specs[5].nodes.retain(|n| n.0 != "n1");
+    specs[5].owners.push(("Avery", (1200.0, 120.0), ""));
+    let mut fr = frames(&specs);
+    fr[4].ocr_anchors = true_ocr(&[]);
+    // Read in the strip right under the collapsed Queue box.
+    collapse_nodes(&mut fr[5], (100.0, 75.0));
+    if ocr_in_last {
+        fr[5].ocr_anchors = true_ocr(&[("Avery", (1200.0, 120.0))])
+            .into_iter()
+            .filter(|a| a.text != "Ingest Gateway")
+            .collect();
+    }
+    fr[5].t_end_s = fr[5].t_start_s + 50.0;
+    fr
+}
+
+#[test]
+fn a_collapsed_reading_places_the_tag_on_ocr_and_a_long_last_view_moves_it() {
+    let s = run(end_move_frames(true), &params());
+    let a = avery(&s);
+    assert_eq!(a.len(), 2, "{a:#?}");
+    assert_eq!(a[0].target.texts(), vec!["Ingest Gateway"]);
+    // Closed where Ingest Gateway was read with Avery nowhere.
+    assert_eq!(a[0].valid_to_s, 80.0);
+    assert_eq!(a[1].target.texts(), vec!["Ledger Store"]);
+    assert_eq!(a[1].opened_by, OpenReason::FinalHold);
+    assert_eq!(a[1].valid_from_s, 100.0);
+    assert!(a[1]
+        .moved_from
+        .as_ref()
+        .is_some_and(|m| m.texts() == vec!["Ingest Gateway"]));
+    assert!(a[1].sightings.iter().all(|x| x.ocr_located));
+    assert!(s
+        .events
+        .iter()
+        .any(|e| e.kind == EventKind::OwnerMoved && e.keyframe_id == "kf05"));
+    // Never tied to the strip box it was read next to.
+    assert!(s
+        .owner_assignments
+        .iter()
+        .all(|x| x.target.texts() != vec!["Queue"]));
+}
+
+#[test]
+fn without_ocr_a_collapsed_last_reading_moves_nothing() {
+    let s = run(end_move_frames(false), &params());
+    let a = avery(&s);
+    assert_eq!(a.len(), 1, "{a:#?}");
+    assert_eq!(a[0].target.texts(), vec!["Ingest Gateway"]);
+    assert!(s
+        .owner_assignments
+        .iter()
+        .all(|x| x.target.texts() != vec!["Queue"]));
+}
+
+#[test]
+fn one_strong_sighting_mid_meeting_opens_nothing() {
+    // The same OCR-placed sighting, followed by another keyframe: a later view can
+    // confirm, so one sighting is not enough.
+    let mut fr = end_move_frames(true);
+    let mut next = frames(&[base()]).remove(0);
+    next.keyframe_id = "kf06".into();
+    next.keyframe_index = 6;
+    next.t_start_s = fr[5].t_end_s;
+    next.t_end_s = next.t_start_s + 20.0;
+    next.t_rep_s = next.t_start_s + 10.0;
+    fr.push(next);
+    let s = run(fr, &params());
+    let a = avery(&s);
+    assert_eq!(a.len(), 1, "{a:#?}");
+    assert_eq!(a[0].target.texts(), vec!["Ingest Gateway"]);
+}
+
+#[test]
+fn a_pan_reveals_elements_without_add_events_but_drawn_ones_are_added() {
+    // Frames 0-2 zoomed in on the left part (Ledger Store and one sticky out of view),
+    // frames 3-5 zoomed out to the whole board. "Cache" is drawn during the zoom-out at
+    // a place the zoomed view showed empty; "Audit Log" is drawn later in a still view.
+    let zoomed = Similarity {
+        scale: 1.3,
+        angle: 0.0,
+        tx: 0.0,
+        ty: 0.0,
+    };
+    let specs: Vec<Spec> = (0..6)
+        .map(|i| {
+            let mut s = Spec {
+                t: if i < 3 { zoomed } else { Similarity::IDENTITY },
+                ink: Some(0.2),
+                ..base()
+            };
+            if i >= 3 {
+                s.nodes.push(("n7", "Cache".into(), (450.0, 420.0)));
+            }
+            if i >= 4 {
+                s.nodes.push(("n8", "Audit Log".into(), (1000.0, 420.0)));
+            }
+            s
+        })
+        .collect();
+    let s = run(frames(&specs), &params());
+    let added: Vec<(EventKind, String)> = s
+        .events
+        .iter()
+        .filter(|e| !e.baseline)
+        .filter(|e| {
+            matches!(
+                e.kind,
+                EventKind::NodeAdded | EventKind::StickyAdded | EventKind::EdgeAdded
+            )
+        })
+        .map(|e| (e.kind, e.detail.clone()))
+        .collect();
+    assert_eq!(
+        added,
+        vec![
+            (EventKind::NodeAdded, "Cache".to_string()),
+            (EventKind::NodeAdded, "Audit Log".to_string()),
+        ],
+        "{:#?}",
+        s.events
+    );
+    let revealed: Vec<(EventKind, &str)> = s
+        .suppressed_events
+        .iter()
+        .filter(|x| x.reason == SuppressReason::RevealedByView)
+        .map(|x| (x.event.kind, x.event.keyframe_id.as_str()))
+        .collect();
+    assert!(
+        revealed.contains(&(EventKind::NodeAdded, "kf03")),
+        "{revealed:?}"
+    );
+    assert!(
+        revealed.contains(&(EventKind::StickyAdded, "kf03")),
+        "{revealed:?}"
+    );
+    assert!(
+        revealed.contains(&(EventKind::EdgeAdded, "kf03")),
+        "{revealed:?}"
+    );
+    // Revealed elements are still on the board.
+    assert!(node_texts(&s).contains(&"Ledger Store".to_string()));
+    assert!(s
+        .stickies
+        .iter()
+        .any(|x| x.text == "Beta milestone in March" && x.in_final));
+}
+
+/// Ink marks on the fictional board, in reference coordinates, each drawn from a
+/// keyframe on; `views` maps reference to each keyframe's canvas.
+struct InkMarks {
+    views: Vec<Similarity>,
+    marks: Vec<(usize, BBox)>,
+}
+
+impl RegionProbe for InkMarks {
+    fn ink_share(&self, keyframe_id: &str, region: &BBox) -> Option<f64> {
+        let i: usize = keyframe_id.trim_start_matches("kf").parse().ok()?;
+        let t = self.views.get(i)?;
+        let c = ((region.x1 + region.x2) / 2.0, (region.y1 + region.y2) / 2.0);
+        let r = ((c.0 - t.tx) / t.scale, (c.1 - t.ty) / t.scale);
+        let inked = self.marks.iter().any(|(from, b)| {
+            *from <= i && r.0 >= b.x1 && r.0 <= b.x2 && r.1 >= b.y1 && r.1 <= b.y2
+        });
+        Some(if inked { 0.4 } else { 0.0 })
+    }
+    fn line_cover(&self, _: &str, _: (f64, f64), _: (f64, f64), _: f64) -> Option<f64> {
+        None
+    }
+}
+
+#[test]
+fn pixels_tell_a_missed_element_revealed_by_a_pan_from_one_drawn_during_it() {
+    // Zoomed in (frames 0-2), then the whole board (frames 3-5). "Cache" was on the
+    // board all along (ink at its place from frame 0) but only read after the zoom-out;
+    // "Spare" was drawn during the zoom-out (no ink at its place before frame 3).
+    let zoomed = Similarity {
+        scale: 1.3,
+        angle: 0.0,
+        tx: 0.0,
+        ty: 0.0,
+    };
+    let views: Vec<Similarity> = (0..6)
+        .map(|i| if i < 3 { zoomed } else { Similarity::IDENTITY })
+        .collect();
+    let specs: Vec<Spec> = views
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let mut s = Spec {
+                t: *t,
+                ink: Some(0.2),
+                ..base()
+            };
+            if i >= 3 {
+                s.nodes.push(("n7", "Cache".into(), (450.0, 420.0)));
+                s.nodes.push(("n8", "Spare".into(), (450.0, 540.0)));
+            }
+            s
+        })
+        .collect();
+    let px = InkMarks {
+        views,
+        marks: vec![
+            (0, BBox::new(360.0, 380.0, 540.0, 460.0)),
+            (3, BBox::new(360.0, 500.0, 540.0, 580.0)),
+        ],
+    };
+    let s = consolidate_with_probe(
+        frames(&specs),
+        "board-1",
+        &params(),
+        &hooks(&NoCorroboration),
+        Some(&px as &dyn RegionProbe),
+    );
+    let added: Vec<String> = s
+        .events
+        .iter()
+        .filter(|e| !e.baseline && e.kind == EventKind::NodeAdded)
+        .map(|e| e.detail.clone())
+        .collect();
+    assert_eq!(added, vec!["Spare".to_string()], "{:#?}", s.events);
+    assert!(s
+        .suppressed_events
+        .iter()
+        .any(|x| { x.reason == SuppressReason::RevealedByView && x.event.detail == "Cache" }));
+    // Without pixels, coverage alone cannot tell them apart.
+    let s = run(frames(&specs), &params());
+    let added: Vec<String> = s
+        .events
+        .iter()
+        .filter(|e| !e.baseline && e.kind == EventKind::NodeAdded)
+        .map(|e| e.detail.clone())
+        .collect();
+    assert!(added.contains(&"Cache".to_string()) && added.contains(&"Spare".to_string()));
+}
+
+/// Pixels whose traced strokes join every pair of boxes (`joined`), and whose
+/// straight corridors are all inked; nothing about boxes.
+struct Strokes {
+    joined: bool,
+}
+
+impl RegionProbe for Strokes {
+    fn ink_share(&self, _: &str, _: &BBox) -> Option<f64> {
+        None
+    }
+    fn line_cover(&self, _: &str, _: (f64, f64), _: (f64, f64), _: f64) -> Option<f64> {
+        Some(0.9)
+    }
+    fn stroke_between(
+        &self,
+        _: &str,
+        _: &BBox,
+        _: &BBox,
+        _: &BBox,
+        _: &[BBox],
+        _: f64,
+    ) -> Option<StrokeTrace> {
+        Some(StrokeTrace {
+            joined: self.joined,
+            ink: 0.1,
+        })
+    }
+    fn traces(&self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn a_connector_missed_before_a_zoom_out_is_not_added_when_a_traced_stroke_shows_it() {
+    // Both ends of the HTTP edge are in the zoomed view from the start, but the
+    // reader only lists the edge after the zoom-out.
+    let zoomed = Similarity {
+        scale: 1.3,
+        angle: 0.0,
+        tx: 0.0,
+        ty: 0.0,
+    };
+    let specs: Vec<Spec> = (0..6)
+        .map(|i| {
+            let mut s = Spec {
+                t: if i < 3 { zoomed } else { Similarity::IDENTITY },
+                ink: Some(0.2),
+                ..base()
+            };
+            if i < 3 {
+                s.edges.retain(|e| e.2 != "HTTP");
+            }
+            s
+        })
+        .collect();
+    let http_added = |s: &BoardStateItem| {
+        s.events.iter().any(|e| {
+            e.kind == EventKind::EdgeAdded && e.detail.contains("Ingest Gateway") && !e.baseline
+        })
+    };
+    let probed = |joined: bool| {
+        consolidate_with_probe(
+            frames(&specs),
+            "board-1",
+            &params(),
+            &hooks(&NoCorroboration),
+            Some(&Strokes { joined } as &dyn RegionProbe),
+        )
+    };
+    let s = probed(true);
+    assert!(!http_added(&s), "{:#?}", s.events);
+    assert!(s.suppressed_events.iter().any(|x| {
+        x.reason == SuppressReason::RevealedByView && x.event.kind == EventKind::EdgeAdded
+    }));
+    // No stroke joined the ends before (corridor ink alone proves nothing), or no
+    // pixels: both ends were in view, so a new connector.
+    assert!(http_added(&probed(false)));
+    assert!(http_added(&run(frames(&specs), &params())));
 }
