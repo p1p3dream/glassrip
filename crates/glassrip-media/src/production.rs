@@ -417,10 +417,19 @@ pub fn pair_score(a: &Plane<f32>, b: &Plane<f32>, p: &ScoreParams) -> PairScore 
 /// Ink change in `production` mode.
 #[derive(Debug, Clone, Copy)]
 pub struct InkChange {
-    /// Change value (1 when alignment failed).
+    /// Change value (1 when alignment failed: segmentation must cut there, but the
+    /// value then measures nothing; check [`InkChange::measured`] before using it
+    /// as evidence of drawn or erased content).
     pub value: f64,
     /// Alignment on the ink path's small gray.
     pub alignment: Alignment,
+}
+
+impl InkChange {
+    /// True when the value was measured on aligned ink masks (not the failure 1.0).
+    pub fn measured(&self) -> bool {
+        self.alignment.ok()
+    }
 }
 
 /// `ink_change(A, B)` with production alignment: phase-initialized ECC on the ink alignment

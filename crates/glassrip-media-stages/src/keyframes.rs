@@ -164,9 +164,12 @@ impl PairOracle for LazyOracle<'_> {
         }
     }
     fn ink(&self, a: usize, b: usize) -> f64 {
+        self.ink_checked(a, b).0
+    }
+    fn ink_checked(&self, a: usize, b: usize) -> (f64, bool) {
         match (self.get(a), self.get(b)) {
-            (Some(x), Some(y)) => self.scorer.ink(&x, &y).0,
-            _ => 1.0,
+            (Some(x), Some(y)) => self.scorer.ink(&x, &y),
+            _ => (1.0, false),
         }
     }
 }
@@ -227,7 +230,14 @@ impl KeyframesStage {
                     frames[i - 1].frame_id
                 )));
             }
-            cache.seed(i - 1, i, p.ssim, p.changed_frac, p.ink_change, p.align_ok);
+            cache.seed_checked(
+                i - 1,
+                i,
+                p.ssim,
+                p.changed_frac,
+                (p.ink_change, p.ink_align_ok),
+                p.align_ok,
+            );
         }
         let sharp: Vec<f64> = frames.iter().map(|f| f.sharpness_lapvar).collect();
         let times: Vec<f64> = frames.iter().map(|f| f.pts_s).collect();
@@ -327,6 +337,7 @@ impl KeyframesStage {
                         changed_frac: Some(b.comparison.frac),
                         ink_change: b.comparison.ink,
                         align_ok: Some(b.comparison.align_ok),
+                        ink_align_ok: b.comparison.ink.map(|_| b.comparison.ink_align_ok),
                     },
                     _ => Boundary {
                         reason: BoundaryReason::Start,
@@ -335,6 +346,7 @@ impl KeyframesStage {
                         changed_frac: None,
                         ink_change: None,
                         align_ok: None,
+                        ink_align_ok: None,
                     },
                 };
                 Keyframe {
@@ -478,7 +490,8 @@ impl Stage for KeyframesStage {
         "keyframes"
     }
     fn version(&self) -> u32 {
-        3
+        // 4: boundaries record whether their ink alignment was usable.
+        4
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {

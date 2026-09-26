@@ -728,7 +728,8 @@ pub fn ocr_anchors(ocr: &OcrView, dirs: Option<&EdgeDirectionItem>) -> Vec<TextA
 
 /// Build consolidation frames from upstream items. Board keyframes missing from
 /// `keyframes` are dropped (no times). A board keyframe's ink change is its own
-/// boundary's only when the previous keyframe is the previous board keyframe;
+/// boundary's only when the previous keyframe is the previous board keyframe and the
+/// boundary's alignment was usable ([`crate::artifacts::BoundaryView::measured_ink`]);
 /// otherwise the pair's ink is unknown.
 pub fn board_frames(
     keyframes: &[KeyframeView],
@@ -759,7 +760,7 @@ pub fn board_frames(
     let mut out = Vec::new();
     let mut prev: Option<usize> = None;
     for (i, b) in boards {
-        let own = kf[i].boundary.as_ref().and_then(|x| x.ink_change);
+        let own = kf[i].boundary.as_ref().and_then(|x| x.measured_ink());
         let ink_change = match prev {
             None => own,
             Some(p) if p + 1 == i => own,
@@ -955,7 +956,10 @@ mod tests {
             t_start_s: t,
             t_end_s: t + 10.0,
             t_rep_s: t + 5.0,
-            boundary: Some(BoundaryView { ink_change: ink }),
+            boundary: Some(BoundaryView {
+                ink_change: ink,
+                ..BoundaryView::default()
+            }),
         }
     }
 
@@ -981,6 +985,29 @@ mod tests {
         // "c" follows a non-board keyframe: its pair ink with "b" is unknown, and the
         // unrelated change at "x" is not attributed to it.
         assert_eq!(ink, vec![Some(0.2), Some(0.01), None]);
+    }
+
+    #[test]
+    fn ink_from_a_failed_alignment_is_unknown_not_a_change() {
+        // A pan the aligner could not follow reports ink 1.0 so that segmentation
+        // cuts there; it measures no ink and must not reach board state as a change.
+        let mut kfs = vec![
+            kf("a", 0.0, None),
+            kf("b", 10.0, Some(1.0)),
+            kf("c", 20.0, Some(1.0)),
+            kf("d", 30.0, Some(0.2)),
+        ];
+        kfs[1].boundary.as_mut().unwrap().ink_align_ok = Some(false);
+        kfs[2].boundary.as_mut().unwrap().align_ok = Some(false);
+        kfs[3].boundary.as_mut().unwrap().ink_align_ok = Some(true);
+        let frames = board_frames(
+            &kfs,
+            vec![item("a"), item("b"), item("c"), item("d")],
+            vec![],
+            vec![],
+        );
+        let ink: Vec<Option<f64>> = frames.iter().map(|f| f.ink_change).collect();
+        assert_eq!(ink, vec![None, None, None, Some(0.2)]);
     }
 
     #[test]

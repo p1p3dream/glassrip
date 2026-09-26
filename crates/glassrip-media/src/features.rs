@@ -153,4 +153,9 @@ impl crate::segment::PairOracle for FeatureOracle<'_> {
     fn ink(&self, a: usize, b: usize) -> f64 {
         ink_change(&self.frames[a].ink, &self.frames[b].ink).value
     }
+
+    fn ink_checked(&self, a: usize, b: usize) -> (f64, bool) {
+        let c = ink_change(&self.frames[a].ink, &self.frames[b].ink);
+        (c.value, c.ecc.ok())
+    }
 }
