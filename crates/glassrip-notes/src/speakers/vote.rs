@@ -1177,4 +1177,49 @@ mod tests {
         assert_eq!(out.labels[2].status, SpeakerStatus::Noise);
         assert!(out.labels[0].votes["rohan-dasgupta"] < 0.0);
     }
+
+    #[test]
+    fn no_participants_leaves_every_label_unnamed() {
+        let table = AliasTable::default();
+        let segs = vec![
+            seg(
+                "s0",
+                "L0",
+                0.0,
+                &["Rohan,", "can", "you", "check", "the", "relay", "config?"],
+            ),
+            seg(
+                "s1",
+                "L1",
+                4.0,
+                &["Yes,", "I", "will", "check", "it", "this", "week."],
+            ),
+            seg("x2", "L2", 12.0, &["Bye."]),
+        ];
+        let p = VoteParams::default();
+        let plan = plan_samples(&segs, &p);
+        let addresses = find_addresses(&segs, &table, p.response_window_s, p.min_name_score);
+        assert!(addresses.is_empty());
+        let out = vote(&segs, &table, &addresses, &plan, &BTreeMap::new(), &p);
+        assert_eq!(out.labels.len(), 3);
+        assert!(out.labels.iter().all(|l| l.person_id.is_none()));
+        assert_eq!(out.labels[0].status, SpeakerStatus::Unresolved);
+        assert_eq!(out.labels[2].status, SpeakerStatus::Noise);
+        assert_eq!(out.segments.len(), 3);
+        assert!(out
+            .segments
+            .iter()
+            .all(|s| s.person_id.is_none() && s.source == SpeakerSource::Unresolved));
+        assert_eq!(out.presenter, None);
+        // and nothing at all with no speech either
+        let empty = vote(
+            &[],
+            &table,
+            &[],
+            &plan_samples(&[], &p),
+            &BTreeMap::new(),
+            &p,
+        );
+        assert!(empty.labels.is_empty() && empty.segments.is_empty());
+    }
 }

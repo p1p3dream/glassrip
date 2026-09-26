@@ -15,9 +15,9 @@ use crate::text::{content_tokens, estimate_tokens, jaccard, mmss};
 /// System prompt for every call.
 pub const SYSTEM: &str = "You write meeting notes from a speaker-attributed transcript and a summary of the whiteboard shown in the meeting. \
 Use only what was said or shown; never add facts. \
-Every item must cite the ids of the transcript lines that support it (segment_ids, for example seg_00012), and may also cite board event ids and keyframe ids from the board summary. Cite only ids that appear in the input. \
+Every item must cite the ids of the transcript lines that support it (segment_ids, for example seg_00012), and may also cite board event ids and keyframe ids from the board summary; an action item or decision backed only by an owner tag on the board may cite just that board id. Cite only ids that appear in the input. \
 The quote field must be copied exactly from one cited transcript line (3 to 20 consecutive words, keep the original wording and spelling) or be an empty string. \
-Decisions: choices the group settled on (what to do, what not to do, who does what), not ideas that were only floated. \
+Decisions: choices the group settled on (what to do, what not to do, a change in who does what), not ideas that were only floated; giving someone a task or ownership is an action item for that person, not a decision. \
 Action items: one person (or everyone) who will do one concrete task; owner is a participant name or everyone; the task starts with a verb and names what is done. Never list greetings, farewells, thanks or small talk. \
 Open questions: questions raised and left unanswered. \
 Timeline: the main phases of the meeting in order, one short entry per phase. \
@@ -48,15 +48,25 @@ fn system(extras: &PromptExtras) -> String {
     }
 }
 
-fn board_block(extras: &PromptExtras) -> String {
+fn board_block(extras: &PromptExtras, reduce: bool) -> String {
     if extras.board_facts.trim().is_empty() {
         return String::new();
     }
-    format!(
-        "\nBoard facts from owner tags (each is likely a decision or an action item: include the ones the transcript does not contradict, as an action item for the owner, citing the id in brackets as an event or keyframe id plus any transcript lines that discuss it):\n{}",
-        extras.board_facts
-    )
+    let intro = if reduce {
+        BOARD_FACTS_REDUCE
+    } else {
+        BOARD_FACTS_INTRO
+    };
+    format!("\n{intro}\n{}", extras.board_facts)
 }
+
+/// The board facts introduction of the reduce call, which classifies drafted
+/// items and may cite only ids that are in the drafts.
+pub const BOARD_FACTS_REDUCE: &str = "Board facts from owner tags, grouped by what each one likely is. Use them to put each drafted item in the right section: a plain owner tag (\"X owns Y\") only says who is responsible for Y, so it is an action item for X, never a decision; an owner tag that moved from one target to another is a decision. Cite only ids that appear in the drafts.";
+
+/// Introduction of the board facts block: a plain owner tag is an action item
+/// for its owner, a moved owner tag is a decision.
+pub const BOARD_FACTS_INTRO: &str = "Board facts from owner tags, grouped by what each one likely is. Include the ones the transcript does not contradict, citing the id in brackets as an event or keyframe id plus any transcript lines that discuss them. A plain owner tag (\"X owns Y\") only says who is responsible for Y: list it as an action item for X, never as a decision. An owner tag that moved from one target to another is a change the group made: list it as a decision. An item backed only by an owner tag may cite just that id, without a transcript line.";
 
 /// One transcript line as the model sees it.
 pub fn format_line(l: &NamedLine) -> String {
@@ -238,12 +248,18 @@ pub fn windows(lines: &[NamedLine], budget_tokens: usize, overlap: usize) -> Vec
 }
 
 fn participants_line(people: &[Person]) -> String {
+    if people.is_empty() {
+        return NO_PARTICIPANTS.into();
+    }
     people
         .iter()
         .map(|p| p.display_name.clone())
         .collect::<Vec<_>>()
         .join(", ")
 }
+
+/// Participants line when no names are known.
+pub const NO_PARTICIPANTS: &str = "none known (speakers are unnamed diarization labels; an action item's owner is everyone or a person named by an owner tag on the board)";
 
 /// Map request for one window.
 /// `part` is (index, count) of the window.
@@ -279,7 +295,7 @@ pub fn map_request(
     let user = format!(
         "Participants: {}\n\nWhiteboard:\n{digest}{}\nTranscript part {} of {total} ({span}). Each line is: segment_id [mm:ss] speaker: text\n{}{}\n\nExtract the decisions, action items, open questions, timeline entries and summary points supported by this part. Return JSON only.",
         participants_line(people),
-        board_block(extras),
+        board_block(extras, false),
         idx + 1,
         body.join("\n"),
         cues.unwrap_or_default(),
@@ -319,7 +335,7 @@ pub fn reduce_request(
     let user = format!(
         "Participants: {}\n\nWhiteboard:\n{digest}\nThe notes below were drafted separately for consecutive parts of one meeting, so the same point can appear more than once. Merge them into one set of notes: combine duplicates into one item and keep the union of their citations, keep the clearest wording, drop items that do not meet the rules, order the timeline by time and merge it into at most 12 phases, and give three to six summary points. Copy segment_ids, event_ids, keyframe_ids and quotes only from the drafts.{}{} Return JSON only.\n\nDrafts:\n{candidates}",
         participants_line(people),
-        board_block(extras),
+        board_block(extras, true),
         if extras.board_questions.is_empty() {
             String::new()
         } else {
@@ -422,7 +438,7 @@ pub fn repair_request(
         .map(format_line)
         .collect();
     let user = format!(
-        "Participants: {}\n\nWhiteboard:\n{digest}\nThese drafted items failed validation:\n{failures}\nRelevant transcript lines (segment_id [mm:ss] speaker: text):\n{}\n\nReturn corrected versions of these items in their sections: cite segment ids that exist and support the item, copy quotes exactly from a cited line (or leave the quote empty), use a participant name or everyone as owner, and start tasks with a verb. Leave out any item the transcript does not support. Return JSON only.",
+        "Participants: {}\n\nWhiteboard:\n{digest}\nThese drafted items failed validation:\n{failures}\nRelevant transcript lines (segment_id [mm:ss] speaker: text):\n{}\n\nReturn corrected versions of these items in their sections: cite segment ids that exist and support the item, copy quotes exactly from a cited line (or leave the quote empty), use a participant name or everyone as owner, and start tasks with a verb. Leave out any item that neither the transcript nor a cited owner tag on the board supports. Return JSON only.",
         participants_line(people),
         ctx.join("\n"),
     );
@@ -476,6 +492,82 @@ mod tests {
             ws.iter().flat_map(|w| w.lines.clone()).collect();
         assert_eq!(covered.len(), 40);
         assert_eq!(windows(&lines[..3], 1_000_000, 2).len(), 1);
+    }
+
+    #[test]
+    fn board_block_offers_owner_tags_as_actions_and_moves_as_decisions() {
+        let lines: Vec<NamedLine> = (0..2).map(line).collect();
+        let win = Window { lines: vec![0, 1] };
+        let facts = "Action item candidates (x):\n- Mira Okafor owns Ledger Store (owner tag from 00:20) [cite ev-1]\nDecision candidates (y):\n- Mira Okafor moved from Ledger Store to Kiosk App at 01:00 [cite ev-2]\n";
+        let extras = PromptExtras {
+            board_facts: facts.into(),
+            ..PromptExtras::default()
+        };
+        let people = vec![Person {
+            person_id: "mira-okafor".into(),
+            display_name: "Mira Okafor".into(),
+            aliases: vec![],
+        }];
+        let map = map_request((0, 1), &win, &lines, "digest", &people, 100, &extras);
+        let user = &map.messages[1].content;
+        assert!(user.contains(BOARD_FACTS_INTRO), "{user}");
+        assert!(user.contains(facts), "facts and their ids are kept: {user}");
+        assert!(
+            !user.contains("likely a decision or an action item"),
+            "{user}"
+        );
+        assert!(BOARD_FACTS_INTRO.contains("list it as an action item for X, never as a decision"));
+        assert!(BOARD_FACTS_INTRO.contains("moved from one target to another"));
+        assert!(BOARD_FACTS_INTRO.contains("list it as a decision"));
+        assert!(user.starts_with("Participants: Mira Okafor\n"), "{user}");
+        let reduce = reduce_request(
+            &[Draft::default(), Draft::default()],
+            "digest",
+            &people,
+            100,
+            &extras,
+        );
+        let merge = &reduce.messages[1].content;
+        assert!(merge.contains(BOARD_FACTS_REDUCE) && merge.contains(facts));
+        assert!(
+            !merge.contains(BOARD_FACTS_INTRO),
+            "the reduce call cites only draft ids"
+        );
+        assert!(
+            !user.contains(BOARD_FACTS_REDUCE),
+            "map calls cite the board ids"
+        );
+        assert!(SYSTEM.contains("a change in who does what"));
+        assert!(SYSTEM.contains("ownership is an action item for that person, not a decision"));
+        // no facts: no block
+        let bare = map_request(
+            (0, 1),
+            &win,
+            &lines,
+            "digest",
+            &people,
+            100,
+            &PromptExtras::default(),
+        );
+        assert!(!bare.messages[1].content.contains("Board facts"));
+    }
+
+    #[test]
+    fn no_participant_names_are_said_plainly() {
+        let lines: Vec<NamedLine> = (0..2).map(line).collect();
+        let win = Window { lines: vec![0, 1] };
+        let map = map_request(
+            (0, 1),
+            &win,
+            &lines,
+            "digest",
+            &[],
+            100,
+            &PromptExtras::default(),
+        );
+        assert!(map.messages[1]
+            .content
+            .starts_with(&format!("Participants: {NO_PARTICIPANTS}\n")));
     }
 
     #[test]
