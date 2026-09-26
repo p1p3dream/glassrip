@@ -3,9 +3,9 @@
 //! Every rule here is general (no meeting-specific words) and has synthetic
 //! regression tests:
 //!
-//! - [`board_facts`]: owner assignments as candidate action items for their
-//!   owner, owner moves as candidate decisions, and removed owner tags as
-//!   context, with the ids to cite.
+//! - [`board_facts`]: owner tags still on the board at the end as candidate
+//!   action items for their owner, owner moves as candidate decisions, and
+//!   owner tags taken off as context, with the ids to cite.
 //! - [`cue_lines`]: transcript sentences with decision, action or question cue
 //!   phrases (recall cues, hedges included), which the model must accept
 //!   (citing them) or leave out. Interrogative sentences are question cues;
@@ -91,9 +91,9 @@ pub struct BoardFact {
     pub ids: Vec<String>,
 }
 
-/// Board facts from owner tags, classified: who owns what (candidate action
-/// items for the owner), who moved from what to what (candidate decisions),
-/// and owner tags taken off (context).
+/// Board facts from owner tags, classified: who owns what at the end
+/// (candidate action items for the owner), who moved from what to what
+/// (candidate decisions), and owner tags taken off before the end (context).
 pub fn board_fact_list(boards: &[BoardStateItem]) -> Vec<BoardFact> {
     let mut out = Vec::new();
     for b in boards {
@@ -102,8 +102,9 @@ pub fn board_fact_list(boards: &[BoardStateItem]) -> Vec<BoardFact> {
             let (events, keyframes) = assignment_ids(b, o);
             let ids: Vec<String> = events.into_iter().chain(keyframes).collect();
             let target = target_text(&o.target);
-            out.push(match &o.moved_from {
-                Some(from) => BoardFact {
+            let ended = o.valid_to_s < end - 0.5;
+            if let Some(from) = &o.moved_from {
+                out.push(BoardFact {
                     kind: BoardFactKind::Decision,
                     text: format!(
                         "{} moved from {} to {} at {}",
@@ -112,9 +113,24 @@ pub fn board_fact_list(boards: &[BoardStateItem]) -> Vec<BoardFact> {
                         target,
                         mmss(o.valid_from_s)
                     ),
+                    ids: ids.clone(),
+                });
+            }
+            if ended {
+                // an owner tag no longer on the board is not a current task
+                out.push(BoardFact {
+                    kind: BoardFactKind::Context,
+                    text: format!(
+                        "{}'s owner tag on {} (from {}) was taken off at {}",
+                        o.display_name,
+                        target,
+                        mmss(o.valid_from_s),
+                        mmss(o.valid_to_s)
+                    ),
                     ids,
-                },
-                None => BoardFact {
+                });
+            } else {
+                out.push(BoardFact {
                     kind: BoardFactKind::ActionItem,
                     text: format!(
                         "{} owns {} (owner tag from {})",
@@ -123,18 +139,6 @@ pub fn board_fact_list(boards: &[BoardStateItem]) -> Vec<BoardFact> {
                         mmss(o.valid_from_s)
                     ),
                     ids,
-                },
-            });
-            if o.valid_to_s < end - 0.5 {
-                out.push(BoardFact {
-                    kind: BoardFactKind::Context,
-                    text: format!(
-                        "{}'s owner tag was taken off {} at {}",
-                        o.display_name,
-                        target,
-                        mmss(o.valid_to_s)
-                    ),
-                    ids: Vec::new(),
                 });
             }
         }
@@ -1014,7 +1018,9 @@ mod tests {
         ];
         let f = board_facts(&[b]);
         assert!(
-            f.contains("- Mira Okafor owns Ledger Store (owner tag from 00:20) [cite ev-1]"),
+            f.contains(
+                "- Mira Okafor's owner tag on Ledger Store (from 00:20) was taken off at 01:00 [cite ev-1]"
+            ),
             "{f}"
         );
         assert!(
@@ -1022,7 +1028,7 @@ mod tests {
             "{f}"
         );
         assert!(
-            f.contains("owner tag was taken off Ledger Store at 01:00"),
+            f.contains("- Mira Okafor owns Kiosk App (owner tag from 01:00) [cite ev-2]"),
             "{f}"
         );
         assert!(board_facts(&[build::board("empty", 10.0)]).is_empty());
@@ -1098,19 +1104,21 @@ mod tests {
         assert_eq!(
             kinds,
             vec![
-                (
-                    BoardFactKind::ActionItem,
-                    "Mira Okafor owns Ledger Store (owner tag from 00:20)",
-                    vec!["ev-1"]
-                ),
+                // taken off before the end: context, not a current task
                 (
                     BoardFactKind::Context,
-                    "Mira Okafor's owner tag was taken off Ledger Store at 01:00",
-                    vec![]
+                    "Mira Okafor's owner tag on Ledger Store (from 00:20) was taken off at 01:00",
+                    vec!["ev-1"]
                 ),
+                // a move is a decision, and the new owner tag a task
                 (
                     BoardFactKind::Decision,
                     "Mira Okafor moved from Ledger Store to Kiosk App at 01:00",
+                    vec!["ev-2"]
+                ),
+                (
+                    BoardFactKind::ActionItem,
+                    "Mira Okafor owns Kiosk App (owner tag from 01:00)",
                     vec!["ev-2"]
                 ),
                 (
@@ -1130,11 +1138,15 @@ mod tests {
         let actions = at("Action item candidates");
         let decisions = at("Decision candidates");
         let context = at("Context only");
-        assert!(actions < at("- Mira Okafor owns Ledger Store"));
+        assert!(actions < at("- Mira Okafor owns Kiosk App"));
         assert!(at("- Rohan Dasgupta owns Badge Printer") < decisions);
         assert!(decisions < at("- Mira Okafor moved from Ledger Store to Kiosk App"));
         assert!(at("- Mira Okafor moved from") < context);
-        assert!(context < at("owner tag was taken off Ledger Store"));
+        assert!(context < at("owner tag on Ledger Store (from 00:20) was taken off"));
+        assert!(
+            !f.contains("owns Ledger Store"),
+            "an ended tag is not a task: {f}"
+        );
         assert!(f[..decisions].contains("not a decision"), "{f}");
         assert!(!f.contains("likely a decision or an action item"), "{f}");
         // a board with owner tags but no move has no decision group

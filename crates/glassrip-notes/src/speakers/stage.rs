@@ -233,17 +233,24 @@ impl NameSpeakersStage {
         };
         let mut notes = Vec::new();
         if no_speech {
+            // nothing to name, with or without participant names
             notes.push(
                 "no transcript segments (no speech detected), so there are no speakers to name"
                     .to_string(),
             );
         }
         if no_people {
-            notes.push(format!(
-                "no participant names (no --participants and no on-screen tile name seen in {} or more keyframes); {} diarization labels left unnamed",
-                p.ocr_min_keyframes,
-                out.labels.len()
-            ));
+            let mut s = format!(
+                "no participant names (no --participants and no on-screen tile name seen in {} or more keyframes)",
+                p.ocr_min_keyframes
+            );
+            if !no_speech {
+                s.push_str(&format!(
+                    "; {} diarization labels left unnamed",
+                    out.labels.len()
+                ));
+            }
+            notes.push(s);
         }
         notes.push(format!(
             "{} direct addresses; {} keyframes available; frame decode and read {:.1} s",
@@ -351,7 +358,9 @@ impl Stage for NameSpeakersStage {
         "name_speakers"
     }
     fn version(&self) -> u32 {
-        1
+        // 2: no speech or no participant names give a summary record instead
+        // of an error; the summary says why
+        2
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {

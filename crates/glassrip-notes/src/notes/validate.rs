@@ -219,6 +219,9 @@ struct OwnerKey {
     name: Vec<String>,
     /// Content tokens of the target.
     target: Vec<String>,
+    /// The owner tag moved here from another target (a change the group made);
+    /// a plain owner tag only says who is responsible.
+    moved: bool,
 }
 
 /// Words that state ownership or assignment ("Avery owns the kiosk", "take
@@ -273,11 +276,12 @@ impl OwnerKey {
 /// Validation switches (see [`super::candidates`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CheckOptions {
-    /// Decisions and action items may be supported by an owner-tag change on
-    /// the board instead of a transcript segment.
+    /// Action items may be supported by an owner tag on the board, and
+    /// decisions by an owner tag moved on the board, instead of a transcript
+    /// segment.
     pub board_support: bool,
-    /// Decisions need a speaker commitment in a cited segment, or an owner-tag
-    /// change on the board.
+    /// Decisions need a speaker commitment in a cited segment, or an owner tag
+    /// moved on the board.
     pub precision_guard: bool,
     /// Remove narrative prefixes ("The team decided to") from decisions and tasks.
     pub strip_prefix: bool,
@@ -336,16 +340,16 @@ impl Corpus {
                 let words = OwnerKey {
                     name: tokens(&o.display_name),
                     target: content_tokens(&crate::board::target_text(&o.target)),
+                    moved: o.moved_from.is_some(),
                 };
                 for e in b.events.iter().filter(|e| {
                     matches!(e.kind, EventKind::OwnerAssigned | EventKind::OwnerMoved)
                         && e.subject == o.person_id
                         && (e.t_s - o.valid_from_s).abs() <= 30.0
                 }) {
-                    owner_keys
-                        .entry(e.event_id.clone())
-                        .or_default()
-                        .push(words.clone());
+                    let mut key = words.clone();
+                    key.moved |= e.kind == EventKind::OwnerMoved;
+                    owner_keys.entry(e.event_id.clone()).or_default().push(key);
                 }
                 if !o.opened_at_keyframe.is_empty() {
                     owner_keys
@@ -901,6 +905,8 @@ pub fn check_with(
     // board support counts only when the item's own text refers to the
     // owner-tag change it cites (see OwnerKey::backs): a name-drop, one shared
     // target word or a generic word does not; the owner field is not text
+    // a decision needs an owner-tag move: a plain owner tag only says who is
+    // responsible, which is an action item, not a decision
     let item_words: BTreeSet<String> = tokens(&text).into_iter().collect();
     let board_backed = evidence
         .event_ids
@@ -908,6 +914,7 @@ pub fn check_with(
         .chain(&evidence.keyframe_ids)
         .filter_map(|id| corpus.owner_keys.get(id))
         .flatten()
+        .filter(|k| section != Section::Decisions || k.moved)
         .any(|k| k.backs(&item_words));
     let board_ok = opts.board_support
         && board_backed
@@ -924,7 +931,7 @@ pub fn check_with(
         });
         if !committed {
             reasons.push(
-                "a decision must cite a line where someone commits to it (or an owner-tag change on the board)"
+                "a decision must cite a line where someone commits to it (or an owner tag moved on the board)"
                     .into(),
             );
         }
@@ -1397,10 +1404,12 @@ mod tests {
         d.keyframe_ids = vec!["kf_000040".into()];
         let e = check_with(Section::Decisions, &d, &c, &all).unwrap_err();
         assert!(e.reasons.iter().any(|r| r.contains("commits")), "{e:?}");
-        // a decision about that owner tag's target is board-backed
+        // a plain owner tag backs an action, not a decision: "Avery owns the
+        // Kiosk App work" is who is responsible, not a choice the group made
         let mut d = item("Avery owns the Kiosk App work", &["s1"], "");
         d.keyframe_ids = vec!["kf_000040".into()];
-        assert!(check_with(Section::Decisions, &d, &c, &all).is_ok());
+        let e = check_with(Section::Decisions, &d, &c, &all).unwrap_err();
+        assert!(e.reasons.iter().any(|r| r.contains("commits")), "{e:?}");
         // personal activities are not tasks
         let coffee = DraftItem {
             owner: "Avery".into(),
@@ -1500,10 +1509,85 @@ mod tests {
         d.keyframe_ids = vec!["kf_000040".into()];
         let e = check_with(Section::Decisions, &d, &c, &ALL).unwrap_err();
         assert!(e.reasons.iter().any(|r| r.contains("commits")), "{e:?}");
-        // naming the target and the ownership is board support
+        // naming the target and the ownership backs an action, but a plain
+        // owner tag is not a decision
+        let a = DraftItem {
+            owner: "Avery".into(),
+            task: "Own the kiosk rollout".into(),
+            keyframe_ids: vec!["kf_000040".into()],
+            ..Default::default()
+        };
+        assert!(check_with(Section::ActionItems, &a, &c, &ALL).is_ok());
         let mut d = item("Avery owns the kiosk rollout", &[], "");
         d.keyframe_ids = vec!["kf_000040".into()];
-        assert!(check_with(Section::Decisions, &d, &c, &ALL).is_ok());
+        let e = check_with(Section::Decisions, &d, &c, &ALL).unwrap_err();
+        assert!(
+            e.reasons.iter().any(|r| r.contains("transcript segment")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn only_a_moved_owner_tag_backs_a_decision() {
+        use crate::board::build;
+        let mut b = build::board("b", 100.0);
+        b.nodes = vec![
+            build::node("n1", "Ledger Store", 0.0, 100.0, None),
+            build::node("n2", "Kiosk App", 0.0, 100.0, None),
+        ];
+        let t1 = build::node_target(&b, "n1");
+        let t2 = build::node_target(&b, "n2");
+        let mut first = build::owner("mira-okafor", "Mira Okafor", t1.clone(), 10.0, 50.0, None);
+        first.opened_at_keyframe = "kf_000010".into();
+        let mut moved = build::owner("mira-okafor", "Mira Okafor", t2, 50.0, 100.0, Some(t1));
+        moved.opened_at_keyframe = "kf_000050".into();
+        b.owner_assignments = vec![first, moved];
+        b.events = vec![
+            build::event(
+                "ev-1",
+                EventKind::OwnerAssigned,
+                10.0,
+                "kf_000010",
+                "mira-okafor",
+                "Mira on Ledger Store",
+            ),
+            build::event(
+                "ev-2",
+                EventKind::OwnerMoved,
+                50.0,
+                "kf_000050",
+                "mira-okafor",
+                "Mira to Kiosk App",
+            ),
+        ];
+        let text = "The importer reads the ledger nightly.";
+        let c = Corpus::new(
+            &[line("s1", 5.0, text, text)],
+            &[b],
+            &KeyframeTimes::default(),
+            AliasTable::from_names(&["Mira Okafor"]),
+        );
+        // the move backs a decision by its event or by the keyframe that opened it
+        for (ev, kf) in [(vec!["ev-2"], vec![]), (vec![], vec!["kf_000050"])] {
+            let mut d = item("Mira moves to the Kiosk App", &[], "");
+            d.event_ids = ev.into_iter().map(String::from).collect();
+            d.keyframe_ids = kf.into_iter().map(String::from).collect();
+            assert!(
+                check_with(Section::Decisions, &d, &c, &ALL).is_ok(),
+                "{d:?}"
+            );
+        }
+        // the plain assignment backs an action for the owner, not a decision
+        let mut d = item("Mira owns the Ledger Store", &[], "");
+        d.event_ids = vec!["ev-1".into()];
+        assert!(check_with(Section::Decisions, &d, &c, &ALL).is_err());
+        let a = DraftItem {
+            owner: "Mira".into(),
+            task: "Own the Ledger Store".into(),
+            event_ids: vec!["ev-1".into()],
+            ..Default::default()
+        };
+        assert!(check_with(Section::ActionItems, &a, &c, &ALL).is_ok());
     }
 
     #[test]
@@ -1520,7 +1604,9 @@ mod tests {
             build::node_target(&b, "n1"),
             40.0,
             100.0,
-            None,
+            // moved here, so it can back a decision (a plain tag cannot); the
+            // cases below test which words refer to it
+            Some(build::node_target(&b, "n2")),
         );
         o1.opened_at_keyframe = "kf_000040".into();
         let mut o2 = build::owner(

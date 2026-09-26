@@ -806,7 +806,6 @@ async fn speech_without_participant_names_is_left_unnamed_not_failed() {
         .unwrap();
     assert_eq!(rep.items_error, 0, "{rep:?}");
     let n = read_notes(&runner);
-    assert!(n.people.is_empty());
     assert!(
         n.caveats.iter().any(|c| c.kind == "no_participants"),
         "{:?}",
@@ -819,8 +818,25 @@ async fn speech_without_participant_names_is_left_unnamed_not_failed() {
         "{:?}",
         n.transcript
     );
+    // with no participant list, the names on the board's owner tags are the
+    // only people known: they (or everyone) can own action items
+    let (board, _) = synthetic_board::synthetic_board();
+    let mut owners: Vec<String> = board
+        .owner_assignments
+        .iter()
+        .map(|o| o.display_name.clone())
+        .collect();
+    owners.sort();
+    owners.dedup();
+    assert!(!owners.is_empty());
+    let mut people: Vec<String> = n.people.iter().map(|p| p.display_name.clone()).collect();
+    people.sort();
+    assert_eq!(people, owners);
+    assert!(!n.action_items.is_empty());
     assert!(
-        n.action_items.iter().all(|a| a.owner == "Everyone"),
+        n.action_items
+            .iter()
+            .all(|a| a.owner == "Everyone" || owners.contains(&a.owner)),
         "{:?}",
         n.action_items
     );
@@ -830,7 +846,9 @@ async fn speech_without_participant_names_is_left_unnamed_not_failed() {
         .find(|(p, _)| p.starts_with("map 1/"))
         .map(|(_, u)| u.as_str())
         .unwrap();
-    assert!(map.starts_with("Participants: none known"), "{map}");
+    let first = map.lines().next().unwrap_or_default();
+    assert!(first.starts_with("Participants: "), "{map}");
+    assert!(owners.iter().all(|o| first.contains(o.as_str())), "{first}");
 }
 
 #[tokio::test]

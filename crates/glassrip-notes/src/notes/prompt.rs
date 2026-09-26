@@ -17,7 +17,7 @@ pub const SYSTEM: &str = "You write meeting notes from a speaker-attributed tran
 Use only what was said or shown; never add facts. \
 Every item must cite the ids of the transcript lines that support it (segment_ids, for example seg_00012), and may also cite board event ids and keyframe ids from the board summary. Cite only ids that appear in the input. \
 The quote field must be copied exactly from one cited transcript line (3 to 20 consecutive words, keep the original wording and spelling) or be an empty string. \
-Decisions: choices the group settled on (what to do, what not to do, who does what), not ideas that were only floated. \
+Decisions: choices the group settled on (what to do, what not to do, a change in who does what), not ideas that were only floated; giving someone a task or ownership is an action item for that person, not a decision. \
 Action items: one person (or everyone) who will do one concrete task; owner is a participant name or everyone; the task starts with a verb and names what is done. Never list greetings, farewells, thanks or small talk. \
 Open questions: questions raised and left unanswered. \
 Timeline: the main phases of the meeting in order, one short entry per phase. \
@@ -48,16 +48,21 @@ fn system(extras: &PromptExtras) -> String {
     }
 }
 
-fn board_block(extras: &PromptExtras) -> String {
+fn board_block(extras: &PromptExtras, reduce: bool) -> String {
     if extras.board_facts.trim().is_empty() {
         return String::new();
     }
-    format!("\n{BOARD_FACTS_INTRO}\n{}", extras.board_facts)
+    let scope = if reduce { BOARD_FACTS_REDUCE } else { "" };
+    format!("\n{BOARD_FACTS_INTRO}{scope}\n{}", extras.board_facts)
 }
+
+/// Added to [`BOARD_FACTS_INTRO`] in the reduce call, which may cite only ids
+/// that are in the drafts.
+pub const BOARD_FACTS_REDUCE: &str = " In this merge, use the facts to put each drafted item in the right section, and cite only ids that appear in the drafts.";
 
 /// Introduction of the board facts block: a plain owner tag is an action item
 /// for its owner, a moved owner tag is a decision.
-pub const BOARD_FACTS_INTRO: &str = "Board facts from owner tags, grouped by what each one likely is. Include the ones the transcript does not contradict, citing the id in brackets as an event or keyframe id plus any transcript lines that discuss them. A plain owner tag (\"X owns Y\") only says who is responsible for Y: list it as an action item for X, never as a decision. An owner tag that moved from one target to another is a change the group made: list it as a decision.";
+pub const BOARD_FACTS_INTRO: &str = "Board facts from owner tags, grouped by what each one likely is. Include the ones the transcript does not contradict, citing the id in brackets as an event or keyframe id plus any transcript lines that discuss them. A plain owner tag (\"X owns Y\") only says who is responsible for Y: list it as an action item for X, never as a decision. An owner tag that moved from one target to another is a change the group made: list it as a decision. An item backed only by an owner tag may cite just that id, without a transcript line.";
 
 /// One transcript line as the model sees it.
 pub fn format_line(l: &NamedLine) -> String {
@@ -286,7 +291,7 @@ pub fn map_request(
     let user = format!(
         "Participants: {}\n\nWhiteboard:\n{digest}{}\nTranscript part {} of {total} ({span}). Each line is: segment_id [mm:ss] speaker: text\n{}{}\n\nExtract the decisions, action items, open questions, timeline entries and summary points supported by this part. Return JSON only.",
         participants_line(people),
-        board_block(extras),
+        board_block(extras, false),
         idx + 1,
         body.join("\n"),
         cues.unwrap_or_default(),
@@ -326,7 +331,7 @@ pub fn reduce_request(
     let user = format!(
         "Participants: {}\n\nWhiteboard:\n{digest}\nThe notes below were drafted separately for consecutive parts of one meeting, so the same point can appear more than once. Merge them into one set of notes: combine duplicates into one item and keep the union of their citations, keep the clearest wording, drop items that do not meet the rules, order the timeline by time and merge it into at most 12 phases, and give three to six summary points. Copy segment_ids, event_ids, keyframe_ids and quotes only from the drafts.{}{} Return JSON only.\n\nDrafts:\n{candidates}",
         participants_line(people),
-        board_block(extras),
+        board_block(extras, true),
         if extras.board_questions.is_empty() {
             String::new()
         } else {
@@ -519,6 +524,13 @@ mod tests {
             &extras,
         );
         assert!(reduce.messages[1].content.contains(BOARD_FACTS_INTRO));
+        assert!(reduce.messages[1].content.contains(BOARD_FACTS_REDUCE));
+        assert!(
+            !user.contains(BOARD_FACTS_REDUCE),
+            "map calls cite the board ids"
+        );
+        assert!(SYSTEM.contains("a change in who does what"));
+        assert!(SYSTEM.contains("ownership is an action item for that person, not a decision"));
         // no facts: no block
         let bare = map_request(
             (0, 1),

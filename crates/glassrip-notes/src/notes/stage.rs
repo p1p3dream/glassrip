@@ -86,7 +86,7 @@ pub struct NotesParams {
     /// Tell the reduce call which open questions the board already has.
     #[serde(default)]
     pub board_questions_in_reduce: bool,
-    /// Decisions need a speaker commitment or an owner-tag change.
+    /// Decisions need a speaker commitment or an owner tag moved on the board.
     #[serde(default)]
     pub precision_guard: bool,
     /// Owner tags valid at the end become "Own <target>" action items when the
@@ -285,6 +285,18 @@ impl NotesStage {
             let i = table.add_person(&person.display_name);
             for a in &person.aliases {
                 table.add_alias(i, a);
+            }
+        }
+        if doc.people.is_empty() {
+            // no participant list and no tile names: the owner tags on the board
+            // still name people, who can then own action items
+            for o in input.boards.iter().flat_map(|b| &b.owner_assignments) {
+                let known = table
+                    .match_screen_text(&o.display_name)
+                    .is_some_and(|m| m.score >= 0.85);
+                if !known && !o.display_name.trim().is_empty() {
+                    table.add_person(o.display_name.trim());
+                }
             }
         }
         let people = table.people().to_vec();
@@ -760,7 +772,7 @@ fn caveats(
     if doc.people.is_empty() {
         out.push(Caveat {
             kind: "no_participants".into(),
-            text: "No participant names were known (no participant list was given and no names were read from video tiles), so speakers are shown by their diarization label and action items can only be assigned to everyone.".into(),
+            text: "No participant names were known (no participant list was given and no names were read from video tiles), so speakers are shown by their diarization label. Action items can only be assigned to everyone or to a person named by an owner tag on the board.".into(),
         });
     }
     let unresolved: Vec<String> = doc
@@ -900,7 +912,9 @@ impl Stage for NotesStage {
         "notes"
     }
     fn version(&self) -> u32 {
-        1
+        // 2: owner tags offered as action items and owner moves as decisions;
+        // blank transcripts take the board-only path
+        2
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
