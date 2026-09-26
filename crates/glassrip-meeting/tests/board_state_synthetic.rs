@@ -2321,6 +2321,9 @@ impl RegionProbe for Canvases {
         self.at(keyframe_id)?
             .stroke_between(a, b, region, masks, ring)
     }
+    fn traces(&self) -> bool {
+        true
+    }
     fn uniform(&self, keyframe_id: &str) -> Option<bool> {
         Some(self.at(keyframe_id)?.uniform())
     }
@@ -2699,10 +2702,11 @@ fn a_card_moved_off_a_rerouted_connector_does_not_remove_it() {
 }
 
 /// Corridor pixels as in [`Pixels`], with a stroke trace that joins the two ends
-/// only while `joined[i]` holds in keyframe `i` (ink `trace_ink[i]`).
+/// only while `joined[i]` holds in keyframe `i` (ink `trace_ink[i]`); `None`
+/// traces nothing there.
 struct TracedPixels {
     px: Pixels,
-    joined: Vec<bool>,
+    joined: Vec<Option<bool>>,
     trace_ink: Vec<f64>,
 }
 
@@ -2730,9 +2734,12 @@ impl RegionProbe for TracedPixels {
     ) -> Option<StrokeTrace> {
         let i: usize = keyframe_id.trim_start_matches("kf").parse().ok()?;
         Some(StrokeTrace {
-            joined: *self.joined.get(i)?,
+            joined: (*self.joined.get(i)?)?,
             ink: *self.trace_ink.get(i)?,
         })
+    }
+    fn traces(&self) -> bool {
+        true
     }
 }
 
@@ -2758,7 +2765,7 @@ fn an_emptied_corridor_without_a_joined_trace_keeps_the_connector() {
     for v in line.iter_mut().skip(5) {
         *v = 0.05;
     }
-    let probe = |joined: Vec<bool>, trace_ink: Vec<f64>| TracedPixels {
+    let probe = |joined: Vec<Option<bool>>, trace_ink: Vec<f64>| TracedPixels {
         px: Pixels {
             line: line.clone(),
             ink: vec![0.5; 9],
@@ -2777,16 +2784,19 @@ fn an_emptied_corridor_without_a_joined_trace_keeps_the_connector() {
     };
     let grpc = |s: &BoardStateItem| s.edges.iter().find(|e| e.label == "gRPC").cloned().unwrap();
 
-    // The trace never joins the ends: the corridor alone cannot remove it.
-    let e = grpc(&run_with(&probe(vec![false; 9], vec![0.2; 9])));
-    assert!(e.in_final, "{e:?}");
-    assert!(
-        e.lifetimes.iter().all(|l| l.removed_at_s.is_none()),
-        "{e:?}"
-    );
+    // The trace never joins the ends, or a tracing probe traces nothing where
+    // the edge was read: the corridor alone cannot remove it.
+    for joined in [Some(false), None] {
+        let e = grpc(&run_with(&probe(vec![joined; 9], vec![0.2; 9])));
+        assert!(e.in_final, "{joined:?}: {e:?}");
+        assert!(
+            e.lifetimes.iter().all(|l| l.removed_at_s.is_none()),
+            "{joined:?}: {e:?}"
+        );
+    }
 
     // Positive control: the trace joined through keyframe 4 and its ink fell.
-    let joined: Vec<bool> = (0..9).map(|i| i < 5).collect();
+    let joined: Vec<Option<bool>> = (0..9).map(|i| Some(i < 5)).collect();
     let ink: Vec<f64> = (0..9).map(|i| if i < 5 { 0.2 } else { 0.02 }).collect();
     let e = grpc(&run_with(&probe(joined, ink)));
     assert!(!e.in_final, "{e:?}");

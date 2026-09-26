@@ -159,6 +159,13 @@ pub trait RegionProbe: Send + Sync {
     ) -> Option<StrokeTrace> {
         None
     }
+    /// True when [`RegionProbe::stroke_between`] traces strokes. A probe that
+    /// traces and still returns `None` for the keyframe that read a connector
+    /// cannot tell whether the connector went; one that does not trace leaves
+    /// the straight corridor to decide alone.
+    fn traces(&self) -> bool {
+        false
+    }
     /// `Some(true)` when the keyframe's whole canvas is one flat color (no drawn
     /// content, not even faint marks: near-zero luminance spread); `None` without
     /// pixels.
@@ -177,7 +184,7 @@ enum Trace {
     Broken,
     /// It still joins the two boxes.
     Joined,
-    /// The probe traced nothing (no stroke tracing, or a degenerate region).
+    /// The probe does not trace strokes.
     Untraced,
     /// The pixels cannot tell (see `routed_trace`).
     Inconclusive,
@@ -1558,9 +1565,10 @@ pub fn consolidate_with_probe(
     // the two boxes in `s` no longer joins them in `f` and the ink it was traced
     // through fell; `Trace::Broken` when it no longer joins them but the ink did
     // not fall (ink added nearby); `Trace::Joined` when it still joins them;
-    // `Trace::Untraced` when the probe traces nothing in `s` at all (no stroke
-    // tracing, a degenerate region); `Trace::Inconclusive` when the pixels cannot
-    // tell: the stroke did not join the boxes in `s` (dashed, or occluded by a
+    // `Trace::Untraced` when the probe does not trace strokes at all
+    // ([`RegionProbe::traces`]); `Trace::Inconclusive` when the pixels cannot
+    // tell: no trace in `s` from a probe that traces (a degenerate region, boxes
+    // too close to trace between), the stroke did not join the boxes in `s` (dashed, or occluded by a
     // card read on its route), no common registration, an end read in `f` away
     // from where `s` puts it (a moved card takes its connector along), or any
     // other element over the traced region added, removed, moved or left unread
@@ -1620,7 +1628,11 @@ pub fn consolidate_with_probe(
                 .map(|x| (x, region, ring))
         });
         let Some((before, region, ring)) = before else {
-            return Trace::Untraced;
+            return if probe.traces() {
+                Trace::Inconclusive
+            } else {
+                Trace::Untraced
+            };
         };
         if !before.joined {
             return Trace::Inconclusive;

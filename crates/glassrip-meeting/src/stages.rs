@@ -1023,6 +1023,9 @@ impl RegionProbe for CropProbe {
         self.canvas(keyframe_id)?
             .stroke_between(a, b, region, masks, ring)
     }
+    fn traces(&self) -> bool {
+        true
+    }
     fn uniform(&self, keyframe_id: &str) -> Option<bool> {
         Some(self.canvas(keyframe_id)?.uniform())
     }
@@ -1191,7 +1194,8 @@ impl Stage for BoardStateStage {
         // 5: routed connectors traced on the canvas with other elements masked, owner
         // events carry structured targets, blank views chain through flat links.
         // 6: an emptied corridor removes a connector only with evidence from its
-        // own traced stroke (a stroke that never joined its ends keeps it).
+        // own traced stroke (a stroke that never joined its ends, or that a
+        // tracing probe could not trace, keeps it).
         6
     }
     fn output(&self) -> ArtifactSpec {
