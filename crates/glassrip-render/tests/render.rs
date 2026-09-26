@@ -17,7 +17,7 @@ use glassrip_core::graph::{meeting_mode_stage_decls, Selection, StageGraph};
 use glassrip_core::jsonl;
 use glassrip_core::manifest::RunDir;
 use glassrip_core::runner::{Runner, RunnerOptions};
-use glassrip_notes::board::{BoardExt, BoardStateItem};
+use glassrip_notes::board::{BoardExt, BoardStateItem, EdgeStyle, OwnerTarget};
 use glassrip_notes::import;
 use glassrip_notes::notes::MeetingNotes;
 use glassrip_notes::schemas;
@@ -104,6 +104,114 @@ fn synthetic_meeting_renders_and_validates() {
     assert!(r.markdown_text.contains("Removed (seen"));
     insta::assert_snapshot!("synthetic_markdown", r.markdown_text);
     insta::assert_snapshot!("synthetic_svg", text);
+}
+
+/// An owner on a short edge hemmed in at its middle (a channel-routed edge runs
+/// beside it, its label sits next to it, and cards close both ends) was left
+/// out, failing strict validation, although the rest of the edge had room.
+#[test]
+fn owners_of_a_crowded_edge_slide_along_it() {
+    let (notes, mut board) = inputs();
+    // Ledger, Relay and Kiosk in one column; Design Kit to the bottom right
+    for (text, cx, cy) in [
+        ("Ledger Service", 250.0, 200.0),
+        ("Relay API", 250.0, 520.0),
+        ("Kiosk App", 250.0, 840.0),
+        ("Design Kit", 1300.0, 840.0),
+    ] {
+        let n = board.nodes.iter_mut().find(|n| n.text == text).unwrap();
+        let b = n.bbox.as_mut().unwrap();
+        (b.x1, b.y1, b.x2, b.y2) = (cx - 100.0, cy - 40.0, cx + 100.0, cy + 40.0);
+    }
+    // The dashed edge runs from the kit to the ledger: its direct route crosses
+    // the kiosk card, so it takes the channel below the cards and climbs back
+    // 12 px beside the Kiosk to Relay edge.
+    let dashed = board
+        .edges
+        .iter_mut()
+        .find(|e| e.style == EdgeStyle::Dashed)
+        .unwrap();
+    std::mem::swap(&mut dashed.src, &mut dashed.dst);
+    let edge = board
+        .final_edges()
+        .into_iter()
+        .find(|e| {
+            let ends = [e.a_text.as_str(), e.b_text.as_str()];
+            ends.contains(&"Kiosk App") && ends.contains(&"Relay API")
+        })
+        .unwrap()
+        .clone();
+    // every participant tags that edge
+    let base = board.current_owners()[0].clone();
+    board.owner_assignments = [
+        ("avery-quinn", "Avery Quinn"),
+        ("rohan-dasgupta", "Rohan Dasgupta"),
+        ("mira-okafor", "Mira Okafor"),
+    ]
+    .into_iter()
+    .map(|(id, name)| {
+        let mut o = base.clone();
+        o.person_id = id.into();
+        o.display_name = name.into();
+        o.moved_from = None;
+        o.target = OwnerTarget::Edge {
+            edge_id: edge.id.clone(),
+            src: edge.src.clone(),
+            dst: edge.dst.clone(),
+            a_text: edge.a_text.clone(),
+            b_text: edge.b_text.clone(),
+        };
+        o
+    })
+    .collect();
+    assert_eq!(board.current_owners().len(), 3);
+
+    let scene = build_scene(&board, &notes);
+    // the crowding this reproduces: the dashed edge is routed via the channel
+    let channel = scene
+        .edges
+        .iter()
+        .find(|e| e.dash.is_some())
+        .expect("dashed edge");
+    assert_eq!(channel.d.matches(" L ").count(), 3, "{}", channel.d);
+    assert!(
+        scene.unplaced.is_empty(),
+        "{:?}\ncards {:?}\npills {:?}\nedges {:?}",
+        scene.unplaced,
+        scene.cards.iter().map(|c| (&c.id, c.r)).collect::<Vec<_>>(),
+        scene
+            .pills
+            .iter()
+            .map(|p| (&p.text.text, p.r))
+            .collect::<Vec<_>>(),
+        scene
+            .edges
+            .iter()
+            .map(|e| (&e.d, e.label.as_ref().map(|l| (&l.text.text, l.r))))
+            .collect::<Vec<_>>()
+    );
+    assert!(overlaps(&scene).is_empty(), "{:?}", overlaps(&scene));
+    // each owner pill sits beside its edge, between the two cards
+    let card = |text: &str| {
+        let id = &board.nodes.iter().find(|n| n.text == text).unwrap().id;
+        scene.cards.iter().find(|c| &c.id == id).unwrap().r
+    };
+    let (relay, kiosk) = (card("Relay API"), card("Kiosk App"));
+    let owners: Vec<_> = scene.pills.iter().filter(|p| p.fill == "#16a34a").collect();
+    assert_eq!(owners.len(), 3);
+    for p in owners {
+        let cy = p.r.y + p.r.h / 2.0;
+        assert!(cy > relay.bottom() && cy < kiosk.y, "{:?}", p.r);
+        assert!(
+            (p.r.x + p.r.w / 2.0 - (relay.x + relay.w / 2.0)).abs() < relay.w,
+            "{:?}",
+            p.r
+        );
+    }
+    // and the full render passes strict validation
+    let dir = tempfile::tempdir().unwrap();
+    let r = render_all(&notes, &[board], &params(dir.path().to_path_buf())).unwrap();
+    assert!(r.ok, "{:?}", r.failures());
 }
 
 #[test]

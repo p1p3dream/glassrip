@@ -106,7 +106,9 @@ impl Stage for RenderStage {
         // 2: edge labels avoid zone titles, slide along their path, and wrap.
         // 3: changed markdown and scene output (and never restored from the
         // cache, see `cacheable`).
-        3
+        // 4: edge owners slide along their edge; validation errors list the
+        // failed checks.
+        4
     }
     /// The markdown, SVG and PNG files are the stage's output and live outside
     /// the run directory: a cache hit would restore the artifact without

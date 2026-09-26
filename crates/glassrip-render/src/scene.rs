@@ -32,6 +32,11 @@ const ZONE_PAD_BOTTOM: f64 = 40.0;
 const PILL_H: f64 = 24.0;
 /// Bottom of the title and legend band; nothing else is placed above it.
 const LEGEND_BOTTOM: f64 = 124.0;
+/// Fractions along a segment that labels and owner pills slide to when the
+/// middle is taken.
+const SLIDE: [f64; 5] = [0.5, 0.3, 0.7, 0.15, 0.85];
+/// Gap between an edge and an owner pill beside it.
+const PILL_GAP: f64 = 10.0;
 
 /// Axis-aligned rectangle.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -492,6 +497,37 @@ fn badge(x: f64, y: f64, text: &str, fill: &str) -> Pill {
     }
 }
 
+/// Owner pill spots beside an edge path: both sides of every segment (longest
+/// first) at the [`SLIDE`] fractions, then every 5% along each segment (a
+/// short edge between two cards has room for a pill only in a narrow band).
+/// Paths are axis-aligned.
+fn beside_path(pts: &[(f64, f64)], w: f64, h: f64) -> Vec<R> {
+    let seg_len = |i: usize| (pts[i + 1].0 - pts[i].0).abs() + (pts[i + 1].1 - pts[i].1).abs();
+    let mut order: Vec<usize> = (0..pts.len().saturating_sub(1)).collect();
+    order.sort_by(|a, b| seg_len(*b).total_cmp(&seg_len(*a)));
+    let fine = (1..20).map(|k| f64::from(k) / 20.0);
+    let fractions: Vec<f64> = SLIDE
+        .into_iter()
+        .chain(fine.filter(|t| !SLIDE.iter().any(|s| (s - t).abs() < 1e-9)))
+        .collect();
+    let mut out = Vec::new();
+    for i in order {
+        let (a, b) = (pts[i], pts[i + 1]);
+        let horizontal = (a.1 - b.1).abs() < 0.5;
+        for &t in &fractions {
+            let m = (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+            if horizontal {
+                out.push(R::new(m.0 - w / 2.0, m.1 + PILL_GAP, w, h));
+                out.push(R::new(m.0 - w / 2.0, m.1 - PILL_GAP - h, w, h));
+            } else {
+                out.push(R::new(m.0 + PILL_GAP, m.1 - h / 2.0, w, h));
+                out.push(R::new(m.0 - w - PILL_GAP, m.1 - h / 2.0, w, h));
+            }
+        }
+    }
+    out
+}
+
 /// Builds the scene for one board.
 pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
     let grids = derive_grids(board);
@@ -686,6 +722,7 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
     taken.extend(zones.iter().map(|z| zone_title_r(z).inflate(2.0)));
     let mut edges = Vec::new();
     let mut edge_anchor: BTreeMap<String, (f64, f64, bool)> = BTreeMap::new();
+    let mut edge_path: BTreeMap<String, Vec<(f64, f64)>> = BTreeMap::new();
     let mut channel = 0usize;
     let mut segments: Vec<((f64, f64), (f64, f64))> = Vec::new();
     let final_edges = board.final_edges();
@@ -769,6 +806,7 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
         let horizontal = (p0.1 - p1.1).abs() < 0.5;
         let mid = ((p0.0 + p1.0) / 2.0, (p0.1 + p1.1) / 2.0);
         edge_anchor.insert(e.id.clone(), (mid.0, mid.1, horizontal));
+        edge_path.insert(e.id.clone(), pts.clone());
         let mut label_lines: Vec<TextLine> = Vec::new();
         let mut leader: Option<(f64, f64, f64, f64)> = None;
         let label = Some(sanitize_dashes(e.label.trim()))
@@ -806,7 +844,7 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
                     for i in order {
                         let (a, b) = (pts[i], pts[i + 1]);
                         let hz = (a.1 - b.1).abs() < 0.5;
-                        for t in [0.5, 0.3, 0.7, 0.15, 0.85] {
+                        for t in SLIDE {
                             let m = (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
                             candidates.extend(around(m, hz));
                         }
@@ -985,6 +1023,12 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
                             v.push(R::new(mx - w - 10.0, my - 28.0 - d, w, h));
                             v.push(R::new(mx + 10.0, my + 28.0 + d, w, h));
                         }
+                    }
+                    // Then beside the rest of the edge: a parallel edge or a
+                    // label next to the middle, with cards at both ends, must
+                    // not leave the owner out while the edge has room elsewhere.
+                    if let Some(path) = edge_path.get(target.as_str()) {
+                        v.extend(beside_path(path, w, h));
                     }
                     v
                 }
@@ -1408,6 +1452,37 @@ mod tests {
         let mut v = vec![0.0, 30.0, 300.0, 310.0];
         snap(&mut v, 100.0);
         assert_eq!(v, vec![15.0, 15.0, 305.0, 305.0]);
+    }
+
+    #[test]
+    fn owner_spots_cover_both_sides_of_every_segment() {
+        // an L-shaped path: a long vertical leg, then a short horizontal one
+        let pts = [(100.0, 100.0), (100.0, 400.0), (200.0, 400.0)];
+        let spots = beside_path(&pts, 60.0, 24.0);
+        // SLIDE is a subset of the 5% steps: 19 fractions per segment
+        let per_segment = 2 * 19;
+        assert_eq!(spots.len(), 2 * per_segment);
+        // the longest segment comes first, starting at its middle, right side
+        assert_eq!(spots[0], R::new(110.0, 238.0, 60.0, 24.0));
+        assert_eq!(spots[1], R::new(30.0, 238.0, 60.0, 24.0));
+        // every spot clears its own segment by the gap (a spot near a corner
+        // may touch the other segment; placement rejects those)
+        let (long, short) = spots.split_at(per_segment);
+        for s in long {
+            assert!(
+                !s.inflate(PILL_GAP - 1.0).hits_segment(pts[0], pts[1]),
+                "{s:?}"
+            );
+        }
+        for s in short {
+            assert!(
+                !s.inflate(PILL_GAP - 1.0).hits_segment(pts[1], pts[2]),
+                "{s:?}"
+            );
+        }
+        // the horizontal leg gets spots above and below it
+        assert!(short.iter().any(|s| s.bottom() <= 400.0 - PILL_GAP));
+        assert!(short.iter().any(|s| s.y >= 400.0 + PILL_GAP));
     }
 
     #[test]
