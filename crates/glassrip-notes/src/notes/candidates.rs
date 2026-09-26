@@ -3,8 +3,9 @@
 //! Every rule here is general (no meeting-specific words) and has synthetic
 //! regression tests:
 //!
-//! - [`board_facts`]: owner assignments, owner moves and removed owner tags as
-//!   candidate decisions and action items, with the ids to cite.
+//! - [`board_facts`]: owner assignments as candidate action items for their
+//!   owner, owner moves as candidate decisions, and removed owner tags as
+//!   context, with the ids to cite.
 //! - [`cue_lines`]: transcript sentences with decision, action or question cue
 //!   phrases (recall cues, hedges included), which the model must accept
 //!   (citing them) or leave out. Interrogative sentences are question cues;
@@ -66,52 +67,116 @@ fn assignment_ids(b: &BoardStateItem, o: &OwnerAssignment) -> (Vec<String>, Vec<
     (events, keyframes)
 }
 
-/// Board facts that are likely decisions or action items: who owns what (from
-/// owner tags), who moved to what, and owner tags taken off. Each line names
-/// the ids to cite.
-pub fn board_facts(boards: &[BoardStateItem]) -> String {
-    let mut s = String::new();
+/// What a board fact is offered to the notes model as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BoardFactKind {
+    /// An owner tag on a box or link: the owner is responsible for it, so it
+    /// is a candidate action item for that owner (not a decision).
+    ActionItem,
+    /// An owner tag moved from one target to another: a change the group made,
+    /// so it is a candidate decision.
+    Decision,
+    /// An owner tag taken off: context for the model, not an item by itself.
+    Context,
+}
+
+/// One board fact with the ids to cite.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoardFact {
+    /// Candidate kind.
+    pub kind: BoardFactKind,
+    /// The fact, as one line of text (no ids).
+    pub text: String,
+    /// Event or keyframe ids that show it (may be empty).
+    pub ids: Vec<String>,
+}
+
+/// Board facts from owner tags, classified: who owns what (candidate action
+/// items for the owner), who moved from what to what (candidate decisions),
+/// and owner tags taken off (context).
+pub fn board_fact_list(boards: &[BoardStateItem]) -> Vec<BoardFact> {
+    let mut out = Vec::new();
     for b in boards {
         let end = b.end_s();
         for o in &b.owner_assignments {
             let (events, keyframes) = assignment_ids(b, o);
             let ids: Vec<String> = events.into_iter().chain(keyframes).collect();
-            let cite = if ids.is_empty() {
-                String::new()
-            } else {
-                format!(" [cite {}]", ids.join(", "))
-            };
             let target = target_text(&o.target);
-            match &o.moved_from {
-                Some(from) => {
-                    let _ = writeln!(
-                        s,
-                        "- {} moved from {} to {} at {}{cite}",
+            out.push(match &o.moved_from {
+                Some(from) => BoardFact {
+                    kind: BoardFactKind::Decision,
+                    text: format!(
+                        "{} moved from {} to {} at {}",
                         o.display_name,
                         target_text(from),
                         target,
                         mmss(o.valid_from_s)
-                    );
-                }
-                None => {
-                    let _ = writeln!(
-                        s,
-                        "- {} owns {} (owner tag from {}){cite}",
+                    ),
+                    ids,
+                },
+                None => BoardFact {
+                    kind: BoardFactKind::ActionItem,
+                    text: format!(
+                        "{} owns {} (owner tag from {})",
                         o.display_name,
                         target,
                         mmss(o.valid_from_s)
-                    );
-                }
-            }
+                    ),
+                    ids,
+                },
+            });
             if o.valid_to_s < end - 0.5 {
-                let _ = writeln!(
-                    s,
-                    "- {}'s owner tag was taken off {} at {}",
-                    o.display_name,
-                    target,
-                    mmss(o.valid_to_s)
-                );
+                out.push(BoardFact {
+                    kind: BoardFactKind::Context,
+                    text: format!(
+                        "{}'s owner tag was taken off {} at {}",
+                        o.display_name,
+                        target,
+                        mmss(o.valid_to_s)
+                    ),
+                    ids: Vec::new(),
+                });
             }
+        }
+    }
+    out
+}
+
+/// Heading of each group in [`board_facts`].
+fn fact_heading(kind: BoardFactKind) -> &'static str {
+    match kind {
+        BoardFactKind::ActionItem => {
+            "Action item candidates (an owner tag says who is responsible: an action item for that owner, not a decision):"
+        }
+        BoardFactKind::Decision => {
+            "Decision candidates (an owner tag moved from one target to another: a change the group made):"
+        }
+        BoardFactKind::Context => "Context only (not an item by itself):",
+    }
+}
+
+/// [`board_fact_list`] as prompt text, grouped by candidate kind, each line
+/// naming the ids to cite. Empty when the boards have no owner tags.
+pub fn board_facts(boards: &[BoardStateItem]) -> String {
+    let facts = board_fact_list(boards);
+    let mut s = String::new();
+    for kind in [
+        BoardFactKind::ActionItem,
+        BoardFactKind::Decision,
+        BoardFactKind::Context,
+    ] {
+        let group: Vec<&BoardFact> = facts.iter().filter(|f| f.kind == kind).collect();
+        if group.is_empty() {
+            continue;
+        }
+        let _ = writeln!(s, "{}", fact_heading(kind));
+        for f in group {
+            let cite = if f.ids.is_empty() {
+                String::new()
+            } else {
+                format!(" [cite {}]", f.ids.join(", "))
+            };
+            let _ = writeln!(s, "- {}{cite}", f.text);
         }
     }
     s
@@ -975,6 +1040,117 @@ mod tests {
         o.opened_at_keyframe = "kf_000010".into();
         b2.owner_assignments = vec![o];
         assert!(board_facts(&[b2]).contains("[cite kf_000010]"));
+    }
+
+    #[test]
+    fn owner_tags_are_action_candidates_and_moves_are_decision_candidates() {
+        let mut b = build::board("b", 100.0);
+        b.nodes = vec![
+            build::node("n1", "Ledger Store", 0.0, 100.0, None),
+            build::node("n2", "Kiosk App", 0.0, 100.0, None),
+            build::node("n3", "Badge Printer", 0.0, 100.0, None),
+        ];
+        let t1 = build::node_target(&b, "n1");
+        let t2 = build::node_target(&b, "n2");
+        let t3 = build::node_target(&b, "n3");
+        b.owner_assignments = vec![
+            build::owner("mira", "Mira Okafor", t1.clone(), 20.0, 60.0, None),
+            build::owner("mira", "Mira Okafor", t2, 60.0, 100.0, Some(t1)),
+            build::owner("rohan", "Rohan Dasgupta", t3, 30.0, 100.0, None),
+        ];
+        b.events = vec![
+            build::event(
+                "ev-1",
+                EventKind::OwnerAssigned,
+                20.0,
+                "kf1",
+                "mira",
+                "Mira on Ledger Store",
+            ),
+            build::event(
+                "ev-2",
+                EventKind::OwnerMoved,
+                60.0,
+                "kf2",
+                "mira",
+                "Mira to Kiosk App",
+            ),
+            build::event(
+                "ev-3",
+                EventKind::OwnerAssigned,
+                30.0,
+                "kf1",
+                "rohan",
+                "Rohan on Badge Printer",
+            ),
+        ];
+        let facts = board_fact_list(std::slice::from_ref(&b));
+        let kinds: Vec<(BoardFactKind, &str, Vec<&str>)> = facts
+            .iter()
+            .map(|f| {
+                (
+                    f.kind,
+                    f.text.as_str(),
+                    f.ids.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (
+                    BoardFactKind::ActionItem,
+                    "Mira Okafor owns Ledger Store (owner tag from 00:20)",
+                    vec!["ev-1"]
+                ),
+                (
+                    BoardFactKind::Context,
+                    "Mira Okafor's owner tag was taken off Ledger Store at 01:00",
+                    vec![]
+                ),
+                (
+                    BoardFactKind::Decision,
+                    "Mira Okafor moved from Ledger Store to Kiosk App at 01:00",
+                    vec!["ev-2"]
+                ),
+                (
+                    BoardFactKind::ActionItem,
+                    "Rohan Dasgupta owns Badge Printer (owner tag from 00:30)",
+                    vec!["ev-3"]
+                ),
+            ]
+        );
+        // the prompt text groups them: every plain owner tag under the action
+        // item candidates, the move under the decision candidates
+        let f = board_facts(&[b]);
+        let at = |needle: &str| {
+            f.find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} not in {f}"))
+        };
+        let actions = at("Action item candidates");
+        let decisions = at("Decision candidates");
+        let context = at("Context only");
+        assert!(actions < at("- Mira Okafor owns Ledger Store"));
+        assert!(at("- Rohan Dasgupta owns Badge Printer") < decisions);
+        assert!(decisions < at("- Mira Okafor moved from Ledger Store to Kiosk App"));
+        assert!(at("- Mira Okafor moved from") < context);
+        assert!(context < at("owner tag was taken off Ledger Store"));
+        assert!(f[..decisions].contains("not a decision"), "{f}");
+        assert!(!f.contains("likely a decision or an action item"), "{f}");
+        // a board with owner tags but no move has no decision group
+        let mut plain = build::board("p", 100.0);
+        plain.nodes = vec![build::node("n1", "Ledger Store", 0.0, 100.0, None)];
+        plain.owner_assignments = vec![build::owner(
+            "mira",
+            "Mira Okafor",
+            build::node_target(&plain, "n1"),
+            10.0,
+            100.0,
+            None,
+        )];
+        let f = board_facts(&[plain]);
+        assert!(f.starts_with("Action item candidates"), "{f}");
+        assert!(!f.contains("Decision candidates"), "{f}");
     }
 
     fn sighting(kf: &str) -> glassrip_meeting::consolidate::owners::OwnerSighting {

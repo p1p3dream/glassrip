@@ -71,8 +71,9 @@ pub struct NotesParams {
     /// prefixes from decisions and tasks.
     #[serde(default)]
     pub concise_items: bool,
-    /// Give the model owner-tag facts from the board as candidate decisions and
-    /// action items, citable by event or keyframe id.
+    /// Give the model owner-tag facts from the board, citable by event or
+    /// keyframe id: owner tags as candidate action items for their owner, owner
+    /// moves as candidate decisions.
     #[serde(default)]
     pub board_candidates: bool,
     /// List each window's decision and question cue sentences for the model to

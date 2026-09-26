@@ -52,11 +52,12 @@ fn board_block(extras: &PromptExtras) -> String {
     if extras.board_facts.trim().is_empty() {
         return String::new();
     }
-    format!(
-        "\nBoard facts from owner tags (each is likely a decision or an action item: include the ones the transcript does not contradict, as an action item for the owner, citing the id in brackets as an event or keyframe id plus any transcript lines that discuss it):\n{}",
-        extras.board_facts
-    )
+    format!("\n{BOARD_FACTS_INTRO}\n{}", extras.board_facts)
 }
+
+/// Introduction of the board facts block: a plain owner tag is an action item
+/// for its owner, a moved owner tag is a decision.
+pub const BOARD_FACTS_INTRO: &str = "Board facts from owner tags, grouped by what each one likely is. Include the ones the transcript does not contradict, citing the id in brackets as an event or keyframe id plus any transcript lines that discuss them. A plain owner tag (\"X owns Y\") only says who is responsible for Y: list it as an action item for X, never as a decision. An owner tag that moved from one target to another is a change the group made: list it as a decision.";
 
 /// One transcript line as the model sees it.
 pub fn format_line(l: &NamedLine) -> String {
@@ -482,6 +483,53 @@ mod tests {
             ws.iter().flat_map(|w| w.lines.clone()).collect();
         assert_eq!(covered.len(), 40);
         assert_eq!(windows(&lines[..3], 1_000_000, 2).len(), 1);
+    }
+
+    #[test]
+    fn board_block_offers_owner_tags_as_actions_and_moves_as_decisions() {
+        let lines: Vec<NamedLine> = (0..2).map(line).collect();
+        let win = Window { lines: vec![0, 1] };
+        let facts = "Action item candidates (x):\n- Mira Okafor owns Ledger Store (owner tag from 00:20) [cite ev-1]\nDecision candidates (y):\n- Mira Okafor moved from Ledger Store to Kiosk App at 01:00 [cite ev-2]\n";
+        let extras = PromptExtras {
+            board_facts: facts.into(),
+            ..PromptExtras::default()
+        };
+        let people = vec![Person {
+            person_id: "mira-okafor".into(),
+            display_name: "Mira Okafor".into(),
+            aliases: vec![],
+        }];
+        let map = map_request((0, 1), &win, &lines, "digest", &people, 100, &extras);
+        let user = &map.messages[1].content;
+        assert!(user.contains(BOARD_FACTS_INTRO), "{user}");
+        assert!(user.contains(facts), "facts and their ids are kept: {user}");
+        assert!(
+            !user.contains("likely a decision or an action item"),
+            "{user}"
+        );
+        assert!(BOARD_FACTS_INTRO.contains("list it as an action item for X, never as a decision"));
+        assert!(BOARD_FACTS_INTRO.contains("moved from one target to another"));
+        assert!(BOARD_FACTS_INTRO.contains("list it as a decision"));
+        assert!(user.starts_with("Participants: Mira Okafor\n"), "{user}");
+        let reduce = reduce_request(
+            &[Draft::default(), Draft::default()],
+            "digest",
+            &people,
+            100,
+            &extras,
+        );
+        assert!(reduce.messages[1].content.contains(BOARD_FACTS_INTRO));
+        // no facts: no block
+        let bare = map_request(
+            (0, 1),
+            &win,
+            &lines,
+            "digest",
+            &people,
+            100,
+            &PromptExtras::default(),
+        );
+        assert!(!bare.messages[1].content.contains("Board facts"));
     }
 
     #[test]
