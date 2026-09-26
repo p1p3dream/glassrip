@@ -352,6 +352,7 @@ async fn main() {
             meta: MarkdownMeta {
                 date: a.date.clone(),
                 source: None,
+                media_duration_s: None,
             },
             ..RenderParams::default()
         });

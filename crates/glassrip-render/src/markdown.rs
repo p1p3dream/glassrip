@@ -72,6 +72,10 @@ pub struct MarkdownMeta {
     pub date: Option<String>,
     /// Source description.
     pub source: Option<String>,
+    /// Length of the recording from the media probe, seconds. The notes'
+    /// length comes from the transcript; without one it is this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_duration_s: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -105,6 +109,18 @@ struct Ctx {
     transcript: Vec<String>,
 }
 
+/// The header's length text: whole minutes, or seconds under a minute (a
+/// short recording is not "0 min"); None when the length is unknown.
+fn length_text(s: f64) -> Option<String> {
+    if !s.is_finite() || s <= 0.0 {
+        None
+    } else if s < 59.5 {
+        Some(format!("{} s", s.round().max(1.0)))
+    } else {
+        Some(format!("{} min", (s / 60.0).round()))
+    }
+}
+
 /// Renders the notes as markdown.
 pub fn render_markdown(
     env: &Environment<'_>,
@@ -122,10 +138,16 @@ pub fn render_markdown(
     if let Some(d) = &meta.date {
         m.push(("Date".to_string(), d.clone()));
     }
-    m.push((
-        "Length".into(),
-        format!("{} min", (notes.duration_s / 60.0).round()),
-    ));
+    let length_s = if notes.transcript.is_empty() {
+        meta.media_duration_s
+            .filter(|d| d.is_finite() && *d > 0.0)
+            .unwrap_or(notes.duration_s)
+    } else {
+        notes.duration_s
+    };
+    if let Some(length) = length_text(length_s) {
+        m.push(("Length".into(), length));
+    }
     let people: Vec<String> = notes
         .people
         .iter()
@@ -137,7 +159,10 @@ pub fn render_markdown(
             }
         })
         .collect();
-    m.push(("Participants".into(), people.join(", ")));
+    // no names known (no participant list, no tiles, no speech): no row
+    if !people.is_empty() {
+        m.push(("Participants".into(), people.join(", ")));
+    }
     m.push((
         "Source".into(),
         meta.source.clone().unwrap_or_else(|| {
@@ -502,6 +527,71 @@ mod tests {
             )
         });
         assert!(!bad, "{md}");
+    }
+
+    fn synthetic_notes() -> MeetingNotes {
+        serde_json::from_str(include_str!("../tests/fixtures/synthetic_notes.json")).unwrap()
+    }
+
+    fn header(notes: &MeetingNotes, media_duration_s: Option<f64>) -> String {
+        let meta = MarkdownMeta {
+            media_duration_s,
+            ..MarkdownMeta::default()
+        };
+        let md = render_markdown(
+            &crate::svg::environment(),
+            notes,
+            &[],
+            &Links::default(),
+            &meta,
+        )
+        .unwrap();
+        md.lines()
+            .take_while(|l| !l.starts_with("## "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Final review: a meeting without known names shows no empty
+    /// "Participants" row.
+    #[test]
+    fn no_participants_row_without_names() {
+        let mut notes = synthetic_notes();
+        assert!(header(&notes, None).contains("| **Participants** | "));
+        notes.people.clear();
+        notes.presenter = None;
+        let h = header(&notes, None);
+        assert!(!h.contains("Participants"), "{h}");
+    }
+
+    /// Final review: notes without a transcript (no speech) take their length
+    /// from the media probe, and a short recording is not "0 min".
+    #[test]
+    fn length_without_a_transcript_comes_from_the_media() {
+        let mut notes = synthetic_notes();
+        assert!(!notes.transcript.is_empty());
+        let spoken = header(&notes, Some(3600.0));
+        assert!(
+            spoken.contains(&format!(
+                "| **Length** | {} min |",
+                (notes.duration_s / 60.0).round()
+            )),
+            "a transcript keeps its own length: {spoken}"
+        );
+
+        notes.transcript.clear();
+        notes.duration_s = 0.0;
+        assert!(header(&notes, Some(185.0)).contains("| **Length** | 3 min |"));
+        let short = header(&notes, Some(20.4));
+        assert!(short.contains("| **Length** | 20 s |"), "{short}");
+        assert!(!short.contains("0 min"), "{short}");
+        let unknown = header(&notes, None);
+        assert!(
+            !unknown.contains("Length"),
+            "an unknown length has no row: {unknown}"
+        );
+        notes.duration_s = 42.0;
+        assert!(header(&notes, None).contains("| **Length** | 42 s |"));
     }
 
     #[test]

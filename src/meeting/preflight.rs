@@ -2,6 +2,12 @@
 //! model the selected stages need must be present. All problems are reported
 //! together; nothing runs when one is found.
 //!
+//! The text model is the exception: `notes` needs it only when the recording
+//! has speech, which is known after transcription. A missing text model is a
+//! warning here; the run checks it again before `notes` (see
+//! [`super::run`]), which fails then unless the notes restore from cache or
+//! come from the board alone.
+//!
 //! GPU placement itself is checked lazily by the vision stages' placement
 //! monitor (Ollama `/api/ps` before the first request and periodically) and by
 //! the notes stage for the text model. With the `cuda` feature, preflight also
@@ -96,7 +102,13 @@ pub fn check(
         "classify/board_read",
         backends.vision.as_ref().map(|_| ()),
     );
-    need(needs.text, "notes", backends.text.as_ref().map(|_| ()));
+    if let (true, Err(reason)) = (needs.text, &backends.text) {
+        tracing::warn!(
+            %reason,
+            "text model unavailable: notes come from the board alone if no speech is \
+             transcribed; with speech the run stops at notes"
+        );
+    }
     need(needs.asr, "asr", backends.asr.as_ref().map(|_| ()));
     need(
         needs.diarize,
@@ -171,18 +183,18 @@ mod tests {
             "ffprobe",
         )
         .unwrap_err();
-        for stage in [
-            "ocr_harvest",
-            "classify/board_read",
-            "notes",
-            "asr",
-            "diarize",
-        ] {
+        for stage in ["ocr_harvest", "classify/board_read", "asr", "diarize"] {
             assert!(
                 problems.iter().any(|p| p.starts_with(stage)),
                 "{stage}: {problems:?}"
             );
         }
+        // A silent recording needs no text model: that is known only after
+        // transcription, so a missing one does not fail preflight.
+        assert!(
+            !problems.iter().any(|p| p.starts_with("notes")),
+            "{problems:?}"
+        );
         // Media-only runs need nothing but the tools.
         let media = Needs::from_plan(&plan(Some("rectify"), None));
         let r = check(&media, &Backends::none("x"), "ffmpeg", "ffprobe");
