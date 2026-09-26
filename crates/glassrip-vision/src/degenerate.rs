@@ -4,15 +4,17 @@
 //! with one element under fresh ids and boxes (one box text 28 times, 60
 //! stickies holding five texts). Such a reply is valid JSON, so the repetition
 //! guard (which stops a runaway *generation*) lets it through. This module judges
-//! a *finished* reading.
+//! a *finished* reading in two steps: [`detect`] flags a reading worth one retry,
+//! and [`collapse`] removes copies only where the reply shows it made them up.
 //!
 //! Per list (nodes, stickies, owner tags, other text; edges keyed by endpoints
 //! and label), for every normalized text:
 //!
 //! - `count`: items with that text;
 //! - `supported`: items with an OCR span of that text of their own inside their
-//!   box (one span backs one item, so stepped copies around one real box share a
-//!   single span);
+//!   box (each span backs the nearest matching item, and backs nothing when that
+//!   item is already backed or a span of its text at the same place backed an
+//!   item: stepped copies around one real box share a single span);
 //! - `repeats = count - max(supported, 1) + 1`: the copies that neither OCR nor a
 //!   single original explains, plus that original.
 //!
@@ -26,14 +28,27 @@
 //! [`STACK_OVERLAP`] of the smaller one (the stepped or piled copies a runaway
 //! reply writes); edges, which have no box, count as stacked. Two "API" boxes or
 //! three "TODO" stickies never reach `min_repeats`; four "TODO" stickies among a
-//! dozen notes stay under the share, however many other labels come in pairs; a
-//! row of identical cards is no copy of one card, whether OCR reads it or not,
-//! and eight "TODO" notes that OCR misses among twenty stay; a runaway grid of
-//! sixty stickies holding five texts does not.
+//! dozen notes stay under the share, however many other labels come in pairs.
 //!
-//! [`collapse`] reduces each repeated text to its best-supported items: every item
-//! backed by its own OCR span, or the first item when OCR backs none. Edges and
-//! owner tags pointing at a removed node move to the node that was kept.
+//! A repeated text only earns the retry. [`collapse`] removes copies of it only
+//! where the reply shows it fabricated them ([`Fabrication`]), and only those:
+//!
+//! - copies piled on each other: each pile keeps its best-supported copy;
+//! - at least `min_repeats` copies lying wholly outside the image the request
+//!   sent: those copies go, OCR-backed or not (nothing outside the image was
+//!   read from it; a tile's OCR anchors cover the whole canvas);
+//! - a list that ran to its `maxItems` while repeating (its last item is a copy
+//!   of a repeated text: the limit, not the board, stopped the run): the text
+//!   keeps its best-supported copies. Owner tags never collapse on the limit:
+//!   one person owns many things.
+//!
+//! Every other copy stays as read, however many there are: a row of identical
+//! cards, or eight "Avery" tags on eight nodes, that OCR misses is still a row,
+//! and real copies of a text keep their place beside fabricated ones.
+//!
+//! Best-supported items: every item backed by its own OCR span, or the first
+//! item when OCR backs none. Edges and owner tags pointing at a removed node
+//! move to the nearest node of its text that was kept.
 
 use std::collections::{HashMap, HashSet};
 
@@ -78,6 +93,52 @@ impl DegenerateParams {
     pub fn enabled(&self) -> bool {
         self.min_repeats >= 2
     }
+}
+
+/// The `maxItems` of each list in the request that produced a reply; `0` when
+/// unknown (no list then counts as run to its limit).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ListCaps {
+    pub nodes: usize,
+    pub edges: usize,
+    pub stickies: usize,
+    pub owner_tags: usize,
+    pub other_visible_text: usize,
+}
+
+impl ListCaps {
+    pub fn of(&self, list: ElementList) -> usize {
+        match list {
+            ElementList::Nodes => self.nodes,
+            ElementList::Edges => self.edges,
+            ElementList::Stickies => self.stickies,
+            ElementList::OwnerTags => self.owner_tags,
+            ElementList::OtherVisibleText => self.other_visible_text,
+        }
+    }
+}
+
+/// What a reply was asked to read: the evidence [`collapse`] weighs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReplyFrame {
+    /// The image the request sent, in the reading's (canvas) pixels.
+    pub extent: BBox,
+    pub caps: ListCaps,
+}
+
+/// Why the copies of a repeated text were made up by the reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Fabrication {
+    /// At least `min_repeats` copies each cover another copy (every repeated
+    /// edge: the same endpoints and label); each pile keeps one copy.
+    Piled,
+    /// At least `min_repeats` copies lie wholly outside the image; they go,
+    /// OCR-backed or not (a tile's OCR anchors cover the whole canvas).
+    OffCanvas,
+    /// The list ran to its `maxItems` with a repeated text last (never counted
+    /// for owner tags); the text keeps its best-supported copies.
+    ListCap,
 }
 
 /// One repeated text in one list.
@@ -127,6 +188,9 @@ pub struct CollapsedText {
     pub text: String,
     pub before: usize,
     pub after: usize,
+    /// What showed the copies were made up.
+    #[serde(default)]
+    pub evidence: Vec<Fabrication>,
 }
 
 /// OCR text that belongs to an element: the same text (at any length), a
@@ -164,40 +228,40 @@ fn center_inside(span: &BBox, b: &BBox, margin: f64) -> bool {
     cx >= b.x1 - mx && cx <= b.x2 + mx && cy >= b.y1 - my && cy <= b.y2 + my
 }
 
-/// Per item: backed by an OCR span of its own. Each span backs at most one item:
-/// the nearest (by box center) matching item whose grown box holds the span. A
-/// span that repeats an earlier one (same text, stacked boxes) and lies in the
-/// item that earlier span backed is a second reading of that item's text and
-/// backs nothing; a span in a box of its own still backs that box.
+/// Two OCR spans of one text at the same place (by IoU) are one text read twice.
+pub const REREAD_IOU: f64 = 0.7;
+
+/// Per item: backed by an OCR span of its own. Each span resolves to one item:
+/// the nearest (by box center) matching item whose grown box holds the span.
+/// The span backs that item unless the item is backed already, or the span
+/// lies where a span of the same text that backed an item lies
+/// ([`REREAD_IOU`]): then it is a second reading of that text and backs nothing.
+/// A span never falls through to another item.
 fn supported(items: &[Item<'_>], anchors: &[(String, BBox)], margin: f64) -> Vec<bool> {
     let mut backed = vec![false; items.len()];
-    // Spans that backed an item: normalized text, box, the item.
-    let mut used: Vec<(String, &BBox, usize)> = Vec::new();
+    // Spans that backed an item: normalized text and box.
+    let mut used: Vec<(String, &BBox)> = Vec::new();
     for (s, sb) in anchors {
-        let ns = normalize(s);
-        let reread = used.iter().any(|(t, tb, i)| {
-            *t == ns
-                && stacked_pair(sb, tb)
-                && items[*i]
-                    .anchorable
-                    .is_some_and(|(_, b)| center_inside(sb, b, margin))
-        });
-        if reread {
-            continue;
-        }
         let best = items
             .iter()
             .enumerate()
-            .filter(|(i, _)| !backed[*i])
             .filter_map(|(i, it)| {
                 let (text, bbox) = it.anchorable?;
                 (span_matches(text, s) && center_inside(sb, bbox, margin))
                     .then(|| (i, distance2(sb, bbox)))
             })
             .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
-        if let Some((i, _)) = best {
+        let Some((i, _)) = best else {
+            continue;
+        };
+        let ns = normalize(s);
+        let reread = backed[i]
+            || used
+                .iter()
+                .any(|(t, ub)| *t == ns && ub.iou(sb) >= REREAD_IOU);
+        if !reread {
             backed[i] = true;
-            used.push((ns, sb, i));
+            used.push((ns, sb));
         }
     }
     backed
@@ -233,6 +297,53 @@ fn stacked(items: &[Item<'_>], idx: &[usize]) -> usize {
         .count()
 }
 
+/// A well-formed box (positive width and height) with no point inside the image
+/// (touching its edge from outside counts as outside). A box without area is
+/// nowhere, so it is not outside either.
+fn outside(b: &BBox, extent: &BBox) -> bool {
+    b.x2 > b.x1
+        && b.y2 > b.y1
+        && (b.x1 >= extent.x2 || b.x2 <= extent.x1 || b.y1 >= extent.y2 || b.y2 <= extent.y1)
+}
+
+/// Piles among `idx`: groups (two or more, in list order) of items whose boxes
+/// cover each other, directly or through a chain of stepped copies; items with
+/// no box (edges) all form one pile.
+fn piles(items: &[Item<'_>], idx: &[usize]) -> Vec<Vec<usize>> {
+    let mut pile_of: Vec<Option<usize>> = vec![None; idx.len()];
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    for a in 0..idx.len() {
+        if pile_of[a].is_some() {
+            continue;
+        }
+        let mut members = vec![a];
+        pile_of[a] = Some(out.len());
+        let mut k = 0;
+        while k < members.len() {
+            let m = members[k];
+            for b in 0..idx.len() {
+                if pile_of[b].is_some() {
+                    continue;
+                }
+                let on = match (items[idx[m]].anchorable, items[idx[b]].anchorable) {
+                    (Some((_, x)), Some((_, y))) => stacked_pair(x, y),
+                    (None, None) => true,
+                    _ => false,
+                };
+                if on {
+                    pile_of[b] = Some(out.len());
+                    members.push(b);
+                }
+            }
+            k += 1;
+        }
+        members.sort_unstable();
+        out.push(members.into_iter().map(|j| idx[j]).collect());
+    }
+    out.retain(|p| p.len() >= 2);
+    out
+}
+
 /// Groups of item indices by key, in order of first appearance.
 fn groups(items: &[Item<'_>]) -> Vec<(String, Vec<usize>)> {
     let mut at: HashMap<&str, usize> = HashMap::new();
@@ -249,13 +360,23 @@ fn groups(items: &[Item<'_>]) -> Vec<(String, Vec<usize>)> {
     out
 }
 
-/// Repeated texts of one list, each with the indices to keep when collapsed.
+/// One repeated text of a list.
+struct Repeat {
+    text: RepeatedText,
+    /// Its items.
+    idx: Vec<usize>,
+    /// Its items backed by an OCR span of their own.
+    backed: Vec<usize>,
+    piled: bool,
+}
+
+/// Repeated texts of one list.
 fn list_repeats(
     list: ElementList,
     items: &[Item<'_>],
     anchors: &[(String, BBox)],
     p: &DegenerateParams,
-) -> Vec<(RepeatedText, Vec<usize>)> {
+) -> Vec<Repeat> {
     let n = items.len();
     if !p.enabled() || n < p.min_repeats {
         return Vec::new();
@@ -297,22 +418,115 @@ fn list_repeats(
             if r < p.min_repeats || !flagged {
                 return None;
             }
-            let mut keep: Vec<usize> = idx.iter().copied().filter(|&i| backed[i]).collect();
-            if keep.is_empty() {
-                keep.push(idx[0]);
-            }
-            Some((
-                RepeatedText {
+            let own: Vec<usize> = idx.iter().copied().filter(|&i| backed[i]).collect();
+            Some(Repeat {
+                text: RepeatedText {
                     list,
                     text: key,
                     count: idx.len(),
                     supported: s,
                     list_len: n,
                 },
-                keep,
-            ))
+                idx,
+                backed: own,
+                piled,
+            })
         })
         .collect()
+}
+
+/// The best-supported of `members`: those backed by OCR, or the first.
+fn best(r: &Repeat, members: &[usize]) -> Vec<usize> {
+    let own: Vec<usize> = members
+        .iter()
+        .copied()
+        .filter(|i| r.backed.contains(i))
+        .collect();
+    if own.is_empty() {
+        members.iter().copied().take(1).collect()
+    } else {
+        own
+    }
+}
+
+/// What shows the reply made up copies of one repeated text, and the items
+/// that stay; `None` when nothing does (every copy stays as read). `stopped`:
+/// the list ran to its limit with a repeated text last.
+fn plan(
+    r: &Repeat,
+    items: &[Item<'_>],
+    frame: &ReplyFrame,
+    stopped: bool,
+    p: &DegenerateParams,
+) -> Option<(Vec<Fabrication>, Vec<usize>)> {
+    let off: Vec<usize> = r
+        .idx
+        .iter()
+        .copied()
+        .filter(|&i| {
+            items[i]
+                .anchorable
+                .is_some_and(|(_, b)| outside(b, &frame.extent))
+        })
+        .collect();
+    let off_canvas = off.len() >= p.min_repeats;
+    let capped = stopped && r.text.list != ElementList::OwnerTags;
+    let evidence: Vec<Fabrication> = [
+        (r.piled, Fabrication::Piled),
+        (off_canvas, Fabrication::OffCanvas),
+        (capped, Fabrication::ListCap),
+    ]
+    .into_iter()
+    .filter_map(|(on, f)| on.then_some(f))
+    .collect();
+    if evidence.is_empty() {
+        return None;
+    }
+    // Keepers come from inside the image when any member is: a tile's OCR
+    // anchors cover the whole canvas, so OCR can back a copy the tile never saw.
+    let prefer_inside = |members: &[usize]| -> Vec<usize> {
+        let inside: Vec<usize> = members
+            .iter()
+            .copied()
+            .filter(|i| !off.contains(i))
+            .collect();
+        if inside.is_empty() {
+            best(r, members)
+        } else {
+            best(r, &inside)
+        }
+    };
+    if capped {
+        return Some((evidence, prefer_inside(&r.idx)));
+    }
+    // Copies outside the image go, OCR-backed or not.
+    let mut gone: HashSet<usize> = if off_canvas {
+        off.iter().copied().collect()
+    } else {
+        HashSet::new()
+    };
+    if r.piled {
+        for pile in piles(items, &r.idx) {
+            let left: Vec<usize> = pile.into_iter().filter(|i| !gone.contains(i)).collect();
+            if left.is_empty() {
+                continue;
+            }
+            let keep = prefer_inside(&left);
+            gone.extend(left.into_iter().filter(|i| !keep.contains(i)));
+        }
+    }
+    let keep: Vec<usize> = r
+        .idx
+        .iter()
+        .copied()
+        .filter(|i| !gone.contains(i))
+        .collect();
+    let keep = if keep.is_empty() {
+        best(r, &r.idx)
+    } else {
+        keep
+    };
+    Some((evidence, keep))
 }
 
 fn edge_key(src: &str, dst: &str, label: &str) -> String {
@@ -369,8 +583,8 @@ fn other_items(r: &BoardReading) -> Vec<Item<'_>> {
         .collect()
 }
 
-/// The repeated texts of a complete reading, or `None` when it is sound.
-/// `anchors` are OCR spans in the reading's (canvas) pixels.
+/// The repeated texts of a complete reading (worth one retry), or `None` when
+/// it is sound. `anchors` are OCR spans in the reading's (canvas) pixels.
 pub fn detect(
     reading: &BoardReading,
     anchors: &[(String, BBox)],
@@ -386,26 +600,44 @@ pub fn detect(
     let repeated: Vec<RepeatedText> = lists
         .iter()
         .flat_map(|(list, items)| list_repeats(*list, items, anchors, p))
-        .map(|(r, _)| r)
+        .map(|r| r.text)
         .collect();
     (!repeated.is_empty()).then_some(DegenerateFinding { repeated })
 }
 
-/// Indices to drop from one list: every repeated text keeps only its chosen items.
-fn drops(repeats: &[(RepeatedText, Vec<usize>)], items: &[Item<'_>]) -> HashSet<usize> {
-    let flagged: HashMap<&str, &Vec<usize>> = repeats
-        .iter()
-        .map(|(r, keep)| (r.text.as_str(), keep))
-        .collect();
-    items
-        .iter()
-        .enumerate()
-        .filter(|(i, it)| {
-            flagged
-                .get(it.key.as_str())
-                .is_some_and(|keep| !keep.contains(i))
+/// One fabricated text: the repeat, its evidence, and the items that stay.
+type Fabricated = (Repeat, Vec<Fabrication>, Vec<usize>);
+
+/// The repeated texts of one list that the reply fabricated.
+fn fabricated(
+    list: ElementList,
+    items: &[Item<'_>],
+    anchors: &[(String, BBox)],
+    frame: &ReplyFrame,
+    p: &DegenerateParams,
+) -> Vec<Fabricated> {
+    let repeats = list_repeats(list, items, anchors, p);
+    let cap = frame.caps.of(list);
+    let stopped = cap > 0
+        && items.len() >= cap
+        && items
+            .last()
+            .is_some_and(|last| repeats.iter().any(|r| r.text.text == last.key));
+    repeats
+        .into_iter()
+        .filter_map(|r| {
+            let (ev, keep) = plan(&r, items, frame, stopped, p)?;
+            Some((r, ev, keep))
         })
-        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Indices to drop from one list: every fabricated text keeps only its chosen
+/// items.
+fn drops(repeats: &[Fabricated]) -> HashSet<usize> {
+    repeats
+        .iter()
+        .flat_map(|(r, _, keep)| r.idx.iter().copied().filter(|i| !keep.contains(i)))
         .collect()
 }
 
@@ -418,20 +650,23 @@ fn retain_indexed<T>(v: &mut Vec<T>, gone: &HashSet<usize>) {
     });
 }
 
-fn record(out: &mut Vec<CollapsedText>, repeats: &[(RepeatedText, Vec<usize>)]) {
-    out.extend(repeats.iter().map(|(r, keep)| CollapsedText {
-        list: r.list,
-        text: r.text.clone(),
-        before: r.count,
+fn record(out: &mut Vec<CollapsedText>, repeats: &[Fabricated]) {
+    out.extend(repeats.iter().map(|(r, ev, keep)| CollapsedText {
+        list: r.text.list,
+        text: r.text.text.clone(),
+        before: r.text.count,
         after: keep.len(),
+        evidence: ev.clone(),
     }));
 }
 
-/// Reduce every repeated text to its best-supported items. Returns the reading
-/// unchanged, with no record, when [`detect`] finds nothing.
+/// Remove the copies the reply fabricated (see [`Fabrication`]); repeated texts
+/// without such evidence, and copies the evidence does not reach, stay as read.
+/// Returns the reading unchanged, with no record, when nothing is fabricated.
 pub fn collapse(
     mut reading: BoardReading,
     anchors: &[(String, BBox)],
+    frame: &ReplyFrame,
     p: &DegenerateParams,
 ) -> (BoardReading, Vec<CollapsedText>) {
     let mut done = Vec::new();
@@ -439,8 +674,8 @@ pub fn collapse(
     // Nodes first: edges and owner tags follow a removed copy to the nearest
     // kept node of its text.
     let items = node_items(&reading);
-    let repeats = list_repeats(ElementList::Nodes, &items, anchors, p);
-    let gone = drops(&repeats, &items);
+    let repeats = fabricated(ElementList::Nodes, &items, anchors, frame, p);
+    let gone = drops(&repeats);
     let mut moved: HashMap<String, String> = HashMap::new();
     if !gone.is_empty() {
         let kept_ids: HashSet<&str> = reading
@@ -507,26 +742,26 @@ pub fn collapse(
     }
 
     let items = edge_items(&reading);
-    let repeats = list_repeats(ElementList::Edges, &items, anchors, p);
-    let gone = drops(&repeats, &items);
+    let repeats = fabricated(ElementList::Edges, &items, anchors, frame, p);
+    let gone = drops(&repeats);
     record(&mut done, &repeats);
     retain_indexed(&mut reading.edges, &gone);
 
     let items = sticky_items(&reading);
-    let repeats = list_repeats(ElementList::Stickies, &items, anchors, p);
-    let gone = drops(&repeats, &items);
+    let repeats = fabricated(ElementList::Stickies, &items, anchors, frame, p);
+    let gone = drops(&repeats);
     record(&mut done, &repeats);
     retain_indexed(&mut reading.stickies, &gone);
 
     let items = owner_items(&reading);
-    let repeats = list_repeats(ElementList::OwnerTags, &items, anchors, p);
-    let gone = drops(&repeats, &items);
+    let repeats = fabricated(ElementList::OwnerTags, &items, anchors, frame, p);
+    let gone = drops(&repeats);
     record(&mut done, &repeats);
     retain_indexed(&mut reading.owner_tags, &gone);
 
     let items = other_items(&reading);
-    let repeats = list_repeats(ElementList::OtherVisibleText, &items, anchors, p);
-    let gone = drops(&repeats, &items);
+    let repeats = fabricated(ElementList::OtherVisibleText, &items, anchors, frame, p);
+    let gone = drops(&repeats);
     record(&mut done, &repeats);
     retain_indexed(&mut reading.other_visible_text, &gone);
 
@@ -609,6 +844,25 @@ mod tests {
         DegenerateParams::default()
     }
 
+    /// A large image and unknown list limits: only piled copies are evidence.
+    fn frame() -> ReplyFrame {
+        ReplyFrame {
+            extent: BBox::new(0.0, 0.0, 10_000.0, 10_000.0),
+            caps: ListCaps::default(),
+        }
+    }
+
+    /// The board schema's list limits.
+    fn board_caps() -> ListCaps {
+        ListCaps {
+            nodes: 60,
+            edges: 80,
+            stickies: 60,
+            owner_tags: 20,
+            other_visible_text: 20,
+        }
+    }
+
     // Legitimate boards: never flagged, never changed.
 
     #[test]
@@ -625,7 +879,7 @@ mod tests {
             sticky("Ship on Friday?", 450.0, 600.0),
         ];
         assert_eq!(detect(&r, &[], &p()), None);
-        let (after, done) = collapse(r.clone(), &[], &p());
+        let (after, done) = collapse(r.clone(), &[], &frame(), &p());
         assert_eq!(after, r);
         assert!(done.is_empty());
     }
@@ -672,7 +926,7 @@ mod tests {
         assert_eq!(detect(&r, &anchors, &p()), None);
         // Without OCR the row is still six cards side by side, not copies.
         assert_eq!(detect(&r, &[], &p()), None);
-        let (after, done) = collapse(r.clone(), &[], &p());
+        let (after, done) = collapse(r.clone(), &[], &frame(), &p());
         assert_eq!(after, r);
         assert!(done.is_empty());
     }
@@ -694,7 +948,7 @@ mod tests {
             bbox: bb(450.0, 380.0),
         }];
         assert_eq!(detect(&r, &[], &p()), None);
-        let (after, done) = collapse(r.clone(), &[], &p());
+        let (after, done) = collapse(r.clone(), &[], &frame(), &p());
         assert_eq!(after, r);
         assert!(done.is_empty());
     }
@@ -714,7 +968,7 @@ mod tests {
         }
         let f = detect(&r, &[], &p()).expect("piled copies");
         assert_eq!((f.repeated[0].count, f.repeated[0].list_len), (5, 8));
-        let (after, _) = collapse(r, &[], &p());
+        let (after, _) = collapse(r, &[], &frame(), &p());
         assert_eq!(after.nodes.len(), 4);
         assert!(!stacked_pair(&bb(0.0, 0.0), &bb(60.0, 0.0)));
         assert!(stacked_pair(&bb(0.0, 0.0), &bb(40.0, 0.0)));
@@ -751,7 +1005,7 @@ mod tests {
             ..p()
         };
         assert_eq!(detect(&r, &[], &off), None);
-        assert!(collapse(r, &[], &off).1.is_empty());
+        assert!(collapse(r, &[], &frame(), &off).1.is_empty());
     }
 
     // Degenerate readings.
@@ -796,7 +1050,7 @@ mod tests {
             (rep.list, rep.text.as_str(), rep.count, rep.supported),
             (ElementList::Nodes, "mobile app", 28, 1)
         );
-        let (after, done) = collapse(r, &anchors, &p());
+        let (after, done) = collapse(r, &anchors, &frame(), &p());
         assert_eq!(after.nodes.len(), 8);
         let app: Vec<&BoardNode> = after
             .nodes
@@ -818,7 +1072,8 @@ mod tests {
                 list: ElementList::Nodes,
                 text: "mobile app".into(),
                 before: 28,
-                after: 1
+                after: 1,
+                evidence: vec![Fabrication::Piled],
             }]
         );
         assert_eq!(detect(&after, &anchors, &p()), None);
@@ -827,7 +1082,7 @@ mod tests {
     #[test]
     fn without_ocr_the_first_copy_is_kept() {
         let (r, _) = runaway_node_list();
-        let (after, _) = collapse(r, &[], &p());
+        let (after, _) = collapse(r, &[], &frame(), &p());
         let app: Vec<&BoardNode> = after
             .nodes
             .iter()
@@ -859,9 +1114,21 @@ mod tests {
             .collect();
         let f = detect(&r, &anchors, &p()).expect("degenerate");
         assert_eq!(f.repeated.len(), 5, "{f}");
-        let (after, done) = collapse(r, &anchors, &p());
+        // The grid ran the sticky list to its limit of 60: made up.
+        let capped = ReplyFrame {
+            caps: board_caps(),
+            ..frame()
+        };
+        let (after, done) = collapse(r.clone(), &anchors, &capped, &p());
         assert_eq!(after.stickies.len(), 5);
-        assert!(done.iter().all(|c| c.before == 12 && c.after == 1));
+        assert!(done
+            .iter()
+            .all(|c| c.before == 12 && c.after == 1 && c.evidence == [Fabrication::ListCap]));
+        // Side by side on the canvas in a list the limit did not stop, the same
+        // notes are retried but kept as read.
+        let (after, done) = collapse(r.clone(), &anchors, &frame(), &p());
+        assert_eq!(after, r);
+        assert!(done.is_empty());
     }
 
     #[test]
@@ -879,6 +1146,10 @@ mod tests {
         }
         let f = detect(&r, &[], &p()).expect("strong bound");
         assert_eq!(f.repeated[0].count, 8);
+        // The notes step half their width: piled, so made up.
+        let (after, done) = collapse(r.clone(), &[], &frame(), &p());
+        assert_eq!(after.stickies.len(), 23);
+        assert_eq!(done[0].evidence, [Fabrication::Piled]);
         let weak = DegenerateParams {
             strong_repeats: 0,
             ..p()
@@ -907,7 +1178,7 @@ mod tests {
             lists,
             [ElementList::OwnerTags, ElementList::OtherVisibleText]
         );
-        let (after, _) = collapse(r, &[], &p());
+        let (after, _) = collapse(r, &[], &frame(), &p());
         assert_eq!(after.owner_tags.len(), 1);
         assert_eq!(after.other_visible_text.len(), 1);
         assert_eq!(after.nodes.len(), 3);
@@ -953,7 +1224,7 @@ mod tests {
         let anchors = vec![span("API", 0.0, 0.0), span("API", 1000.0, 600.0)];
         let f = detect(&r, &anchors, &p()).expect("degenerate");
         assert_eq!((f.repeated[0].count, f.repeated[0].supported), (5, 2));
-        let (after, _) = collapse(r, &anchors, &p());
+        let (after, _) = collapse(r, &anchors, &frame(), &p());
         let ids: Vec<&str> = after.nodes.iter().map(|n| n.local_id.as_str()).collect();
         assert_eq!(ids, ["n1", "n2", "n6"]);
         let edges: Vec<(&str, &str)> = after
@@ -1051,7 +1322,7 @@ mod tests {
             r.stickies.push(sticky("TODO", f64::from(i) * 120.0, 200.0));
         }
         assert_eq!(detect(&r, &[], &p()), None);
-        let (after, done) = collapse(r.clone(), &[], &p());
+        let (after, done) = collapse(r.clone(), &[], &frame(), &p());
         assert_eq!(after, r);
         assert!(done.is_empty());
     }
@@ -1064,5 +1335,305 @@ mod tests {
             f.to_string(),
             "Nodes \"mobile app\" x28 of 35 (1 OCR-backed)"
         );
+    }
+
+    // Regressions: copies side by side are retried, never collapsed by count.
+
+    /// Eight nodes, each with an "Avery" owner tag under it that OCR missed.
+    fn owner_on_every_node(n: usize) -> BoardReading {
+        let mut r = reading();
+        r.nodes = distinct_nodes(n);
+        for node in r.nodes.clone() {
+            let b = node.bbox;
+            r.owner_tags.push(OwnerTag {
+                name_raw: "Avery".into(),
+                near: node.local_id.clone(),
+                bbox: BBox::new(b.x1, b.y2 + 2.0, b.x1 + 40.0, b.y2 + 14.0),
+            });
+        }
+        r
+    }
+
+    #[test]
+    fn one_owner_on_eight_nodes_is_flagged_but_kept() {
+        let r = owner_on_every_node(8);
+        // Eight copies, seven excess of eight: worth the retry...
+        let f = detect(&r, &[], &p()).expect("flagged for the retry");
+        assert_eq!(
+            (f.repeated[0].list, f.repeated[0].count),
+            (ElementList::OwnerTags, 8)
+        );
+        // ...but when the retry repeats them, every assignment stays.
+        let capped = ReplyFrame {
+            caps: board_caps(),
+            ..frame()
+        };
+        let (after, done) = collapse(r.clone(), &[], &capped, &p());
+        assert_eq!(after, r);
+        assert!(done.is_empty());
+        // Owner tags never collapse on the list limit: twenty tags on twenty
+        // nodes fill the owner list and stay.
+        let full = owner_on_every_node(20);
+        assert_eq!(full.owner_tags.len(), board_caps().owner_tags);
+        assert!(detect(&full, &[], &p()).is_some());
+        let (after, done) = collapse(full.clone(), &[], &capped, &p());
+        assert_eq!(after, full);
+        assert!(done.is_empty());
+    }
+
+    #[test]
+    fn owner_tags_off_the_canvas_go_and_the_rest_stay() {
+        // Three real tags, five copies wholly outside the 800 x 400 image: the
+        // copies go, the three real assignments stay.
+        let mut r = owner_on_every_node(8);
+        let small = ReplyFrame {
+            extent: BBox::new(0.0, 0.0, 800.0, 400.0),
+            ..frame()
+        };
+        for (i, t) in r.owner_tags.iter_mut().enumerate().skip(3) {
+            let x = 900.0 + i as f64 * 50.0;
+            t.bbox = BBox::new(x, 500.0, x + 40.0, 512.0);
+        }
+        let (after, done) = collapse(r.clone(), &[], &small, &p());
+        assert_eq!(after.owner_tags, r.owner_tags[..3]);
+        assert_eq!((done[0].before, done[0].after), (8, 3));
+        assert_eq!(done[0].evidence, [Fabrication::OffCanvas]);
+        // With every copy outside, the first stays.
+        for (i, t) in r.owner_tags.iter_mut().enumerate() {
+            let x = 900.0 + i as f64 * 50.0;
+            t.bbox = BBox::new(x, 500.0, x + 40.0, 512.0);
+        }
+        let (after, _) = collapse(r.clone(), &[], &small, &p());
+        assert_eq!(after.owner_tags, r.owner_tags[..1]);
+    }
+
+    #[test]
+    fn a_tile_drops_its_off_tile_copies_even_where_canvas_ocr_backs_them() {
+        // A tile covering x 0..500 reads one real "Queue" box and restates it
+        // eight times to the right of the tile, where OCR of the whole canvas
+        // happens to read "Queue" under one of the copies.
+        let mut r = reading();
+        r.nodes = vec![node("q0", "Queue", 100.0, 100.0)];
+        for k in 0..8 {
+            r.nodes.push(node(
+                &format!("q{}", k + 1),
+                "Queue",
+                600.0 + f64::from(k) * 150.0,
+                100.0,
+            ));
+        }
+        let anchors = vec![span("Queue", 100.0, 100.0), span("Queue", 750.0, 100.0)];
+        let tile = ReplyFrame {
+            extent: BBox::new(0.0, 0.0, 500.0, 400.0),
+            ..frame()
+        };
+        assert!(detect(&r, &anchors, &p()).is_some());
+        let (after, done) = collapse(r.clone(), &anchors, &tile, &p());
+        let ids: Vec<&str> = after.nodes.iter().map(|n| n.local_id.as_str()).collect();
+        assert_eq!(ids, ["q0"]);
+        assert_eq!(done[0].evidence, [Fabrication::OffCanvas]);
+        // Run to the list limit, the keepers still come from inside the tile.
+        let capped = ReplyFrame {
+            caps: ListCaps {
+                nodes: 9,
+                ..ListCaps::default()
+            },
+            ..tile
+        };
+        let (after, _) = collapse(r, &anchors, &capped, &p());
+        let ids: Vec<&str> = after.nodes.iter().map(|n| n.local_id.as_str()).collect();
+        assert_eq!(ids, ["q0"]);
+    }
+
+    #[test]
+    fn a_pile_collapses_but_separate_copies_of_its_text_stay() {
+        // Five "Card" copies stepped 10 px over one box, and three real "Card"
+        // boxes elsewhere: the pile keeps one copy, the three stay.
+        let mut r = reading();
+        r.nodes = distinct_nodes(2);
+        for k in 0..5 {
+            r.nodes.push(node(
+                &format!("p{k}"),
+                "Card",
+                600.0 + f64::from(k) * 10.0,
+                400.0,
+            ));
+        }
+        for k in 0..3 {
+            r.nodes
+                .push(node(&format!("c{k}"), "Card", f64::from(k) * 150.0, 800.0));
+        }
+        let (after, done) = collapse(r, &[], &frame(), &p());
+        let ids: Vec<&str> = after.nodes.iter().map(|n| n.local_id.as_str()).collect();
+        assert_eq!(ids, ["n1", "n2", "p0", "c0", "c1", "c2"]);
+        assert_eq!(done[0].evidence, [Fabrication::Piled]);
+    }
+
+    /// Seven pairs of real "Deploy" cards overlapping by 40% of a card, each
+    /// read by OCR with a wide span (the two spans of a pair pile on each other
+    /// and the second span's center lies in the first card too), and an edge
+    /// from each card to its pair.
+    fn deploy_pairs() -> (BoardReading, Vec<(String, BBox)>) {
+        let mut r = reading();
+        let mut spans = Vec::new();
+        for k in 0..7 {
+            let y = f64::from(k) * 100.0;
+            for (id, x) in [("a", 0.0), ("b", 60.0)] {
+                r.nodes.push(BoardNode {
+                    local_id: format!("{id}{k}"),
+                    text: "Deploy".into(),
+                    bbox: BBox::new(x, y, x + 100.0, y + 50.0),
+                    conf: 0.9,
+                });
+            }
+            r.edges.push(edge(&format!("a{k}"), &format!("b{k}"), ""));
+            spans.push((
+                "Deploy".to_string(),
+                BBox::new(0.0, y + 15.0, 120.0, y + 35.0),
+            ));
+            spans.push((
+                "Deploy".to_string(),
+                BBox::new(40.0, y + 15.0, 160.0, y + 35.0),
+            ));
+        }
+        (r, spans)
+    }
+
+    #[test]
+    fn overlapping_cards_each_keep_their_own_span() {
+        let (r, spans) = deploy_pairs();
+        assert!(stacked_pair(&spans[0].1, &spans[1].1));
+        assert!(!stacked_pair(&r.nodes[0].bbox, &r.nodes[1].bbox));
+        let items = node_items(&r);
+        assert_eq!(supported(&items, &spans, 0.25), vec![true; 14]);
+        assert_eq!(detect(&r, &spans, &p()), None);
+        let (after, done) = collapse(r.clone(), &spans, &frame(), &p());
+        assert_eq!(after, r);
+        assert!(done.is_empty());
+    }
+
+    #[test]
+    fn cards_overlapping_by_more_than_half_each_keep_their_own_span() {
+        // Seven pairs of real "Deploy" cards overlapping by 60% (piled by the
+        // box rule), each read by OCR once at its own text.
+        let mut r = reading();
+        let mut spans = Vec::new();
+        for k in 0..7 {
+            let y = f64::from(k) * 100.0;
+            for (id, x) in [("a", 0.0), ("b", 40.0)] {
+                r.nodes.push(BoardNode {
+                    local_id: format!("{id}{k}"),
+                    text: "Deploy".into(),
+                    bbox: BBox::new(x, y, x + 100.0, y + 50.0),
+                    conf: 0.9,
+                });
+                spans.push((
+                    "Deploy".to_string(),
+                    BBox::new(x + 10.0, y + 15.0, x + 90.0, y + 35.0),
+                ));
+            }
+        }
+        assert!(stacked_pair(&r.nodes[0].bbox, &r.nodes[1].bbox));
+        let items = node_items(&r);
+        assert_eq!(supported(&items, &spans, 0.25), vec![true; 14]);
+        assert_eq!(detect(&r, &spans, &p()), None);
+    }
+
+    #[test]
+    fn a_span_that_resolves_to_a_backed_card_backs_nothing() {
+        // One card, OCR reports its text twice: the second span resolves to the
+        // same card and does not fall through to a neighbor.
+        let mut r = reading();
+        r.nodes = vec![
+            node("a", "Deploy", 0.0, 0.0),
+            node("b", "Deploy", 160.0, 0.0),
+        ];
+        let twice = vec![span("Deploy", 0.0, 0.0), span("Deploy", 2.0, 0.0)];
+        let items = node_items(&r);
+        assert_eq!(supported(&items, &twice, 0.25), vec![true, false]);
+    }
+
+    /// A runaway row: two real boxes, then one text restated 28 times in a row
+    /// with a fixed step that runs past the right edge of the 1920 px image.
+    fn row_past_the_edge() -> BoardReading {
+        let mut r = reading();
+        r.nodes = vec![
+            node("n1", "Camera", 220.0, 255.0),
+            node("n2", "Upload", 320.0, 255.0),
+        ];
+        for k in 0..28 {
+            let x = 565.0 + f64::from(k) * 135.0;
+            r.nodes.push(BoardNode {
+                local_id: format!("n{}", k + 3),
+                text: "Mobile App".into(),
+                bbox: BBox::new(x, 255.0, x + 80.0, 295.0),
+                conf: 0.9,
+            });
+        }
+        r.edges = (0..28)
+            .map(|k| edge("n2", &format!("n{}", k + 3), ""))
+            .collect();
+        r
+    }
+
+    #[test]
+    fn a_runaway_row_past_the_canvas_edge_is_collapsed() {
+        let r = row_past_the_edge();
+        assert!(detect(&r, &[], &p()).is_some());
+        let image = ReplyFrame {
+            extent: BBox::new(0.0, 0.0, 1920.0, 954.0),
+            caps: ListCaps::default(),
+        };
+        // The 17 copies wholly past the edge go; their edges join the nearest
+        // kept copy's. The eleven inside stay (the retry repeated them).
+        let (after, done) = collapse(r.clone(), &[], &image, &p());
+        assert_eq!(after.nodes.len(), 13);
+        assert_eq!(after.edges.len(), 11);
+        assert!(after.nodes.iter().all(|n| n.bbox.x1 < 1920.0));
+        assert_eq!((done[0].before, done[0].after), (28, 11));
+        assert_eq!(done[0].evidence, [Fabrication::OffCanvas]);
+        // At the compact list limit (30 nodes) the same row is also capped.
+        let compact = ReplyFrame {
+            caps: ListCaps {
+                nodes: 30,
+                ..ListCaps::default()
+            },
+            ..image
+        };
+        let (after, done) = collapse(r.clone(), &[], &compact, &p());
+        assert_eq!(
+            done[0].evidence,
+            [Fabrication::OffCanvas, Fabrication::ListCap]
+        );
+        assert_eq!((after.nodes.len(), after.edges.len()), (3, 1));
+        // A list at its limit whose last item is no copy was not stopped mid-run.
+        let mut last_real = r.clone();
+        last_real.nodes.rotate_left(2);
+        let (after, done) = collapse(
+            last_real.clone(),
+            &[],
+            &ReplyFrame {
+                extent: frame().extent,
+                ..compact
+            },
+            &p(),
+        );
+        assert_eq!(after, last_real);
+        assert!(done.is_empty());
+        // Inside a wide enough image, below the limit, the row is kept.
+        let (after, done) = collapse(r.clone(), &[], &frame(), &p());
+        assert_eq!(after, r);
+        assert!(done.is_empty());
+    }
+
+    #[test]
+    fn a_box_touching_the_edge_from_outside_is_outside() {
+        let e = BBox::new(0.0, 0.0, 100.0, 100.0);
+        assert!(outside(&BBox::new(100.0, 0.0, 120.0, 10.0), &e));
+        assert!(!outside(&BBox::new(90.0, 0.0, 120.0, 10.0), &e));
+        assert!(outside(&BBox::new(-30.0, 0.0, 0.0, 10.0), &e));
+        // A box without area is nowhere.
+        assert!(!outside(&BBox::new(0.0, 0.0, 0.0, 0.0), &e));
+        assert!(!outside(&BBox::new(200.0, 0.0, 200.0, 10.0), &e));
     }
 }

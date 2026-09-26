@@ -706,9 +706,11 @@ async fn a_regular_row_cut_at_the_limit_takes_the_budget_retry() {
 
 /// Scripted model whose board reads come back complete and valid but list the
 /// one real box six times under fresh ids (stepped boxes), with an edge to each
-/// copy. The repeat-penalty retry answers as `retry` says.
+/// copy (or the answer `board` builds). The repeat-penalty retry answers as
+/// `retry` says.
 struct DegenerateModel {
     retry: RetryReply,
+    board: fn(f64, f64) -> serde_json::Value,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -740,6 +742,24 @@ fn degenerate_board(w: f64, h: f64) -> serde_json::Value {
            "other_visible_text": [], "confidence": 0.7})
 }
 
+/// Eight separate boxes, each with an "Avery" owner tag under it: one person
+/// owning eight things, a name OCR does not read.
+fn one_owner_board(w: f64, h: f64) -> serde_json::Value {
+    let mut nodes = Vec::new();
+    let mut owner_tags = Vec::new();
+    for k in 0..8 {
+        let x = 0.02 * w + f64::from(k) * 0.12 * w;
+        nodes.push(
+            json!({"local_id": format!("n{}", k + 1), "text": format!("Step {k}"),
+            "bbox_2d": [x, 0.3 * h, x + 0.1 * w, 0.4 * h], "conf": 0.9}),
+        );
+        owner_tags.push(json!({"name_raw": "Avery", "near": format!("n{}", k + 1),
+            "bbox_2d": [x, 0.42 * h, x + 0.05 * w, 0.46 * h]}));
+    }
+    json!({"nodes": nodes, "edges": [], "stickies": [], "owner_tags": owner_tags,
+           "other_visible_text": [], "confidence": 0.7})
+}
+
 #[async_trait]
 impl VisionBackend for DegenerateModel {
     fn id(&self) -> BackendId {
@@ -763,7 +783,7 @@ impl VisionBackend for DegenerateModel {
             });
         }
         if board && (!retry || self.retry == RetryReply::Degenerate) {
-            let value = degenerate_board(
+            let value = (self.board)(
                 f64::from(request.image.width()),
                 f64::from(request.image.height()),
             );
@@ -793,7 +813,10 @@ async fn degenerate_reads_retry_then_collapse_and_replay(retry: RetryReply) {
         root,
         &live,
         Arc::new(RecordingBackend::new(
-            Arc::new(DegenerateModel { retry }),
+            Arc::new(DegenerateModel {
+                retry,
+                board: degenerate_board,
+            }),
             store.clone(),
         )),
     )
@@ -874,4 +897,63 @@ async fn still_degenerate_reads_are_collapsed_and_replay() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_degenerate_retry_keeps_the_first_reply_and_replays() {
     degenerate_reads_retry_then_collapse_and_replay(RetryReply::Truncated).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn separate_owner_tags_the_retry_repeats_are_kept_and_replay() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_inputs(root);
+    let store = RawStore::new(root.join("raw"));
+    let live = root.join("live");
+    let (monitor, _) = run_branch(
+        root,
+        &live,
+        Arc::new(RecordingBackend::new(
+            Arc::new(DegenerateModel {
+                retry: RetryReply::Degenerate,
+                board: one_owner_board,
+            }),
+            store.clone(),
+        )),
+    )
+    .await;
+    // 3 classify + 2 flagged board reads + 2 penalized retries.
+    assert_eq!(monitor.completed(), 7);
+    let readings: Vec<(String, BoardReadingItem)> = read(&live, artifacts::BOARD_READING);
+    assert_eq!(readings.len(), 2);
+    for (_, r) in &readings {
+        let d = r.requests[0]
+            .degenerate
+            .as_ref()
+            .expect("the repeated owner is flagged for the retry");
+        let rep = &d.finding.repeated[0];
+        assert_eq!((rep.text.as_str(), rep.count), ("avery", 8));
+        assert!(d.retried && d.retry_error.is_none(), "{d:?}");
+        // The retry repeats the tags side by side: every assignment stays.
+        assert!(d.collapsed.is_empty(), "{d:?}");
+        assert_eq!(r.result.owner_tags.len(), 8);
+        let near: Vec<&str> = r
+            .result
+            .owner_tags
+            .iter()
+            .map(|o| o.near.as_str())
+            .collect();
+        assert_eq!(near, ["n1", "n2", "n3", "n4", "n5", "n6", "n7", "n8"]);
+    }
+
+    let replay = root.join("replay");
+    run_branch(
+        root,
+        &replay,
+        Arc::new(ReplayBackend::new("scripted-vl", store)),
+    )
+    .await;
+    let again: Vec<(String, BoardReadingItem)> = read(&replay, artifacts::BOARD_READING);
+    assert_eq!(again.len(), 2);
+    for ((_, a), (_, b)) in again.iter().zip(&readings) {
+        assert_eq!(a.result, b.result);
+        assert_eq!(a.requests[0].request_key, b.requests[0].request_key);
+        assert_eq!(a.requests[0].degenerate, b.requests[0].degenerate);
+    }
 }

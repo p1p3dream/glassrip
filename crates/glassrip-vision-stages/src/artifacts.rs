@@ -360,8 +360,10 @@ pub struct DegenerateLog {
     /// store records); the first reply was kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_error: Option<String>,
-    /// Texts of the kept reply reduced to their best-supported copies (a warning:
-    /// the reading was still degenerate). Empty when the retry came back sound.
+    /// Texts of the kept reply that it fabricated (see
+    /// `glassrip_vision::degenerate::Fabrication`), reduced to their
+    /// best-supported copies (a warning). Empty when the retry came back sound
+    /// or no repeated text showed a sign of fabrication (kept as read).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collapsed: Vec<glassrip_vision::degenerate::CollapsedText>,
 }
