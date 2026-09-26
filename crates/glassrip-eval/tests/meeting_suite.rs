@@ -627,3 +627,129 @@ fn owner_and_static_window_clocks_are_declared_per_section() {
     g.clocks.allowed_events = Some(grid(10.0));
     assert_eq!(metrics(&g)["events.false_change"], 1.0);
 }
+
+/// Codex final round 3 BLOCKER: `glassrip eval --suite meeting` with a golden set
+/// and no run artifacts (or only some of them) scored nothing and still reported
+/// PASS. Every section that could not be scored fails the suite.
+#[tokio::test]
+async fn meeting_eval_without_run_artifacts_fails() {
+    #[derive(clap::Parser)]
+    struct Wrap {
+        #[command(flatten)]
+        args: glassrip_eval::cli::EvalArgs,
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let private = tmp.path().join("private");
+    std::fs::create_dir_all(private.join("golden")).unwrap();
+    std::fs::write(
+        private.join("golden/meeting_golden.json"),
+        serde_json::to_vec_pretty(&golden()).unwrap(),
+    )
+    .unwrap();
+    let cfg = tmp.path().join("eval.toml");
+    std::fs::write(
+        &cfg,
+        format!("[eval]\nprivate_fixtures = \"{}\"\n", private.display()),
+    )
+    .unwrap();
+    let eval = |artifacts: Option<&Path>, out: &str| {
+        let out = tmp.path().join(out);
+        let mut argv = vec![
+            "eval".to_string(),
+            "--suite".into(),
+            "meeting".into(),
+            "--config".into(),
+            cfg.display().to_string(),
+            "--out".into(),
+            out.display().to_string(),
+        ];
+        if let Some(a) = artifacts {
+            argv.extend(["--artifacts".to_string(), a.display().to_string()]);
+        }
+        let args = <Wrap as clap::Parser>::try_parse_from(argv).unwrap().args;
+        async move {
+            let outcome = glassrip_eval::cli::run(args).await.unwrap();
+            let report: Value =
+                serde_json::from_slice(&std::fs::read(out.join("eval_report.json")).unwrap())
+                    .unwrap();
+            (outcome, report)
+        }
+    };
+    let gate = |report: &Value| {
+        report["gates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["name"] == "all_sections_scored")
+            .cloned()
+            .unwrap_or_else(|| panic!("no completeness gate: {report}"))
+    };
+
+    // No artifacts directory at all (the default under the private root).
+    let (outcome, report) = eval(None, "none").await;
+    assert!(!outcome.passed, "{report}");
+    assert_eq!(outcome.status, glassrip_eval::report::Status::Fail);
+    assert_eq!(gate(&report)["pass"], json!(false), "{report}");
+    // An explicit artifacts path that does not exist.
+    let (outcome, _) = eval(Some(&tmp.path().join("missing")), "missing").await;
+    assert!(!outcome.passed);
+
+    // Only the notes: every other section is unscored.
+    let run = tmp.path().join("run");
+    write(
+        &run,
+        schema::MEETING_NOTES,
+        vec![(
+            "meeting_notes",
+            ra::notes("ok", &["defer the importer"], &[], &[]),
+        )],
+    );
+    let (outcome, report) = eval(Some(&run), "partial").await;
+    assert!(!outcome.passed, "{report}");
+    let detail = gate(&report)["detail"].as_str().unwrap().to_string();
+    assert!(detail.contains("glassrip.board_state"), "{detail}");
+}
+
+/// Codex final round 3 MAJOR: a speakers artifact whose labels were all left
+/// unresolved is not a name mapping, and an unresolved voice never stands in for
+/// a person in the post-mapping error.
+#[test]
+fn unresolved_labels_do_not_satisfy_the_post_mapping_speaker_check() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        schema::TRANSCRIPT,
+        vec![
+            ("s1", ra::segment("s1", "S0", 0.0, 5.0, "hi", &[])),
+            ("s2", ra::segment("s2", "S1", 5.0, 9.0, "ok", &[])),
+        ],
+    );
+    let speakers = |s0: Option<&str>| {
+        vec![
+            ("S0", ra::speaker_label("S0", s0)),
+            ("S1", ra::speaker_label("S1", None)),
+        ]
+    };
+    // Two labels, two people in the golden set, nobody named.
+    write(dir.path(), schema::SPEAKERS, speakers(None));
+    let run = run_meeting(&golden(), &RunArtifacts::scan(dir.path()).unwrap(), 2.0).unwrap();
+    assert!(
+        !run.metrics.contains_key("audio.speaker_identity_error"),
+        "{:?}",
+        run.metrics
+    );
+    assert!(
+        run.gate_failures.iter().any(|g| g.contains("names nobody")),
+        "{:?}",
+        run.gate_failures
+    );
+    // One named, one unresolved: the unresolved voice does not fill in for the
+    // second person.
+    write(dir.path(), schema::SPEAKERS, speakers(Some("avery")));
+    let run = run_meeting(&golden(), &RunArtifacts::scan(dir.path()).unwrap(), 2.0).unwrap();
+    assert_eq!(run.metrics["audio.speaker_identities"], 2.0);
+    assert_eq!(run.metrics["audio.speaker_unresolved"], 1.0);
+    assert_eq!(run.metrics["audio.speaker_mapping_coverage"], 0.5);
+    assert_eq!(run.metrics["audio.speaker_identity_error"], 2.0);
+    assert!(run.gate_failures.is_empty(), "{:?}", run.gate_failures);
+}

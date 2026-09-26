@@ -642,6 +642,29 @@ fn resolve_person(g: &MeetingGolden, name: &str) -> Option<String> {
 /// unattributed voice. An unresolved segment is never folded into a person the
 /// pipeline did not name it as.
 pub fn speaker_identities(records: &[SpeakersRecord], segs: &[TranscriptSegment]) -> usize {
+    let a = speaker_attribution(records, segs);
+    a.people + a.unresolved
+}
+
+/// How the `name_speakers` mapping attributes the transcript's speech.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpeakerAttribution {
+    /// Distinct people the speech was attributed to.
+    pub people: usize,
+    /// Distinct voices left unresolved (raw labels nobody was named for).
+    pub unresolved: usize,
+    /// Segments attributed to a person.
+    pub named_segments: usize,
+    /// Segments.
+    pub segments: usize,
+}
+
+/// Attribution of each segment as in [`speaker_identities`], split into named
+/// people and unresolved voices.
+pub fn speaker_attribution(
+    records: &[SpeakersRecord],
+    segs: &[TranscriptSegment],
+) -> SpeakerAttribution {
     let mut by_segment: BTreeMap<&str, Option<&str>> = BTreeMap::new();
     let mut by_label: BTreeMap<&str, &str> = BTreeMap::new();
     for r in records {
@@ -657,20 +680,31 @@ pub fn speaker_identities(records: &[SpeakersRecord], segs: &[TranscriptSegment]
             _ => {}
         }
     }
-    segs.iter()
-        .map(|s| {
-            let label = s.speaker_label.trim();
-            let person = match by_segment.get(s.segment_id.as_str()) {
-                Some(explicit) => *explicit,
-                None => by_label.get(label).copied(),
-            };
-            match person {
-                Some(p) => format!("person:{p}"),
-                None => format!("label:{label}"),
+    let mut people = std::collections::BTreeSet::new();
+    let mut unresolved = std::collections::BTreeSet::new();
+    let mut named_segments = 0;
+    for s in segs {
+        let label = s.speaker_label.trim();
+        let person = match by_segment.get(s.segment_id.as_str()) {
+            Some(explicit) => *explicit,
+            None => by_label.get(label).copied(),
+        };
+        match person {
+            Some(p) => {
+                named_segments += 1;
+                people.insert(p);
             }
-        })
-        .collect::<std::collections::BTreeSet<_>>()
-        .len()
+            None => {
+                unresolved.insert(label);
+            }
+        }
+    }
+    SpeakerAttribution {
+        people: people.len(),
+        unresolved: unresolved.len(),
+        named_segments,
+        segments: segs.len(),
+    }
 }
 
 /// Owner truth with each kind of time (probes, assignment windows, moves) moved from
@@ -1066,26 +1100,46 @@ pub fn run_meeting(
                 (n as f64 - people).abs(),
             );
             // After `name_speakers`: two labels mapped to one person are one
-            // speaker, and speech nobody was named for is its own voice. Without a
-            // mapping (no speakers artifact, or one with no label or segment
-            // records) there is nothing to score, and the 9.3 target cannot pass
-            // by being skipped: the run fails.
+            // speaker, and speech nobody was named for is its own voice. The
+            // error is the gap between the people named and the people, plus
+            // every unresolved voice: an unresolved label never stands in for a
+            // person, so the 9.3 target passes only when all speech is named and
+            // the named people match. Without a mapping (no speakers artifact, or
+            // one that names nobody) there is nothing to score, and the target
+            // cannot pass by being skipped: the run fails.
             let mapping = speakers.as_ref().filter(|records| {
-                records
-                    .iter()
-                    .any(|r| matches!(r, SpeakersRecord::Label(_) | SpeakersRecord::Segment(_)))
+                records.iter().any(|r| match r {
+                    SpeakersRecord::Label(l) => l.person_id.is_some(),
+                    SpeakersRecord::Segment(s) => s.person_id.is_some(),
+                    _ => false,
+                })
             });
             match mapping {
                 Some(records) => {
-                    let identities = speaker_identities(records, segs);
-                    m.insert("audio.speaker_identities".into(), identities as f64);
+                    let a = speaker_attribution(records, segs);
+                    m.insert(
+                        "audio.speaker_identities".into(),
+                        (a.people + a.unresolved) as f64,
+                    );
+                    m.insert("audio.speaker_unresolved".into(), a.unresolved as f64);
                     m.insert(
                         "audio.speaker_identity_error".into(),
-                        (identities as f64 - people).abs(),
+                        (a.people as f64 - people).abs() + a.unresolved as f64,
                     );
+                    if a.segments > 0 {
+                        m.insert(
+                            "audio.speaker_mapping_coverage".into(),
+                            a.named_segments as f64 / a.segments as f64,
+                        );
+                    }
+                    if a.named_segments == 0 && !segs.is_empty() {
+                        run.gate_failures.push(
+                            "speaker mapping coverage: glassrip.speakers names nobody in the transcript's speech".into(),
+                        );
+                    }
                 }
                 None if !segs.is_empty() => run.gate_failures.push(
-                    "audio.speaker_identity_error not evaluated: the transcript has speech but glassrip.speakers holds no name mapping".into(),
+                    "audio.speaker_identity_error not evaluated: the transcript has speech but glassrip.speakers names nobody".into(),
                 ),
                 None => {}
             }

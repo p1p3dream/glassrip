@@ -743,6 +743,39 @@ const NEUTRAL_ADVERBS: &[&str] = &[
     "anymore", "again", "either", "ever", "really", "actually", "still", "longer",
 ];
 
+/// Reporting verbs and sequence words that frame a retraction before its
+/// negation ("Later Tam said she won't ship weekly builds") without naming
+/// anything the claim is about.
+const REPORTING_WORDS: &[&str] = &[
+    "say",
+    "said",
+    "tell",
+    "told",
+    "later",
+    "then",
+    "now",
+    "announce",
+    "announced",
+    "confirm",
+    "confirmed",
+    "mention",
+    "mentioned",
+    "decide",
+    "decided",
+    "agree",
+    "agreed",
+    "add",
+    "added",
+    "clarify",
+    "clarified",
+    "note",
+    "noted",
+    "explain",
+    "explained",
+    "reply",
+    "replied",
+];
+
 /// In one unit of a prediction (a clause, or an "and" segment of one,
 /// [`claim_segments`]), a gold word is *flipped* when the unit states it with the
 /// opposite polarity, and *kept* when the unit states it with the gold's polarity
@@ -759,9 +792,10 @@ const NEUTRAL_ADVERBS: &[&str] = &[
 /// a word of its own (not a gold word, not one of [`NEUTRAL_ADVERBS`]) stands
 /// between or after its flipped gold words ("Tamsin doesn't ship nightly builds",
 /// "she does not ship weekly builds to production", "... do not ship after audit"),
-/// or, where no gold word is both flipped and kept, right next to a kept gold word
-/// other than a participant ("Tamsin's nightly builds do not ship", "the Ledger
-/// Queue does not ship"). Otherwise it retracts when some gold word is flipped, the
+/// or, where no gold word is both flipped and kept, anywhere before the negation
+/// unless it is a name or one of [`REPORTING_WORDS`] ("Tamsin's nightly builds do
+/// not ship", "the Ledger Queue does not ship", "Tamsin nightly does not ship
+/// builds"). Otherwise it retracts when some gold word is flipped, the
 /// claim's protected words (head and predicate, [`covers`]) are flipped or kept, and
 ///
 /// - when no gold word is both flipped and kept, the flipped and kept words together
@@ -845,14 +879,15 @@ fn clause_retracts(
             }
         });
     }
-    let modifies_kept = |i: usize| {
-        [i.checked_sub(1), Some(i + 1)]
-            .into_iter()
-            .flatten()
-            .filter_map(|j| prefix.get(j))
-            .any(|y| !y.term.starts_with('@') && gold_term(y))
-    };
-    if (0..prefix.len()).any(|i| own(&prefix[i]) && modifies_kept(i)) {
+    // A word of the unit's own before the negation (other than a name or a
+    // reporting word) makes the clause about something else, wherever it sits:
+    // next to a kept gold word ("Tamsin's nightly builds do not ship"), a
+    // participant, or the negation ("Tamsin nightly does not ship builds").
+    let reporting = |x: &ClaimWord| REPORTING_WORDS.iter().any(|a| stem(a) == x.term);
+    if prefix
+        .iter()
+        .any(|x| own(x) && !reporting(x) && !x.term.starts_with('@') && !vocab.is_name(&x.term))
+    {
         return false;
     }
     let retracted = |w: &ClaimWord| flipped(w) || kept(w);
@@ -1562,6 +1597,11 @@ mod tests {
             (
                 "Tamsin ships builds",
                 "Tamsin ships builds; Tamsin's nightly builds do not ship",
+            ),
+            // Kimi final N1: a word of its own next to a participant only
+            (
+                "Tamsin ships builds",
+                "Tamsin ships builds; Tamsin nightly does not ship builds",
             ),
             (
                 "Ledger ships weekly builds",

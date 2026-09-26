@@ -316,6 +316,29 @@ fn standard_gates(report: &mut EvalReport, runs: &[SuiteRun]) {
     }
 }
 
+/// A suite scored from run artifacts fails when any section could not be scored
+/// (no run artifacts at all, or a missing artifact): its metrics are absent, and
+/// an absent metric has no target to miss, so without this gate a run that scored
+/// nothing would pass.
+fn completeness_gate(report: &mut EvalReport, runs: &[SuiteRun]) {
+    let missing: std::collections::BTreeSet<&str> = runs
+        .iter()
+        .flat_map(|r| r.not_run.iter().map(String::as_str))
+        .collect();
+    report.gates.push(GateResult {
+        name: "all_sections_scored".into(),
+        pass: missing.is_empty(),
+        detail: if missing.is_empty() {
+            "every section was scored".into()
+        } else {
+            format!(
+                "not scored: {}",
+                missing.into_iter().collect::<Vec<_>>().join("; ")
+            )
+        },
+    });
+}
+
 /// Runs `glassrip eval`.
 pub async fn run(args: EvalArgs) -> Result<EvalOutcome> {
     let config = load_config(args.config.as_deref())?;
@@ -589,6 +612,7 @@ pub async fn run(args: EvalArgs) -> Result<EvalOutcome> {
             };
             let mut report = base_report(suite, "artifacts", &model, &runs);
             standard_gates(&mut report, &runs);
+            completeness_gate(&mut report, &runs);
             let out = args
                 .out
                 .clone()

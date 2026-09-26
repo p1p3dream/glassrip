@@ -951,10 +951,27 @@ async fn score_run_with_eval(root: &Path, run: &Path) {
     .unwrap()
     .args;
     let outcome = glassrip_eval::cli::run(args).await.unwrap();
-    assert!(outcome.passed, "{:?}", outcome.status);
     let report: Value =
         serde_json::from_slice(&std::fs::read(report_dir.join("eval_report.json")).unwrap())
             .unwrap();
+    // The scripted run names nobody (no tile names on the synthetic video), so the
+    // post-mapping speaker check has nothing to score and fails the suite; every
+    // other gate passes and every section is scored.
+    let failed: Vec<&Value> = report["gates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|g| g["pass"] != json!(true))
+        .collect();
+    assert!(!outcome.passed, "{:?}", outcome.status);
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert!(
+        failed[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("glassrip.speakers names nobody"),
+        "{failed:?}"
+    );
     let metric = |k: &str| {
         report["metrics"][k]["mean"]
             .as_f64()
