@@ -40,7 +40,7 @@ use crate::text::{
 
 /// Owner events of an assignment: the owner tag of this person appearing on,
 /// or moving to, this target near the assignment's start.
-fn owner_events<'a>(b: &'a BoardStateItem, o: &OwnerAssignment) -> Vec<&'a BoardEvent> {
+pub(crate) fn owner_events<'a>(b: &'a BoardStateItem, o: &OwnerAssignment) -> Vec<&'a BoardEvent> {
     let tid = target_id(&o.target);
     let ttext = target_text(&o.target).to_lowercase();
     b.events

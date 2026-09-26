@@ -15,7 +15,7 @@ use crate::text::{content_tokens, estimate_tokens, jaccard, mmss};
 /// System prompt for every call.
 pub const SYSTEM: &str = "You write meeting notes from a speaker-attributed transcript and a summary of the whiteboard shown in the meeting. \
 Use only what was said or shown; never add facts. \
-Every item must cite the ids of the transcript lines that support it (segment_ids, for example seg_00012), and may also cite board event ids and keyframe ids from the board summary. Cite only ids that appear in the input. \
+Every item must cite the ids of the transcript lines that support it (segment_ids, for example seg_00012), and may also cite board event ids and keyframe ids from the board summary; an action item or decision backed only by an owner tag on the board may cite just that board id. Cite only ids that appear in the input. \
 The quote field must be copied exactly from one cited transcript line (3 to 20 consecutive words, keep the original wording and spelling) or be an empty string. \
 Decisions: choices the group settled on (what to do, what not to do, a change in who does what), not ideas that were only floated; giving someone a task or ownership is an action item for that person, not a decision. \
 Action items: one person (or everyone) who will do one concrete task; owner is a participant name or everyone; the task starts with a verb and names what is done. Never list greetings, farewells, thanks or small talk. \
@@ -52,13 +52,17 @@ fn board_block(extras: &PromptExtras, reduce: bool) -> String {
     if extras.board_facts.trim().is_empty() {
         return String::new();
     }
-    let scope = if reduce { BOARD_FACTS_REDUCE } else { "" };
-    format!("\n{BOARD_FACTS_INTRO}{scope}\n{}", extras.board_facts)
+    let intro = if reduce {
+        BOARD_FACTS_REDUCE
+    } else {
+        BOARD_FACTS_INTRO
+    };
+    format!("\n{intro}\n{}", extras.board_facts)
 }
 
-/// Added to [`BOARD_FACTS_INTRO`] in the reduce call, which may cite only ids
-/// that are in the drafts.
-pub const BOARD_FACTS_REDUCE: &str = " In this merge, use the facts to put each drafted item in the right section, and cite only ids that appear in the drafts.";
+/// The board facts introduction of the reduce call, which classifies drafted
+/// items and may cite only ids that are in the drafts.
+pub const BOARD_FACTS_REDUCE: &str = "Board facts from owner tags, grouped by what each one likely is. Use them to put each drafted item in the right section: a plain owner tag (\"X owns Y\") only says who is responsible for Y, so it is an action item for X, never a decision; an owner tag that moved from one target to another is a decision. Cite only ids that appear in the drafts.";
 
 /// Introduction of the board facts block: a plain owner tag is an action item
 /// for its owner, a moved owner tag is a decision.
@@ -255,7 +259,7 @@ fn participants_line(people: &[Person]) -> String {
 }
 
 /// Participants line when no names are known.
-pub const NO_PARTICIPANTS: &str = "none known (speakers are unnamed diarization labels; use everyone as the owner of an action item)";
+pub const NO_PARTICIPANTS: &str = "none known (speakers are unnamed diarization labels; an action item's owner is everyone or a person named by an owner tag on the board)";
 
 /// Map request for one window.
 /// `part` is (index, count) of the window.
@@ -434,7 +438,7 @@ pub fn repair_request(
         .map(format_line)
         .collect();
     let user = format!(
-        "Participants: {}\n\nWhiteboard:\n{digest}\nThese drafted items failed validation:\n{failures}\nRelevant transcript lines (segment_id [mm:ss] speaker: text):\n{}\n\nReturn corrected versions of these items in their sections: cite segment ids that exist and support the item, copy quotes exactly from a cited line (or leave the quote empty), use a participant name or everyone as owner, and start tasks with a verb. Leave out any item the transcript does not support. Return JSON only.",
+        "Participants: {}\n\nWhiteboard:\n{digest}\nThese drafted items failed validation:\n{failures}\nRelevant transcript lines (segment_id [mm:ss] speaker: text):\n{}\n\nReturn corrected versions of these items in their sections: cite segment ids that exist and support the item, copy quotes exactly from a cited line (or leave the quote empty), use a participant name or everyone as owner, and start tasks with a verb. Leave out any item that neither the transcript nor a cited owner tag on the board supports. Return JSON only.",
         participants_line(people),
         ctx.join("\n"),
     );
@@ -523,8 +527,12 @@ mod tests {
             100,
             &extras,
         );
-        assert!(reduce.messages[1].content.contains(BOARD_FACTS_INTRO));
-        assert!(reduce.messages[1].content.contains(BOARD_FACTS_REDUCE));
+        let merge = &reduce.messages[1].content;
+        assert!(merge.contains(BOARD_FACTS_REDUCE) && merge.contains(facts));
+        assert!(
+            !merge.contains(BOARD_FACTS_INTRO),
+            "the reduce call cites only draft ids"
+        );
         assert!(
             !user.contains(BOARD_FACTS_REDUCE),
             "map calls cite the board ids"

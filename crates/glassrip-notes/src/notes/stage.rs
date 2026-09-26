@@ -287,19 +287,19 @@ impl NotesStage {
                 table.add_alias(i, a);
             }
         }
+        // the participants (from the speakers artifact) are the meeting's people
+        let people = table.people().to_vec();
         if doc.people.is_empty() {
             // no participant list and no tile names: the owner tags on the board
-            // still name people, who can then own action items
+            // still name people, who can then own action items (they are not
+            // listed as participants: an owner tag does not show attendance)
             for o in input.boards.iter().flat_map(|b| &b.owner_assignments) {
-                let known = table
-                    .match_screen_text(&o.display_name)
-                    .is_some_and(|m| m.score >= 0.85);
-                if !known && !o.display_name.trim().is_empty() {
+                // add_person keeps one person per slug
+                if !o.display_name.trim().is_empty() {
                     table.add_person(o.display_name.trim());
                 }
             }
         }
-        let people = table.people().to_vec();
         let corpus = Corpus::new(&lines, &input.boards, &input.keyframes, table);
         let digest = board_digest(&input.boards, &input.keyframes);
 
@@ -693,7 +693,12 @@ impl NotesStage {
         }
         let mut open_questions = Vec::new();
         let added = merge_board_questions(&mut open_questions, &input.boards);
-        let duration_s = input.boards.iter().map(|b| b.end_s()).fold(0.0, f64::max);
+        let duration_s = input
+            .segments
+            .iter()
+            .map(|s| s.end_s)
+            .chain(input.boards.iter().map(|b| b.end_s()))
+            .fold(0.0, f64::max);
         let mut caveats = vec![Caveat {
             kind: "no_audio".into(),
             text: "No speech was transcribed (the recording has no audio stream or no words were recognized). These notes come from the whiteboard only: decisions, action items and the transcript are not available.".into(),

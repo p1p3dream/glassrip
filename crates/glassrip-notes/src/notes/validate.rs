@@ -222,6 +222,8 @@ struct OwnerKey {
     /// The owner tag moved here from another target (a change the group made);
     /// a plain owner tag only says who is responsible.
     moved: bool,
+    /// The owner tag is still on the board at the end (a current task).
+    current: bool,
 }
 
 /// Words that state ownership or assignment ("Avery owns the kiosk", "take
@@ -341,12 +343,11 @@ impl Corpus {
                     name: tokens(&o.display_name),
                     target: content_tokens(&crate::board::target_text(&o.target)),
                     moved: o.moved_from.is_some(),
+                    current: o.valid_to_s >= b.end_s() - 0.5,
                 };
-                for e in b.events.iter().filter(|e| {
-                    matches!(e.kind, EventKind::OwnerAssigned | EventKind::OwnerMoved)
-                        && e.subject == o.person_id
-                        && (e.t_s - o.valid_from_s).abs() <= 30.0
-                }) {
+                // the owner events of this assignment: same person, same target,
+                // near its start
+                for e in super::candidates::owner_events(b, o) {
                     let mut key = words.clone();
                     key.moved |= e.kind == EventKind::OwnerMoved;
                     owner_keys.entry(e.event_id.clone()).or_default().push(key);
@@ -914,7 +915,12 @@ pub fn check_with(
         .chain(&evidence.keyframe_ids)
         .filter_map(|id| corpus.owner_keys.get(id))
         .flatten()
-        .filter(|k| section != Section::Decisions || k.moved)
+        .filter(|k| match section {
+            Section::Decisions => k.moved,
+            // a tag taken off before the end is not a current task
+            Section::ActionItems => k.current,
+            _ => true,
+        })
         .any(|k| k.backs(&item_words));
     let board_ok = opts.board_support
         && board_backed
@@ -1577,17 +1583,87 @@ mod tests {
                 "{d:?}"
             );
         }
-        // the plain assignment backs an action for the owner, not a decision
+        // the plain assignment is not a decision, and, taken off at 00:50, not
+        // a current task either
         let mut d = item("Mira owns the Ledger Store", &[], "");
         d.event_ids = vec!["ev-1".into()];
         assert!(check_with(Section::Decisions, &d, &c, &ALL).is_err());
-        let a = DraftItem {
+        let action = |task: &str, ev: &str| DraftItem {
             owner: "Mira".into(),
-            task: "Own the Ledger Store".into(),
-            event_ids: vec!["ev-1".into()],
+            task: task.into(),
+            event_ids: vec![ev.into()],
             ..Default::default()
         };
+        let a = action("Own the Ledger Store", "ev-1");
+        assert!(check_with(Section::ActionItems, &a, &c, &ALL).is_err());
+        // the tag still on the board backs an action for its owner
+        let a = action("Own the Kiosk App", "ev-2");
         assert!(check_with(Section::ActionItems, &a, &c, &ALL).is_ok());
+    }
+
+    #[test]
+    fn a_plain_owner_event_does_not_inherit_a_nearby_move() {
+        use crate::board::build;
+        // one person tagged on the Ledger Store, then (within 30 s) moved onto
+        // the Kiosk App from somewhere else: each event belongs to its target
+        let mut b = build::board("b", 100.0);
+        b.nodes = vec![
+            build::node("n1", "Ledger Store", 0.0, 100.0, None),
+            build::node("n2", "Kiosk App", 0.0, 100.0, None),
+            build::node("n3", "Badge Printer", 0.0, 100.0, None),
+        ];
+        let plain = build::owner(
+            "mira-okafor",
+            "Mira Okafor",
+            build::node_target(&b, "n1"),
+            40.0,
+            100.0,
+            None,
+        );
+        let moved = build::owner(
+            "mira-okafor",
+            "Mira Okafor",
+            build::node_target(&b, "n2"),
+            50.0,
+            100.0,
+            Some(build::node_target(&b, "n3")),
+        );
+        b.owner_assignments = vec![plain, moved];
+        b.events = vec![
+            build::event(
+                "ev-a",
+                EventKind::OwnerAssigned,
+                40.0,
+                "kf_000040",
+                "mira-okafor",
+                "Mira on Ledger Store",
+            ),
+            build::event(
+                "ev-m",
+                EventKind::OwnerMoved,
+                50.0,
+                "kf_000050",
+                "mira-okafor",
+                "Mira to Kiosk App",
+            ),
+        ];
+        let text = "The importer reads the ledger nightly.";
+        let c = Corpus::new(
+            &[line("s1", 5.0, text, text)],
+            &[b],
+            &KeyframeTimes::default(),
+            AliasTable::from_names(&["Mira Okafor"]),
+        );
+        let decision = |ev: &str| {
+            let mut d = item("Mira moves to the Kiosk App", &[], "");
+            d.event_ids = vec![ev.into()];
+            check_with(Section::Decisions, &d, &c, &ALL)
+        };
+        assert!(decision("ev-m").is_ok());
+        assert!(
+            decision("ev-a").is_err(),
+            "the plain event is about the Ledger Store"
+        );
     }
 
     #[test]
