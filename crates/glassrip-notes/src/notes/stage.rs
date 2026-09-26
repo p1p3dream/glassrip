@@ -919,7 +919,8 @@ impl Stage for NotesStage {
     fn version(&self) -> u32 {
         // 2: owner tags offered as action items and owner moves as decisions;
         // blank transcripts take the board-only path
-        2
+        // 3: owner events matched to assignments by structured target id
+        3
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {

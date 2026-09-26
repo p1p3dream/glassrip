@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 
 /// Version of the detection rules. Recorded replies stopped by the guard are only
 /// valid under the policy that stopped them (see `raw_store` in the stages crate).
-pub const POLICY_VERSION: u32 = 2;
+pub const POLICY_VERSION: u32 = 3;
 
 /// Detector thresholds.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]

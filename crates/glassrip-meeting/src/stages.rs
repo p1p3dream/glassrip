@@ -1188,7 +1188,9 @@ impl Stage for BoardStateStage {
         // 3: final state is "observed and not later removed", with coverage evidence.
         // 4: canvas pixels decide removals (connector corridors, emptied boxes), and
         // ink from a failed alignment is unknown.
-        4
+        // 5: routed connectors traced on the canvas with other elements masked, owner
+        // events carry structured targets, blank views chain through flat links.
+        5
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {

@@ -491,7 +491,8 @@ impl Stage for KeyframesStage {
     }
     fn version(&self) -> u32 {
         // 4: boundaries record whether their ink alignment was usable.
-        4
+        // 5: two flat frames align as the identity and measure no change.
+        5
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
