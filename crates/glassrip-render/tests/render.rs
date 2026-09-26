@@ -175,9 +175,9 @@ fn owners_of_a_crowded_edge_slide_along_it() {
         .expect("dashed edge");
     assert_eq!(channel.d.matches(" L ").count(), 3, "{}", channel.d);
     assert!(
-        scene.unplaced.is_empty(),
+        scene.degraded.is_empty(),
         "{:?}\ncards {:?}\npills {:?}\nedges {:?}",
-        scene.unplaced,
+        scene.degraded,
         scene.cards.iter().map(|c| (&c.id, c.r)).collect::<Vec<_>>(),
         scene
             .pills
@@ -212,6 +212,271 @@ fn owners_of_a_crowded_edge_slide_along_it() {
     let dir = tempfile::tempdir().unwrap();
     let r = render_all(&notes, &[board], &params(dir.path().to_path_buf())).unwrap();
     assert!(r.ok, "{:?}", r.failures());
+}
+
+/// The synthetic board with far more annotations than fit: 36 owner tags with
+/// long move notes split between one card and one edge, and an edge label that
+/// is one unbreakable token of wide glyphs, wider than the canvas.
+fn crowded_board() -> (MeetingNotes, BoardStateItem) {
+    let (notes, mut board) = inputs();
+    let node = board
+        .final_nodes()
+        .into_iter()
+        .find(|n| n.text == "Relay API")
+        .unwrap()
+        .clone();
+    let edge = board
+        .final_edges()
+        .into_iter()
+        .find(|e| {
+            let ends = [e.a_text.as_str(), e.b_text.as_str()];
+            ends.contains(&"Kiosk App") && ends.contains(&"Relay API")
+        })
+        .unwrap()
+        .clone();
+    let on_node = OwnerTarget::Node {
+        node_id: node.id.clone(),
+        text: node.text.clone(),
+    };
+    let on_edge = OwnerTarget::Edge {
+        edge_id: edge.id.clone(),
+        src: edge.src.clone(),
+        dst: edge.dst.clone(),
+        a_text: edge.a_text.clone(),
+        b_text: edge.b_text.clone(),
+    };
+    let base = board.current_owners()[0].clone();
+    board.owner_assignments = (0..36)
+        .map(|i| {
+            let mut o = base.clone();
+            o.person_id = format!("person-{i}");
+            o.display_name = format!("Maximiliana{i:02} Example");
+            let (target, from) = if i % 2 == 0 {
+                (on_node.clone(), on_edge.clone())
+            } else {
+                (on_edge.clone(), on_node.clone())
+            };
+            o.target = target;
+            o.moved_from = Some(from);
+            o
+        })
+        .collect();
+    let long = "W".repeat(320);
+    board
+        .edges
+        .iter_mut()
+        .find(|e| e.id == edge.id)
+        .unwrap()
+        .label = long;
+    (notes, board)
+}
+
+#[test]
+fn a_crowded_board_lists_what_does_not_fit_below_it() {
+    let (notes, board) = crowded_board();
+    let scene = build_scene(&board, &notes);
+    // no overlaps and everything inside the canvas, markers and list included
+    assert!(overlaps(&scene).is_empty(), "{:?}", overlaps(&scene));
+    let f = scene.footnotes.as_ref().expect("an annotation list");
+    assert!(f.items.len() >= 3, "{}", f.items.len());
+    assert_eq!(f.items.len(), scene.degraded.len());
+    // the unbreakable label is among them, split over lines inside the list
+    assert!(scene
+        .degraded
+        .iter()
+        .any(|d| d.contains("Label on the") && d.contains("WWWW")));
+    assert!(scene.edges.iter().all(|e| e
+        .label
+        .as_ref()
+        .is_none_or(|l| !l.text.text.contains("WWWW"))));
+    // entries are numbered in order, and every line stays inside the list
+    for (i, it) in f.items.iter().enumerate() {
+        assert_eq!(it.marker.text.text, (i + 1).to_string());
+        assert!(it.marker.r.x >= f.r.x && it.marker.r.bottom() <= f.r.bottom());
+        for l in &it.lines {
+            let right = l.x + glassrip_render::scene::list_text_w(&l.text);
+            assert!(l.x >= f.r.x && right <= f.r.right(), "{l:?} {:?}", f.r);
+            assert!(l.y > f.r.y && l.y <= f.r.bottom(), "{l:?} {:?}", f.r);
+        }
+    }
+    // entries do not overlap each other
+    let spans: Vec<(f64, f64)> = f
+        .items
+        .iter()
+        .map(|it| {
+            let last = it.lines.last().map_or(it.marker.r.bottom(), |l| l.y);
+            (it.marker.r.y, last.max(it.marker.r.bottom()))
+        })
+        .collect();
+    for w in spans.windows(2) {
+        assert!(w[0].1 <= w[1].0, "{spans:?}");
+    }
+    // markers on the board point at the entries, one per number at most, and
+    // every entry without one says so in its warning
+    assert!(!scene.markers.is_empty());
+    let numbers: std::collections::BTreeSet<usize> = scene
+        .markers
+        .iter()
+        .map(|m| m.text.text.parse::<usize>().unwrap())
+        .collect();
+    assert_eq!(numbers.len(), scene.markers.len());
+    for n in 1..=f.items.len() {
+        let w = &scene.degraded[n - 1];
+        assert!(w.contains(&format!("as note {n}")), "{w}");
+        assert_eq!(numbers.contains(&n), !w.contains("(no marker"), "{w}");
+    }
+    // leaders have length and stay inside the canvas
+    for l in &scene.leaders {
+        assert!((l.0 - l.2).abs() + (l.1 - l.3).abs() > 0.0, "{l:?}");
+        for (x, y) in [(l.0, l.1), (l.2, l.3)] {
+            assert!(x >= 0.0 && x <= scene.width && y >= 0.0 && y <= scene.height);
+        }
+    }
+    // the list sits below everything else and the canvas grew to hold it
+    let (_, plain) = inputs();
+    let plain = build_scene(&plain, &notes);
+    assert!(scene.height > plain.height);
+    for (name, r) in &scene.blocking {
+        if name != "annotation list" {
+            assert!(r.bottom() <= f.r.y, "{name} {r:?} {:?}", f.r);
+        }
+    }
+    // placement tried harder first: some owners are on the board
+    assert!(scene.pills.iter().any(|p| p.fill == "#16a34a"));
+
+    // the full render passes strict validation and reports warnings
+    let dir = tempfile::tempdir().unwrap();
+    let out = std::env::var("GLASSRIP_RENDER_DUMP_DIR")
+        .map(|d| PathBuf::from(d).join("crowded"))
+        .unwrap_or_else(|_| dir.path().to_path_buf());
+    let r = render_all(&notes, &[board], &params(out)).unwrap();
+    assert!(r.ok, "{:?}", r.failures());
+    let warnings = r.warnings();
+    assert_eq!(warnings.len(), scene.degraded.len());
+    assert!(
+        warnings.iter().all(|w| w.starts_with("svg ")),
+        "{warnings:?}"
+    );
+    let text = &r.svg_text[0].1;
+    assert!(text.contains("Annotations without room on the board"));
+    assert!(text.contains("Listed below the board"));
+    // the list's text renders inside the canvas with the real font
+    assert!(
+        r.svg[0].1.overlaps.iter().all(|o| !o.starts_with("text ")),
+        "{:?}",
+        r.svg[0].1.overlaps
+    );
+}
+
+/// Both reviewers of the first version: a relation label on a vertical edge in
+/// the rightmost column took its first spot, right of the edge, although that
+/// spot ran past the canvas, failing the run. Spots outside the canvas are
+/// never taken now; the label goes left, wraps, moves out, or is listed.
+#[test]
+fn a_relation_label_in_the_rightmost_column_stays_inside_the_canvas() {
+    let (notes, mut board) = inputs();
+    // Ledger above Design Kit at the far right: the dashed relation between
+    // them is a vertical edge in the rightmost column
+    for (text, cx, cy) in [
+        ("Ledger Service", 1300.0, 200.0),
+        ("Relay API", 250.0, 360.0),
+        ("Kiosk App", 800.0, 360.0),
+        ("Design Kit", 1300.0, 520.0),
+    ] {
+        let n = board.nodes.iter_mut().find(|n| n.text == text).unwrap();
+        let b = n.bbox.as_mut().unwrap();
+        (b.x1, b.y1, b.x2, b.y2) = (cx - 100.0, cy - 40.0, cx + 100.0, cy + 40.0);
+    }
+    let scene = build_scene(&board, &notes);
+    let dashed = scene.edges.iter().find(|e| e.dash.is_some()).unwrap();
+    assert_eq!(dashed.d.matches(" L ").count(), 1, "vertical: {}", dashed.d);
+    // the architecture spans the canvas: the right of the edge has no room
+    // for the label (the old first pick ran 147 px past the canvas)
+    let right = scene.cards.iter().map(|c| c.r.right()).fold(0.0, f64::max);
+    assert!(right >= scene.width - 80.0, "{right} {}", scene.width);
+    let l = dashed.label.as_ref().expect("placed, not listed");
+    assert!(l.r.x >= 0.0 && l.r.right() <= scene.width, "{:?}", l.r);
+    assert!(overlaps(&scene).is_empty(), "{:?}", overlaps(&scene));
+    let dir = tempfile::tempdir().unwrap();
+    let r = render_all(&notes, &[board], &params(dir.path().to_path_buf())).unwrap();
+    assert!(r.ok, "{:?}", r.failures());
+}
+
+/// Glyphs past the canvas: a defect in the annotation list (its layout
+/// guarantees room), a warning elsewhere (laid out from width estimates, and
+/// never a reason to fail a meeting run). Measured on the rendered glyphs.
+#[test]
+fn text_outside_the_canvas_fails_only_in_the_list() {
+    let env = glassrip_render::svg::environment();
+    let (notes, board) = inputs();
+    let mut scene = build_scene(&board, &notes);
+    scene.footer.x = scene.width + 200.0;
+    let text = glassrip_render::svg::render_svg(&env, &scene).unwrap();
+    let (checks, _) = glassrip_render::svg::validate_svg(&text, &scene, &bundled_fonts());
+    assert!(checks.ok, "{:?}", checks.failures());
+    assert!(
+        checks
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("text \"Source:") && w.ends_with("outside the canvas")),
+        "{:?}",
+        checks.warnings
+    );
+
+    let (notes, board) = crowded_board();
+    let mut scene = build_scene(&board, &notes);
+    let width = scene.width;
+    let f = scene.footnotes.as_mut().unwrap();
+    f.items[0].lines[0].x = width + 200.0;
+    let text = glassrip_render::svg::render_svg(&env, &scene).unwrap();
+    let (checks, _) = glassrip_render::svg::validate_svg(&text, &scene, &bundled_fonts());
+    assert!(!checks.ok);
+    assert!(
+        checks
+            .overlaps
+            .iter()
+            .any(|o| o.starts_with("text \"Label on the") && o.ends_with("outside the canvas")),
+        "{:?}",
+        checks.overlaps
+    );
+}
+
+#[test]
+fn a_normal_board_has_no_annotation_list() {
+    let (notes, board) = inputs();
+    let scene = build_scene(&board, &notes);
+    assert!(scene.footnotes.is_none());
+    assert!(scene.markers.is_empty());
+    assert!(scene.degraded.is_empty());
+    let dir = tempfile::tempdir().unwrap();
+    let r = render_all(&notes, &[board], &params(dir.path().to_path_buf())).unwrap();
+    assert!(r.ok, "{:?}", r.failures());
+    assert!(r.warnings().is_empty());
+    let text = &r.svg_text[0].1;
+    assert!(!text.contains("Annotations without room"));
+    assert!(!text.contains("Listed below the board"));
+}
+
+/// Real defects stay failures: two cards on top of each other are not an
+/// annotation and are never moved below the board.
+#[test]
+fn overlapping_primary_boxes_still_fail() {
+    let (notes, board) = inputs();
+    let mut scene = build_scene(&board, &notes);
+    let first = scene.cards[0].r;
+    let i = scene
+        .blocking
+        .iter()
+        .position(|(n, _)| n.starts_with("card ") && !n.ends_with(&scene.cards[0].id))
+        .unwrap();
+    scene.blocking[i].1 = first;
+    let o = overlaps(&scene);
+    assert!(o.iter().any(|m| m.contains("overlaps")), "{o:?}");
+    let env = glassrip_render::svg::environment();
+    let text = glassrip_render::svg::render_svg(&env, &scene).unwrap();
+    let (checks, _) = glassrip_render::svg::validate_svg(&text, &scene, &bundled_fonts());
+    assert!(!checks.ok);
+    assert!(checks.warnings.is_empty());
 }
 
 #[test]
@@ -260,7 +525,7 @@ fn edge_labels_never_cover_zone_titles() {
                     .iter()
                     .filter(|(n, _)| n.starts_with("zone title"))
                     .count();
-                // Crowded positions may leave a note unplaced (reported, not
+                // Crowded positions may move a note below the board (a warning,
                 // drawn); what this checks is that no label covers anything.
                 let o: Vec<String> = overlaps(&scene)
                     .into_iter()

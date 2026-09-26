@@ -92,6 +92,11 @@ pub struct SvgChecks {
     pub style_violations: Vec<String>,
     /// Layout method.
     pub layout_method: String,
+    /// Annotations with no room on the board, listed below it instead, and
+    /// text other than the annotation list whose glyphs reach past the canvas
+    /// (warnings: they do not fail validation).
+    #[serde(default)]
+    pub warnings: Vec<String>,
     /// All checks passed.
     pub ok: bool,
 }
@@ -148,6 +153,43 @@ fn count_text(g: &usvg::Group, total: &mut usize, rendered: &mut usize) {
                 let b = t.flattened().bounding_box();
                 if b.width() > 0.0 && b.height() > 0.0 {
                     *rendered += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Text whose rendered glyphs reach outside the `w` x `h` canvas (measured
+/// with the fonts actually loaded, not estimated). Lines of the annotation
+/// list go to `strict` (its layout guarantees room, so a miss is a defect);
+/// other text, laid out from width estimates, goes to `warn`.
+fn text_outside(g: &usvg::Group, w: f32, h: f32, strict: &mut Vec<String>, warn: &mut Vec<String>) {
+    for n in g.children() {
+        match n {
+            usvg::Node::Group(g) => text_outside(g, w, h, strict, warn),
+            usvg::Node::Text(t) => {
+                let b = t.abs_bounding_box();
+                if b.width() > 0.0
+                    && (b.left() < -0.5
+                        || b.top() < -0.5
+                        || b.right() > w + 0.5
+                        || b.bottom() > h + 0.5)
+                {
+                    let text: String = t
+                        .chunks()
+                        .iter()
+                        .map(|c| c.text())
+                        .collect::<String>()
+                        .chars()
+                        .take(40)
+                        .collect();
+                    let msg = format!("text \"{text}\" is outside the canvas");
+                    if t.id().starts_with(crate::scene::LIST_ID) {
+                        strict.push(msg);
+                    } else {
+                        warn.push(msg);
+                    }
                 }
             }
             _ => {}
@@ -306,6 +348,7 @@ pub fn validate_svg(svg: &str, scene: &Scene, fonts: &FontConfig) -> (SvgChecks,
         overlaps: overlaps(scene),
         style_violations: style_violations(svg),
         layout_method: scene.layout_method.to_string(),
+        warnings: scene.degraded.clone(),
         ok: false,
     };
     let tree = match usvg::Tree::from_str(svg, &opt) {
@@ -323,6 +366,14 @@ pub fn validate_svg(svg: &str, scene: &Scene, fonts: &FontConfig) -> (SvgChecks,
         tree.root(),
         &mut checks.text_nodes,
         &mut checks.text_rendered,
+    );
+    let size_f = tree.size();
+    text_outside(
+        tree.root(),
+        size_f.width(),
+        size_f.height(),
+        &mut checks.overlaps,
+        &mut checks.warnings,
     );
     let Some(mut pixmap) = tiny_skia::Pixmap::new(size.width(), size.height()) else {
         checks.parse_error = Some("zero-sized canvas".into());
@@ -374,6 +425,7 @@ mod tests {
             overlaps: vec!["card a overlaps card b".into()],
             style_violations: vec!["uses <marker> (arrowheads must be polygons)".into()],
             layout_method: "grid".into(),
+            warnings: vec!["no room on the board, listed below it as note 1: x".into()],
             ok: false,
         };
         assert_eq!(

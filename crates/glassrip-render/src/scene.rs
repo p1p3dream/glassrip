@@ -112,6 +112,9 @@ pub struct TextLine {
     pub anchor: &'static str,
     /// Extra fill color.
     pub fill: Option<String>,
+    /// Element id (lines of the annotation list, whose glyphs validation
+    /// requires inside the canvas).
+    pub id: Option<String>,
 }
 
 fn tl(x: f64, y: f64, text: impl Into<String>, class: &str) -> TextLine {
@@ -122,6 +125,7 @@ fn tl(x: f64, y: f64, text: impl Into<String>, class: &str) -> TextLine {
         class: class.into(),
         anchor: "start",
         fill: None,
+        id: None,
     }
 }
 
@@ -289,6 +293,26 @@ pub struct Legend {
     pub items: Vec<LegendItem>,
 }
 
+/// An annotation that had no free place on the board, listed below it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Footnote {
+    /// Number marker at the start of the entry (same look as on the board).
+    pub marker: Pill,
+    /// Wrapped text lines.
+    pub lines: Vec<TextLine>,
+}
+
+/// The block below the board listing annotations that did not fit on it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Footnotes {
+    /// Box.
+    pub r: R,
+    /// Heading.
+    pub title: TextLine,
+    /// Entries, top to bottom.
+    pub items: Vec<Footnote>,
+}
+
 /// Everything the SVG template draws.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Scene {
@@ -320,6 +344,13 @@ pub struct Scene {
     pub banner: Option<Banner>,
     /// Group panels.
     pub panels: Vec<Panel>,
+    /// Numbered markers on the board for annotations listed in `footnotes`.
+    pub markers: Vec<Pill>,
+    /// Leader lines `(x1, y1, x2, y2)` from owner pills, notes and badges placed
+    /// away from their element back to it.
+    pub leaders: Vec<(f64, f64, f64, f64)>,
+    /// Annotations without room on the board, listed below it.
+    pub footnotes: Option<Footnotes>,
     /// Footer.
     pub footer: TextLine,
     /// Layout method (`board_positions` or `sugiyama` or `grid`).
@@ -327,9 +358,10 @@ pub struct Scene {
     /// Boxes that must not overlap (name, box).
     #[serde(skip)]
     pub blocking: Vec<(String, R)>,
-    /// Owner pills, notes and badges that found no free place (left out).
+    /// Annotations (owner pills, notes, badges, edge labels) that found no free
+    /// place on the board and were moved to `footnotes`: warnings, not failures.
     #[serde(skip)]
-    pub unplaced: Vec<String>,
+    pub degraded: Vec<String>,
 }
 
 fn arrowhead(tip: (f64, f64), from: (f64, f64)) -> ((f64, f64), String) {
@@ -528,6 +560,254 @@ fn beside_path(pts: &[(f64, f64)], w: f64, h: f64) -> Vec<R> {
     out
 }
 
+/// Spots of size `w` x `h` just outside a card: along the top (right to
+/// left), down both sides, then along the bottom.
+fn around_card(r: &R, w: f64, h: f64) -> Vec<R> {
+    const G: f64 = 6.0;
+    let mut out = Vec::new();
+    let mut x = r.right() - w;
+    while x >= r.x - 0.5 {
+        out.push(R::new(x, r.y - h - G, w, h));
+        x -= 12.0;
+    }
+    let mut y = r.y;
+    while y <= r.bottom() - h + 0.5 {
+        out.push(R::new(r.right() + G, y, w, h));
+        out.push(R::new(r.x - w - G, y, w, h));
+        y += 12.0;
+    }
+    let mut x = r.right() - w;
+    while x >= r.x - 0.5 {
+        out.push(R::new(x, r.bottom() + G, w, h));
+        x -= 12.0;
+    }
+    out
+}
+
+/// Spots of size `w` x `h` centered on rings around `c` (16 per ring).
+fn ring_spots(c: (f64, f64), w: f64, h: f64, radii: &[f64]) -> Vec<R> {
+    let mut out = Vec::new();
+    for rad in radii {
+        for step in 0..16 {
+            let a = f64::from(step) * std::f64::consts::PI / 8.0;
+            let (x, y) = (c.0 + rad * a.cos(), c.1 + rad * a.sin());
+            out.push(R::new(x - w / 2.0, y - h / 2.0, w, h));
+        }
+    }
+    out
+}
+
+/// Id prefix of the annotation list's text lines.
+pub const LIST_ID: &str = "annotation-list";
+
+/// Upper bound of a character's advance in the list's 12 px regular text, by
+/// width class (wide capitals and symbols, other capitals and digits, the
+/// rest); generous so a line never runs past the list.
+pub fn list_char_w(c: char) -> f64 {
+    let em = match c {
+        'W' | 'M' | 'm' | 'w' | '@' | '%' | '&' => 1.0,
+        // full-width scripts and emoji
+        c if !c.is_ascii() => 1.3,
+        c if c.is_uppercase() || c.is_ascii_digit() => 0.8,
+        _ => 0.6,
+    };
+    12.0 * em
+}
+
+/// Width of `s` in the list by [`list_char_w`].
+pub fn list_text_w(s: &str) -> f64 {
+    s.chars().map(list_char_w).sum()
+}
+
+/// Word wrap to at most `max_px` per line by [`list_text_w`], splitting a
+/// word longer than a line.
+fn wrap_px(text: &str, max_px: f64) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        let joined = if cur.is_empty() {
+            word.to_string()
+        } else {
+            format!("{cur} {word}")
+        };
+        if list_text_w(&joined) <= max_px {
+            cur = joined;
+            continue;
+        }
+        if !cur.is_empty() {
+            lines.push(std::mem::take(&mut cur));
+        }
+        for c in word.chars() {
+            if !cur.is_empty() && list_text_w(&cur) + list_char_w(c) > max_px {
+                lines.push(std::mem::take(&mut cur));
+            }
+            cur.push(c);
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+/// Size of the numbered marker for footnote `n`.
+fn marker_size(n: usize) -> (f64, f64) {
+    (if n < 10 { 18.0 } else { 26.0 }, 18.0)
+}
+
+/// Numbered marker for footnote `n` with its top left at `(x, y)`.
+fn marker(n: usize, x: f64, y: f64) -> Pill {
+    let (w, h) = marker_size(n);
+    let r = R::new(x, y, w, h);
+    Pill {
+        r,
+        rx: 9.0,
+        fill: "#334155".into(),
+        stroke: None,
+        text: tc(r.cx(), r.y + 13.0, n.to_string(), "label"),
+    }
+}
+
+/// The point of a polyline nearest to `p`.
+fn nearest_on_path(pts: &[(f64, f64)], p: (f64, f64)) -> Option<(f64, f64)> {
+    pts.windows(2)
+        .map(|w| {
+            let (a, b) = (w[0], w[1]);
+            let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+            let len2 = dx * dx + dy * dy;
+            let t = if len2 > 0.0 {
+                (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            (a.0 + dx * t, a.1 + dy * t)
+        })
+        .min_by(|a, b| {
+            let d = |q: &(f64, f64)| (q.0 - p.0).powi(2) + (q.1 - p.1).powi(2);
+            d(a).total_cmp(&d(b))
+        })
+}
+
+/// A leader line.
+type Leader = (f64, f64, f64, f64);
+
+/// Leader from the nearest point of `r` to `anchor`.
+fn leader_to(r: &R, anchor: (f64, f64)) -> Leader {
+    let near = (
+        anchor.0.clamp(r.x, r.right()),
+        anchor.1.clamp(r.y, r.bottom()),
+    );
+    (near.0, near.1, anchor.0, anchor.1)
+}
+
+/// True when the line runs through the interior of `r` (touching its border
+/// does not count); exact (Liang-Barsky clipping).
+fn line_hits(l: &Leader, r: &R) -> bool {
+    let (dx, dy) = (l.2 - l.0, l.3 - l.1);
+    let (mut t0, mut t1) = (0.0f64, 1.0f64);
+    for (p, q) in [
+        (-dx, l.0 - r.x),
+        (dx, r.right() - l.0),
+        (-dy, l.1 - r.y),
+        (dy, r.bottom() - l.1),
+    ] {
+        if p.abs() < 1e-12 {
+            if q <= 0.0 {
+                return false;
+            }
+        } else {
+            let t = q / p;
+            if p < 0.0 {
+                t0 = t0.max(t);
+            } else {
+                t1 = t1.min(t);
+            }
+        }
+    }
+    t1 - t0 > 1e-9
+}
+
+/// True when a leader crosses no taken box except `target`, the box of the
+/// element it points at.
+fn leader_clear(l: &Leader, taken: &[R], target: Option<R>) -> bool {
+    taken
+        .iter()
+        .filter(|t| Some(**t) != target)
+        .all(|t| !line_hits(l, t))
+}
+
+/// Free space for annotations: inside the canvas below the title band and
+/// above the stickies and banner, clear of taken boxes, edges and leaders.
+struct Space<'a> {
+    width: f64,
+    limit: f64,
+    segments: &'a [Segment],
+}
+
+/// An axis-aligned piece of a drawn edge.
+type Segment = ((f64, f64), (f64, f64));
+
+impl Space<'_> {
+    fn free(&self, r: &R, taken: &[R], leaders: &[Leader]) -> bool {
+        r.x >= MARGIN / 2.0
+            && r.right() <= self.width - MARGIN / 2.0
+            && r.y >= LEGEND_BOTTOM
+            && r.bottom() <= self.limit
+            && !taken.iter().any(|t| t.intersects(r))
+            && !self
+                .segments
+                .iter()
+                .any(|(a, b)| r.inflate(3.0).hits_segment(*a, *b))
+            && !leaders.iter().any(|l| line_hits(l, &r.inflate(2.0)))
+    }
+
+    /// The first free spot in `direct`; else the first free spot in `ringed`
+    /// whose leader to `anchor(spot)` crosses no taken box but `target`.
+    fn place(
+        &self,
+        direct: &[R],
+        ringed: &[R],
+        anchor: impl Fn(&R) -> (f64, f64),
+        target: Option<R>,
+        taken: &[R],
+        leaders: &[Leader],
+    ) -> Option<(R, Option<Leader>)> {
+        if let Some(r) = direct.iter().find(|r| self.free(r, taken, leaders)) {
+            return Some((*r, None));
+        }
+        ringed.iter().find_map(|r| {
+            if !self.free(r, taken, leaders) {
+                return None;
+            }
+            let l = leader_to(r, anchor(r));
+            leader_clear(&l, taken, target).then_some((*r, Some(l)))
+        })
+    }
+}
+
+/// Where a leader line from a spot ends on its element.
+type Anchor = Box<dyn Fn(&R) -> (f64, f64)>;
+
+/// Spots for an owner pill: next to its element, further out (with a leader
+/// back to `anchor`), and for its marker when it has no room at all.
+struct OwnerSpots {
+    direct: Vec<R>,
+    ringed: Vec<R>,
+    anchor: Anchor,
+    /// The taken box of the element a leader may end in.
+    target: Option<R>,
+    marker: Vec<R>,
+}
+
+/// An annotation moved to the footnotes, waiting for its marker.
+struct Pending {
+    text: String,
+    /// Marker spots, best first (sized for this footnote's number).
+    spots: Vec<R>,
+    /// False when its element is not drawn on the board at all.
+    drawn: bool,
+}
+
 /// Builds the scene for one board.
 pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
     let grids = derive_grids(board);
@@ -724,7 +1004,11 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
     let mut edge_anchor: BTreeMap<String, (f64, f64, bool)> = BTreeMap::new();
     let mut edge_path: BTreeMap<String, Vec<(f64, f64)>> = BTreeMap::new();
     let mut channel = 0usize;
-    let mut segments: Vec<((f64, f64), (f64, f64))> = Vec::new();
+    let mut segments: Vec<Segment> = Vec::new();
+    // annotations moved to the footnotes, in footnote order
+    let mut pending: Vec<Pending> = Vec::new();
+    // leader lines drawn so far (later annotations keep off them)
+    let mut leaders: Vec<Leader> = Vec::new();
     let final_edges = board.final_edges();
     for e in &final_edges {
         let (Some(a), Some(b)) = (card_of.get(e.src.as_str()), card_of.get(e.dst.as_str())) else {
@@ -809,9 +1093,10 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
         edge_path.insert(e.id.clone(), pts.clone());
         let mut label_lines: Vec<TextLine> = Vec::new();
         let mut leader: Option<(f64, f64, f64, f64)> = None;
-        let label = Some(sanitize_dashes(e.label.trim()))
+        let label_text = sanitize_dashes(e.label.trim());
+        let label = Some(label_text.clone())
             .filter(|t| !t.is_empty())
-            .map(|text| {
+            .and_then(|text| {
                 let relation = dashed || text.chars().count() > 22;
                 let place = |tw: f64, h: f64| -> (Vec<(f64, f64)>, Option<R>) {
                     let around = |mid: (f64, f64), horizontal: bool| -> Vec<(f64, f64)> {
@@ -852,7 +1137,13 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
                     let free = candidates
                         .iter()
                         .map(|(x, y)| R::new(*x, *y, tw, h))
-                        .find(|r| !taken.iter().any(|t| t.intersects(r)));
+                        .find(|r| {
+                            r.x >= MARGIN / 2.0
+                                && r.right() <= width - MARGIN / 2.0
+                                && r.y >= LEGEND_BOTTOM
+                                && !taken.iter().any(|t| t.intersects(r))
+                                && !leaders.iter().any(|l| line_hits(l, &r.inflate(2.0)))
+                        });
                     (candidates, free)
                 };
                 let (h, tw) = if relation {
@@ -860,7 +1151,7 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
                 } else {
                     (18.0, text_width(&text, 11.0, true) + 16.0)
                 };
-                let (candidates, mut found) = place(tw, h);
+                let (_, mut found) = place(tw, h);
                 // A long relation label with no free spot at full width is wrapped
                 // (at most 26 characters per line) and placed again.
                 let mut lines = vec![text.clone()];
@@ -905,17 +1196,22 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
                                 && r.right() <= width - MARGIN / 2.0
                                 && r.y >= LEGEND_BOTTOM
                                 && !taken.iter().any(|t| t.intersects(&r))
+                                && !leaders.iter().any(|l| line_hits(l, &r.inflate(2.0)))
                             {
-                                let near =
-                                    (mid.0.clamp(r.x, r.right()), mid.1.clamp(r.y, r.bottom()));
-                                leader = Some((near.0, near.1, mid.0, mid.1));
+                                // the leader may cross nothing on its way back
+                                let l = leader_to(&r, mid);
+                                if !leader_clear(&l, &taken, None) {
+                                    continue;
+                                }
+                                leader = Some(l);
                                 found = Some(r);
                                 break 'rings;
                             }
                         }
                     }
                 }
-                let r = found.unwrap_or_else(|| R::new(candidates[0].0, candidates[0].1, tw, h));
+                // No room anywhere: the label goes to the footnotes (below).
+                let r = found?;
                 let text = lines[0].clone();
                 for (k, l) in lines.iter().enumerate().skip(1) {
                     let mut t = tc(r.cx(), r.y + 16.0 + 16.0 * k as f64, l.clone(), "body");
@@ -936,16 +1232,28 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
                 if relation {
                     t.fill = Some("#5b21b6".into());
                 }
-                Pill {
+                Some(Pill {
                     r,
                     rx: if relation { 6.0 } else { 4.0 },
                     fill: fill.into(),
                     stroke: Some(stroke.into()),
                     text: t,
-                }
+                })
             });
         if let Some(l) = &label {
             taken.push(l.r);
+            leaders.extend(leader);
+        } else if !label_text.is_empty() {
+            let (mw, mh) = marker_size(pending.len() + 1);
+            pending.push(Pending {
+                text: format!(
+                    "Label on the {} to {} link: {label_text}",
+                    sanitize_dashes(&e.a_text),
+                    sanitize_dashes(&e.b_text)
+                ),
+                spots: beside_path(&pts, mw, mh),
+                drawn: true,
+            });
         }
         edges.push(EdgeArt {
             d: path_d(&pts),
@@ -965,22 +1273,39 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
     };
 
     // owner pills, moved-from notes, deferred badges; none may cover a card,
-    // another label or an edge
+    // another label or an edge. Each tries spots next to its element, then
+    // spots further out joined by a leader line; one with no room at all goes
+    // to the footnotes below the board, marked by its number on the board.
+    let zones_bottom = zones.iter().map(|z| z.r.bottom()).fold(0.0, f64::max);
+    // stickies, the banner and panels start at or below this line
+    // (the first sticky row starts 24 px lower; the banner or a panel starts
+    // right there when there are no stickies; an edge label placed away from
+    // its path may reach below the cards, and pushes them down)
+    let sticky_gap = if board.final_stickies().is_empty() {
+        0.0
+    } else {
+        24.0
+    };
+    let labels_bottom = edges
+        .iter()
+        .filter_map(|e| e.label.as_ref().map(|l| l.r.bottom()))
+        .fold(0.0, f64::max);
+    let annot_limit = channels_bottom
+        .max(zones_bottom)
+        .max(arch_bottom + ZONE_PAD_BOTTOM)
+        .max(labels_bottom + 8.0 - sticky_gap);
+    let space = Space {
+        width,
+        limit: annot_limit + sticky_gap,
+        segments: &segments,
+    };
+    let node_text: BTreeMap<&str, String> = nodes
+        .iter()
+        .map(|n| (n.id.as_str(), sanitize_dashes(&n.text)))
+        .collect();
     let mut pills: Vec<Pill> = Vec::new();
     let mut notes_txt: Vec<TextLine> = Vec::new();
     let mut note_boxes: Vec<R> = Vec::new();
-    // inside the canvas (below the legend) and clear of cards, labels and edges
-    let free = |r: &R, taken: &[R]| {
-        r.x >= MARGIN / 2.0
-            && r.right() <= width - MARGIN / 2.0
-            && r.y >= LEGEND_BOTTOM
-            && !taken.iter().any(|t| t.intersects(r))
-            && !segments
-                .iter()
-                .any(|(a, b)| r.inflate(3.0).hits_segment(*a, *b))
-    };
-    // first free candidate, else None (the item is left out and reported)
-    let first_free = |cands: &[R], taken: &[R]| cands.iter().copied().find(|c| free(c, taken));
     let mut per_target: BTreeMap<String, Vec<&OwnerAssignment>> = BTreeMap::new();
     for o in board.current_owners() {
         let key = match &o.target {
@@ -989,27 +1314,60 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
         };
         per_target.entry(key).or_default().push(o);
     }
-    let mut unplaced: Vec<String> = Vec::new();
     for (target, owners) in per_target {
         for o in owners {
             let name = sanitize_dashes(&short_name(notes, &o.person_id, &o.display_name));
             let proto = pill(0.0, 0.0, &name, "#16a34a", "pill-text", 11.0, true);
             let (w, h) = (proto.r.w, proto.r.h);
-            let cands: Vec<R> = match &o.target {
+            let moved = o.moved_from.as_ref().map(|from| {
+                format!(
+                    "moved from {} ({})",
+                    sanitize_dashes(&target_text(from)),
+                    mmss(o.valid_from_s)
+                )
+            });
+            let what = sanitize_dashes(&target_text(&o.target));
+            let spots = match &o.target {
                 OwnerTarget::Node { .. } => {
-                    let Some(r) = card_of.get(target.as_str()) else {
+                    let Some(r) = card_of.get(target.as_str()).copied() else {
+                        // not drawn as a card (a grid member): listed only
+                        pending.push(Pending {
+                            text: format!("Owner {name} of {what}"),
+                            spots: Vec::new(),
+                            drawn: false,
+                        });
                         continue;
                     };
-                    // above the card, sliding right (bounded), then below it
+                    // above the card, sliding right (bounded), then below it,
+                    // then all around it
                     let mut v: Vec<R> = (0..16)
                         .map(|k| R::new(r.x + 12.0 * k as f64, r.y - 34.0, w, h))
                         .collect();
                     v.extend((0..4).map(|k| R::new(r.x + 12.0 * k as f64, r.bottom() + 8.0, w, h)));
-                    v
+                    v.extend(around_card(&r, w, h));
+                    let rings =
+                        ring_spots((r.cx(), r.cy()), w, h, &[110.0, 140.0, 170.0, 200.0, 240.0]);
+                    let (mw, mh) = marker_size(pending.len() + 1);
+                    let anchor: Anchor = Box::new(move |p: &R| {
+                        (p.cx().clamp(r.x, r.right()), p.cy().clamp(r.y, r.bottom()))
+                    });
+                    OwnerSpots {
+                        direct: v,
+                        ringed: rings,
+                        anchor,
+                        target: Some(r.inflate(4.0)),
+                        marker: around_card(&r, mw, mh),
+                    }
                 }
                 OwnerTarget::Edge { .. } => {
                     let Some((mx, my, horizontal)) = edge_anchor.get(target.as_str()).copied()
                     else {
+                        // the edge is not drawn (an end is not a card): listed only
+                        pending.push(Pending {
+                            text: format!("Owner {name} of {what}"),
+                            spots: Vec::new(),
+                            drawn: false,
+                        });
                         continue;
                     };
                     let mut v = Vec::new();
@@ -1027,45 +1385,125 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
                     // Then beside the rest of the edge: a parallel edge or a
                     // label next to the middle, with cards at both ends, must
                     // not leave the owner out while the edge has room elsewhere.
-                    if let Some(path) = edge_path.get(target.as_str()) {
-                        v.extend(beside_path(path, w, h));
+                    let path = edge_path.get(target.as_str()).cloned().unwrap_or_default();
+                    v.extend(beside_path(&path, w, h));
+                    let rings = ring_spots((mx, my), w, h, &[60.0, 90.0, 120.0, 160.0]);
+                    let (mw, mh) = marker_size(pending.len() + 1);
+                    // the nearest point of the edge (not its middle, where a
+                    // label may sit on the line)
+                    let line = path.clone();
+                    let anchor: Anchor = Box::new(move |p: &R| {
+                        nearest_on_path(&line, (p.cx(), p.cy())).unwrap_or((mx, my))
+                    });
+                    OwnerSpots {
+                        direct: v,
+                        ringed: rings,
+                        anchor,
+                        target: None,
+                        marker: beside_path(&path, mw, mh),
                     }
-                    v
                 }
             };
-            let Some(pr) = first_free(&cands, &taken) else {
-                unplaced.push(format!("owner {name}"));
+            let OwnerSpots {
+                direct,
+                ringed,
+                anchor,
+                target: lead_target,
+                marker: marker_spots,
+            } = spots;
+            let Some((pr, lead)) =
+                space.place(&direct, &ringed, anchor, lead_target, &taken, &leaders)
+            else {
+                let mut text = format!("Owner {name} of {what}");
+                if let Some(m) = &moved {
+                    text.push_str(&format!(", {m}"));
+                }
+                pending.push(Pending {
+                    text,
+                    spots: marker_spots,
+                    drawn: true,
+                });
                 continue;
             };
             let p = pill(pr.x, pr.y, &name, "#16a34a", "pill-text", 11.0, true);
             taken.push(p.r);
-            if let Some(from) = &o.moved_from {
-                let txt = format!(
-                    "moved from {} ({})",
-                    sanitize_dashes(&target_text(from)),
-                    mmss(o.valid_from_s)
-                );
-                let tw = text_width(&txt, 10.0, false);
-                let spots = [
-                    R::new(p.r.right() + 8.0, p.r.y + 4.0, tw, 16.0),
-                    R::new(p.r.x, p.r.y - 20.0, tw, 16.0),
-                    R::new(p.r.right() - tw, p.r.y - 20.0, tw, 16.0),
-                    R::new(p.r.x, p.r.bottom() + 4.0, tw, 16.0),
-                ];
-                match first_free(&spots, &taken) {
-                    Some(nb) => {
-                        notes_txt.push(tl(nb.x, nb.y + 12.0, txt, "small"));
+            leaders.extend(lead);
+            if let Some(txt) = moved {
+                // one line beside the pill, then two lines, then further out
+                // with a leader back to the pill
+                let one = vec![txt.clone()];
+                let two = wrap(&txt, txt.chars().count().div_ceil(2) + 4);
+                let mut placed = None;
+                for lines in [one, two] {
+                    let tw = lines
+                        .iter()
+                        .map(|l| text_width(l, 10.0, false))
+                        .fold(0.0, f64::max);
+                    let th = 12.0 * lines.len() as f64 + 4.0;
+                    let direct = [
+                        R::new(p.r.right() + 8.0, p.r.y + 4.0, tw, th),
+                        R::new(p.r.x, p.r.y - th - 4.0, tw, th),
+                        R::new(p.r.right() - tw, p.r.y - th - 4.0, tw, th),
+                        R::new(p.r.x, p.r.bottom() + 4.0, tw, th),
+                        R::new(p.r.x - tw - 8.0, p.r.y + 4.0, tw, th),
+                        R::new(p.r.right() - tw, p.r.bottom() + 4.0, tw, th),
+                    ];
+                    let ringed = ring_spots(
+                        (p.r.cx(), p.r.cy()),
+                        tw,
+                        th,
+                        &[(tw + p.r.w) / 2.0 + 20.0, (tw + p.r.w) / 2.0 + 60.0],
+                    );
+                    let pr = p.r;
+                    let anchor = move |nb: &R| {
+                        (
+                            nb.cx().clamp(pr.x, pr.right()),
+                            nb.cy().clamp(pr.y, pr.bottom()),
+                        )
+                    };
+                    if let Some(found) =
+                        space.place(&direct, &ringed, anchor, Some(pr), &taken, &leaders)
+                    {
+                        placed = Some((found, lines));
+                        break;
+                    }
+                }
+                match placed {
+                    Some(((nb, lead), lines)) => {
+                        for (k, l) in lines.into_iter().enumerate() {
+                            notes_txt.push(tl(nb.x, nb.y + 12.0 + 12.0 * k as f64, l, "small"));
+                        }
                         taken.push(nb);
                         note_boxes.push(nb);
+                        leaders.extend(lead);
                     }
-                    None => unplaced.push(format!("note {txt}")),
+                    None => {
+                        let (mw, mh) = marker_size(pending.len() + 1);
+                        let mut spots = vec![
+                            R::new(p.r.right() + 4.0, p.r.y + 3.0, mw, mh),
+                            R::new(p.r.x - mw - 4.0, p.r.y + 3.0, mw, mh),
+                            R::new(p.r.right() - mw, p.r.y - mh - 4.0, mw, mh),
+                            R::new(p.r.x, p.r.bottom() + 4.0, mw, mh),
+                        ];
+                        spots.extend(ring_spots(
+                            (p.r.cx(), p.r.cy()),
+                            mw,
+                            mh,
+                            &[p.r.w / 2.0 + 16.0],
+                        ));
+                        pending.push(Pending {
+                            text: format!("Owner {name} of {what}: {txt}"),
+                            spots,
+                            drawn: true,
+                        });
+                    }
                 }
             }
             pills.push(p);
         }
     }
     for (id, t) in &deferred {
-        let Some(r) = card_of.get(id.as_str()) else {
+        let Some(r) = card_of.get(id.as_str()).copied() else {
             continue;
         };
         let text = format!("DEFERRED ({})", mmss(*t));
@@ -1088,26 +1526,77 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
                 b.r.h,
             )
         }));
-        let Some(br) = first_free(&cands, &taken) else {
-            unplaced.push(text);
+        cands.extend(around_card(&r, b.r.w, b.r.h));
+        let ringed = ring_spots(
+            (r.cx(), r.cy()),
+            b.r.w,
+            b.r.h,
+            &[120.0, 160.0, 200.0, 240.0],
+        );
+        let anchor = move |p: &R| (p.cx().clamp(r.x, r.right()), p.cy().clamp(r.y, r.bottom()));
+        let Some((br, lead)) = space.place(
+            &cands,
+            &ringed,
+            anchor,
+            Some(r.inflate(4.0)),
+            &taken,
+            &leaders,
+        ) else {
+            let (mw, mh) = marker_size(pending.len() + 1);
+            pending.push(Pending {
+                text: format!(
+                    "{} {text}",
+                    node_text.get(id.as_str()).cloned().unwrap_or_default()
+                ),
+                spots: around_card(&r, mw, mh),
+                drawn: true,
+            });
             continue;
         };
         b.r = br;
         b.text.x = b.r.cx();
         b.text.y = b.r.y + 16.0;
         taken.push(b.r);
+        leaders.extend(lead);
         pills.push(b);
+    }
+
+    // markers for the footnotes: the first free spot next to each element
+    let mut markers: Vec<Pill> = Vec::new();
+    let mut degraded: Vec<String> = Vec::new();
+    for (i, p) in pending.iter().enumerate() {
+        let n = i + 1;
+        let spot = p
+            .spots
+            .iter()
+            .find(|r| space.free(r, &taken, &leaders))
+            .copied();
+        match spot {
+            Some(r) => {
+                let m = marker(n, r.x, r.y);
+                taken.push(m.r);
+                markers.push(m);
+                degraded.push(format!(
+                    "no room on the board, listed below it as note {n}: {}",
+                    p.text
+                ));
+            }
+            None if !p.drawn => degraded.push(format!(
+                "its element is not drawn on the board, listed below it as note {n} (no marker): {}",
+                p.text
+            )),
+            None => degraded.push(format!(
+                "no room on the board, listed below it as note {n} (no marker, no room for one): {}",
+                p.text
+            )),
+        }
     }
 
     // stickies
     let mut stickies = Vec::new();
     let mut sorted = board.final_stickies();
     sorted.sort_by(|a, b| first_seen(&a.lifetimes).total_cmp(&first_seen(&b.lifetimes)));
-    let zones_bottom = zones.iter().map(|z| z.r.bottom()).fold(0.0, f64::max);
-    let mut y = channels_bottom
-        .max(zones_bottom)
-        .max(arch_bottom + ZONE_PAD_BOTTOM)
-        + 24.0;
+    let mut y = annot_limit + 24.0;
     let per_row = 6usize;
     for row in sorted.chunks(per_row) {
         let n = row.len() as f64;
@@ -1284,6 +1773,42 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
         bottom += r.h + 24.0;
     }
 
+    // annotations without room on the board, one numbered entry per line
+    // group, below everything else (the canvas grows to hold them)
+    let footnotes = (!pending.is_empty()).then(|| {
+        let (fx, fw) = (MARGIN, width - 2.0 * MARGIN);
+        let max_px = fw - 72.0;
+        let mut y = bottom + 44.0;
+        let mut items = Vec::new();
+        for (i, p) in pending.iter().enumerate() {
+            let m = marker(i + 1, fx + 16.0, y);
+            let lines = wrap_px(&p.text, max_px)
+                .into_iter()
+                .enumerate()
+                .map(|(k, l)| TextLine {
+                    id: Some(format!("{LIST_ID}-{}-{k}", i + 1)),
+                    ..tl(fx + 52.0, y + 13.0 + 18.0 * k as f64, l, "body")
+                })
+                .collect::<Vec<_>>();
+            y += 18.0 * lines.len().max(1) as f64 + 8.0;
+            items.push(Footnote { marker: m, lines });
+        }
+        let r = R::new(fx, bottom, fw, y - bottom + 8.0);
+        Footnotes {
+            r,
+            title: tl(
+                fx + 16.0,
+                bottom + 26.0,
+                "Annotations without room on the board (numbered where they belong when a number fits)",
+                "body-strong",
+            ),
+            items,
+        }
+    });
+    if let Some(f) = &footnotes {
+        bottom += f.r.h + 24.0;
+    }
+
     let height = bottom + 40.0;
     let title_text = notes
         .title
@@ -1328,6 +1853,9 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
     if !stickies.is_empty() {
         add("sticky", "Board sticky", 28.0);
     }
+    if !markers.is_empty() {
+        add("marker", "Listed below the board", 28.0);
+    }
     let lw = lx;
     let legend = Legend {
         r: R::new((width - lw) / 2.0, 76.0, lw, 44.0),
@@ -1365,7 +1893,18 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
     for (i, p) in panels.iter().enumerate() {
         blocking.push((format!("panel {i}"), p.r));
     }
+    for m in &markers {
+        blocking.push((format!("marker {}", m.text.text), m.r));
+    }
+    if let Some(f) = &footnotes {
+        blocking.push(("annotation list".into(), f.r));
+    }
 
+    // edge label leaders are drawn with their edge
+    let leaders: Vec<Leader> = leaders
+        .into_iter()
+        .filter(|l| !edges.iter().any(|e| e.leader == Some(*l)))
+        .collect();
     Scene {
         width: width.round(),
         height: height.round(),
@@ -1381,10 +1920,13 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
         stickies,
         banner,
         panels,
+        markers,
+        leaders,
+        footnotes,
         footer: tc(width / 2.0, height - 24.0, footer, "small"),
         layout_method,
         blocking,
-        unplaced,
+        degraded,
     }
 }
 
@@ -1399,7 +1941,8 @@ fn zone_title_r(z: &Zone) -> R {
     )
 }
 
-/// Pairs of blocking boxes that overlap.
+/// Blocking boxes outside the canvas and pairs that overlap. Annotations with
+/// no room are not listed: they are moved below the board (`Scene::degraded`).
 pub fn overlaps(scene: &Scene) -> Vec<String> {
     let b = &scene.blocking;
     let mut out = Vec::new();
@@ -1417,9 +1960,6 @@ pub fn overlaps(scene: &Scene) -> Vec<String> {
         {
             out.push(format!("{name} is outside the canvas"));
         }
-    }
-    for u in &scene.unplaced {
-        out.push(format!("{u} could not be placed without overlapping"));
     }
     for i in 0..b.len() {
         for j in (i + 1)..b.len() {
@@ -1483,6 +2023,45 @@ mod tests {
         // the horizontal leg gets spots above and below it
         assert!(short.iter().any(|s| s.bottom() <= 400.0 - PILL_GAP));
         assert!(short.iter().any(|s| s.y >= 400.0 + PILL_GAP));
+    }
+
+    #[test]
+    fn leaders_hit_box_interiors_only() {
+        let r = R::new(10.0, 10.0, 20.0, 20.0);
+        // through the middle, and a diagonal clipping a corner
+        assert!(line_hits(&(0.0, 20.0, 40.0, 20.0), &r));
+        assert!(line_hits(&(5.0, 20.0, 20.0, 5.0), &r));
+        // ending inside counts; ending on the border does not
+        assert!(line_hits(&(0.0, 20.0, 15.0, 20.0), &r));
+        assert!(!line_hits(&(0.0, 20.0, 10.0, 20.0), &r));
+        // along a border, beside it, stopping short, a point on the border
+        assert!(!line_hits(&(10.0, 0.0, 10.0, 40.0), &r));
+        assert!(!line_hits(&(0.0, 5.0, 40.0, 5.0), &r));
+        assert!(!line_hits(&(0.0, 20.0, 5.0, 20.0), &r));
+        assert!(!line_hits(&(10.0, 15.0, 10.0, 15.0), &r));
+        // a point inside is a hit
+        assert!(line_hits(&(15.0, 15.0, 15.0, 15.0), &r));
+        // a corner graze outside the box
+        assert!(!line_hits(&(0.0, 20.0, 20.0, 0.0), &r));
+    }
+
+    #[test]
+    fn the_list_wraps_wide_scripts_and_long_words_within_its_width() {
+        let cjk: String = "\u{4e2d}\u{6587}\u{5185}\u{5bb9}".repeat(60);
+        for text in [
+            format!("Owner \u{674e}\u{56db} of {cjk}"),
+            "W".repeat(400),
+            "https://example.com/".repeat(30),
+        ] {
+            let lines = wrap_px(&text, 600.0);
+            assert!(lines.len() > 1);
+            for l in &lines {
+                assert!(list_text_w(l) <= 600.0, "{l}");
+            }
+            assert_eq!(lines.concat().replace(' ', ""), text.replace(' ', ""));
+        }
+        // a full-width glyph is bounded above its real advance (about 1 em)
+        assert!(list_char_w('\u{4e2d}') >= 12.0);
     }
 
     #[test]
