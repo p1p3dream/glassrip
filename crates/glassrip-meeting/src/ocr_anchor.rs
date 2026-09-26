@@ -19,7 +19,7 @@
 //! - **Edge labels.** The label box becomes the OCR box of the label text found near
 //!   the reader's label box, or, when there is none, in the corridor between the two
 //!   nodes (a repeated short label elsewhere around them is another connector's).
-//!   Spans that belong to a node are never a label.
+//!   Spans inside a node's box are never a label.
 //! - **Masking.** Every OCR text box is returned for masking, so label glyphs never
 //!   join a connector wherever the reader placed its boxes.
 //!
@@ -343,11 +343,11 @@ pub fn reanchor(board: &ValidatedBoard, ocr: &[TextAnchor], p: &OcrAnchorParams)
         nodes.iter().find(|n| n.local_id == id).map(|n| n.bbox)
     };
     let nodes = out.board.nodes.clone();
+    // A span inside a node's (re-anchored) box is that node's text, never a label;
+    // a span that merely shares a word with a node nearby stays a label candidate.
     let free: Vec<&Span> = spans
         .iter()
-        .zip(&owner)
-        .filter(|(_, o)| o.is_none())
-        .map(|(s, _)| s)
+        .filter(|x| !nodes.iter().any(|n| inside(center(&x.bbox), &n.bbox)))
         .collect();
     for e in &mut out.board.edges {
         let label = clean_label(&e.label);
@@ -646,6 +646,42 @@ mod tests {
         assert_eq!(
             r.board.edges[0].label_bbox,
             Some(BBox::new(235.0, 168.0, 265.0, 182.0))
+        );
+    }
+
+    #[test]
+    fn a_label_sharing_a_word_with_a_nearby_box_is_still_found() {
+        // Node "Say yes" sits right beside the connector's "yes" label: the label
+        // span lies in the node's search window but outside its box.
+        let n1 = BBox::new(100.0, 100.0, 200.0, 150.0);
+        let n2 = BBox::new(500.0, 100.0, 600.0, 150.0);
+        let n3 = BBox::new(260.0, 20.0, 360.0, 70.0);
+        let edge = BoardEdge {
+            src: "n1".into(),
+            dst: "n2".into(),
+            label: "yes".into(),
+            label_bbox: None,
+            style: EdgeStyle::Solid,
+            conf: 0.9,
+        };
+        let board_ = board(
+            vec![
+                node("n1", "Start", n1),
+                node("n2", "Finish", n2),
+                node("n3", "Say yes", n3),
+            ],
+            vec![edge],
+        );
+        let ocr = vec![
+            anchor("Say", 275.0, 38.0, 305.0, 52.0),
+            anchor("yes", 310.0, 38.0, 340.0, 52.0),
+            anchor("yes", 335.0, 108.0, 365.0, 122.0),
+        ];
+        let r = reanchor(&board_, &ocr, &tight());
+        assert_eq!(r.labels_found, 1);
+        assert_eq!(
+            r.board.edges[0].label_bbox,
+            Some(BBox::new(335.0, 108.0, 365.0, 122.0))
         );
     }
 }
