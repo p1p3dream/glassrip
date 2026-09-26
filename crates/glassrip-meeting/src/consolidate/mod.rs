@@ -1541,22 +1541,23 @@ pub fn consolidate_with_probe(
     // pixels, whatever route it takes: `Some(true)` when the stroke that joined the
     // two boxes in `s` no longer joins them in `f` and the ink it was traced
     // through fell; `Some(false)` when it still joins them; `None` when the pixels
-    // cannot tell (no stroke traced in `s`, no common registration, or an end read
-    // in `f` away from where `s` puts it: a moved card takes its connector along).
-    // In each keyframe the other elements read there are masked out at their own
-    // boxes, so a card between the ends, changed, moved or not, neither vetoes nor
-    // fakes the erasure, and an unread mark erased near the ends does not break a
-    // stroke that is still drawn. Masking only removes ink, so a keyframe that
-    // masks less (an element the reader left out) can only keep the edge.
-    // Traces in `s` are cached per (a, b, s).
+    // cannot tell: no stroke traced in `s`, no common registration, an end read in
+    // `f` away from where `s` puts it (a moved card takes its connector along), a
+    // broken stroke without an ink drop, or any other element over the traced
+    // region added, removed, moved or left unread between the two keyframes (a
+    // card placed on a connector hides part of it, a card moved off it may let it
+    // be rerouted through the place it left). The other elements are masked out at
+    // their boxes in each keyframe, so an unchanged card between the ends neither
+    // vetoes nor fakes the erasure, and an unread mark erased near the ends does
+    // not break a stroke that is still drawn. Traces in `s` are cached per
+    // (a, b, s).
     let raw_at = |t: &Track, k: usize| t.obs.iter().find(|o| o.frame == k).and_then(|o| o.raw_bbox);
-    let masks_at = |a: usize, b: usize, k: usize| -> Vec<BBox> {
+    let others = |a: usize, b: usize| {
         tracks
             .iter()
             .enumerate()
-            .filter(|(i, _)| *i != a && *i != b)
-            .filter_map(|(_, x)| raw_at(x, k))
-            .collect()
+            .filter(move |(i, _)| *i != a && *i != b)
+            .map(|(_, x)| x)
     };
     // (trace, traced region, band width) in the keyframe that read the edge.
     type Traced = Option<(StrokeTrace, BBox, f64)>;
@@ -1567,11 +1568,12 @@ pub fn consolidate_with_probe(
         let (ta, tb) = (&tracks[a], &tracks[b]);
         let (ba, bb) = (raw_at(ta, s)?, raw_at(tb, s)?);
         let (t, k) = s_to_f(s, f)?;
+        let center = |r: &BBox| ((r.x1 + r.x2) / 2.0, (r.y1 + r.y2) / 2.0);
+        let inside =
+            |c: (f64, f64), m: &BBox| c.0 >= m.x1 && c.0 <= m.x2 && c.1 >= m.y1 && c.1 <= m.y2;
         for (tr, bs) in [(ta, &ba), (tb, &bb)] {
             if let Some(r) = raw_at(tr, f) {
-                let m = map_bbox(&t, bs);
-                let c = ((r.x1 + r.x2) / 2.0, (r.y1 + r.y2) / 2.0);
-                if !(c.0 >= m.x1 && c.0 <= m.x2 && c.1 >= m.y1 && c.1 <= m.y2) {
+                if !inside(center(&r), &map_bbox(&t, bs)) {
                     return None;
                 }
             }
@@ -1586,31 +1588,49 @@ pub fn consolidate_with_probe(
                 ba.x2.max(bb.x2) + margin,
                 ba.y2.max(bb.y2) + margin,
             );
+            let masks: Vec<BBox> = others(a, b).filter_map(|x| raw_at(x, s)).collect();
             probe
-                .stroke_between(
-                    &frames[s].keyframe_id,
-                    &ba,
-                    &bb,
-                    &region,
-                    &masks_at(a, b, s),
-                    ring,
-                )
+                .stroke_between(&frames[s].keyframe_id, &ba, &bb, &region, &masks, ring)
                 .map(|x| (x, region, ring))
         });
         let (before, region, ring) = before?;
         if !before.joined {
             return None;
         }
+        // Every other element over the traced region is read in both keyframes at
+        // the same place (within the band width).
+        let region_f = map_bbox(&t, &region);
+        let meets = |r: &BBox| {
+            r.x1 < region_f.x2 && region_f.x1 < r.x2 && r.y1 < region_f.y2 && region_f.y1 < r.y2
+        };
+        let mut masks = Vec::new();
+        for x in others(a, b) {
+            let (at_s, at_f) = (raw_at(x, s).map(|r| map_bbox(&t, &r)), raw_at(x, f));
+            if !(at_s.as_ref().is_some_and(meets) || at_f.as_ref().is_some_and(meets)) {
+                continue;
+            }
+            let (Some(ms), Some(rf)) = (at_s, at_f) else {
+                return None;
+            };
+            let (cs, cf) = (center(&ms), center(&rf));
+            if (cs.0 - cf.0).hypot(cs.1 - cf.1) > ring * k {
+                return None;
+            }
+            masks.push(rf);
+        }
         let now = probe.stroke_between(
             &frames[f].keyframe_id,
             &map_bbox(&t, &ba),
             &map_bbox(&t, &bb),
-            &map_bbox(&t, &region),
-            &masks_at(a, b, f),
+            &region_f,
+            &masks,
             ring * k,
         )?;
+        if now.joined {
+            return Some(false);
+        }
         let fell = now.ink <= before.ink - rp.min_ink_drop.max(rp.min_ink_drop_share * before.ink);
-        Some(!now.joined && fell)
+        fell.then_some(true)
     };
 
     let mut edges: Vec<EdgeState> = Vec::new();

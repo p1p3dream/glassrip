@@ -2364,8 +2364,9 @@ fn a_routed_connector_is_traced_around_the_elements_between_its_ends() {
         (5, 5, 0, 9, None),
         // An unread mark between the ends is erased, the connector stays: kept.
         (0, 0, 5, 9, None),
-        // Both the card and the connector are erased: removed.
-        (5, 5, 0, 5, Some(100.0)),
+        // Both the card and the connector are erased: the region changed around
+        // the connector, so the pixels cannot tell and it is kept.
+        (5, 5, 0, 5, None),
     ];
     for (card_read, card_drawn, blob_drawn, line_drawn, removed) in cases {
         let mut specs: Vec<Spec> = (0..9)
@@ -2578,6 +2579,70 @@ fn an_erased_straight_mark_across_the_corridor_is_not_the_routed_connector() {
         e.lifetimes.iter().all(|l| l.removed_at_s.is_none()),
         "{e:?}"
     );
+}
+
+#[test]
+fn a_card_moved_onto_a_drawn_connector_does_not_remove_it() {
+    // A card moves from below the routed connector onto its lower leg at keyframe
+    // 5 (covering part of it); the connector is still drawn and the reader leaves
+    // it out. The card changed place over the traced region, so the pixels cannot
+    // tell and the connector stays.
+    let grpc = |s: &BoardStateItem| s.edges.iter().find(|e| e.label == "gRPC").cloned().unwrap();
+    let mut specs: Vec<Spec> = (0..9)
+        .map(|_| Spec {
+            ink: Some(0.01),
+            ..base()
+        })
+        .collect();
+    specs[5].ink = Some(0.2);
+    for (i, s) in specs.iter_mut().enumerate() {
+        s.stickies.push((
+            "Temp note",
+            if i < 5 {
+                (950.0, 460.0)
+            } else {
+                (950.0, 330.0)
+            },
+        ));
+        if i >= 5 {
+            s.edges.retain(|e| e.2 != "gRPC");
+        }
+    }
+    let canvases = paint_all(&specs, |_| vec![routed_grpc()]);
+    let e = grpc(&run_canvases(frames(&specs), &canvases));
+    assert!(
+        e.lifetimes.iter().all(|l| l.removed_at_s.is_none()),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn a_connector_erased_while_ink_is_added_near_it_is_not_vetoed_by_the_trace() {
+    // A straight connector between Queue and Ledger Store is erased at keyframe 5
+    // while an unread scribble is added under it; the corridor empties. The trace
+    // breaks without an ink drop, which cannot tell: the corridor decides.
+    let grpc = |s: &BoardStateItem| s.edges.iter().find(|e| e.label == "gRPC").cloned().unwrap();
+    let mut specs: Vec<Spec> = (0..9)
+        .map(|_| Spec {
+            ink: Some(0.01),
+            ..base()
+        })
+        .collect();
+    specs[5].ink = Some(0.2);
+    for s in specs.iter_mut().skip(5) {
+        s.edges.retain(|e| e.2 != "gRPC");
+    }
+    let straight = Mark::Path(vec![(790.0, 216.0), (1110.0, 204.0)]);
+    let canvases = paint_all(&specs, |i| {
+        if i < 5 {
+            vec![straight.clone()]
+        } else {
+            vec![Mark::Fill(BBox::new(820.0, 290.0, 1080.0, 330.0))]
+        }
+    });
+    let e = grpc(&run_canvases(frames(&specs), &canvases));
+    assert!(!e.in_final, "{e:?}");
+    assert_eq!(e.lifetimes.last().unwrap().removed_at_s, Some(100.0));
 }
 
 #[test]
