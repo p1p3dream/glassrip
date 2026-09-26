@@ -1141,38 +1141,22 @@ pub fn consolidate_with_probe(
         // The blank view must be the same view: every board keyframe since the
         // last sighting was compared with its predecessor on aligned ink (a pan
         // or a cut the aligner cannot follow leaves the ink unknown), and the ink
-        // changed on the way. A flat canvas cannot be aligned at all, so a link
-        // into a confidently blank keyframe from the keyframe right before it
-        // (nothing between them) is measured from the pixels instead: blank to
-        // blank is no change; content to blank is a full change only right after
-        // the track's last sighting, and only when the view there was still (the
-        // track read at the same place in the keyframe before). A view that was
-        // moving when the canvas went blank is a pan to empty canvas as far as
-        // anything here can tell, and keeps the track.
+        // changed on the way. A flat canvas has nothing to align on, so a link
+        // between two adjacent keyframes that are both confidently blank is
+        // measured from the pixels instead: no change. A link from content into
+        // a blank view stays unknown when the aligner could not measure it: an
+        // erasure, a pan and a cut to empty canvas look the same there, and the
+        // element stays.
         let kid = |k: usize| frames[k].keyframe_id.as_str();
-        let adjacent =
-            |k: usize| k > 0 && frames[k - 1].keyframe_index + 1 == frames[k].keyframe_index;
-        let still_at_s = || {
-            let at = |k: usize| t.obs.iter().find(|o| o.frame == k).and_then(|o| o.raw_bbox);
-            let (Some(now), Some(prev)) = (at(s), s.checked_sub(1).and_then(at)) else {
-                return false;
-            };
-            let tol = (0.1 * now.width().min(now.height())).max(2.0);
-            adjacent(s)
-                && ((now.x1 + now.x2) - (prev.x1 + prev.x2)).abs() / 2.0 <= tol
-                && ((now.y1 + now.y2) - (prev.y1 + prev.y2)).abs() / 2.0 <= tol
-        };
         let link = |k: usize| -> Option<f64> {
             if let Some(x) = frames[k].ink_change {
                 return Some(x);
             }
-            if probe.uniform(kid(k)) != Some(true) || !adjacent(k) {
-                return None;
-            }
-            match probe.uniform(kid(k - 1))? {
-                true => Some(0.0),
-                false => (k == s + 1 && still_at_s()).then_some(1.0),
-            }
+            let adjacent = k > 0 && frames[k - 1].keyframe_index + 1 == frames[k].keyframe_index;
+            (adjacent
+                && probe.uniform(kid(k)) == Some(true)
+                && probe.uniform(kid(k - 1)) == Some(true))
+            .then_some(0.0)
         };
         let chain: Vec<Option<f64>> = (s + 1..=f).map(link).collect();
         if !chain.iter().all(Option::is_some)
@@ -1553,24 +1537,38 @@ pub fn consolidate_with_probe(
             probe.line_cover(kf, t.apply(p), t.apply(q), half * k)?,
         ))
     };
-    // A routed connector between `a` and `b` (read in keyframe `s`) traced on the
+    // A connector between tracks `a` and `b` (read in keyframe `s`) traced on the
     // pixels, whatever route it takes: `Some(true)` when the stroke that joined the
     // two boxes in `s` no longer joins them in `f` and the ink it was traced
     // through fell; `Some(false)` when it still joins them; `None` when the pixels
     // cannot tell (no stroke traced in `s`, no common registration, or an end read
     // in `f` away from where `s` puts it: a moved card takes its connector along).
-    // Every other element read in `s` is masked out in both keyframes, so a card
-    // between the ends, changed or not, neither vetoes nor fakes the erasure, and
-    // an unread mark erased near the ends does not break a stroke that is still
-    // drawn.
-    let routed_gone = |a: &Track, b: &Track, s: usize, f: usize| -> Option<bool> {
+    // In each keyframe the other elements read there are masked out at their own
+    // boxes, so a card between the ends, changed, moved or not, neither vetoes nor
+    // fakes the erasure, and an unread mark erased near the ends does not break a
+    // stroke that is still drawn. Masking only removes ink, so a keyframe that
+    // masks less (an element the reader left out) can only keep the edge.
+    // Traces in `s` are cached per (a, b, s).
+    let raw_at = |t: &Track, k: usize| t.obs.iter().find(|o| o.frame == k).and_then(|o| o.raw_bbox);
+    let masks_at = |a: usize, b: usize, k: usize| -> Vec<BBox> {
+        tracks
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != a && *i != b)
+            .filter_map(|(_, x)| raw_at(x, k))
+            .collect()
+    };
+    // (trace, traced region, band width) in the keyframe that read the edge.
+    type Traced = Option<(StrokeTrace, BBox, f64)>;
+    let traced: std::cell::RefCell<HashMap<(usize, usize, usize), Traced>> =
+        std::cell::RefCell::new(HashMap::new());
+    let routed_gone = |a: usize, b: usize, s: usize, f: usize| -> Option<bool> {
         let probe = probe?;
-        let raw =
-            |t: &Track, k: usize| t.obs.iter().find(|o| o.frame == k).and_then(|o| o.raw_bbox);
-        let (ba, bb) = (raw(a, s)?, raw(b, s)?);
+        let (ta, tb) = (&tracks[a], &tracks[b]);
+        let (ba, bb) = (raw_at(ta, s)?, raw_at(tb, s)?);
         let (t, k) = s_to_f(s, f)?;
-        for (tr, bs) in [(a, &ba), (b, &bb)] {
-            if let Some(r) = raw(tr, f) {
+        for (tr, bs) in [(ta, &ba), (tb, &bb)] {
+            if let Some(r) = raw_at(tr, f) {
                 let m = map_bbox(&t, bs);
                 let c = ((r.x1 + r.x2) / 2.0, (r.y1 + r.y2) / 2.0);
                 if !(c.0 >= m.x1 && c.0 <= m.x2 && c.1 >= m.y1 && c.1 <= m.y2) {
@@ -1579,31 +1577,36 @@ pub fn consolidate_with_probe(
             }
         }
         let rp = &params.region_probe;
-        let ring = (rp.corridor_half_width_share * ba.height().min(bb.height())).max(3.0);
-        let margin = rp.stroke_margin_share * ba.height().max(bb.height());
-        let region = BBox::new(
-            ba.x1.min(bb.x1) - margin,
-            ba.y1.min(bb.y1) - margin,
-            ba.x2.max(bb.x2) + margin,
-            ba.y2.max(bb.y2) + margin,
-        );
-        let masks: Vec<BBox> = tracks
-            .iter()
-            .filter(|x| !std::ptr::eq(*x, a) && !std::ptr::eq(*x, b))
-            .filter_map(|x| raw(x, s))
-            .collect();
-        let before =
-            probe.stroke_between(&frames[s].keyframe_id, &ba, &bb, &region, &masks, ring)?;
+        let before = *traced.borrow_mut().entry((a, b, s)).or_insert_with(|| {
+            let ring = (rp.corridor_half_width_share * ba.height().min(bb.height())).max(3.0);
+            let margin = rp.stroke_margin_share * ba.height().max(bb.height());
+            let region = BBox::new(
+                ba.x1.min(bb.x1) - margin,
+                ba.y1.min(bb.y1) - margin,
+                ba.x2.max(bb.x2) + margin,
+                ba.y2.max(bb.y2) + margin,
+            );
+            probe
+                .stroke_between(
+                    &frames[s].keyframe_id,
+                    &ba,
+                    &bb,
+                    &region,
+                    &masks_at(a, b, s),
+                    ring,
+                )
+                .map(|x| (x, region, ring))
+        });
+        let (before, region, ring) = before?;
         if !before.joined {
             return None;
         }
-        let mapped: Vec<BBox> = masks.iter().map(|m| map_bbox(&t, m)).collect();
         let now = probe.stroke_between(
             &frames[f].keyframe_id,
             &map_bbox(&t, &ba),
             &map_bbox(&t, &bb),
             &map_bbox(&t, &region),
-            &mapped,
+            &masks_at(a, b, f),
             ring * k,
         )?;
         let fell = now.ink <= before.ink - rp.min_ink_drop.max(rp.min_ink_drop_share * before.ink);
@@ -1654,22 +1657,26 @@ pub fn consolidate_with_probe(
                 if !(present(ta) && present(tb)) {
                     return Visibility::Unknown;
                 }
-                let gone = verdict(f).map(|d| !d).unwrap_or_else(|| {
-                    let from = last_read(f).map_or(0, |s| s + 1);
-                    let inked = (from..=f).any(|k| {
-                        frames[k]
-                            .ink_change
-                            .is_some_and(|x| x >= params.ink_event_threshold)
-                    });
-                    // With pixels, the traced stroke must say the connector went
-                    // (pixels that cannot tell keep it); without pixels, the board
-                    // ink is all there is to go on.
-                    inked
-                        && match last_read(f) {
-                            Some(s) if probe.is_some() => routed_gone(ta, tb, s, f) == Some(true),
-                            _ => probe.is_none(),
-                        }
-                });
+                // A corridor that emptied is confirmed by the traced stroke when it
+                // can speak: an unread straight mark erased across the corridor of
+                // a connector routed around it is not the connector.
+                let traced_gone = || last_read(f).and_then(|s| routed_gone(a, b, s, f));
+                let gone = match verdict(f) {
+                    Some(true) => false,
+                    Some(false) => traced_gone() != Some(false),
+                    None => {
+                        let from = last_read(f).map_or(0, |s| s + 1);
+                        let inked = (from..=f).any(|k| {
+                            frames[k]
+                                .ink_change
+                                .is_some_and(|x| x >= params.ink_event_threshold)
+                        });
+                        // With pixels, the traced stroke must say the connector went
+                        // (pixels that cannot tell keep it); without pixels, the board
+                        // ink is all there is to go on.
+                        inked && (probe.is_none() || traced_gone() == Some(true))
+                    }
+                };
                 if gone {
                     Visibility::Visible
                 } else {

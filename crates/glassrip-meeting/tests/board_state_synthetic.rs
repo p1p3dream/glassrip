@@ -2461,9 +2461,14 @@ fn a_moved_end_card_does_not_read_as_an_erased_connector() {
 }
 
 /// A board holding one sticky, read at `place(i)` in keyframes 0 to 3; from
-/// keyframe 4 the canvas is one flat color. The flat views cannot be aligned, so
-/// their ink change is unknown.
-fn flat_canvas_case(place: impl Fn(usize) -> (f64, f64)) -> BoardStateItem {
+/// keyframe 4 the canvas is one flat color. `erase_ink` is the ink change measured
+/// into keyframe 4; the flat views after it cannot be aligned with each other, so
+/// their ink change is unknown. `uniform` lets the probe report flat canvases.
+fn flat_canvas_case(
+    place: impl Fn(usize) -> (f64, f64),
+    erase_ink: Option<f64>,
+    uniform: bool,
+) -> BoardStateItem {
     let specs: Vec<Spec> = (0..8)
         .map(|i| Spec {
             nodes: vec![],
@@ -2473,7 +2478,11 @@ fn flat_canvas_case(place: impl Fn(usize) -> (f64, f64)) -> BoardStateItem {
             } else {
                 vec![]
             },
-            ink: if i < 4 { Some(0.01) } else { None },
+            ink: match i {
+                0..=3 => Some(0.01),
+                4 => erase_ink,
+                _ => None,
+            },
             ..base()
         })
         .collect();
@@ -2493,24 +2502,133 @@ fn flat_canvas_case(place: impl Fn(usize) -> (f64, f64)) -> BoardStateItem {
         ]
     });
     assert!(canvases.0[4].uniform() && !canvases.0[3].uniform());
-    run_canvases(fr, &canvases)
+    struct NoUniform<'a>(&'a Canvases);
+    impl RegionProbe for NoUniform<'_> {
+        fn ink_share(&self, k: &str, r: &BBox) -> Option<f64> {
+            self.0.ink_share(k, r)
+        }
+        fn line_cover(&self, k: &str, a: (f64, f64), b: (f64, f64), h: f64) -> Option<f64> {
+            self.0.line_cover(k, a, b, h)
+        }
+    }
+    let hidden = NoUniform(&canvases);
+    let probe: &dyn RegionProbe = if uniform { &canvases } else { &hidden };
+    consolidate_with_probe(
+        fr,
+        "board-1",
+        &params(),
+        &hooks(&NoCorroboration),
+        Some(probe),
+    )
 }
 
 #[test]
 fn erasing_the_only_element_on_a_flat_canvas_is_a_removal() {
-    // The view was still (the sticky read at the same place in keyframes 2 and
-    // 3), then the canvas went flat: the sticky was erased.
-    let s = flat_canvas_case(|_| (800.0, 450.0));
+    // The erasure was measured into keyframe 4 (aligned ink 0.2); the flat views
+    // after it cannot be aligned. Two flat adjacent views are no change, so the
+    // chain stays linked through them and the sticky is removed.
+    let s = flat_canvas_case(|_| (800.0, 450.0), Some(0.2), true);
     let x = &s.stickies[0];
     assert!(!x.in_final, "{x:?}");
     assert_eq!(x.lifetimes.last().unwrap().removed_at_s, Some(80.0));
+    // Without the flat-canvas measure the unknown links break the chain.
+    let s = flat_canvas_case(|_| (800.0, 450.0), Some(0.2), false);
+    assert!(s.stickies[0].in_final, "{:?}", s.stickies[0]);
 }
 
 #[test]
-fn a_pan_to_flat_canvas_is_not_an_erasure() {
-    // The view was moving (the sticky read 120 px further left each keyframe)
-    // when the canvas went flat: a pan to empty canvas, the sticky stays.
-    let s = flat_canvas_case(|i| (1100.0 - 120.0 * i as f64, 450.0));
-    let x = &s.stickies[0];
-    assert!(x.in_final, "{x:?}");
+fn a_cut_or_pan_to_flat_canvas_is_not_an_erasure() {
+    // The aligner could not measure the step into the flat view: an erasure, a
+    // cut or a pan to empty canvas look the same there. Whether the view was
+    // still before (the sticky at the same place) or moving (120 px further left
+    // each keyframe), the sticky stays.
+    let still = flat_canvas_case(|_| (800.0, 450.0), None, true);
+    assert!(still.stickies[0].in_final, "{:?}", still.stickies[0]);
+    let moving = flat_canvas_case(|i| (1100.0 - 120.0 * i as f64, 450.0), None, true);
+    assert!(moving.stickies[0].in_final, "{:?}", moving.stickies[0]);
+}
+
+#[test]
+fn an_erased_straight_mark_across_the_corridor_is_not_the_routed_connector() {
+    // An unread straight line runs through the straight corridor between Queue
+    // and Ledger Store (touching the routed connector's far leg) and is erased at
+    // keyframe 5, while the routed connector stays. The corridor empties, but the
+    // traced connector still joins the ends.
+    let grpc = |s: &BoardStateItem| s.edges.iter().find(|e| e.label == "gRPC").cloned().unwrap();
+    let mut specs: Vec<Spec> = (0..9)
+        .map(|_| Spec {
+            ink: Some(0.01),
+            ..base()
+        })
+        .collect();
+    specs[5].ink = Some(0.2);
+    for s in specs.iter_mut().skip(5) {
+        s.edges.retain(|e| e.2 != "gRPC");
+    }
+    let canvases = paint_all(&specs, |i| {
+        let mut m = vec![routed_grpc()];
+        if i < 5 {
+            m.push(Mark::Path(vec![(830.0, 212.0), (1070.0, 208.0)]));
+        }
+        m
+    });
+    let e = grpc(&run_canvases(frames(&specs), &canvases));
+    assert!(e.in_final, "{e:?}");
+    assert!(
+        e.lifetimes.iter().all(|l| l.removed_at_s.is_none()),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn a_card_moved_off_a_rerouted_connector_does_not_remove_it() {
+    // A card between Queue and Ledger Store moves 120 px down at keyframe 5 and
+    // the connector is rerouted straight through the place it left; the reader
+    // leaves the connector out. Each keyframe masks the card where it is read
+    // there, so the new route is traced.
+    let grpc = |s: &BoardStateItem| s.edges.iter().find(|e| e.label == "gRPC").cloned().unwrap();
+    let mut specs: Vec<Spec> = (0..9)
+        .map(|_| Spec {
+            ink: Some(0.01),
+            ..base()
+        })
+        .collect();
+    specs[5].ink = Some(0.2);
+    for (i, s) in specs.iter_mut().enumerate() {
+        s.stickies.push((
+            "Temp note",
+            if i < 5 {
+                (950.0, 210.0)
+            } else {
+                (950.0, 330.0)
+            },
+        ));
+        if i >= 5 {
+            s.edges.retain(|e| e.2 != "gRPC");
+        }
+    }
+    let canvases = paint_all(&specs, |i| {
+        if i < 5 {
+            vec![Mark::Path(vec![
+                (790.0, 220.0),
+                (850.0, 220.0),
+                (850.0, 300.0),
+                (1050.0, 300.0),
+                (1050.0, 200.0),
+                (1110.0, 200.0),
+            ])]
+        } else {
+            vec![Mark::Path(vec![
+                (790.0, 220.0),
+                (850.0, 220.0),
+                (850.0, 205.0),
+                (1110.0, 205.0),
+            ])]
+        }
+    });
+    let e = grpc(&run_canvases(frames(&specs), &canvases));
+    assert!(
+        e.lifetimes.iter().all(|l| l.removed_at_s.is_none()),
+        "{e:?}"
+    );
 }

@@ -789,17 +789,26 @@ impl ProbeCanvas {
         if x2 - x1 < (4 * c) as f64 || y2 - y1 < (4 * c) as f64 {
             return None;
         }
-        let window = (x1, y1, x2, y2);
-        let ignored: Vec<Rect> = masks
+        let (x0, y0) = (x1 as usize, y1 as usize);
+        let (ww, wh) = (x2 as usize - x0, y2 as usize - y0);
+        // The ignored pixels of the window, rasterized once (pixel centers inside
+        // a grown box).
+        let mut ignored = vec![false; ww * wh];
+        for m in masks
             .iter()
             .filter(|m| finite(m))
             .map(|m| grow(px(m), Self::BOX_PAD))
-            .filter(|m| m.0 < window.2 && window.0 < m.2 && m.1 < window.3 && window.1 < m.3)
             .chain([pa, pb])
-            .collect();
-        let (x0, y0) = (x1 as usize, y1 as usize);
-        let cols = (x2 as usize - x0).div_ceil(c);
-        let rows = (y2 as usize - y0).div_ceil(c);
+        {
+            let lo = |v: f64, o: usize| ((v - 0.5).ceil().max(o as f64) as usize).saturating_sub(o);
+            let (mx1, my1) = (lo(m.0, x0), lo(m.1, y0));
+            let (mx2, my2) = (lo(m.2, x0).min(ww), lo(m.3, y0).min(wh));
+            for y in my1..my2 {
+                ignored[y * ww + mx1.min(mx2)..y * ww + mx2].fill(true);
+            }
+        }
+        let cols = ww.div_ceil(c);
+        let rows = wh.div_ceil(c);
         // Per cell: holds ink, ink in a's band, ink in b's band.
         let mut ink = vec![false; cols * rows];
         let mut near_a = vec![false; cols * rows];
@@ -807,7 +816,7 @@ impl ProbeCanvas {
         for y in y0..(y2 as usize) {
             for x in x0..(x2 as usize) {
                 let (fx, fy) = (x as f64 + 0.5, y as f64 + 0.5);
-                if ignored.iter().any(|m| inside(m, fx, fy)) || !self.ink_at(x as f64, y as f64) {
+                if ignored[(y - y0) * ww + (x - x0)] || !self.ink_at(x as f64, y as f64) {
                     continue;
                 }
                 let i = ((y - y0) / c) * cols + (x - x0) / c;

@@ -44,28 +44,27 @@ use crate::text::{
 /// event's kind agrees with the assignment (a move or not), and its structured
 /// target (and, for a move, the target it left) is the assignment's by id. An
 /// event without a structured target (a state written before events carried
-/// one) matches only on the exact detail text the board stage writes, never on
-/// a substring: a tag moved to "Ledger Store" is not a tag on "Ledger".
+/// one) matches no assignment: its detail text cannot tell two targets with the
+/// same name apart, and the assignment is still cited by the keyframe that
+/// opened it.
 pub(crate) fn owner_events<'a>(b: &'a BoardStateItem, o: &OwnerAssignment) -> Vec<&'a BoardEvent> {
     let want = if o.moved_from.is_some() {
         EventKind::OwnerMoved
     } else {
         EventKind::OwnerAssigned
     };
-    let legacy_detail = format!("{} -> {}", o.display_name, o.target.texts().join(" - "));
     b.events
         .iter()
         .filter(|e| e.kind == want && e.subject == o.person_id)
-        .filter(|e| match &e.owner_target {
-            Some(t) => {
-                same_target(t, &o.target)
-                    && match (&e.owner_from, &o.moved_from) {
-                        (None, None) => true,
-                        (Some(a), Some(b)) => same_target(a, b),
-                        _ => false,
-                    }
-            }
-            None => e.detail == legacy_detail,
+        .filter(|e| {
+            e.owner_target
+                .as_ref()
+                .is_some_and(|t| same_target(t, &o.target))
+                && match (&e.owner_from, &o.moved_from) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => same_target(a, b),
+                    _ => false,
+                }
         })
         .filter(|e| (e.t_s - o.valid_from_s).abs() <= 30.0)
         .collect()
@@ -1824,8 +1823,8 @@ mod tests {
     fn owner_events_match_their_target_by_id_not_by_a_shared_name() {
         // Mira's plain tag on "Ledger" and, 10 s later, her tag moved to
         // "Ledger Store" from the Kiosk App: each event belongs to its own
-        // assignment, with or without structured targets (a state written
-        // before events carried one matches on the exact detail only).
+        // assignment by target id. Events without a structured target (a
+        // state written before events carried one) match none.
         let mut b = build::board("b", 100.0);
         b.nodes = vec![
             build::node("n1", "Ledger", 0.0, 100.0, None),
@@ -1875,7 +1874,7 @@ mod tests {
                 "Mira Okafor -> Ledger Store",
             ),
         ];
-        for events in [structured, legacy] {
+        for (events, matched) in [(structured, true), (legacy, false)] {
             b.events = events;
             let ids = |o: &OwnerAssignment| -> Vec<String> {
                 owner_events(&b, o)
@@ -1883,9 +1882,32 @@ mod tests {
                     .map(|e| e.event_id.clone())
                     .collect()
             };
-            assert_eq!(ids(&plain), vec!["ev-a"]);
-            assert_eq!(ids(&moved), vec!["ev-m"]);
+            let want = |id: &str| {
+                if matched {
+                    vec![id.to_string()]
+                } else {
+                    vec![]
+                }
+            };
+            assert_eq!(ids(&plain), want("ev-a"));
+            assert_eq!(ids(&moved), want("ev-m"));
         }
+        // Two targets with the same text: the event names one of them by id.
+        b.nodes.push(build::node("n4", "Ledger", 0.0, 100.0, None));
+        let twin = build::owner(
+            "mira",
+            "Mira Okafor",
+            build::node_target(&b, "n4"),
+            40.0,
+            100.0,
+            None,
+        );
+        b.events = vec![BoardEvent {
+            owner_target: Some(n1.clone()),
+            ..build::event("ev-a", EventKind::OwnerAssigned, 40.0, "kf1", "mira", "x")
+        }];
+        assert_eq!(owner_events(&b, &plain).len(), 1);
+        assert!(owner_events(&b, &twin).is_empty());
         // A move with the right destination but another origin is not this move.
         b.events = vec![BoardEvent {
             owner_target: Some(n2),
