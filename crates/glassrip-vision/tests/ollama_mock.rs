@@ -919,3 +919,120 @@ async fn unguarded_requests_do_not_stream_or_send_overrides() {
         "no override, server default"
     );
 }
+
+fn guarded_board() -> VisionRequest {
+    let mut r = VisionRequest::for_output::<glassrip_vision::board::BoardReadOutput>(
+        "Read the synthetic board.",
+        self_test_image().unwrap(),
+        GenerationOptions {
+            seed: 7,
+            num_predict: 2048,
+        },
+    )
+    .unwrap();
+    r.repetition_guard = Some(glassrip_vision::repetition::RepetitionParams::default());
+    r
+}
+
+/// Six identical cards in one row, sequential ids, evenly spaced boxes.
+fn card_row_pieces() -> Vec<String> {
+    let mut pieces = vec!["{\"nodes\": [".to_string()];
+    for c in 0..6u32 {
+        let x = 100 + c * 120;
+        pieces.push(format!(
+            "{}{{\"local_id\": \"n{}\", \"text\": \"Card\", \"bbox_2d\": [{x}, 900, {}, 930], \"conf\": 0.9}}",
+            if c == 0 { "" } else { ", " },
+            30 + c,
+            x + 80
+        ));
+    }
+    pieces.push(
+        "], \"edges\": [], \"stickies\": [], \"owner_tags\": [], \"other_visible_text\": [], \"confidence\": 0.9}"
+            .to_string(),
+    );
+    pieces
+}
+
+fn final_line(done_reason: &str) -> String {
+    let mut s = json!({
+        "model": MODEL, "message": {"role": "assistant", "content": ""}, "done": true,
+        "done_reason": done_reason, "prompt_eval_count": 612, "eval_count": 300,
+        "total_duration": 2_000_000_000u64
+    })
+    .to_string();
+    s.push('\n');
+    s
+}
+
+/// Codex 5 / GLM B1: a complete, valid reading of a regular board streams to the
+/// end and is accepted.
+#[tokio::test]
+async fn a_complete_regular_board_is_accepted() {
+    let server = MockServer::start().await;
+    let pieces = card_row_pieces();
+    let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(stream_body(&refs, true)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let raw = backend(&server)
+        .infer(guarded_board(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(raw.done_reason.as_deref(), Some("stop"));
+    assert_eq!(raw.json["nodes"].as_array().unwrap().len(), 6);
+}
+
+/// A complete reply that validates is accepted even when the detector would
+/// flag it: the guard stops runaway generations, it does not judge answers.
+#[tokio::test]
+async fn a_complete_valid_reply_is_never_rejected_for_repetition() {
+    let server = MockServer::start().await;
+    let edge = "{\"src\": \"n1\", \"dst\": \"n2\", \"label\": \"\", \"label_bbox_2d\": [0, 0, 0, 0], \"style\": \"solid\", \"conf\": 0.9}";
+    let body = format!(
+        "{{\"nodes\": [{{\"local_id\": \"n1\", \"text\": \"Api\", \"bbox_2d\": [10, 10, 90, 40], \"conf\": 0.9}}, {{\"local_id\": \"n2\", \"text\": \"Db\", \"bbox_2d\": [200, 10, 290, 40], \"conf\": 0.9}}], \"edges\": [{edge}, {edge}, {edge}], \"stickies\": [], \"owner_tags\": [], \"other_visible_text\": [], \"confidence\": 0.8}}"
+    );
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(stream_body(&[&body], true)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let raw = backend(&server)
+        .infer(guarded_board(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(raw.json["edges"].as_array().unwrap().len(), 3);
+}
+
+/// GLM B1: a reply cut off at the output limit inside a regular run is a
+/// truncation (the budget retry), not a repetition (the penalty retry).
+#[tokio::test]
+async fn a_regular_run_cut_at_the_limit_is_a_truncation() {
+    let server = MockServer::start().await;
+    let pieces = card_row_pieces();
+    let mut body = String::new();
+    for p in &pieces[..pieces.len() - 1] {
+        body.push_str(
+            &json!({"model": MODEL, "message": {"role": "assistant", "content": p}, "done": false})
+                .to_string(),
+        );
+        body.push('\n');
+    }
+    body.push_str(&final_line("length"));
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .expect(1)
+        .mount(&server)
+        .await;
+    match backend(&server)
+        .infer(guarded_board(), CancellationToken::new())
+        .await
+    {
+        Err(VisionError::Truncated { .. }) => {}
+        other => panic!("expected a truncation, got {other:?}"),
+    }
+}

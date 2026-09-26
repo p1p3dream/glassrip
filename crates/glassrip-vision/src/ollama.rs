@@ -584,7 +584,12 @@ impl OllamaBackend {
                     }
                     return Ok(v);
                 }
-                if let Some(finding) = guard.feed(&content) {
+                // A reply whose final line has already arrived is complete: it is
+                // read to the end, not cut.
+                if let Some(finding) = guard
+                    .feed(&content)
+                    .filter(|_| !final_line_buffered(&pending))
+                {
                     // Dropping `resp` closes the connection; Ollama cancels the
                     // generation when its client goes away.
                     return Err(AttemptError::Fatal(VisionError::Repetition {
@@ -843,12 +848,13 @@ impl OllamaBackend {
             .as_ref()
             .map(|m| m.content.clone())
             .unwrap_or_default();
-        repetition(request, &text)?;
         truncation(request, &resp, &text)?;
         let first_errors = match validate_text(request, &text) {
             Ok(json) => return Ok(Self::to_raw(resp, json, text, attempts, wall, false)),
             Err(errors) => errors,
         };
+        // Repairing a loop only echoes it back.
+        repetition(request, &text)?;
         if !allow_repair {
             return Err(VisionError::SchemaInvalid {
                 attempts: 1,
@@ -861,14 +867,32 @@ impl OllamaBackend {
             errors = %format_field_errors(&first_errors),
             "model output failed validation; sending one repair request"
         );
-        let plan = plan_repair(
+        // A repair that cannot fit depends on this reply's length, not on the
+        // request: report the invalid reply, not an input the request cannot fit.
+        let plan = match plan_repair(
             self.config.num_ctx,
             request.image.tokens(),
             &request.prompt,
             request.options.num_predict,
             &text,
             &first_errors,
-        )?;
+        ) {
+            Ok(plan) => plan,
+            Err(VisionError::ContextOverflow { estimated, num_ctx }) => {
+                tracing::warn!(
+                    model = %self.config.model,
+                    estimated,
+                    num_ctx,
+                    "repair request would not fit num_ctx; reporting the invalid reply"
+                );
+                return Err(VisionError::SchemaInvalid {
+                    attempts: 1,
+                    errors: first_errors,
+                    raw_text: text,
+                });
+            }
+            Err(e) => return Err(e),
+        };
         if plan.echo_reduced {
             tracing::warn!(
                 model = %self.config.model,
@@ -884,15 +908,17 @@ impl OllamaBackend {
             .as_ref()
             .map(|m| m.content.clone())
             .unwrap_or_default();
-        repetition(request, &text)?;
         truncation(request, &resp, &text)?;
         match validate_text(request, &text) {
             Ok(json) => Ok(Self::to_raw(resp, json, text, attempts, wall, true)),
-            Err(errors) => Err(VisionError::SchemaInvalid {
-                attempts: 2,
-                errors,
-                raw_text: text,
-            }),
+            Err(errors) => {
+                repetition(request, &text)?;
+                Err(VisionError::SchemaInvalid {
+                    attempts: 2,
+                    errors,
+                    raw_text: text,
+                })
+            }
         }
     }
 
@@ -1079,9 +1105,27 @@ impl OllamaBackend {
     }
 }
 
+/// True when `pending` (NDJSON bytes not read yet) already holds a complete final
+/// (`"done": true`) line.
+fn final_line_buffered(pending: &[u8]) -> bool {
+    pending
+        .split(|b| *b == b'\n')
+        .rev()
+        .skip(1) // the part after the last newline is not a complete line
+        .any(|line| {
+            serde_json::from_slice::<Value>(line)
+                .ok()
+                .and_then(|v| v.get("done").and_then(Value::as_bool))
+                == Some(true)
+        })
+}
+
 /// A guarded request's returned text is checked once more (a non-streaming path, or
-/// a loop completed inside one chunk): a loop is reported as
-/// [`VisionError::Repetition`] before truncation or validation.
+/// a loop completed inside one chunk), but only when the reply is not a usable
+/// answer: cut off at the output limit (then a loop, not the budget, decides the
+/// retry) or invalid (a repair would echo the loop). A complete reply that
+/// validates is accepted whatever the detector says, so a regular board is never
+/// rejected for its regularity.
 pub fn repetition(request: &VisionRequest, text: &str) -> Result<()> {
     if let Some(p) = &request.repetition_guard {
         if let Some(finding) = crate::repetition::detect(text, p) {
@@ -1099,6 +1143,7 @@ pub fn repetition(request: &VisionRequest, text: &str) -> Result<()> {
 /// report it as [`VisionError::Truncated`] instead of validating or repairing it.
 fn truncation(request: &VisionRequest, resp: &ChatResponse, text: &str) -> Result<()> {
     if resp.done_reason.as_deref() == Some("length") {
+        repetition(request, text)?;
         return Err(VisionError::Truncated {
             num_predict: request.options.num_predict,
             eval_count: resp.eval_count,

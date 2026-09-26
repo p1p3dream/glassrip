@@ -624,3 +624,81 @@ async fn streamed_loops_retry_with_a_repeat_penalty_and_replay() {
 async fn returned_loops_retry_with_a_repeat_penalty_and_replay() {
     looping_reads_retry_with_a_repeat_penalty_and_replay(true).await;
 }
+
+/// GLM B1: a board read cut off at the output limit inside a regular row of six
+/// identical cards (sequential ids, evenly spaced boxes). The row is not a loop, so
+/// the budget (compact) retry runs, not the repeat-penalty retry.
+struct CardRowModel;
+
+fn card_row_text() -> String {
+    let mut s = String::from("{\n  \"nodes\": [\n");
+    for c in 0..6u32 {
+        let x = 100 + c * 120;
+        s.push_str(&format!(
+            "    {{\"local_id\": \"n{}\", \"text\": \"Card\", \"bbox_2d\": [{x}, 400, {}, 440], \"conf\": 0.9}},\n",
+            30 + c,
+            x + 80
+        ));
+    }
+    s
+}
+
+#[async_trait]
+impl VisionBackend for CardRowModel {
+    fn id(&self) -> BackendId {
+        ScriptedModel.id()
+    }
+    async fn preflight(&self) -> glassrip_vision::Result<Placement> {
+        Err(VisionError::Config("unused".into()))
+    }
+    async fn infer(
+        &self,
+        request: VisionRequest,
+        cancel: CancellationToken,
+    ) -> glassrip_vision::Result<RawResponse> {
+        let nodes_budget = request.schema.json()["properties"]["nodes"]["maxItems"].as_u64();
+        if nodes_budget == Some(60) {
+            return Err(VisionError::Truncated {
+                num_predict: request.options.num_predict,
+                eval_count: Some(request.options.num_predict),
+                raw_text: card_row_text(),
+            });
+        }
+        ScriptedModel.infer(request, cancel).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_regular_row_cut_at_the_limit_takes_the_budget_retry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_inputs(root);
+    let store = RawStore::new(root.join("raw"));
+    let live = root.join("live");
+    run_branch(
+        root,
+        &live,
+        Arc::new(RecordingBackend::new(Arc::new(CardRowModel), store.clone())),
+    )
+    .await;
+    let readings: Vec<(String, BoardReadingItem)> = read(&live, artifacts::BOARD_READING);
+    assert_eq!(readings.len(), 2);
+    for (_, r) in &readings {
+        let log = &r.requests[0];
+        assert!(log.compact_retry, "{log:?}");
+        assert_eq!(log.repetition, None, "a regular row is not a loop");
+        assert_eq!(log.sampling.repeat_penalty, None);
+    }
+    let replay = root.join("replay");
+    run_branch(
+        root,
+        &replay,
+        Arc::new(ReplayBackend::new("scripted-vl", store)),
+    )
+    .await;
+    let again: Vec<(String, BoardReadingItem)> = read(&replay, artifacts::BOARD_READING);
+    for ((_, a), (_, b)) in again.iter().zip(&readings) {
+        assert_eq!(a.result, b.result);
+        assert_eq!(a.requests[0].request_key, b.requests[0].request_key);
+    }
+}
