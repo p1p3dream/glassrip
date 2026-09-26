@@ -489,16 +489,60 @@ pub struct ClaimWord {
     pub negated: bool,
 }
 
+/// Number words folded to their digits, so "retry thirty times" and "retry 30 times"
+/// share a term. "one" is left out: it is as often a pronoun ("the new one") as a
+/// count. Compounds ("twenty five") stay two terms and do not match "25".
+const NUMBER_WORDS: &[(&str, &str)] = &[
+    ("zero", "0"),
+    ("two", "2"),
+    ("three", "3"),
+    ("four", "4"),
+    ("five", "5"),
+    ("six", "6"),
+    ("seven", "7"),
+    ("eight", "8"),
+    ("nine", "9"),
+    ("ten", "10"),
+    ("eleven", "11"),
+    ("twelve", "12"),
+    ("thirteen", "13"),
+    ("fourteen", "14"),
+    ("fifteen", "15"),
+    ("sixteen", "16"),
+    ("seventeen", "17"),
+    ("eighteen", "18"),
+    ("nineteen", "19"),
+    ("twenty", "20"),
+    ("thirty", "30"),
+    ("forty", "40"),
+    ("fifty", "50"),
+    ("sixty", "60"),
+    ("seventy", "70"),
+    ("eighty", "80"),
+    ("ninety", "90"),
+];
+
+/// The digits of a normalized number word ([`NUMBER_WORDS`]).
+fn number_word(lower: &str) -> Option<&'static str> {
+    NUMBER_WORDS
+        .iter()
+        .find(|(w, _)| *w == lower)
+        .map(|(_, d)| *d)
+}
+
 /// The comparison terms of one word: participant terms where [`Vocabulary`] knows the
-/// name and the word may name someone ([`may_name`]), stems of the other
-/// non-stopword parts.
+/// name and the word may name someone ([`may_name`]), digits of number words
+/// ([`NUMBER_WORDS`]), stems of the other non-stopword parts.
 fn word_terms(word: &str, name_ok: bool, vocab: &Vocabulary) -> Vec<String> {
     normalize_label(word)
         .split(' ')
         .filter(|p| !p.is_empty())
         .filter_map(|p| match vocab.person(p, name_ok) {
             Some(t) => Some(t),
-            None => (!STOPWORDS.contains(&p)).then(|| stem(p)),
+            None => match number_word(p) {
+                Some(d) => Some(d.to_string()),
+                None => (!STOPWORDS.contains(&p)).then(|| stem(p)),
+            },
         })
         .collect()
 }
@@ -558,7 +602,8 @@ pub fn content_stems(text: &str) -> std::collections::BTreeSet<String> {
 /// matching prediction must also name. A word is a key term when it is a known
 /// participant or entity name ([`Vocabulary`], at any position, first word
 /// included), is capitalized anywhere but the first word, is an acronym (two or
-/// more capitals), or holds a digit or underscore. Negation words never are.
+/// more capitals), holds a digit or underscore, or is a number word
+/// ([`NUMBER_WORDS`], so "thirty" keys like "30"). Negation words never are.
 /// Returned as comparison terms.
 pub fn key_terms(text: &str, vocab: &Vocabulary) -> std::collections::BTreeSet<String> {
     let tokens = tokenize(text);
@@ -568,7 +613,8 @@ pub fn key_terms(text: &str, vocab: &Vocabulary) -> std::collections::BTreeSet<S
         let Token::Word(w) = token else { continue };
         let upper = w.chars().filter(char::is_ascii_uppercase).count();
         let capitalized = w.chars().next().is_some_and(char::is_uppercase);
-        let special = w.chars().any(|c| c.is_ascii_digit() || c == '_');
+        let special = w.chars().any(|c| c.is_ascii_digit() || c == '_')
+            || number_word(&w.to_lowercase()).is_some();
         let shaped = (capitalized && !first) || upper >= 2 || special;
         first = false;
         if is_negation(w) {
@@ -625,31 +671,116 @@ fn polar_overlap(g: &[ClaimWord], p: &[ClaimWord]) -> (usize, usize, usize) {
     (gs.intersection(&ps).count(), gs.len(), ps.len())
 }
 
-/// True when `pred` states some gold claim word only with the opposite polarity
-/// (gold "ship weekly builds" and "we will not ship; weekly builds stay" disagree on
-/// "ship", whatever else they share), or when one of its clauses states the gold
-/// claim with the opposite polarity: the flipped head plus as many flipped gold words
-/// as [`covers`] needs ("ship weekly builds; do not ship weekly builds" retracts the
-/// claim). A clause that negates the head about something else does not ("we don't
-/// ship nightly builds; we ship weekly builds").
-pub fn contradicts(gold: &str, pred: &str, vocab: &Vocabulary) -> bool {
-    let g: std::collections::BTreeSet<ClaimWord> = claim_words(gold, vocab).into_iter().collect();
-    let Some(head) = claim_words(gold, vocab).into_iter().next() else {
-        return false;
-    };
-    let flip = |w: &ClaimWord| ClaimWord {
+/// The same claim word with the opposite polarity.
+fn flip(w: &ClaimWord) -> ClaimWord {
+    ClaimWord {
         term: w.term.clone(),
         negated: !w.negated,
-    };
-    let p: std::collections::BTreeSet<ClaimWord> = claim_words(pred, vocab).into_iter().collect();
-    if g.iter().any(|w| p.contains(&flip(w)) && !p.contains(w)) {
+    }
+}
+
+/// The protected words of a gold phrasing's claim words `g`: its head (the first
+/// content word) and its predicate (the first content word that is not a name or a
+/// key term in `keys`). Both are the same word when the phrasing opens with a verb.
+fn protected_words<'a>(
+    g: &'a [ClaimWord],
+    keys: &std::collections::BTreeSet<String>,
+    vocab: &Vocabulary,
+) -> Vec<&'a ClaimWord> {
+    let head = g.first();
+    let predicate = g
+        .iter()
+        .find(|w| !vocab.is_name(&w.term) && !keys.contains(&w.term));
+    head.into_iter().chain(predicate).collect()
+}
+
+/// True when `pred` states some gold claim word only with the opposite polarity
+/// (gold "ship weekly builds" and "we will not ship; weekly builds stay" disagree on
+/// "ship", whatever else they share), or when one of its clauses restates the gold
+/// claim retracted.
+///
+/// A clause retracts the claim when it states at least one gold word only with the
+/// opposite polarity and states the claim's protected words (head and predicate,
+/// [`covers`]) and as many gold words as [`covers`] needs, each either with the
+/// opposite polarity or, for the arguments a negation follows, with the gold's
+/// polarity before the clause's first negated word. So "Tamsin does not ship weekly
+/// builds" retracts "Tamsin ships weekly builds", and "weekly builds do not ship on
+/// Friday" retracts "weekly builds ship on Friday", whichever word the gold opens
+/// with. A clause that negates the predicate about something else does not ("we
+/// don't ship nightly builds; we ship weekly builds"), nor does one that states a
+/// gold word with both polarities ("Tamsin ships weekly builds and doesn't ship
+/// nightly builds"). Entity words match through [`Vocabulary::names`].
+pub fn contradicts(gold: &str, pred: &str, vocab: &Vocabulary) -> bool {
+    use std::collections::BTreeSet;
+    let gw = claim_words(gold, vocab);
+    let g: BTreeSet<ClaimWord> = gw.iter().cloned().collect();
+    if g.is_empty() {
+        return false;
+    }
+    let p: BTreeSet<ClaimWord> = claim_words(pred, vocab).into_iter().collect();
+    if g.iter()
+        .any(|w| stated(&flip(w), &p, vocab) && !stated(w, &p, vocab))
+    {
         return true;
     }
-    let keyed = !key_terms(gold, vocab).is_empty();
-    let need = g.len() - allowed_missing(g.len(), keyed);
+    let keys = key_terms(gold, vocab);
+    let need = g.len() - allowed_missing(g.len(), !keys.is_empty());
+    let anchors = protected_words(&gw, &keys, vocab);
     claim_clauses(pred, vocab).iter().any(|clause| {
-        let c: std::collections::BTreeSet<&ClaimWord> = clause.iter().collect();
-        c.contains(&flip(&head)) && g.iter().filter(|w| c.contains(&flip(w))).count() >= need
+        let all: BTreeSet<ClaimWord> = clause.iter().cloned().collect();
+        let before_negation = clause
+            .iter()
+            .position(|w| w.negated)
+            .unwrap_or(clause.len());
+        let prefix: BTreeSet<ClaimWord> = clause[..before_negation].iter().cloned().collect();
+        let flipped = |w: &ClaimWord| stated(&flip(w), &all, vocab);
+        // Gold words before the first one the clause flips are its subject arguments.
+        let Some(first) = gw.iter().position(&flipped) else {
+            return false;
+        };
+        let subject: BTreeSet<&ClaimWord> = gw[..first].iter().collect();
+        let retracted = |w: &ClaimWord| {
+            if subject.contains(w) {
+                stated(w, &prefix, vocab)
+            } else {
+                flipped(w)
+            }
+        };
+        anchors.iter().all(|w| retracted(w)) && g.iter().filter(|w| retracted(w)).count() >= need
+    })
+}
+
+/// Participant terms of the capitalized function words that are also participant
+/// names and that a phrasing reads as function words ("Will" in "Will we ship
+/// weekly builds?", [`may_name`]).
+fn unread_names(text: &str, vocab: &Vocabulary) -> std::collections::BTreeSet<String> {
+    let tokens = tokenize(text);
+    tokens
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| match t {
+            Token::Word(w)
+                if w.chars().next().is_some_and(char::is_uppercase)
+                    && is_function_word(&w.to_lowercase())
+                    && !may_name(&tokens, i) =>
+            {
+                Some(w)
+            }
+            _ => None,
+        })
+        .flat_map(|w| word_terms(w, true, vocab))
+        .filter(|t| t.starts_with('@'))
+        .collect()
+}
+
+/// True when a clause of `pred` makes the participant `person` the subject of the
+/// claim word `predicate`: the participant's words come right before it ("Will Park
+/// ships" for "ship"), not with other words between ("Will said we ship").
+fn subject_of(pred: &str, person: &str, predicate: &str, vocab: &Vocabulary) -> bool {
+    claim_clauses(pred, vocab).iter().any(|clause| {
+        clause
+            .windows(2)
+            .any(|pair| pair[0].term == person && pair[1].term == predicate)
     })
 }
 
@@ -675,23 +806,32 @@ fn stated(w: &ClaimWord, p: &std::collections::BTreeSet<ClaimWord>, vocab: &Voca
 /// content word, and its predicate, the first content word that is not a name or
 /// key term) and enough of its other claim words with the same polarity
 /// ([`allowed_missing`]), and contradicts none of them ([`contradicts`]).
+///
+/// A participant name the gold reads as a function word ("Will" in "Will we ship
+/// weekly builds?") may not become the subject of the gold's predicate in the
+/// prediction ("Will Park ships weekly builds" states a claim about a person, not
+/// the question).
 pub fn covers(gold: &str, pred: &str, vocab: &Vocabulary) -> bool {
     let g = claim_words(gold, vocab);
     let p: std::collections::BTreeSet<ClaimWord> = claim_words(pred, vocab).into_iter().collect();
     let gs: std::collections::BTreeSet<&ClaimWord> = g.iter().collect();
     let keys = key_terms(gold, vocab);
-    let head = g.first();
+    let protected = protected_words(&g, &keys, vocab);
+    let protected_stated = protected.iter().all(|w| stated(w, &p, vocab));
     let predicate = g
         .iter()
         .find(|w| !vocab.is_name(&w.term) && !keys.contains(&w.term));
-    let protected_stated = head
-        .into_iter()
-        .chain(predicate)
-        .all(|w| stated(w, &p, vocab));
+    let misread_name = predicate.is_some_and(|pw| {
+        unread_names(gold, vocab)
+            .iter()
+            .filter(|person| !g.iter().any(|w| &w.term == *person))
+            .any(|person| subject_of(pred, person, &pw.term, vocab))
+    });
     let inter = gs.iter().filter(|w| stated(w, &p, vocab)).count();
     let ng = gs.len();
     ng > 0
         && protected_stated
+        && !misread_name
         && ng - inter <= allowed_missing(ng, !keys.is_empty())
         && !contradicts(gold, pred, vocab)
 }
@@ -1147,6 +1287,122 @@ mod tests {
         let pred = "Tamsin will not ship; weekly builds remain after quarterly review";
         assert!(contradicts(gold, pred, &v));
         assert!(!covers(gold, pred, &v));
+    }
+
+    /// Final review BLOCKER (Codex 1, Kimi M1): a retraction is anchored on the
+    /// claim's predicate and arguments, not its first word, so a name-headed or
+    /// noun-headed claim stated and then retracted does not match.
+    #[test]
+    fn a_retraction_is_anchored_on_the_predicate_not_the_first_word() {
+        let v = names();
+        // name-headed: the name comes before the negation and is never flipped
+        let gold = "Tamsin ships weekly builds";
+        let pred = "Tamsin ships weekly builds; Tamsin does not ship weekly builds";
+        assert!(contradicts(gold, pred, &v));
+        assert!(!covers(gold, pred, &v));
+        assert!(!covers(
+            gold,
+            "Tamsin ships weekly builds. Later Tam said she won't ship weekly builds",
+            &v
+        ));
+        // noun-headed: the subject noun phrase comes before the negation
+        let none = Vocabulary::default();
+        let gold = "weekly builds ship on Friday";
+        assert!(covers(gold, "weekly builds ship on Friday", &none));
+        assert!(!covers(
+            gold,
+            "weekly builds ship on Friday; weekly builds do not ship on Friday",
+            &none
+        ));
+        // entity-headed: an entity sibling word states the entity when retracted too
+        let gold = "Ledger API ships weekly builds";
+        assert!(!covers(
+            gold,
+            "Ledger API ships weekly builds; the Ledger does not ship weekly builds",
+            &v
+        ));
+        // verb-headed still holds
+        assert!(!covers(
+            "ship weekly builds",
+            "ship weekly builds; we never ship weekly builds",
+            &none
+        ));
+        // negated gold, name-headed: an affirming clause retracts it
+        let gold = "Tamsin does not ship weekly builds";
+        assert!(!covers(
+            gold,
+            "Tamsin does not ship weekly builds; Tamsin ships weekly builds",
+            &v
+        ));
+        assert!(covers(gold, "Tamsin won't ship weekly builds", &v));
+    }
+
+    /// The anchored retraction rule stays narrow: a clause that negates the
+    /// predicate about something else, states a gold word with both polarities, or
+    /// negates a side word after the full claim, is not a retraction.
+    #[test]
+    fn a_contrast_about_something_else_is_not_a_retraction() {
+        let v = names();
+        let gold = "Tamsin ships weekly builds";
+        for pred in [
+            "Tamsin ships weekly builds, not nightly builds",
+            "Tamsin ships weekly builds and doesn't ship nightly builds",
+            "Tamsin ships weekly builds that never break",
+            "Quill does not ship nightly builds; Tamsin ships weekly builds",
+            "Tamsin doesn't ship nightly builds; Tamsin ships weekly builds",
+        ] {
+            assert!(!contradicts(gold, pred, &v), "{pred}");
+            assert!(covers(gold, pred, &v), "{pred}");
+        }
+        let none = Vocabulary::default();
+        assert!(covers(
+            "weekly builds ship on Friday",
+            "weekly builds ship on Friday; nightly builds do not ship on Friday",
+            &none
+        ));
+    }
+
+    /// GLM final M10: a function-word name read as a function word in the gold may
+    /// not become the subject of the gold's predicate in the prediction; an
+    /// attribution with other words between still matches.
+    #[test]
+    fn a_question_word_name_does_not_become_the_subject() {
+        let mut v = Vocabulary::default();
+        v.add_person("will", ["Will Park"]);
+        let gold = "Will we ship weekly builds?";
+        assert!(!covers(gold, "Will Park ships weekly builds", &v));
+        assert!(!covers(gold, "Will ships weekly builds", &v));
+        assert!(covers(gold, "Are we shipping weekly builds?", &v));
+        assert!(covers(gold, "Will asked whether we ship weekly builds", &v));
+        // a gold that names Will is about Will
+        assert!(covers(
+            "Will Park ships weekly builds",
+            "Will ships weekly builds",
+            &v
+        ));
+    }
+
+    /// GLM final M11: number words and digits compare equal and both key the claim.
+    #[test]
+    fn number_words_match_digits() {
+        let v = Vocabulary::default();
+        assert!(key_terms("retry thirty times", &v).contains("30"));
+        assert!(key_terms("retry 30 times", &v).contains("30"));
+        assert!(covers("retry 30 times", "retry thirty times", &v));
+        assert!(covers("retry thirty times", "we retry 30 times", &v));
+        assert!(key_terms_present(
+            "retry 30 times",
+            "retry thirty times",
+            &v
+        ));
+        assert!(!covers("retry 30 times", "retry forty times", &v));
+        assert!(!key_terms_present(
+            "retry thirty times",
+            "retry 40 times",
+            &v
+        ));
+        // "one" is not folded: it is as often a pronoun
+        assert!(key_terms("ship the new one", &v).is_empty());
     }
 
     /// Codex round-1 M4: a participant name is a name where it is capitalized, even
