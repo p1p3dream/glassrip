@@ -714,12 +714,22 @@ pub fn speaker_attribution(
         let n = s.words.len();
         let mut covered = vec![false; n];
         let mut voices = Vec::new();
-        for sp in spans
+        // Same rule as the named transcript (glassrip-notes named.rs): spans in
+        // word order, and a span overlapping one already used is skipped, so the
+        // eval never credits a voice the notes do not attribute.
+        let mut valid: Vec<_> = spans
             .iter()
             .filter(|sp| sp.word_start < sp.word_end && sp.word_end <= n)
-        {
+            .collect();
+        valid.sort_by_key(|sp| sp.word_start);
+        let mut next = 0;
+        for sp in valid {
+            if sp.word_start < next {
+                continue;
+            }
             covered[sp.word_start..sp.word_end].fill(true);
             voices.push(named(&sp.person_id));
+            next = sp.word_end;
         }
         if n == 0 || covered.iter().any(|c| !c) {
             voices.push(person);

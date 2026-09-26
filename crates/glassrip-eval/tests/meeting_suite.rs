@@ -873,3 +873,50 @@ fn only_speech_is_attributed_and_word_spans_count() {
     assert_eq!(run.metrics["audio.speaker_identity_error"], 1.0);
     assert!(run.gate_failures.is_empty(), "{:?}", run.gate_failures);
 }
+
+/// Overlapping word spans credit only the first, as the named transcript does:
+/// spans [0,2] avery and [1,2] jordan in one segment are one voice, not two, so
+/// a golden set of two people is not satisfied.
+#[test]
+fn overlapping_word_spans_credit_only_the_first() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        schema::TRANSCRIPT,
+        vec![(
+            "s1",
+            ra::segment(
+                "s1",
+                "S0",
+                0.0,
+                5.0,
+                "ship it",
+                &[("ship", 0.0), ("it", 0.5)],
+            ),
+        )],
+    );
+    write(
+        dir.path(),
+        schema::SPEAKERS,
+        vec![
+            ("S0", ra::speaker_label("S0", Some("avery"))),
+            (
+                "seg-s1",
+                json!({
+                    "kind": "segment", "segment_id": "s1", "start_s": 0.0, "end_s": 5.0,
+                    "label": "S0", "person_id": "avery", "confidence": 0.9,
+                    "source": "label_map", "scores": {}, "observations": [],
+                    "spans": [
+                        {"word_start": 0, "word_end": 2, "person_id": "avery",
+                         "confidence": 0.8, "source": "visual_relabel", "reason": "tile"},
+                        {"word_start": 1, "word_end": 2, "person_id": "jordan",
+                         "confidence": 0.8, "source": "visual_relabel", "reason": "tile"}
+                    ]
+                }),
+            ),
+        ],
+    );
+    let run = run_meeting(&golden(), &RunArtifacts::scan(dir.path()).unwrap(), 2.0).unwrap();
+    assert_eq!(run.metrics["audio.speaker_identities"], 1.0);
+    assert_eq!(run.metrics["audio.speaker_identity_error"], 1.0);
+}
