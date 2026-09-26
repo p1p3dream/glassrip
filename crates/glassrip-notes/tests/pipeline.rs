@@ -885,3 +885,54 @@ async fn nothing_heard_or_read_gives_degraded_empty_notes() {
     assert!(n.summary.is_empty() && n.timeline.is_empty() && n.open_questions.is_empty());
     assert!(n.decisions.is_empty() && n.action_items.is_empty() && n.transcript.is_empty());
 }
+
+/// Codex final round 3 MAJOR: the text model's digest keys the notes cache, so
+/// other weights retagged under the same model name do not restore the old
+/// notes, and a server serving other weights than the pinned digest is refused
+/// instead of writing its output under the pinned key.
+#[tokio::test]
+async fn the_text_model_digest_keys_the_notes_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let (run, ids) = empty_input_run(dir.path(), Some(transcript()), true);
+    let mut runner = speakers_and_notes_runner(run, dir.path());
+    runner.run_stage(&unnamed_speakers_stage()).await.unwrap();
+    let backend = Arc::new(Replay {
+        ids,
+        ..Replay::default()
+    });
+    let notes = |digest: &str| {
+        NotesStage::new(NotesParams::default(), backend.clone())
+            .with_text_digest(Some(digest.to_string()))
+    };
+    let rep = runner.run_stage(&notes("sha256:synthetic")).await.unwrap();
+    assert_eq!(rep.items_error, 0, "{rep:?}");
+    assert!(runner.cache_hit(&notes("sha256:synthetic")));
+    assert!(
+        !runner.cache_hit(&notes("sha256:retagged")),
+        "another digest is another key"
+    );
+    // The server still serves sha256:synthetic: the retagged key is not filled.
+    let calls = backend.log.lock().unwrap().len();
+    match runner.run_stage(&notes("sha256:retagged")).await {
+        Ok(rep) => {
+            assert_ne!(
+                rep.status,
+                glassrip_core::manifest::StageStatus::Cached,
+                "{rep:?}"
+            );
+            assert_eq!(rep.items_error, 1, "{rep:?}");
+        }
+        Err(e) => assert!(
+            matches!(
+                e,
+                glassrip_core::runner::RunnerError::ErrorRateExceeded { .. }
+            ),
+            "{e}"
+        ),
+    }
+    assert!(
+        backend.log.lock().unwrap().len() > calls,
+        "the server was contacted, not a cache entry restored"
+    );
+    assert!(!runner.cache_hit(&notes("sha256:retagged")));
+}

@@ -834,6 +834,30 @@ pub async fn run_meeting(
         Err(reason) => (Arc::new(NoTextModel(reason.clone())), Some(reason)),
     };
     {
+        // The text model's digest keys the notes cache when the notes need the
+        // model (speech): the digest resolved when connecting (live, or recorded
+        // by an earlier run for an offline rerun, the same pinned-digest policy
+        // as the vision stages), else asked of the server and recorded so an
+        // offline rerun can key the same entry. Without speech the notes ask no
+        // model, so the key names none.
+        let speech = transcript_has_speech(&runner);
+        let text_model = cfg.models.text.clone();
+        let text_digest = if !speech {
+            None
+        } else if let Some(d) = backends.model_digests.get(&text_model) {
+            Some(d.clone())
+        } else if unavailable.is_none() {
+            let d = text.digest(&text_model).await.ok().flatten();
+            if let Some(d) = &d {
+                let (model, d) = (text_model.clone(), d.clone());
+                runner.run_dir_mut().update(|m| {
+                    m.model_digests.insert(model, d);
+                })?;
+            }
+            d
+        } else {
+            None
+        };
         let notes = NotesStage::new(
             NotesParams {
                 text_model: cfg.models.text.clone(),
@@ -848,7 +872,8 @@ pub async fn run_meeting(
                 ..NotesParams::default()
             },
             text,
-        );
+        )
+        .with_text_digest(text_digest);
         let selected = matches!(
             runner.plan().decision("notes"),
             Some(StageDecision::Run { .. })
@@ -856,7 +881,7 @@ pub async fn run_meeting(
         match &unavailable {
             // Without speech the notes come from the board alone and ask no
             // model, so the text model is not needed.
-            Some(reason) if selected && !transcript_has_speech(&runner) => tracing::info!(
+            Some(reason) if selected && !speech => tracing::info!(
                 %reason,
                 "no speech was transcribed: notes come from the board alone, no text model needed"
             ),

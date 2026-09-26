@@ -446,14 +446,21 @@ impl DiarizeEngine for SilentDiarizer {
 struct ScriptedText {
     log: Mutex<Vec<String>>,
     resident: Mutex<Vec<String>>,
+    digest: String,
 }
 
 impl ScriptedText {
     fn new() -> Self {
+        Self::with_digest("sha256:scripted-text")
+    }
+
+    /// The same model name serving other weights (a retag).
+    fn with_digest(digest: &str) -> Self {
         Self {
             log: Mutex::new(Vec::new()),
             // The vision model is still loaded when phase C starts.
             resident: Mutex::new(vec![VISION_MODEL.into()]),
+            digest: digest.into(),
         }
     }
 }
@@ -509,7 +516,7 @@ impl TextBackend for ScriptedText {
             .collect())
     }
     async fn digest(&self, _model: &str) -> Result<Option<String>, LlmError> {
-        Ok(Some("sha256:scripted-text".into()))
+        Ok(Some(self.digest.clone()))
     }
 }
 
@@ -783,6 +790,9 @@ async fn meeting_mode_end_to_end_on_a_synthetic_video() {
         ));
         b.text = Ok(Arc::new(DownText));
         b.text_offline = Some("server down in this test".into());
+        // As `Backends::connect` does offline: the recorded text digest keys notes.
+        b.model_digests
+            .insert(TEXT_MODEL.into(), recorded[TEXT_MODEL].clone());
         b
     };
     let cached = run_meeting(
@@ -809,6 +819,42 @@ async fn meeting_mode_end_to_end_on_a_synthetic_video() {
     assert!(
         matches!(&err, glassrip::meeting::MeetingError::Offline { stage, .. } if stage == "board_read"),
         "{err}"
+    );
+
+    // ---- Codex final round 3: other weights retagged under the same text model
+    // name do not restore the old notes; the notes are asked again.
+    let retagged = Arc::new(ScriptedText::with_digest("sha256:retagged-text"));
+    let rerun = run_meeting(
+        &opts,
+        backends(&out.join(meeting::RAW_RESPONSES_DIR), Arc::clone(&retagged)),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let status = |stage: &str| {
+        rerun
+            .reports
+            .iter()
+            .find(|r| r.stage == stage)
+            .map(|r| r.status)
+    };
+    assert_eq!(status("notes"), Some(StageStatus::Ok));
+    assert_eq!(status("board_state"), Some(StageStatus::Cached));
+    assert!(
+        retagged
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.starts_with("chat ")),
+        "the retagged model was asked"
+    );
+    assert_eq!(
+        manifest(&out)
+            .model_digests
+            .get(TEXT_MODEL)
+            .map(String::as_str),
+        Some("sha256:retagged-text")
     );
 
     // ---- --from-stage board_read with a large model that is not loaded yet:

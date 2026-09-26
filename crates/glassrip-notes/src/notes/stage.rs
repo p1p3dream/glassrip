@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use glassrip_audio::types::TranscriptSegment;
 use glassrip_core::envelope::{ErrorCode, ErrorInfo};
 use glassrip_core::runner::{
-    ArtifactSpec, InputDecl, ItemContext, Stage, StageError, StageInputs, WorkItem,
+    ArtifactSpec, InputDecl, ItemContext, KeyExtras, Stage, StageError, StageInputs, WorkItem,
 };
 use schemars::JsonSchema;
 use semver::Version;
@@ -163,12 +163,29 @@ pub struct NotesInput {
 pub struct NotesStage {
     params: NotesParams,
     backend: Arc<dyn TextBackend>,
+    text_digest: Option<String>,
 }
 
 impl NotesStage {
-    /// A stage using `backend` for the text model.
+    /// A stage using `backend` for the text model. Its cache key names the text
+    /// model but not its weights until [`NotesStage::with_text_digest`] pins them.
     pub fn new(params: NotesParams, backend: Arc<dyn TextBackend>) -> Self {
-        Self { params, backend }
+        Self {
+            params,
+            backend,
+            text_digest: None,
+        }
+    }
+
+    /// Pins the text model's digest, resolved before the run: it keys the cache
+    /// (weights retagged under the same name do not restore the old notes), and a
+    /// run whose server reports another digest fails instead of writing output
+    /// under the pinned key. `None` when the run needs no text model (no speech:
+    /// the notes come from the board alone), so the key does not depend on one.
+    #[must_use]
+    pub fn with_text_digest(mut self, digest: Option<String>) -> Self {
+        self.text_digest = digest;
+        self
     }
 
     fn model_err(e: impl std::fmt::Display) -> ErrorInfo {
@@ -305,6 +322,18 @@ impl NotesStage {
 
         let placement = self.enter_phase_c().await?;
         let model_digest = self.backend.digest(&p.text_model).await.ok().flatten();
+        // Spec 8.1: the digest keyed before the run must be the one answering.
+        if let (Some(pinned), Some(now)) = (&self.text_digest, &model_digest) {
+            if pinned != now {
+                return Err(ErrorInfo::new(
+                    ErrorCode::ModelRequest,
+                    format!(
+                        "text model {} changed digest during the run ({pinned} keyed, {now} served)",
+                        p.text_model
+                    ),
+                ));
+            }
+        }
 
         let mut calls = Vec::new();
         let wins = match p.window_s {
@@ -920,6 +949,9 @@ impl Stage for NotesStage {
         // 2: owner tags offered as action items and owner moves as decisions;
         // blank transcripts take the board-only path
         // 3: owner events matched to assignments by structured target id
+        // (the text model digest joined the key through `key_extras`, not the
+        // version: the output is unchanged, and a keyed digest already misses
+        // every entry written without one)
         3
     }
     fn output(&self) -> ArtifactSpec {
@@ -950,6 +982,15 @@ impl Stage for NotesStage {
     }
     fn params(&self) -> &NotesParams {
         &self.params
+    }
+    fn key_extras(&self) -> KeyExtras {
+        KeyExtras {
+            model_digest: self
+                .text_digest
+                .as_ref()
+                .map(|d| format!("{}@{d}", self.params.text_model)),
+            ..KeyExtras::default()
+        }
     }
     fn item_timeout(&self) -> Option<Duration> {
         Some(Duration::from_secs(3 * 3600))
