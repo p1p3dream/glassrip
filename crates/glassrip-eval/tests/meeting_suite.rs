@@ -801,3 +801,75 @@ fn empty_artifacts_leave_sections_unscored_and_fail() {
         run.gate_failures
     );
 }
+
+/// Codex final round 3, third pass: segments without speech (blank text, no
+/// words) are not speech to attribute, and a word range the speakers artifact
+/// gives its own speaker counts as that speaker.
+#[test]
+fn only_speech_is_attributed_and_word_spans_count() {
+    let mapped = || {
+        vec![
+            ("S0", ra::speaker_label("S0", Some("avery"))),
+            ("S1", ra::speaker_label("S1", Some("jordan"))),
+        ]
+    };
+    // Blank segments mapped to both people: no speech, and the golden set has
+    // two speakers, so the check cannot pass.
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        schema::TRANSCRIPT,
+        vec![
+            ("s1", ra::segment("s1", "S0", 0.0, 5.0, "  ", &[])),
+            ("s2", ra::segment("s2", "S1", 5.0, 9.0, "", &[])),
+        ],
+    );
+    write(dir.path(), schema::SPEAKERS, mapped());
+    let run = run_meeting(&golden(), &RunArtifacts::scan(dir.path()).unwrap(), 2.0).unwrap();
+    assert!(!run.metrics.contains_key("audio.speaker_identity_error"));
+    assert!(
+        run.gate_failures.iter().any(|g| g.contains("no speech")),
+        "{:?}",
+        run.gate_failures
+    );
+
+    // A third voice inside avery's segment: three people spoke, not two.
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        schema::TRANSCRIPT,
+        vec![
+            (
+                "s1",
+                ra::segment(
+                    "s1",
+                    "S0",
+                    0.0,
+                    5.0,
+                    "ship it now",
+                    &[("ship", 0.0), ("it", 0.5), ("now", 1.0)],
+                ),
+            ),
+            (
+                "s2",
+                ra::segment("s2", "S1", 5.0, 9.0, "ok", &[("ok", 5.0)]),
+            ),
+        ],
+    );
+    let mut records = mapped();
+    records.push((
+        "seg-s1",
+        json!({
+            "kind": "segment", "segment_id": "s1", "start_s": 0.0, "end_s": 5.0,
+            "label": "S0", "person_id": "avery", "confidence": 0.9,
+            "source": "label_map", "scores": {}, "observations": [],
+            "spans": [{"word_start": 2, "word_end": 3, "person_id": "riley",
+                       "confidence": 0.8, "source": "visual_relabel", "reason": "tile"}]
+        }),
+    ));
+    write(dir.path(), schema::SPEAKERS, records);
+    let run = run_meeting(&golden(), &RunArtifacts::scan(dir.path()).unwrap(), 2.0).unwrap();
+    assert_eq!(run.metrics["audio.speaker_identities"], 3.0);
+    assert_eq!(run.metrics["audio.speaker_identity_error"], 1.0);
+    assert!(run.gate_failures.is_empty(), "{:?}", run.gate_failures);
+}

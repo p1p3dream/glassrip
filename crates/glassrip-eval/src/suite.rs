@@ -653,9 +653,9 @@ pub struct SpeakerAttribution {
     pub people: usize,
     /// Distinct voices left unresolved (raw labels nobody was named for).
     pub unresolved: usize,
-    /// Segments attributed to a person.
+    /// Segments with speech whose every word is attributed to a person.
     pub named_segments: usize,
-    /// Segments.
+    /// Segments with speech.
     pub segments: usize,
 }
 
@@ -667,18 +667,30 @@ fn named(person_id: &Option<String>) -> Option<&str> {
         .filter(|p| !p.is_empty())
 }
 
-/// Attribution of each segment as in [`speaker_identities`], split into named
-/// people and unresolved voices.
+/// True when a segment holds speech: some non-blank text or word (the test the
+/// notes apply to their named lines).
+fn has_speech(s: &TranscriptSegment) -> bool {
+    !s.text.trim().is_empty() || s.words.iter().any(|w| !w.w.trim().is_empty())
+}
+
+/// Attribution of the speech as in [`speaker_identities`], split into named
+/// people and unresolved voices. Only segments with speech count. A word range
+/// the speakers artifact gives its own speaker is that speaker's (as the notes
+/// split the line); the rest of the segment is the segment's.
 pub fn speaker_attribution(
     records: &[SpeakersRecord],
     segs: &[TranscriptSegment],
 ) -> SpeakerAttribution {
-    let mut by_segment: BTreeMap<&str, Option<&str>> = BTreeMap::new();
+    type Decided<'a> = (Option<&'a str>, &'a [glassrip_notes::speakers::WordSpan]);
+    let mut by_segment: BTreeMap<&str, Decided> = BTreeMap::new();
     let mut by_label: BTreeMap<&str, &str> = BTreeMap::new();
     for r in records {
         match r {
             SpeakersRecord::Segment(s) => {
-                by_segment.insert(s.segment_id.as_str(), named(&s.person_id));
+                by_segment.insert(
+                    s.segment_id.as_str(),
+                    (named(&s.person_id), s.spans.as_slice()),
+                );
             }
             SpeakersRecord::Label(l) => {
                 if let Some(p) = named(&l.person_id) {
@@ -691,27 +703,48 @@ pub fn speaker_attribution(
     let mut people = std::collections::BTreeSet::new();
     let mut unresolved = std::collections::BTreeSet::new();
     let mut named_segments = 0;
-    for s in segs {
+    let mut segments = 0;
+    for s in segs.iter().filter(|s| has_speech(s)) {
+        segments += 1;
         let label = s.speaker_label.trim();
-        let person = match by_segment.get(s.segment_id.as_str()) {
-            Some(explicit) => *explicit,
-            None => by_label.get(label).copied(),
+        let (person, spans) = match by_segment.get(s.segment_id.as_str()) {
+            Some(decided) => *decided,
+            None => (by_label.get(label).copied(), &[][..]),
         };
-        match person {
-            Some(p) => {
-                named_segments += 1;
-                people.insert(p);
+        let n = s.words.len();
+        let mut covered = vec![false; n];
+        let mut voices = Vec::new();
+        for sp in spans
+            .iter()
+            .filter(|sp| sp.word_start < sp.word_end && sp.word_end <= n)
+        {
+            covered[sp.word_start..sp.word_end].fill(true);
+            voices.push(named(&sp.person_id));
+        }
+        if n == 0 || covered.iter().any(|c| !c) {
+            voices.push(person);
+        }
+        let mut all_named = true;
+        for v in voices {
+            match v {
+                Some(p) => {
+                    people.insert(p);
+                }
+                None => {
+                    all_named = false;
+                    unresolved.insert(label);
+                }
             }
-            None => {
-                unresolved.insert(label);
-            }
+        }
+        if all_named {
+            named_segments += 1;
         }
     }
     SpeakerAttribution {
         people: people.len(),
         unresolved: unresolved.len(),
         named_segments,
-        segments: segs.len(),
+        segments,
     }
 }
 
@@ -1128,10 +1161,11 @@ pub fn run_meeting(
                     _ => false,
                 })
             });
+            let speech = segs.iter().any(has_speech);
             match mapping {
                 // No speech to attribute: the check cannot run when the golden
                 // set says people spoke.
-                _ if segs.is_empty() => {
+                _ if !speech => {
                     if golden.transcript.speaker_count > 0 {
                         run.gate_failures.push(format!(
                             "audio.speaker_identity_error not evaluated: the transcript has no speech but the golden set has {} speaker(s)",
@@ -1156,16 +1190,15 @@ pub fn run_meeting(
                             a.named_segments as f64 / a.segments as f64,
                         );
                     }
-                    if a.named_segments == 0 && !segs.is_empty() {
+                    if a.people == 0 {
                         run.gate_failures.push(
                             "speaker mapping coverage: glassrip.speakers names nobody in the transcript's speech".into(),
                         );
                     }
                 }
-                None if !segs.is_empty() => run.gate_failures.push(
+                None => run.gate_failures.push(
                     "audio.speaker_identity_error not evaluated: the transcript has speech but glassrip.speakers names nobody".into(),
                 ),
-                None => {}
             }
             details.insert("hotwords".into(), json!(hw.per_word));
         }
