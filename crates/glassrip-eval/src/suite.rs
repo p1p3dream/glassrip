@@ -659,6 +659,14 @@ pub struct SpeakerAttribution {
     pub segments: usize,
 }
 
+/// A person id that names someone: a blank id is no one.
+fn named(person_id: &Option<String>) -> Option<&str> {
+    person_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+}
+
 /// Attribution of each segment as in [`speaker_identities`], split into named
 /// people and unresolved voices.
 pub fn speaker_attribution(
@@ -670,10 +678,10 @@ pub fn speaker_attribution(
     for r in records {
         match r {
             SpeakersRecord::Segment(s) => {
-                by_segment.insert(s.segment_id.as_str(), s.person_id.as_deref());
+                by_segment.insert(s.segment_id.as_str(), named(&s.person_id));
             }
             SpeakersRecord::Label(l) => {
-                if let Some(p) = l.person_id.as_deref() {
+                if let Some(p) = named(&l.person_id) {
                     by_label.insert(l.label.as_str(), p);
                 }
             }
@@ -861,6 +869,14 @@ pub fn run_meeting(
             m.remove("board.owner.fp");
             details.insert("board_chrome_hits".into(), json!(score.chrome_hits));
             details.insert("final_board_id".into(), json!(state.board_id));
+        } else if !(golden.final_board.nodes.is_empty()
+            && golden.final_board.edges.is_empty()
+            && golden.final_board.stickies.is_empty())
+        {
+            run.not_run.push(
+                "board metrics: glassrip.board_state holds no final board for the golden board"
+                    .into(),
+            );
         }
 
         // Owners and events are timed: use every state item, each resolved
@@ -1050,10 +1066,8 @@ pub fn run_meeting(
                 _ => None,
             })
             .collect();
-        let mapped: std::collections::BTreeSet<&str> = labels
-            .iter()
-            .filter_map(|l| l.person_id.as_deref())
-            .collect();
+        let mapped: std::collections::BTreeSet<&str> =
+            labels.iter().filter_map(|l| named(&l.person_id)).collect();
         m.insert("speakers.labels".into(), labels.len() as f64);
         m.insert("speakers.distinct_people".into(), mapped.len() as f64);
         m.insert(
@@ -1109,12 +1123,22 @@ pub fn run_meeting(
             // cannot pass by being skipped: the run fails.
             let mapping = speakers.as_ref().filter(|records| {
                 records.iter().any(|r| match r {
-                    SpeakersRecord::Label(l) => l.person_id.is_some(),
-                    SpeakersRecord::Segment(s) => s.person_id.is_some(),
+                    SpeakersRecord::Label(l) => named(&l.person_id).is_some(),
+                    SpeakersRecord::Segment(s) => named(&s.person_id).is_some(),
                     _ => false,
                 })
             });
             match mapping {
+                // No speech to attribute: the check cannot run when the golden
+                // set says people spoke.
+                _ if segs.is_empty() => {
+                    if golden.transcript.speaker_count > 0 {
+                        run.gate_failures.push(format!(
+                            "audio.speaker_identity_error not evaluated: the transcript has no speech but the golden set has {} speaker(s)",
+                            golden.transcript.speaker_count
+                        ));
+                    }
+                }
                 Some(records) => {
                     let a = speaker_attribution(records, segs);
                     m.insert(

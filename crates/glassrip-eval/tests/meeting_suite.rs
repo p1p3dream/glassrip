@@ -743,6 +743,15 @@ fn unresolved_labels_do_not_satisfy_the_post_mapping_speaker_check() {
         "{:?}",
         run.gate_failures
     );
+    // A blank person id names no one either (Codex final round 3, second pass).
+    write(dir.path(), schema::SPEAKERS, speakers(Some(" ")));
+    let run = run_meeting(&golden(), &RunArtifacts::scan(dir.path()).unwrap(), 2.0).unwrap();
+    assert!(!run.metrics.contains_key("audio.speaker_identity_error"));
+    assert!(
+        run.gate_failures.iter().any(|g| g.contains("names nobody")),
+        "{:?}",
+        run.gate_failures
+    );
     // One named, one unresolved: the unresolved voice does not fill in for the
     // second person.
     write(dir.path(), schema::SPEAKERS, speakers(Some("avery")));
@@ -752,4 +761,43 @@ fn unresolved_labels_do_not_satisfy_the_post_mapping_speaker_check() {
     assert_eq!(run.metrics["audio.speaker_mapping_coverage"], 0.5);
     assert_eq!(run.metrics["audio.speaker_identity_error"], 2.0);
     assert!(run.gate_failures.is_empty(), "{:?}", run.gate_failures);
+}
+
+/// Codex final round 3, second pass: artifacts that exist but hold nothing do
+/// not let the suite pass unscored. A board state with no final board is an
+/// unscored board section, and a transcript with no speech cannot pass the
+/// speaker check when the golden set has speakers.
+#[test]
+fn empty_artifacts_leave_sections_unscored_and_fail() {
+    let dir = tempfile::tempdir().unwrap();
+    for schema in [
+        schema::KEYFRAMES,
+        schema::SCREEN_CLASS,
+        schema::BOARD_STATE,
+        schema::TRANSCRIPT,
+        schema::SPEAKERS,
+    ] {
+        write(dir.path(), schema, vec![]);
+    }
+    write(
+        dir.path(),
+        schema::MEETING_NOTES,
+        vec![(
+            "meeting_notes",
+            ra::notes("ok", &["defer the importer"], &[], &[]),
+        )],
+    );
+    let run = run_meeting(&golden(), &RunArtifacts::scan(dir.path()).unwrap(), 2.0).unwrap();
+    assert!(
+        run.not_run.iter().any(|n| n.contains("no final board")),
+        "{:?}",
+        run.not_run
+    );
+    assert!(
+        run.gate_failures
+            .iter()
+            .any(|g| g.contains("no speech but the golden set has 2 speaker(s)")),
+        "{:?}",
+        run.gate_failures
+    );
 }
