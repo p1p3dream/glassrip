@@ -394,6 +394,10 @@ async fn a_rerun_rewrites_the_rendered_files() {
     let written = files(&read(&r));
     assert_eq!(written.len(), 3);
     drop(r);
+    assert!(
+        Cache::in_workspace(dir.path()).ls().unwrap().is_empty(),
+        "nothing is stored for a stage that is never restored"
+    );
     for f in &written {
         std::fs::remove_file(f).unwrap();
     }

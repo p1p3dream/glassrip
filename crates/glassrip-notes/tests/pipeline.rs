@@ -936,3 +936,69 @@ async fn the_text_model_digest_keys_the_notes_cache() {
     );
     assert!(!runner.cache_hit(&notes("sha256:retagged")));
 }
+
+/// A text server that answers like `Replay` but reports no digest.
+struct NoDigest(Arc<Replay>);
+
+#[async_trait]
+impl TextBackend for NoDigest {
+    async fn chat(&self, model: &str, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+        self.0.chat(model, req).await
+    }
+    async fn load(&self, model: &str) -> Result<(), LlmError> {
+        self.0.load(model).await
+    }
+    async fn unload(&self, model: &str) -> Result<(), LlmError> {
+        self.0.unload(model).await
+    }
+    async fn loaded(&self) -> Result<Vec<LoadedModel>, LlmError> {
+        self.0.loaded().await
+    }
+    async fn digest(&self, _model: &str) -> Result<Option<String>, LlmError> {
+        Ok(None)
+    }
+}
+
+/// Codex final round 3, second pass: a text model whose digest nobody can tell
+/// never keys a cache entry (the notes are recomputed), a pinned digest the
+/// server cannot confirm is refused, and notes keyed as board-only refuse a
+/// transcript with speech.
+#[tokio::test]
+async fn notes_without_a_known_text_digest_are_not_cached() {
+    let dir = tempfile::tempdir().unwrap();
+    let (run, ids) = empty_input_run(dir.path(), Some(transcript()), true);
+    let mut runner = speakers_and_notes_runner(run, dir.path());
+    runner.run_stage(&unnamed_speakers_stage()).await.unwrap();
+    let replay = Arc::new(Replay {
+        ids,
+        ..Replay::default()
+    });
+    let backend = Arc::new(NoDigest(replay));
+    let unknown = NotesStage::new(NotesParams::default(), backend.clone()).with_text_digest(None);
+    for _ in 0..2 {
+        assert!(!runner.cache_hit(&unknown));
+        let rep = runner.run_stage(&unknown).await.unwrap();
+        assert_eq!(rep.items_error, 0, "{rep:?}");
+        assert_eq!(rep.status, glassrip_core::manifest::StageStatus::Ok);
+    }
+    for (stage, why) in [
+        (
+            NotesStage::new(NotesParams::default(), backend.clone())
+                .with_text_digest(Some("sha256:synthetic".into())),
+            "an unconfirmed pinned digest is refused",
+        ),
+        (
+            NotesStage::new(NotesParams::default(), backend.clone()).without_text_model(),
+            "board-only keyed notes refuse speech",
+        ),
+    ] {
+        let failed = match runner.run_stage(&stage).await {
+            Ok(rep) => rep.items_error == 1,
+            Err(e) => matches!(
+                e,
+                glassrip_core::runner::RunnerError::ErrorRateExceeded { .. }
+            ),
+        };
+        assert!(failed, "{why}");
+    }
+}

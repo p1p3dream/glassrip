@@ -838,8 +838,9 @@ pub async fn run_meeting(
         // model (speech): the digest resolved when connecting (live, or recorded
         // by an earlier run for an offline rerun, the same pinned-digest policy
         // as the vision stages), else asked of the server and recorded so an
-        // offline rerun can key the same entry. Without speech the notes ask no
-        // model, so the key names none.
+        // offline rerun can key the same entry. A digest nobody can tell makes
+        // the notes not cacheable (see `NotesStage::cacheable`). Without speech
+        // the notes ask no model, so the key names none.
         let speech = transcript_has_speech(&runner);
         let text_model = cfg.models.text.clone();
         let text_digest = if !speech {
@@ -872,8 +873,12 @@ pub async fn run_meeting(
                 ..NotesParams::default()
             },
             text,
-        )
-        .with_text_digest(text_digest);
+        );
+        let notes = if speech {
+            notes.with_text_digest(text_digest)
+        } else {
+            notes.without_text_model()
+        };
         let selected = matches!(
             runner.plan().decision("notes"),
             Some(StageDecision::Run { .. })

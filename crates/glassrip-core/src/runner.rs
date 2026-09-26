@@ -133,8 +133,9 @@ pub trait Stage: Send + Sync {
         KeyExtras::default()
     }
     /// False for a stage whose result is more than its artifact (say files it
-    /// writes outside the run directory): it is never restored from the cache
-    /// or resumed from a partial, but runs whenever selected, as if forced.
+    /// writes outside the run directory), or whose key cannot identify it: it is
+    /// never restored from the cache, resumed from a partial, or stored in the
+    /// cache, but runs whenever selected, as if forced.
     fn cacheable(&self) -> bool {
         true
     }
@@ -1378,8 +1379,13 @@ impl Runner {
             // Cached all the same when nothing plainly retryable failed, so the
             // next run (in any run directory) retries only the unsettled items
             // and keeps counting their recurrences; a restored output over the
-            // limit fails the stage again (see the cache hit above).
-            if retryable == 0 {
+            // limit fails the stage again (see the cache hit above). A stage
+            // that is not cacheable stores nothing and never resumes.
+            if !stage.cacheable() {
+                drop(writer);
+                fs_err::remove_file(&partial).map_err(Self::io_err(&partial))?;
+                remove_if_exists(&seed_marker)?;
+            } else if retryable == 0 {
                 let over = self
                     .with_run(|r| r.partials_dir())
                     .join(format!("{name}-{}.over-limit.jsonl", &key.as_str()[..16]));
@@ -1407,7 +1413,11 @@ impl Runner {
         }
         jsonl::write_atomic(&out_path, &header, &items)?;
         drop(writer);
-        if retryable == 0 {
+        if !stage.cacheable() {
+            // Never restored, so nothing is stored; the output is written.
+            fs_err::remove_file(&partial).map_err(Self::io_err(&partial))?;
+            remove_if_exists(&seed_marker)?;
+        } else if retryable == 0 {
             // Terminal failures are cached with the results: the cache key holds
             // everything that determines them (inputs, params, model digest), so a
             // rerun restores them instead of asking again. `--force-stage` or a

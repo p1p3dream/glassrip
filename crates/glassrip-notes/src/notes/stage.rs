@@ -163,28 +163,45 @@ pub struct NotesInput {
 pub struct NotesStage {
     params: NotesParams,
     backend: Arc<dyn TextBackend>,
+    text_needed: bool,
     text_digest: Option<String>,
 }
 
 impl NotesStage {
-    /// A stage using `backend` for the text model. Its cache key names the text
-    /// model but not its weights until [`NotesStage::with_text_digest`] pins them.
+    /// A stage using `backend` for the text model. Until
+    /// [`NotesStage::with_text_digest`] pins the model's weights (or
+    /// [`NotesStage::without_text_model`] says none is needed) the stage is not
+    /// cacheable: a key without the weights could restore notes another model
+    /// wrote under the same name.
     pub fn new(params: NotesParams, backend: Arc<dyn TextBackend>) -> Self {
         Self {
             params,
             backend,
+            text_needed: true,
             text_digest: None,
         }
     }
 
-    /// Pins the text model's digest, resolved before the run: it keys the cache
-    /// (weights retagged under the same name do not restore the old notes), and a
-    /// run whose server reports another digest fails instead of writing output
-    /// under the pinned key. `None` when the run needs no text model (no speech:
-    /// the notes come from the board alone), so the key does not depend on one.
+    /// The text model is needed (the transcript has speech) and its digest,
+    /// resolved before the run, is `digest`: it keys the cache (weights retagged
+    /// under the same name do not restore the old notes), and a server that
+    /// serves another digest, or cannot confirm this one, is refused instead of
+    /// writing output under the pinned key. `None` (the digest is unknown) makes
+    /// the stage not cacheable.
     #[must_use]
     pub fn with_text_digest(mut self, digest: Option<String>) -> Self {
+        self.text_needed = true;
         self.text_digest = digest;
+        self
+    }
+
+    /// No text model is needed: the transcript has no speech and the notes come
+    /// from the board alone, so the cache key names no model weights. A run that
+    /// finds speech after all is refused.
+    #[must_use]
+    pub fn without_text_model(mut self) -> Self {
+        self.text_needed = false;
+        self.text_digest = None;
         self
     }
 
@@ -320,18 +337,36 @@ impl NotesStage {
         let corpus = Corpus::new(&lines, &input.boards, &input.keyframes, table);
         let digest = board_digest(&input.boards, &input.keyframes);
 
+        if !self.text_needed {
+            return Err(ErrorInfo::new(
+                ErrorCode::ModelRequest,
+                "the notes were keyed without a text model, but the transcript has speech",
+            ));
+        }
         let placement = self.enter_phase_c().await?;
         let model_digest = self.backend.digest(&p.text_model).await.ok().flatten();
         // Spec 8.1: the digest keyed before the run must be the one answering.
-        if let (Some(pinned), Some(now)) = (&self.text_digest, &model_digest) {
-            if pinned != now {
-                return Err(ErrorInfo::new(
-                    ErrorCode::ModelRequest,
-                    format!(
-                        "text model {} changed digest during the run ({pinned} keyed, {now} served)",
-                        p.text_model
-                    ),
-                ));
+        if let Some(pinned) = &self.text_digest {
+            match &model_digest {
+                Some(now) if now == pinned => {}
+                Some(now) => {
+                    return Err(ErrorInfo::new(
+                        ErrorCode::ModelRequest,
+                        format!(
+                            "text model {} changed digest during the run ({pinned} keyed, {now} served)",
+                            p.text_model
+                        ),
+                    ))
+                }
+                None => {
+                    return Err(ErrorInfo::new(
+                        ErrorCode::ModelRequest,
+                        format!(
+                            "text model {} digest {pinned} was keyed but the server cannot confirm it",
+                            p.text_model
+                        ),
+                    ))
+                }
             }
         }
 
@@ -991,6 +1026,11 @@ impl Stage for NotesStage {
                 .map(|d| format!("{}@{d}", self.params.text_model)),
             ..KeyExtras::default()
         }
+    }
+    /// Cacheable when the key identifies what the output depends on: no text
+    /// model (board-only notes), or the pinned digest of the one used.
+    fn cacheable(&self) -> bool {
+        !self.text_needed || self.text_digest.is_some()
     }
     fn item_timeout(&self) -> Option<Duration> {
         Some(Duration::from_secs(3 * 3600))
