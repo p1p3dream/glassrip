@@ -24,7 +24,7 @@ use crate::artifacts::{
 use crate::consolidate::owners::{Corroborator, NoCorroboration};
 use crate::consolidate::{
     consolidate_with_probe, split_boards, BoardFrame, BoardStateItem, ConsolidationParams, Hooks,
-    RegionProbe, SecondReader, TextAnchor,
+    RegionProbe, SecondReader, StrokeTrace, TextAnchor,
 };
 use crate::direction::{frame_weight, DirectionVotes};
 use crate::pixel_direction::{
@@ -662,12 +662,24 @@ pub struct ProbeCanvas {
     sx: f64,
     sy: f64,
     tolerance: u8,
+    /// No pixel is ink and the luminance spread is under
+    /// [`ProbeCanvas::UNIFORM_MAX_STD`].
+    uniform: bool,
 }
 
 impl ProbeCanvas {
     /// A pixel is ink when one of its channels differs from the canvas background
     /// (the per-channel median of a sample grid) by more than this.
     pub const DEFAULT_TOLERANCE: u8 = 48;
+    /// Largest luminance standard deviation (0 to 255) of a canvas that counts
+    /// as one flat color: compression noise on a flat fill stays well under it,
+    /// and any drawn mark or text raises it.
+    pub const UNIFORM_MAX_STD: f64 = 2.0;
+    /// Cell size (image pixels) of the stroke trace grid: gaps up to about a
+    /// cell (dashes, anti-aliasing breaks) are bridged.
+    const STROKE_CELL: usize = 3;
+    /// Image pixels added around every ignored box (outlines drawn on the edge).
+    const BOX_PAD: f64 = 2.0;
 
     /// `image` is the canvas crop; `canvas` the size of the reading's coordinate
     /// space (identity scale when unknown).
@@ -693,13 +705,151 @@ impl ProbeCanvas {
             }
             _ => (1.0, 1.0),
         };
-        Self {
+        let mut canvas = Self {
             image,
             background,
             sx,
             sy,
             tolerance: Self::DEFAULT_TOLERANCE,
+            uniform: false,
+        };
+        canvas.uniform = canvas.measure_uniform();
+        canvas
+    }
+
+    fn measure_uniform(&self) -> bool {
+        let (w, h) = (self.image.width(), self.image.height());
+        if w == 0 || h == 0 {
+            return false;
         }
+        let (mut sum, mut sq, mut n) = (0.0f64, 0.0f64, 0.0f64);
+        for y in 0..h {
+            for x in 0..w {
+                let p = self.image.get_pixel(x, y).0;
+                if (0..3).any(|c| p[c].abs_diff(self.background[c]) > self.tolerance) {
+                    return false;
+                }
+                let l = 0.299 * f64::from(p[0]) + 0.587 * f64::from(p[1]) + 0.114 * f64::from(p[2]);
+                sum += l;
+                sq += l * l;
+                n += 1.0;
+            }
+        }
+        let mean = sum / n;
+        (sq / n - mean * mean).max(0.0).sqrt() <= Self::UNIFORM_MAX_STD
+    }
+
+    /// [`RegionProbe::uniform`] on this canvas.
+    pub fn uniform(&self) -> bool {
+        self.uniform
+    }
+
+    /// [`RegionProbe::stroke_between`] on this canvas: ink pixels outside the
+    /// ignored boxes are pooled into cells of [`ProbeCanvas::STROKE_CELL`] pixels,
+    /// and the cells holding ink in the band around `a` are flooded (8-connected)
+    /// through ink cells; the stroke joins when the flood reaches a cell holding
+    /// ink in the band around `b`.
+    pub fn stroke_between(
+        &self,
+        a: &BBox,
+        b: &BBox,
+        region: &BBox,
+        masks: &[BBox],
+        ring: f64,
+    ) -> Option<StrokeTrace> {
+        type Rect = (f64, f64, f64, f64);
+        let finite = |r: &BBox| [r.x1, r.y1, r.x2, r.y2].iter().all(|v| v.is_finite());
+        if !(finite(a) && finite(b) && finite(region) && ring.is_finite()) {
+            return None;
+        }
+        let px = |r: &BBox| -> Rect {
+            (
+                r.x1 * self.sx,
+                r.y1 * self.sy,
+                r.x2 * self.sx,
+                r.y2 * self.sy,
+            )
+        };
+        let grow = |r: Rect, d: f64| -> Rect { (r.0 - d, r.1 - d, r.2 + d, r.3 + d) };
+        let inside = |r: &Rect, x: f64, y: f64| x >= r.0 && x < r.2 && y >= r.1 && y < r.3;
+        let ring = (ring * (self.sx + self.sy) / 2.0).max(2.0);
+        let (pa, pb) = (grow(px(a), Self::BOX_PAD), grow(px(b), Self::BOX_PAD));
+        let (ra, rb) = (grow(pa, ring), grow(pb, ring));
+        if ra.0 < rb.2 && rb.0 < ra.2 && ra.1 < rb.3 && rb.1 < ra.3 {
+            return None;
+        }
+        let r = px(region);
+        let (w, h) = (
+            f64::from(self.image.width()),
+            f64::from(self.image.height()),
+        );
+        let (x1, y1) = (r.0.max(0.0).floor(), r.1.max(0.0).floor());
+        let (x2, y2) = (r.2.min(w).ceil(), r.3.min(h).ceil());
+        let c = Self::STROKE_CELL;
+        if x2 - x1 < (4 * c) as f64 || y2 - y1 < (4 * c) as f64 {
+            return None;
+        }
+        let (x0, y0) = (x1 as usize, y1 as usize);
+        let (ww, wh) = (x2 as usize - x0, y2 as usize - y0);
+        // The ignored pixels of the window, rasterized once (pixel centers inside
+        // a grown box).
+        let mut ignored = vec![false; ww * wh];
+        for m in masks
+            .iter()
+            .filter(|m| finite(m))
+            .map(|m| grow(px(m), Self::BOX_PAD))
+            .chain([pa, pb])
+        {
+            let lo = |v: f64, o: usize| ((v - 0.5).ceil().max(o as f64) as usize).saturating_sub(o);
+            let (mx1, my1) = (lo(m.0, x0), lo(m.1, y0));
+            let (mx2, my2) = (lo(m.2, x0).min(ww), lo(m.3, y0).min(wh));
+            for y in my1..my2 {
+                ignored[y * ww + mx1.min(mx2)..y * ww + mx2].fill(true);
+            }
+        }
+        let cols = ww.div_ceil(c);
+        let rows = wh.div_ceil(c);
+        // Per cell: holds ink, ink in a's band, ink in b's band.
+        let mut ink = vec![false; cols * rows];
+        let mut near_a = vec![false; cols * rows];
+        let mut near_b = vec![false; cols * rows];
+        for y in y0..(y2 as usize) {
+            for x in x0..(x2 as usize) {
+                let (fx, fy) = (x as f64 + 0.5, y as f64 + 0.5);
+                if ignored[(y - y0) * ww + (x - x0)] || !self.ink_at(x as f64, y as f64) {
+                    continue;
+                }
+                let i = ((y - y0) / c) * cols + (x - x0) / c;
+                ink[i] = true;
+                near_a[i] |= inside(&ra, fx, fy);
+                near_b[i] |= inside(&rb, fx, fy);
+            }
+        }
+        let mut seen = near_a.clone();
+        let mut stack: Vec<usize> = (0..seen.len()).filter(|&i| seen[i]).collect();
+        let mut joined = false;
+        while let Some(i) = stack.pop() {
+            if near_b[i] {
+                joined = true;
+                break;
+            }
+            let (cx, cy) = ((i % cols) as isize, (i / cols) as isize);
+            for dy in -1isize..=1 {
+                for dx in -1isize..=1 {
+                    let (nx, ny) = (cx + dx, cy + dy);
+                    if nx < 0 || ny < 0 || nx >= cols as isize || ny >= rows as isize {
+                        continue;
+                    }
+                    let j = ny as usize * cols + nx as usize;
+                    if ink[j] && !seen[j] {
+                        seen[j] = true;
+                        stack.push(j);
+                    }
+                }
+            }
+        }
+        let share = ink.iter().filter(|&&v| v).count() as f64 / ink.len().max(1) as f64;
+        Some(StrokeTrace { joined, ink: share })
     }
 
     fn ink_at(&self, x: f64, y: f64) -> bool {
@@ -860,6 +1010,21 @@ impl RegionProbe for CropProbe {
         half_width: f64,
     ) -> Option<f64> {
         self.canvas(keyframe_id)?.line_cover(a, b, half_width)
+    }
+    fn stroke_between(
+        &self,
+        keyframe_id: &str,
+        a: &BBox,
+        b: &BBox,
+        region: &BBox,
+        masks: &[BBox],
+        ring: f64,
+    ) -> Option<StrokeTrace> {
+        self.canvas(keyframe_id)?
+            .stroke_between(a, b, region, masks, ring)
+    }
+    fn uniform(&self, keyframe_id: &str) -> Option<bool> {
+        Some(self.canvas(keyframe_id)?.uniform())
     }
 }
 

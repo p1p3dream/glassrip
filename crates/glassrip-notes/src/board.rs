@@ -379,6 +379,8 @@ pub mod build {
             detail: detail.into(),
             ink_change: Some(0.2),
             baseline: false,
+            owner_target: None,
+            owner_from: None,
         }
     }
 }

@@ -9,7 +9,7 @@ use super::{
     ActionItem, Decision, DroppedItem, Evidence, OpenQuestion, QuestionSource, Quote, QuoteMatch,
     SummaryPoint, TimelineEntry,
 };
-use crate::board::{first_seen, BoardExt, BoardStateItem, EventKind, KeyframeTimes, StickyKind};
+use crate::board::{first_seen, BoardExt, BoardStateItem, KeyframeTimes, StickyKind};
 use crate::named::NamedLine;
 use crate::people::AliasTable;
 use crate::text::{
@@ -345,12 +345,14 @@ impl Corpus {
                     moved: o.moved_from.is_some(),
                     current: o.valid_to_s >= b.end_s() - 0.5,
                 };
-                // the owner events of this assignment: same person, same target,
-                // near its start
+                // the owner events of this assignment (same person, same target
+                // by id, same kind, near its start): an event backs a move only
+                // through the move assignment it was matched to
                 for e in super::candidates::owner_events(b, o) {
-                    let mut key = words.clone();
-                    key.moved |= e.kind == EventKind::OwnerMoved;
-                    owner_keys.entry(e.event_id.clone()).or_default().push(key);
+                    owner_keys
+                        .entry(e.event_id.clone())
+                        .or_default()
+                        .push(words.clone());
                 }
                 if !o.opened_at_keyframe.is_empty() {
                     owner_keys
@@ -1183,6 +1185,7 @@ pub fn dropped(section: Section, item: &DraftItem, reasons: Vec<String>) -> Drop
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::board::EventKind;
     use crate::named::NamedLine;
 
     fn line(id: &str, t: f64, text: &str, raw: &str) -> NamedLine {
@@ -1566,6 +1569,10 @@ mod tests {
                 "Mira to Kiosk App",
             ),
         ];
+        let (n1, n2) = (build::node_target(&b, "n1"), build::node_target(&b, "n2"));
+        b.events[0].owner_target = Some(n1.clone());
+        b.events[1].owner_target = Some(n2);
+        b.events[1].owner_from = Some(n1);
         let text = "The importer reads the ledger nightly.";
         let c = Corpus::new(
             &[line("s1", 5.0, text, text)],
@@ -1647,6 +1654,9 @@ mod tests {
                 "Mira to Kiosk App",
             ),
         ];
+        b.events[0].owner_target = Some(build::node_target(&b, "n1"));
+        b.events[1].owner_target = Some(build::node_target(&b, "n2"));
+        b.events[1].owner_from = Some(build::node_target(&b, "n3"));
         let text = "The importer reads the ledger nightly.";
         let c = Corpus::new(
             &[line("s1", 5.0, text, text)],
@@ -1664,6 +1674,84 @@ mod tests {
             decision("ev-a").is_err(),
             "the plain event is about the Ledger Store"
         );
+    }
+
+    #[test]
+    fn a_move_to_ledger_store_does_not_back_the_plain_tag_on_ledger() {
+        use crate::board::{build, BoardEvent};
+        // Mira's plain tag on "Ledger" stays to the end; 10 s after it she is
+        // moved onto "Ledger Store" from the Kiosk App, and that tag is taken
+        // off at 01:10. The move event is about Ledger Store only: it cannot
+        // back a current task on Ledger.
+        let mut b = build::board("b", 100.0);
+        b.nodes = vec![
+            build::node("n1", "Ledger", 0.0, 100.0, None),
+            build::node("n2", "Ledger Store", 0.0, 100.0, None),
+            build::node("n3", "Kiosk App", 0.0, 100.0, None),
+        ];
+        let (n1, n2, n3) = (
+            build::node_target(&b, "n1"),
+            build::node_target(&b, "n2"),
+            build::node_target(&b, "n3"),
+        );
+        b.owner_assignments = vec![
+            build::owner("mira-okafor", "Mira Okafor", n1.clone(), 40.0, 100.0, None),
+            build::owner(
+                "mira-okafor",
+                "Mira Okafor",
+                n2.clone(),
+                50.0,
+                70.0,
+                Some(n3.clone()),
+            ),
+        ];
+        b.events = vec![
+            BoardEvent {
+                owner_target: Some(n1),
+                ..build::event(
+                    "ev-a",
+                    EventKind::OwnerAssigned,
+                    40.0,
+                    "kf_000040",
+                    "mira-okafor",
+                    "Mira Okafor -> Ledger",
+                )
+            },
+            BoardEvent {
+                owner_target: Some(n2),
+                owner_from: Some(n3),
+                ..build::event(
+                    "ev-m",
+                    EventKind::OwnerMoved,
+                    50.0,
+                    "kf_000050",
+                    "mira-okafor",
+                    "Mira Okafor -> Ledger Store",
+                )
+            },
+        ];
+        let text = "The importer reads the ledger nightly.";
+        let c = Corpus::new(
+            &[line("s1", 5.0, text, text)],
+            &[b],
+            &KeyframeTimes::default(),
+            AliasTable::from_names(&["Mira Okafor"]),
+        );
+        let action = |ev: &str| DraftItem {
+            owner: "Mira".into(),
+            task: "Own the Ledger".into(),
+            event_ids: vec![ev.into()],
+            ..Default::default()
+        };
+        assert!(check_with(Section::ActionItems, &action("ev-a"), &c, &ALL).is_ok());
+        assert!(
+            check_with(Section::ActionItems, &action("ev-m"), &c, &ALL).is_err(),
+            "the move event is about Ledger Store, whose tag was taken off"
+        );
+        // the move still backs the decision it is about
+        let mut d = item("Mira moves to the Ledger Store", &[], "");
+        d.event_ids = vec!["ev-m".into()];
+        assert!(check_with(Section::Decisions, &d, &c, &ALL).is_ok());
     }
 
     #[test]
