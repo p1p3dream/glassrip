@@ -64,13 +64,13 @@ use crate::register::{
 use crate::similarity::Similarity;
 use crate::text::{clean_label, is_unreliable, normalize, AliasTable};
 
-use anchor::{anchor_tag, box_distance, AnchorParams, Anchored, EdgeGeom};
+use anchor::{anchor_tag, box_distance, edge_end_ambiguities, AnchorParams, Anchored, EdgeGeom};
 use cleanup::{derive_groups, fold_fragments, Titles};
 use events::{BoardEvent, EventGate, EventKind, SuppressReason, SuppressedEvent};
 use owner_geometry::{OwnerGeometryParams, TagIn};
 use owners::{
-    apply_alternation, assign_with, collapse_edge_pairs, AnchorKind, Corroborator, OwnerAssignment,
-    OwnerParams, OwnerSighting, OwnerTarget,
+    apply_alternation, assign_with, collapse_edge_pairs, consolidate_tags, AnchorKind,
+    Corroborator, NameRead, OwnerAssignment, OwnerParams, OwnerSighting, OwnerTarget, TagPlace,
 };
 use tracks::{
     assign_frame, intervals, Interval, MatchParams, Obs, ObsList, SupportParams, Track, Visibility,
@@ -361,6 +361,10 @@ pub struct ConsolidationParams {
     /// sighting of an owner tag opens an assignment (no later keyframe can confirm it).
     #[serde(default = "default_owner_final_hold_s")]
     pub owner_final_hold_s: f64,
+    /// Reach, in tag sizes, within which a person's OCR-read tags at one registered
+    /// place are the same physical tag (one target set for all its keyframes).
+    #[serde(default = "default_owner_tag_reach_share")]
+    pub owner_tag_reach_share: f64,
     /// Alternations (A, B, A, B has 3) a strictly interleaving stretch between an
     /// edge's ends needs before its sightings are re-anchored to the edge.
     pub alternation_min_alternations: usize,
@@ -395,6 +399,7 @@ impl Default for ConsolidationParams {
             owner_anchor: AnchorParams::default(),
             owner_geometry: OwnerGeometryParams::default(),
             owner_final_hold_s: default_owner_final_hold_s(),
+            owner_tag_reach_share: default_owner_tag_reach_share(),
             alternation_min_alternations: 3,
             backfill_untargeted_owners: false,
         }
@@ -403,6 +408,10 @@ impl Default for ConsolidationParams {
 
 fn default_owner_final_hold_s() -> f64 {
     30.0
+}
+
+fn default_owner_tag_reach_share() -> f64 {
+    0.5
 }
 
 fn default_coverage_radius_share() -> f64 {
@@ -2030,7 +2039,74 @@ pub fn consolidate_with_probe(
         // Reader boxes that all coincide are no geometry, unless OCR placed what is
         // used (an unreliable reading keeps nothing else).
         let use_geometry = geo || placed.unreliable;
-        for (tag_index, ((name, near, _), pl)) in tags.into_iter().zip(placed.tags).enumerate() {
+        // OCR can vouch for names only where the OCR check runs.
+        let has_ocr = params.owner_geometry.enabled && !f.ocr_anchors.is_empty();
+        let pad =
+            |g: &BBox| owner_geometry::tag_box(g, placed.line, params.owner_geometry.tag_pad_lines);
+        // OCR-first tags. A reader tag OCR read sits on its OCR text; in a keyframe
+        // where OCR read a person's name, that person's other reader tags are
+        // misplaced or duplicated and dropped; every other OCR name span is a tag the
+        // reader missed. A span inside an element that mentions the name is no tag.
+        let ocr_people: HashSet<&str> = placed
+            .name_spans
+            .iter()
+            .filter(|s| !s.mention)
+            .map(|s| s.person.as_str())
+            .collect();
+        let span_of = |si: &usize| Some(*si).filter(|si| !placed.name_spans[*si].mention);
+        // (name, reader's near, geometry box, box on OCR text, who read the name)
+        let mut all: Vec<(String, String, Option<BBox>, bool, NameRead)> = Vec::new();
+        for (i, ((name, near, _), pl)) in tags.into_iter().zip(&placed.tags).enumerate() {
+            match placed.tag_spans[i].as_ref().and_then(span_of) {
+                Some(si) => all.push((
+                    name,
+                    near,
+                    Some(pad(&placed.name_spans[si].glyph)),
+                    true,
+                    NameRead::Ocr,
+                )),
+                None if people[i].as_deref().is_some_and(|p| ocr_people.contains(p)) => {}
+                None => all.push((
+                    name,
+                    near,
+                    pl.map(|p| p.bbox),
+                    pl.is_some_and(|p| p.ocr),
+                    if has_ocr {
+                        NameRead::Reader
+                    } else {
+                        NameRead::Unchecked
+                    },
+                )),
+            }
+        }
+        let claimed: HashSet<usize> = placed.tag_spans.iter().flatten().copied().collect();
+        for (si, ns) in placed.name_spans.iter().enumerate() {
+            if !ns.mention && !claimed.contains(&si) {
+                all.push((
+                    ns.text.clone(),
+                    String::new(),
+                    Some(pad(&ns.glyph)),
+                    true,
+                    NameRead::Ocr,
+                ));
+            }
+        }
+        let place_of = |b: &BBox| {
+            positioned(fi).then(|| {
+                let c = regs[fi]
+                    .to_reference
+                    .apply(((b.x1 + b.x2) / 2.0, (b.y1 + b.y2) / 2.0));
+                let k = regs[fi].to_reference.scale.abs();
+                TagPlace {
+                    cluster: regs[fi].cluster,
+                    x: c.0,
+                    y: c.1,
+                    w: b.width() * k,
+                    h: b.height() * k,
+                }
+            })
+        };
+        for (tag_index, (name, near, bx, box_ocr, name_read)) in all.into_iter().enumerate() {
             let Some(person) = params.participants.resolve(&name) else {
                 rejected_owner_tags.push(RejectedOwnerTag {
                     keyframe_id: f.keyframe_id.clone(),
@@ -2038,28 +2114,48 @@ pub fn consolidate_with_probe(
                 });
                 continue;
             };
-            // (target, anchor, the tag and every target node placed on OCR text)
-            let mut targets: Vec<(OwnerTarget, AnchorKind, bool)> = Vec::new();
-            if let (true, Some(pl)) = (use_geometry, pl) {
-                let on_ocr = |ks: &[usize]| pl.ocr && ks.iter().all(|t| ocr_placed[fi].contains(t));
-                match anchor_tag(&pl.bbox, &node_boxes, &frame_edges, &params.owner_anchor) {
+            // (target, anchor, the tag and every target node placed on OCR text,
+            // other targets the geometry fits)
+            type Found = (OwnerTarget, AnchorKind, bool, Vec<OwnerTarget>);
+            let mut targets: Vec<Found> = Vec::new();
+            if let (true, Some(bx)) = (use_geometry, bx) {
+                let on_ocr =
+                    |ks: &[usize]| box_ocr && ks.iter().all(|t| ocr_placed[fi].contains(t));
+                let amb = edge_end_ambiguities(&bx, &frame_edges, &params.owner_anchor);
+                match anchor_tag(&bx, &node_boxes, &frame_edges, &params.owner_anchor) {
                     Some(Anchored::Node(AnchorKey::Node(x))) => {
+                        let alts: Vec<OwnerTarget> = amb
+                            .iter()
+                            .filter(|(_, end)| *end == AnchorKey::Node(x))
+                            .filter_map(|(e, _)| match e {
+                                AnchorKey::Edge(k) => edge_target(*k),
+                                AnchorKey::Node(_) => None,
+                            })
+                            .collect();
                         targets.extend(
-                            owner_node(x).map(|t| (t, AnchorKind::GeometryNode, on_ocr(&[x]))),
+                            owner_node(x)
+                                .map(|t| (t, AnchorKind::GeometryNode, on_ocr(&[x]), alts)),
                         );
                     }
                     Some(Anchored::Bridge(AnchorKey::Node(x), AnchorKey::Node(y))) => {
                         for z in [x, y] {
-                            targets.extend(
-                                owner_node(z)
-                                    .map(|t| (t, AnchorKind::GeometryBridge, on_ocr(&[z]))),
-                            );
+                            targets.extend(owner_node(z).map(|t| {
+                                (t, AnchorKind::GeometryBridge, on_ocr(&[z]), Vec::new())
+                            }));
                         }
                     }
                     Some(Anchored::Edge(AnchorKey::Edge(k))) => {
+                        let alts: Vec<OwnerTarget> = amb
+                            .iter()
+                            .filter(|(e, _)| *e == AnchorKey::Edge(k))
+                            .filter_map(|(_, end)| match end {
+                                AnchorKey::Node(x) => owner_node(*x),
+                                AnchorKey::Edge(_) => None,
+                            })
+                            .collect();
                         targets.extend(
                             edge_target(k)
-                                .map(|t| (t, AnchorKind::GeometryEdge, on_ocr(&[k.0, k.1]))),
+                                .map(|t| (t, AnchorKind::GeometryEdge, on_ocr(&[k.0, k.1]), alts)),
                         );
                     }
                     _ => {}
@@ -2070,31 +2166,23 @@ pub fn consolidate_with_probe(
                     node_track
                         .get(&(fi, near.clone()))
                         .and_then(|&ti| owner_node(ti))
-                        .map(|t| (t, AnchorKind::Near, false)),
+                        .map(|t| (t, AnchorKind::Near, false, Vec::new())),
                 );
             }
             let entry = by_person
                 .entry(person.person_id.clone())
                 .or_insert_with(|| (person.display_name.clone(), Vec::new()));
-            let targets: Vec<(Option<OwnerTarget>, AnchorKind, bool)> = if targets.is_empty() {
-                vec![(None, AnchorKind::Untargeted, false)]
-            } else {
-                targets
-                    .into_iter()
-                    .map(|(t, a, l)| (Some(t), a, l))
-                    .collect()
-            };
-            for (t, anchor, located) in targets {
-                // Several tags of one person in a keyframe are kept when their targets
-                // differ (multi-target owners).
-                if entry
-                    .1
-                    .iter()
-                    .any(|s| s.keyframe_id == f.keyframe_id && s.target == t)
-                {
-                    continue;
-                }
-                entry.1.push(OwnerSighting {
+            let targets: Vec<(Option<OwnerTarget>, AnchorKind, bool, Vec<OwnerTarget>)> =
+                if targets.is_empty() {
+                    vec![(None, AnchorKind::Untargeted, false, Vec::new())]
+                } else {
+                    targets
+                        .into_iter()
+                        .map(|(t, a, l, alts)| (Some(t), a, l, alts))
+                        .collect()
+                };
+            for (t, anchor, located, alternates) in targets {
+                let sighting = OwnerSighting {
                     keyframe_id: f.keyframe_id.clone(),
                     t_start_s: f.t_start_s,
                     t_end_s: f.t_end_s,
@@ -2103,7 +2191,24 @@ pub fn consolidate_with_probe(
                     anchor,
                     tag: tag_index as u32,
                     ocr_located: located,
-                });
+                    name_read,
+                    alternates,
+                    place: bx.as_ref().and_then(&place_of),
+                    physical: None,
+                };
+                // Several tags of one person in a keyframe are kept when their targets
+                // differ (multi-target owners); for one target the stronger evidence,
+                // unless both are placed: two placed tags are two physical tags.
+                let strength = |s: &OwnerSighting| (s.ocr_located, s.name_read != NameRead::Reader);
+                match entry.1.iter().position(|s| {
+                    s.keyframe_id == f.keyframe_id
+                        && s.target == sighting.target
+                        && !(s.place.is_some() && sighting.place.is_some() && s.tag != sighting.tag)
+                }) {
+                    None => entry.1.push(sighting),
+                    Some(j) if strength(&sighting) > strength(&entry.1[j]) => entry.1[j] = sighting,
+                    Some(_) => {}
+                }
             }
         }
     }
@@ -2142,13 +2247,31 @@ pub fn consolidate_with_probe(
                 .any(|&t| tracks[t].obs.iter().any(|o| o.frame == *fi))
         })
     };
-    let target_visible = |kf: &str, t: &OwnerTarget| match t {
-        OwnerTarget::Node { node_id, .. } => track_of_id
-            .get(node_id.as_str())
-            .is_some_and(|&ti| seen(ti, kf)),
-        OwnerTarget::Edge { edge_id, .. } => edge_of_id
-            .get(edge_id.as_str())
-            .is_some_and(|&(a, b)| seen(a, kf) && seen(b, kf)),
+    // The tag's registered position lies inside the keyframe's canvas. Without a
+    // known tag position the target alone decides; with one, a keyframe that cannot
+    // map it (not registered, another registration cluster, no canvas) is not
+    // evidence either way.
+    let in_view = |fi: usize, place: Option<&TagPlace>| -> bool {
+        let Some(p) = place else { return true };
+        if !positioned(fi) || regs[fi].cluster != p.cluster {
+            return false;
+        }
+        let (Some(c), Some(inv)) = (canvases[fi], regs[fi].to_reference.inverse()) else {
+            return false;
+        };
+        let q = inv.apply((p.x, p.y));
+        q.0 >= 0.0 && q.1 >= 0.0 && q.0 <= c.width && q.1 <= c.height
+    };
+    let target_visible = |kf: &str, t: &OwnerTarget, place: Option<&TagPlace>| {
+        let read = match t {
+            OwnerTarget::Node { node_id, .. } => track_of_id
+                .get(node_id.as_str())
+                .is_some_and(|&ti| seen(ti, kf)),
+            OwnerTarget::Edge { edge_id, .. } => edge_of_id
+                .get(edge_id.as_str())
+                .is_some_and(|&(a, b)| seen(a, kf) && seen(b, kf)),
+        };
+        read && frame_of_kf.get(kf).is_some_and(|&fi| in_view(fi, place))
     };
     let target_tracks = |t: &OwnerTarget| -> Vec<usize> {
         match t {
@@ -2171,26 +2294,29 @@ pub fn consolidate_with_probe(
             &alternation_edges,
             params.alternation_min_alternations,
         );
+        consolidate_tags(&mut sightings, params.owner_tag_reach_share);
         // The first keyframe in [after, before) that read the target, OCR placed it,
-        // and names the person nowhere.
-        let absent = |t: &OwnerTarget, after: f64, before: f64| -> Option<f64> {
-            let ts = target_tracks(t);
-            if ts.is_empty() {
-                return None;
-            }
-            frames
-                .iter()
-                .enumerate()
-                .find(|(fi, f)| {
-                    f.t_start_s >= after - 1e-9
-                        && f.t_start_s < before - 1e-9
-                        && !named[*fi].contains(&pid)
-                        && ts
-                            .iter()
-                            .all(|&ti| seen(ti, &f.keyframe_id) && ocr_placed[*fi].contains(&ti))
-                })
-                .map(|(_, f)| f.t_start_s)
-        };
+        // has the tag's last position in view, and names the person nowhere.
+        let absent =
+            |t: &OwnerTarget, place: Option<&TagPlace>, after: f64, before: f64| -> Option<f64> {
+                let ts = target_tracks(t);
+                if ts.is_empty() {
+                    return None;
+                }
+                frames
+                    .iter()
+                    .enumerate()
+                    .find(|(fi, f)| {
+                        f.t_start_s >= after - 1e-9
+                            && f.t_start_s < before - 1e-9
+                            && !named[*fi].contains(&pid)
+                            && in_view(*fi, place)
+                            && ts.iter().all(|&ti| {
+                                seen(ti, &f.keyframe_id) && ocr_placed[*fi].contains(&ti)
+                            })
+                    })
+                    .map(|(_, f)| f.t_start_s)
+            };
         owner_assignments.extend(assign_with(
             &pid,
             &name,

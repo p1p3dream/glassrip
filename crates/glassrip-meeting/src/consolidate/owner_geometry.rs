@@ -25,6 +25,11 @@
 //!   and the others are left out of owner geometry.
 //!
 //! Without OCR the reader's boxes are used as they are.
+//!
+//! Every OCR span that names a participant is also reported ([`NameSpan`]), whether or
+//! not the reader emitted a tag there: owner sightings start from what OCR read, and a
+//! span inside another element that mentions the name (a sticky saying "ask Avery")
+//! is flagged as a mention, not a tag.
 
 use glassrip_vision::board::ValidatedBoard;
 use glassrip_vision::BBox;
@@ -55,6 +60,14 @@ pub struct OwnerGeometryParams {
     pub min_window_lines: f64,
     /// Smallest margin of the confirming window, as a share of the canvas diagonal.
     pub min_displacement_share: f64,
+    /// Padding around an OCR name span, in OCR line heights, that gives the tag's
+    /// box for owner geometry (a name tag is its text plus a margin).
+    #[serde(default = "default_tag_pad_lines")]
+    pub tag_pad_lines: f64,
+}
+
+fn default_tag_pad_lines() -> f64 {
+    1.0
 }
 
 impl Default for OwnerGeometryParams {
@@ -67,6 +80,7 @@ impl Default for OwnerGeometryParams {
             line_reach: (4.0, 2.0),
             min_window_lines: 2.0,
             min_displacement_share: 0.05,
+            tag_pad_lines: default_tag_pad_lines(),
         }
     }
 }
@@ -89,6 +103,42 @@ pub struct FrameGeometry {
     pub tags: Vec<Option<Placed>>,
     /// The reading's own boxes were judged unreliable.
     pub unreliable: bool,
+    /// Per tag: the OCR name span (index into `name_spans`) that located it.
+    pub tag_spans: Vec<Option<usize>>,
+    /// OCR spans naming a participant, in OCR order.
+    pub name_spans: Vec<NameSpan>,
+    /// Median OCR line height (0 without OCR).
+    pub line: f64,
+}
+
+/// An OCR span that names a participant.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NameSpan {
+    /// Participant id.
+    pub person: String,
+    /// Text as read.
+    pub text: String,
+    /// Glyph box.
+    pub glyph: BBox,
+    /// The span lies in another element whose text mentions the name: not a tag.
+    pub mention: bool,
+}
+
+/// The box of a name tag read by OCR: the glyph box padded by `pad_lines` line
+/// heights on every side.
+pub fn tag_box(glyph: &BBox, line: f64, pad_lines: f64) -> BBox {
+    let m = (line * pad_lines).max(0.0);
+    BBox::new(glyph.x1 - m, glyph.y1 - m, glyph.x2 + m, glyph.y2 + m)
+}
+
+/// True when some word or pair of adjacent words of `text` names `pid`.
+fn mentions(text: &str, pid: &str, names: &dyn Fn(&str) -> Option<String>) -> bool {
+    let norm = normalize(text);
+    let words: Vec<&str> = norm.split_whitespace().collect();
+    words.iter().any(|w| names(w).as_deref() == Some(pid))
+        || words
+            .windows(2)
+            .any(|w| names(&format!("{} {}", w[0], w[1])).as_deref() == Some(pid))
 }
 
 /// One name tag to place: its reader box and the participant it names.
@@ -153,6 +203,9 @@ pub fn place(
             nodes: board.nodes.iter().map(|n| as_read(&n.bbox)).collect(),
             tags: tags.iter().map(|t| as_read(&t.bbox)).collect(),
             unreliable: false,
+            tag_spans: vec![None; tags.len()],
+            name_spans: Vec::new(),
+            line: 0.0,
         };
     }
     // Index-aligned with `ocr`.
@@ -235,18 +288,19 @@ pub fn place(
     let found: Vec<Option<Found>> = (0..elements.len()).map(locate).collect();
 
     // Tags: OCR spans naming each tag's person, nearest first, each span once.
-    let name_spans: Vec<(String, BBox)> = ocr
+    let name_spans: Vec<(String, BBox, &str)> = ocr
         .iter()
         .zip(&glyphs)
         .filter(|(a, _)| a.bbox.is_well_formed())
-        .filter_map(|(a, g)| names(&a.text).map(|pid| (pid, *g)))
+        .filter_map(|(a, g)| names(&a.text).map(|pid| (pid, *g, a.text.as_str())))
         .collect();
     let mut tag_found: Vec<Option<Found>> = vec![None; tags.len()];
+    let mut tag_spans: Vec<Option<usize>> = vec![None; tags.len()];
     let mut span_used = vec![false; name_spans.len()];
     let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
     for (ti, t) in tags.iter().enumerate() {
         let Some(pid) = t.person else { continue };
-        for (si, (spid, sb)) in name_spans.iter().enumerate() {
+        for (si, (spid, sb, _)) in name_spans.iter().enumerate() {
             let c = center(sb);
             if spid == pid && confirms(c, &t.bbox) {
                 let tc = center(&t.bbox);
@@ -261,6 +315,7 @@ pub fn place(
                 text: name_spans[si].1,
                 local: true,
             });
+            tag_spans[ti] = Some(si);
             span_used[si] = true;
         }
     }
@@ -277,7 +332,7 @@ pub fn place(
         let spans_left: Vec<usize> = name_spans
             .iter()
             .enumerate()
-            .filter(|(si, (spid, _))| spid == pid && !span_used[*si])
+            .filter(|(si, (spid, _, _))| spid == pid && !span_used[*si])
             .map(|(si, _)| si)
             .collect();
         // A name inside another element's box is a mention in its text, unless that
@@ -293,6 +348,7 @@ pub fn place(
                 text: name_spans[spans_left[0]].1,
                 local: false,
             });
+            tag_spans[ti] = Some(spans_left[0]);
             span_used[spans_left[0]] = true;
         }
     }
@@ -306,6 +362,49 @@ pub fn place(
     let displaced = located.iter().filter(|local| !**local).count();
     let unreliable = located.len() >= p.min_located.max(1)
         && displaced as f64 >= p.displaced_share * located.len() as f64;
+
+    // OCR reads another word (3+ characters, not a name of `pid`) of `text` within two
+    // lines of `c`: the name is part of that text as written on the canvas.
+    let words_near = |c: (f64, f64), text: &str, pid: &str| {
+        let norm = normalize(text);
+        let words: Vec<&str> = norm
+            .split_whitespace()
+            .filter(|w| w.chars().count() >= 3 && names(w).as_deref() != Some(pid))
+            .collect();
+        ocr.iter().zip(&glyphs).any(|(a, g)| {
+            let dx = (g.x1 - c.0).max(c.0 - g.x2).max(0.0);
+            let dy = (g.y1 - c.1).max(c.1 - g.y2).max(0.0);
+            dx <= 2.0 * line
+                && dy <= 2.0 * line
+                && normalize(&a.text)
+                    .split_whitespace()
+                    .any(|w| words.contains(&w))
+        })
+    };
+    // Every name span, flagged when it lies in another element whose text mentions the
+    // name without being the name: inside the element's located text when OCR found
+    // it, else inside its reader box with more of its words read around the name.
+    let spans_out: Vec<NameSpan> = name_spans
+        .iter()
+        .map(|(pid, g, text)| {
+            let c = center(g);
+            // Where OCR located the element, its text says where it is; the reader's
+            // box only for elements OCR did not locate.
+            let mention = elements.iter().zip(&found).any(|(e, f)| {
+                let inside = match f {
+                    Some(f) => in_margin(c, &f.text, line, line),
+                    None => in_window(c, &e.1, 0.0) && words_near(c, e.0, pid),
+                };
+                inside && names(e.0).as_deref() != Some(pid) && mentions(e.0, pid, names)
+            });
+            NameSpan {
+                person: pid.clone(),
+                text: (*text).to_string(),
+                glyph: *g,
+                mention,
+            }
+        })
+        .collect();
 
     let placed = |b: &BBox, f: &Option<Found>| match f {
         Some(f) if unreliable || !f.local => Some(Placed {
@@ -332,6 +431,9 @@ pub fn place(
             .map(|(t, f)| placed(&t.bbox, f))
             .collect(),
         unreliable,
+        tag_spans,
+        name_spans: spans_out,
+        line,
     }
 }
 
