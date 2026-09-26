@@ -330,3 +330,83 @@ fn em_dashes_in_board_text_are_sanitized() {
     assert!(!r.svg_text[0].1.contains('\u{2014}'));
     assert!(!r.markdown_text.contains('\u{2014}'));
 }
+
+/// Codex final round 3 MAJOR: the render stage's output is the files it writes
+/// outside the run directory, so a rerun never restores it from the cache: files
+/// deleted since the last run are written again, not reported from a cached
+/// artifact.
+#[tokio::test]
+async fn a_rerun_rewrites_the_rendered_files() {
+    let (notes, board) = inputs();
+    let dir = tempfile::tempdir().unwrap();
+    let run_path = dir.path().join("run");
+    let run = RunDir::open(&run_path, "synthetic", Producer::glassrip("0.1.0", None)).unwrap();
+    import::write_artifact(
+        &run,
+        schemas::MEETING_NOTES,
+        Version::new(1, 0, 0),
+        serde_json::json!({}),
+        vec![("meeting_notes".to_string(), notes)],
+    )
+    .unwrap();
+    import::import_boards(&run, &[board]).unwrap();
+    drop(run);
+    let out = dir.path().join("out");
+    let stage = RenderStage::new(RenderParams {
+        out_dir: out.clone(),
+        ..params(PathBuf::new())
+    });
+    let runner = || {
+        Runner::new(
+            RunDir::open(&run_path, "synthetic", Producer::glassrip("0.1.0", None)).unwrap(),
+            StageGraph::new(meeting_mode_stage_decls()).unwrap(),
+            // Selected without being forced (`from` would force it).
+            &Selection::default(),
+            Cache::in_workspace(dir.path()),
+            RunnerOptions::default(),
+            CancellationToken::new(),
+        )
+        .unwrap()
+    };
+    let files = |recs: &[Record<RenderResult>]| -> Vec<PathBuf> {
+        recs[0]
+            .outcome
+            .result
+            .as_ref()
+            .unwrap()
+            .files
+            .iter()
+            .map(|f| out.join(&f.name))
+            .collect()
+    };
+    let read = |r: &Runner| {
+        jsonl::read::<Record<RenderResult>>(
+            &r.run_dir().artifact_path(RENDER_SCHEMA),
+            &SchemaReq::new(RENDER_SCHEMA, 1),
+        )
+        .unwrap()
+        .items
+    };
+
+    let mut r = runner();
+    let rep = r.run_stage(&stage).await.unwrap();
+    assert_eq!(rep.items_error, 0);
+    let written = files(&read(&r));
+    assert_eq!(written.len(), 3);
+    drop(r);
+    for f in &written {
+        std::fs::remove_file(f).unwrap();
+    }
+
+    let mut r = runner();
+    assert!(!r.cache_hit(&stage), "render never restores from the cache");
+    let rep = r.run_stage(&stage).await.unwrap();
+    assert_ne!(
+        rep.status,
+        glassrip_core::manifest::StageStatus::Cached,
+        "{rep:?}"
+    );
+    for f in files(&read(&r)) {
+        assert!(f.is_file(), "{} was not rewritten", f.display());
+    }
+}

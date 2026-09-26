@@ -132,6 +132,12 @@ pub trait Stage: Send + Sync {
     fn key_extras(&self) -> KeyExtras {
         KeyExtras::default()
     }
+    /// False for a stage whose result is more than its artifact (say files it
+    /// writes outside the run directory): it is never restored from the cache
+    /// or resumed from a partial, but runs whenever selected, as if forced.
+    fn cacheable(&self) -> bool {
+        true
+    }
     /// Items processed concurrently.
     fn concurrency(&self) -> usize {
         1
@@ -915,6 +921,9 @@ impl Runner {
     /// valid cache entry exists for its key. Model stages use this to skip model
     /// preflight on a fully cached rerun. Errors (missing inputs) mean "no".
     pub fn cache_hit<S: Stage>(&self, stage: &S) -> bool {
+        if !stage.cacheable() {
+            return false;
+        }
         match self.plan.decision(stage.name()) {
             Some(StageDecision::Run { force: false }) => {}
             _ => return false,
@@ -972,7 +981,8 @@ impl Runner {
                 }
                 return Ok(report);
             }
-            Some(StageDecision::Run { force }) => force,
+            // A stage that is not cacheable always starts over.
+            Some(StageDecision::Run { force }) => force || !stage.cacheable(),
         };
         if self.cancel.is_cancelled() {
             return Err(RunnerError::Cancelled {
@@ -1374,16 +1384,18 @@ impl Runner {
                     .with_run(|r| r.partials_dir())
                     .join(format!("{name}-{}.over-limit.jsonl", &key.as_str()[..16]));
                 jsonl::write_atomic(&over, &header, &items)?;
-                match self.cache.put_file(name, &key, OUTPUT_EXT, &over) {
-                    // The cache holds the stage's state now; the partial would only
-                    // go stale against it.
-                    Ok(_) => {
-                        drop(writer);
-                        fs_err::remove_file(&partial).map_err(Self::io_err(&partial))?;
-                        remove_if_exists(&seed_marker)?;
-                    }
-                    Err(e) => warn!(stage = name, error = %e, "could not store output in cache"),
+                if let Err(e) = self.cache.put_file(name, &key, OUTPUT_EXT, &over) {
+                    warn!(stage = name, error = %e, "could not store output in cache; dropping the partial output");
                 }
+                // Stored: the cache holds the stage's state now, and the partial
+                // would only go stale against it. Not stored: a kept partial (and
+                // its seed marker) would be resumed as is by every later run,
+                // failing the stage again without retrying anything until the
+                // cache is writable; without it the next run starts from the
+                // cache entry (or from scratch) and retries what is unsettled.
+                drop(writer);
+                fs_err::remove_file(&partial).map_err(Self::io_err(&partial))?;
+                remove_if_exists(&seed_marker)?;
                 fs_err::remove_file(&over).map_err(Self::io_err(&over))?;
             }
             return Err(RunnerError::ErrorRateExceeded {
@@ -2622,6 +2634,57 @@ mod tests {
             (20, 0, 0)
         );
         assert_eq!(source.calls(), 21);
+    }
+
+    /// Kimi final N5: an over-limit output the cache cannot store does not pin
+    /// the run directory to its partial. The next run starts from the cache entry
+    /// and retries the unsettled item, which now recovers.
+    #[tokio::test]
+    async fn an_over_limit_output_the_cache_cannot_store_is_not_resumed() {
+        use std::os::unix::fs::PermissionsExt;
+        let env = env();
+        let source = SourceStage::new(1);
+        {
+            let mut b = source.behavior.lock().unwrap();
+            b.fail = [0].into();
+            b.recurrent = [0].into();
+        }
+        // Over the limit, cached with the item unsettled.
+        let mut r = runner(&env, "run-a", &Selection::default());
+        assert!(r.run_stage(&source).await.is_err());
+        drop(r);
+        assert_eq!(source.calls(), 1);
+
+        // The item fails again while the entry's directory is read-only.
+        let dirs: Vec<PathBuf> = env
+            .cache
+            .ls()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.path.parent().unwrap().to_path_buf())
+            .collect();
+        let set_mode = |mode: u32| {
+            for d in &dirs {
+                fs_err::set_permissions(d, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+        };
+        set_mode(0o555);
+        let mut r = runner(&env, "run-b", &Selection::default());
+        let result = r.run_stage(&source).await;
+        set_mode(0o755);
+        assert!(matches!(result, Err(RunnerError::ErrorRateExceeded { .. })));
+        drop(r);
+        assert_eq!(source.calls(), 2);
+
+        // The item recovers: it is asked again, not read back from the partial.
+        source.behavior.lock().unwrap().fail.clear();
+        let mut r = runner(&env, "run-b", &Selection::default());
+        let rep = r.run_stage(&source).await.unwrap();
+        assert_eq!(
+            (rep.status, rep.items_ok, rep.items_processed),
+            (StageStatus::Ok, 1, 1)
+        );
+        assert_eq!(source.calls(), 3);
     }
 
     /// Codex runner review round 2: a resume on a cache miss keeps the marker
