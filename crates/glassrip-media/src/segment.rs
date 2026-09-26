@@ -18,6 +18,12 @@ pub trait PairOracle: Sync {
     fn score(&self, a: usize, b: usize) -> (f64, f64, bool);
     /// Ink change of `b` relative to `a`.
     fn ink(&self, a: usize, b: usize) -> f64;
+    /// [`PairOracle::ink`] and whether its alignment was usable. A failed alignment
+    /// reports a full change (1.0) so segmentation still cuts there, but the value
+    /// measures nothing and consumers must treat it as unknown.
+    fn ink_checked(&self, a: usize, b: usize) -> (f64, bool) {
+        (self.ink(a, b), true)
+    }
 }
 
 /// Thresholds for `differs(x, y)`.
@@ -85,6 +91,8 @@ pub struct Comparison {
     pub ink: Option<f64>,
     /// Whether the pair-score ECC converged.
     pub align_ok: bool,
+    /// Whether the ink path's alignment was usable (true when ink was not computed).
+    pub ink_align_ok: bool,
     /// Why the pair differs, or `None` when it does not.
     pub reason: Option<Reason>,
 }
@@ -115,13 +123,34 @@ impl<'a, O: PairOracle> DiffCache<'a, O> {
 
     /// Inserts a precomputed comparison (for example the consecutive pairs).
     pub fn seed(&self, a: usize, b: usize, ssim: f64, frac: f64, ink: f64, align_ok: bool) {
+        self.seed_checked(a, b, ssim, frac, (ink, true), align_ok);
+    }
+
+    /// [`DiffCache::seed`] with the ink alignment flag.
+    pub fn seed_checked(
+        &self,
+        a: usize,
+        b: usize,
+        ssim: f64,
+        frac: f64,
+        ink: (f64, bool),
+        align_ok: bool,
+    ) {
         let c = self.classify(ssim, frac, Some(ink), align_ok);
         if let Ok(mut m) = self.cache.lock() {
             m.insert((a, b), c);
         }
     }
 
-    fn classify(&self, ssim: f64, frac: f64, ink: Option<f64>, align_ok: bool) -> Comparison {
+    fn classify(
+        &self,
+        ssim: f64,
+        frac: f64,
+        ink: Option<(f64, bool)>,
+        align_ok: bool,
+    ) -> Comparison {
+        let ink_align_ok = ink.is_none_or(|i| i.1);
+        let ink = ink.map(|i| i.0);
         let reason = if ssim < self.thr.ssim {
             Some(Reason::Ssim)
         } else if frac > self.thr.frac {
@@ -136,6 +165,7 @@ impl<'a, O: PairOracle> DiffCache<'a, O> {
             frac,
             ink,
             align_ok,
+            ink_align_ok,
             reason,
         }
     }
@@ -155,7 +185,7 @@ impl<'a, O: PairOracle> DiffCache<'a, O> {
         let ink = if decided {
             None
         } else {
-            Some(self.oracle.ink(a, b))
+            Some(self.oracle.ink_checked(a, b))
         };
         let c = self.classify(ssim, frac, ink, align_ok);
         if let Ok(mut m) = self.cache.lock() {
@@ -589,5 +619,39 @@ mod tests {
                 assert_eq!(runs, vec![vec![0, 1], vec![2], vec![3, 4, 5]]);
             }
         }
+    }
+
+    /// Static frames whose ink alignment fails between 1 and 2.
+    struct Unaligned;
+
+    impl PairOracle for Unaligned {
+        fn score(&self, _a: usize, _b: usize) -> (f64, f64, bool) {
+            (0.95, 0.01, true)
+        }
+        fn ink(&self, a: usize, b: usize) -> f64 {
+            self.ink_checked(a, b).0
+        }
+        fn ink_checked(&self, a: usize, b: usize) -> (f64, bool) {
+            if (a < 2) != (b < 2) {
+                (1.0, false)
+            } else {
+                (0.0, true)
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_ink_alignment_cuts_but_is_flagged() {
+        let o = Unaligned;
+        let cache = DiffCache::new(&o, Thresholds::default());
+        let c = cache.get(0, 2);
+        assert_eq!(c.reason, Some(Reason::Ink), "segmentation still cuts");
+        assert!(!c.ink_align_ok, "the 1.0 is not a measurement");
+        let c = cache.get(0, 1);
+        assert!(c.ink_align_ok && !c.differs());
+        cache.seed_checked(2, 3, 0.95, 0.01, (1.0, false), true);
+        assert!(!cache.get(2, 3).ink_align_ok);
+        cache.seed(3, 4, 0.95, 0.01, 0.2, true);
+        assert!(cache.get(3, 4).ink_align_ok);
     }
 }

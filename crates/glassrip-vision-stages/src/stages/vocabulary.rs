@@ -1,8 +1,13 @@
 //! `ocr_vocabulary`: the ASR vocabulary list from on-screen text (spec 6.8, 6.12).
 //!
-//! Participants come from tile labels and banners; board labels and
-//! identifiers come from text inside the shared area. A term must appear in at
-//! least `min_keyframes` keyframes, which drops one-off OCR misreads.
+//! Participants come from the configured participant list when there is one
+//! (`--participants`): those spellings are authoritative, and a tile label counts
+//! only as a sighting of the configured participant it matches, so OCR misspellings
+//! of a name and UI labels read as tile names ("Learn more", an app name) never enter
+//! the prompt as people. Without a configured list, participants come from tile
+//! labels and banners. Board labels and identifiers come from text inside the shared
+//! area. A term must appear in at least `min_keyframes` keyframes, which drops
+//! one-off OCR misreads (configured participants are always kept).
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -25,6 +30,9 @@ pub struct VocabularyParams {
     pub min_confidence: f64,
     /// Capitalized words too common to help recognition.
     pub stopwords: Vec<String>,
+    /// Configured participant display names (authoritative when non-empty).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub participants: Vec<String>,
 }
 
 impl Default for VocabularyParams {
@@ -41,8 +49,38 @@ impl Default for VocabularyParams {
             .iter()
             .map(|s| s.to_string())
             .collect(),
+            participants: Vec::new(),
         }
     }
+}
+
+/// Configured participants with the keyframes whose tile labels name them (first
+/// keyframe id, empty when never seen on screen).
+pub fn configured_participants(
+    items: &[OcrKeyframe],
+    names: &[String],
+) -> Vec<(String, u32, String)> {
+    names
+        .iter()
+        .filter(|n| !n.trim().is_empty())
+        .map(|name| {
+            let seen: Vec<&OcrKeyframe> = items
+                .iter()
+                .filter(|it| {
+                    it.tile_names
+                        .iter()
+                        .any(|t| names_match(name, strip_ellipsis(t)))
+                })
+                .collect();
+            (
+                name.trim().to_string(),
+                seen.len() as u32,
+                seen.first()
+                    .map(|k| k.keyframe_id.clone())
+                    .unwrap_or_default(),
+            )
+        })
+        .collect()
 }
 
 /// Participant names seen in at least `min_keyframes` keyframes, longest
@@ -90,7 +128,12 @@ fn identifier_like(t: &str) -> bool {
 
 /// Build the vocabulary.
 pub fn build(items: &[OcrKeyframe], p: &VocabularyParams) -> Vocabulary {
-    let mut terms: Vec<VocabularyTerm> = participants(items, p.min_keyframes)
+    let people = if p.participants.is_empty() {
+        participants(items, p.min_keyframes)
+    } else {
+        configured_participants(items, &p.participants)
+    };
+    let mut terms: Vec<VocabularyTerm> = people
         .into_iter()
         .map(|(text, keyframes, first)| VocabularyTerm {
             text,
@@ -154,7 +197,9 @@ pub fn build(items: &[OcrKeyframe], p: &VocabularyParams) -> Vocabulary {
         })
         .collect();
     rest.sort_by(|a, b| b.keyframes.cmp(&a.keyframes).then(a.text.cmp(&b.text)));
-    terms.sort_by(|a, b| b.keyframes.cmp(&a.keyframes).then(a.text.cmp(&b.text)));
+    if p.participants.is_empty() {
+        terms.sort_by(|a, b| b.keyframes.cmp(&a.keyframes).then(a.text.cmp(&b.text)));
+    }
     terms.extend(rest);
     terms.truncate(p.max_terms);
     Vocabulary { terms }
@@ -240,6 +285,34 @@ mod tests {
             tile_names: names.iter().map(|s| s.to_string()).collect(),
             share_area: None,
         }
+    }
+
+    #[test]
+    fn configured_participants_replace_tile_labels() {
+        // Tiles read "Ada Qu1ll" (misspelled) and a UI label; the list says
+        // "Ada Quill" and "Bo Tran Liu" (never on screen).
+        let items = vec![
+            kf("k1", &["Ada Qu1ll", "Learn more"], &["Ledger API"]),
+            kf("k2", &["Ada Qu1ll", "Learn more"], &["Ledger API"]),
+        ];
+        let p = VocabularyParams {
+            participants: vec!["Ada Quill".into(), "Bo Tran Liu".into()],
+            ..VocabularyParams::default()
+        };
+        let v = build(&items, &p);
+        let people: Vec<(&str, u32)> = v
+            .terms
+            .iter()
+            .filter(|t| t.kind == TermKind::Participant)
+            .map(|t| (t.text.as_str(), t.keyframes))
+            .collect();
+        assert_eq!(people, vec![("Ada Quill", 2), ("Bo Tran Liu", 0)]);
+        assert!(!v.terms.iter().any(|t| t.text.contains("Learn")));
+        assert!(!v.terms.iter().any(|t| t.text.contains("Qu1ll")));
+        assert!(v.terms.iter().any(|t| t.text == "Ledger"));
+        // Without a list the tile labels are the participants.
+        let v = build(&items, &VocabularyParams::default());
+        assert!(v.terms.iter().any(|t| t.text == "Learn more"));
     }
 
     #[test]

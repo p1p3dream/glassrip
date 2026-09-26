@@ -411,14 +411,14 @@ impl Stage for CanvasCropStage {
             let overlaps = s.bbox.iou(&canvas) > 0.0;
             match region {
                 TextRegion::Canvas => heights.push(s.bbox.height()),
-                TextRegion::Chrome | TextRegion::Tile if overlaps => {
-                    if reason != Some(ChromeReason::OutsideCanvas) {
-                        masks.push(ChromeMask {
-                            bbox: s.bbox,
-                            reason: reason.unwrap_or(ChromeReason::Denylist),
-                            text: s.text.clone(),
-                        });
-                    }
+                TextRegion::Chrome | TextRegion::Tile
+                    if overlaps && reason != Some(ChromeReason::OutsideCanvas) =>
+                {
+                    masks.push(ChromeMask {
+                        bbox: s.bbox,
+                        reason: reason.unwrap_or(ChromeReason::Denylist),
+                        text: s.text.clone(),
+                    });
                 }
                 _ => {}
             }

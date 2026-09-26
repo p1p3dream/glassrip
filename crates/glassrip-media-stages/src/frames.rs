@@ -4,8 +4,10 @@
 //! stream's start. Bucket membership is computed on integer PTS (the interval must be a
 //! whole number of time-base ticks), from the demuxer's packet index, so the expected grid
 //! is known before decoding. Each non-empty bucket yields one frame, `f<k:06>`, the one
-//! nearest the bucket's center (like the prototype's `fps` filter, whose frame for a grid
-//! point comes from around the middle of its window):
+//! nearest the bucket's center. (The prototype's ffmpeg `fps` filter instead kept the
+//! last frame before the next grid point and named it by the grid point; its frame
+//! times are nominal, and the eval maps them to content time, see `FrameClock` in
+//! glassrip-eval.) Frame selection:
 //!
 //! - `grid`: nearest of all frames (every frame is decoded);
 //! - `sync`: nearest sync (key) frame (`-skip_frame nokey`, only sync frames are decoded,

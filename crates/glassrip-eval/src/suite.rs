@@ -31,14 +31,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{EvalError, Result};
 use crate::fixture::{BoardCase, DocsCase};
-use crate::golden::MeetingGolden;
+use crate::golden::{ClockSection, MeetingGolden};
 use crate::metrics::audio::{hotword_wer, speaker_label_count, TimedWord};
 use crate::metrics::board::{
     is_chrome, score_board, BoardScore, Direction, GoldBoard, GoldSticky, NodeResolver, PredBoard,
     PredEdge, PredNode, PredOwnerTag, PredSticky,
 };
 use crate::metrics::docs::{score_document, DocScore, PredDocument};
-use crate::metrics::events::{false_change_events, PredEvent, EVENT_TOLERANCE_S};
+use crate::metrics::events::{false_change_events, PredEvent, StaticWindow, EVENT_TOLERANCE_S};
 use crate::metrics::notes::{negative_hits, score_items, PredItem};
 use crate::metrics::owners::{owner_attribution, owner_move_errors, Assignment, Target};
 use crate::metrics::screen::{ScreenScore, ScreenType};
@@ -69,6 +69,9 @@ pub struct SuiteRun {
     pub latencies_s: Vec<f64>,
     /// Hard-gate failures detected while scoring (for example degraded notes).
     pub gate_failures: Vec<String>,
+    /// Things a reader should know that fail nothing (for example a golden section
+    /// scored on a clock it did not declare).
+    pub warnings: Vec<String>,
 }
 
 fn put_prf(m: &mut Metrics, prefix: &str, c: Counts) {
@@ -632,6 +635,168 @@ fn resolve_person(g: &MeetingGolden, name: &str) -> Option<String> {
     g.resolve_person(name).map(str::to_string)
 }
 
+/// Distinct speakers of the transcript after the `name_speakers` mapping. A segment
+/// counts as its per-segment record when there is one (its person, or, when that
+/// record left it unresolved, its raw diarizer label), else as its label's mapped
+/// person, else as its raw label. Speech with no label and no person counts as one
+/// unattributed voice. An unresolved segment is never folded into a person the
+/// pipeline did not name it as.
+pub fn speaker_identities(records: &[SpeakersRecord], segs: &[TranscriptSegment]) -> usize {
+    let a = speaker_attribution(records, segs);
+    a.people + a.unresolved
+}
+
+/// How the `name_speakers` mapping attributes the transcript's speech.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpeakerAttribution {
+    /// Distinct people the speech was attributed to.
+    pub people: usize,
+    /// Distinct voices left unresolved (raw labels nobody was named for).
+    pub unresolved: usize,
+    /// Segments with speech whose every word is attributed to a person.
+    pub named_segments: usize,
+    /// Segments with speech.
+    pub segments: usize,
+}
+
+/// A person id that names someone: a blank id is no one.
+fn named(person_id: &Option<String>) -> Option<&str> {
+    person_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+}
+
+/// True when a segment holds speech: some non-blank text or word (the test the
+/// notes apply to their named lines).
+fn has_speech(s: &TranscriptSegment) -> bool {
+    !s.text.trim().is_empty() || s.words.iter().any(|w| !w.w.trim().is_empty())
+}
+
+/// Attribution of the speech as in [`speaker_identities`], split into named
+/// people and unresolved voices. Only segments with speech count. A word range
+/// the speakers artifact gives its own speaker is that speaker's (as the notes
+/// split the line); the rest of the segment is the segment's.
+pub fn speaker_attribution(
+    records: &[SpeakersRecord],
+    segs: &[TranscriptSegment],
+) -> SpeakerAttribution {
+    type Decided<'a> = (Option<&'a str>, &'a [glassrip_notes::speakers::WordSpan]);
+    let mut by_segment: BTreeMap<&str, Decided> = BTreeMap::new();
+    let mut by_label: BTreeMap<&str, &str> = BTreeMap::new();
+    for r in records {
+        match r {
+            SpeakersRecord::Segment(s) => {
+                by_segment.insert(
+                    s.segment_id.as_str(),
+                    (named(&s.person_id), s.spans.as_slice()),
+                );
+            }
+            SpeakersRecord::Label(l) => {
+                if let Some(p) = named(&l.person_id) {
+                    by_label.insert(l.label.as_str(), p);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut people = std::collections::BTreeSet::new();
+    let mut unresolved = std::collections::BTreeSet::new();
+    let mut named_segments = 0;
+    let mut segments = 0;
+    for s in segs.iter().filter(|s| has_speech(s)) {
+        segments += 1;
+        let label = s.speaker_label.trim();
+        let (person, spans) = match by_segment.get(s.segment_id.as_str()) {
+            Some(decided) => *decided,
+            None => (by_label.get(label).copied(), &[][..]),
+        };
+        let n = s.words.len();
+        let mut covered = vec![false; n];
+        let mut voices = Vec::new();
+        // Same rule as the named transcript (glassrip-notes named.rs): spans in
+        // word order, and a span overlapping one already used is skipped, so the
+        // eval never credits a voice the notes do not attribute.
+        let mut valid: Vec<_> = spans
+            .iter()
+            .filter(|sp| sp.word_start < sp.word_end && sp.word_end <= n)
+            .collect();
+        valid.sort_by_key(|sp| sp.word_start);
+        let mut next = 0;
+        for sp in valid {
+            if sp.word_start < next {
+                continue;
+            }
+            covered[sp.word_start..sp.word_end].fill(true);
+            voices.push(named(&sp.person_id));
+            next = sp.word_end;
+        }
+        if n == 0 || covered.iter().any(|c| !c) {
+            voices.push(person);
+        }
+        let mut all_named = true;
+        for v in voices {
+            match v {
+                Some(p) => {
+                    people.insert(p);
+                }
+                None => {
+                    all_named = false;
+                    unresolved.insert(label);
+                }
+            }
+        }
+        if all_named {
+            named_segments += 1;
+        }
+    }
+    SpeakerAttribution {
+        people: people.len(),
+        unresolved: unresolved.len(),
+        named_segments,
+        segments,
+    }
+}
+
+/// Owner truth with each kind of time (probes, assignment windows, moves) moved from
+/// its declared clock to PTS.
+fn owners_on_pts(g: &MeetingGolden) -> crate::golden::OwnerTruth {
+    let probe = g.clock(ClockSection::OwnerProbes);
+    let window = g.clock(ClockSection::OwnerAssignments);
+    let moved = g.clock(ClockSection::OwnerMoves);
+    let mut out = g.owners.clone();
+    for p in &mut out.probes_s {
+        *p = probe.content_time(*p);
+    }
+    for a in &mut out.assignments {
+        a.valid_from_s = window.content_time(a.valid_from_s);
+        a.valid_to_s = a.valid_to_s.map(|t| window.content_time(t));
+    }
+    for m in &mut out.moves {
+        m.t_s = moved.content_time(m.t_s);
+    }
+    out
+}
+
+/// Static windows with their bounds and their allowed events each moved from its
+/// declared clock to PTS.
+fn windows_on_pts(g: &MeetingGolden) -> Vec<StaticWindow> {
+    let bounds = g.clock(ClockSection::StaticWindows);
+    let allowed = g.clock(ClockSection::AllowedEvents);
+    g.static_windows
+        .iter()
+        .cloned()
+        .map(|mut w| {
+            w.t_start_s = bounds.content_time(w.t_start_s);
+            w.t_end_s = bounds.content_time(w.t_end_s);
+            for e in &mut w.allowed_events {
+                e.t_s = allowed.content_time(e.t_s);
+            }
+            w
+        })
+        .collect()
+}
+
 /// Scores a meeting run against the private golden set.
 pub fn run_meeting(
     golden: &MeetingGolden,
@@ -673,7 +838,22 @@ pub fn run_meeting(
             }
         }
     }
+    run.warnings.extend(golden.clock_warnings());
+    run.warnings.extend(golden.name_warnings());
     let m = &mut run.metrics;
+    // Each section joins on the clock its golden declares (PTS unless declared).
+    let screen_clock = golden.clock(ClockSection::ScreenTypes);
+    let trap_clock = golden.clock(ClockSection::Traps);
+    details.insert(
+        "golden_clocks".into(),
+        json!(ClockSection::ALL
+            .iter()
+            .map(|s| (
+                s.name(),
+                json!({"clock": golden.clock(*s), "declared": golden.declared_clock(*s).is_some()})
+            ))
+            .collect::<BTreeMap<_, _>>()),
+    );
 
     // Screen types and trap coverage.
     match (&kspans, &screen_items) {
@@ -689,7 +869,8 @@ pub fn run_meeting(
                     unconfirmed += 1;
                     continue;
                 }
-                let pred = join_time(label.t_rep_s, ks, tolerance_s)
+                let t = screen_clock.content_time(label.t_rep_s);
+                let pred = join_time(t, ks, tolerance_s)
                     .and_then(|i| by_kf.get(ks[i].keyframe_id.as_str()).copied().flatten());
                 score.record(label.screen_type, pred);
             }
@@ -710,6 +891,7 @@ pub fn run_meeting(
                 _ => vec![],
             };
             for tt in times {
+                let tt = trap_clock.content_time(tt);
                 t.record(join_time(tt, ks, tolerance_s).is_some());
             }
         }
@@ -730,6 +912,14 @@ pub fn run_meeting(
             m.remove("board.owner.fp");
             details.insert("board_chrome_hits".into(), json!(score.chrome_hits));
             details.insert("final_board_id".into(), json!(state.board_id));
+        } else if !(golden.final_board.nodes.is_empty()
+            && golden.final_board.edges.is_empty()
+            && golden.final_board.stickies.is_empty())
+        {
+            run.not_run.push(
+                "board metrics: glassrip.board_state holds no final board for the golden board"
+                    .into(),
+            );
         }
 
         // Owners and events are timed: use every state item, each resolved
@@ -804,17 +994,18 @@ pub fn run_meeting(
                 .as_ref()
                 .is_none_or(|ks| join_time(t, ks, tolerance_s).is_some())
         };
+        let gold_owners = owners_on_pts(golden);
         let attr = owner_attribution(
-            &golden.owners.assignments,
+            &gold_owners.assignments,
             &pred_assign,
-            &golden.owners.probes_s,
+            &gold_owners.probes_s,
             joined,
         );
         put_tally(m, "owners.attribution", attr.tally);
         m.insert("owners.extra".into(), attr.extra as f64);
         m.insert("owners.unresolved".into(), unresolved as f64);
         m.insert("owners.negative_hits".into(), negatives as f64);
-        let moves = owner_move_errors(&golden.owners.moves, &pred_assign, tolerance_s);
+        let moves = owner_move_errors(&gold_owners.moves, &pred_assign, tolerance_s);
         let missed = moves.iter().filter(|r| r.error_s.is_none()).count();
         m.insert("owners.moves_missed".into(), missed as f64);
         if let Some(max) = moves.iter().filter_map(|r| r.error_s).reduce(f64::max) {
@@ -823,8 +1014,8 @@ pub fn run_meeting(
         details.insert("owner_probes".into(), json!(attr.probes));
         details.insert("owner_moves".into(), json!(moves));
 
-        let (n, offenders) =
-            false_change_events(&golden.static_windows, &events, EVENT_TOLERANCE_S);
+        let windows = windows_on_pts(golden);
+        let (n, offenders) = false_change_events(&windows, &events, EVENT_TOLERANCE_S);
         m.insert("events.false_change".into(), n as f64);
         details.insert("false_change_events".into(), json!(offenders));
     } else {
@@ -869,24 +1060,29 @@ pub fn run_meeting(
                 })
                 .collect();
             let t = &golden.transcript;
+            let vocab = golden.vocabulary();
             put_prf(
                 m,
                 "notes.decision",
-                score_items(&t.decisions, &decisions, SENTENCE_MATCH_DICE).0,
+                score_items(&t.decisions, &decisions, SENTENCE_MATCH_DICE, &vocab).0,
             );
             put_prf(
                 m,
                 "notes.action",
-                score_items(&t.action_items, &actions, SENTENCE_MATCH_DICE).0,
+                score_items(&t.action_items, &actions, SENTENCE_MATCH_DICE, &vocab).0,
             );
             put_prf(
                 m,
                 "notes.question",
-                score_items(&t.open_questions, &questions, SENTENCE_MATCH_DICE).0,
+                score_items(&t.open_questions, &questions, SENTENCE_MATCH_DICE, &vocab).0,
             );
             let neg = negative_hits(&t.negative_action_items, &actions, SENTENCE_MATCH_DICE);
             m.insert("notes.negative_action_hits".into(), neg.len() as f64);
             details.insert("negative_action_hits".into(), json!(neg));
+            details.insert(
+                "golden_unkeyed_notes_items".into(),
+                json!(golden.unkeyed_notes_items()),
+            );
         }
         None if notes_errored => {
             // the notes stage ran and failed: the section fails and its targets
@@ -913,10 +1109,8 @@ pub fn run_meeting(
                 _ => None,
             })
             .collect();
-        let mapped: std::collections::BTreeSet<&str> = labels
-            .iter()
-            .filter_map(|l| l.person_id.as_deref())
-            .collect();
+        let mapped: std::collections::BTreeSet<&str> =
+            labels.iter().filter_map(|l| named(&l.person_id)).collect();
         m.insert("speakers.labels".into(), labels.len() as f64);
         m.insert("speakers.distinct_people".into(), mapped.len() as f64);
         m.insert(
@@ -955,11 +1149,67 @@ pub fn run_meeting(
                 m.insert("audio.hotword_wer".into(), hw.total.rate());
             }
             let n = speaker_label_count(segs.iter().map(|s| s.speaker_label.as_str()));
+            let people = golden.transcript.speaker_count as f64;
+            // Raw diarization: distinct diarizer labels against the people.
             m.insert("audio.speaker_labels".into(), n as f64);
             m.insert(
-                "audio.speaker_label_error".into(),
-                (n as f64 - golden.transcript.speaker_count as f64).abs(),
+                "audio.diarizer_label_error".into(),
+                (n as f64 - people).abs(),
             );
+            // After `name_speakers`: two labels mapped to one person are one
+            // speaker, and speech nobody was named for is its own voice. The
+            // error is the gap between the people named and the people, plus
+            // every unresolved voice: an unresolved label never stands in for a
+            // person, so the 9.3 target passes only when all speech is named and
+            // the named people match. Without a mapping (no speakers artifact, or
+            // one that names nobody) there is nothing to score, and the target
+            // cannot pass by being skipped: the run fails.
+            let mapping = speakers.as_ref().filter(|records| {
+                records.iter().any(|r| match r {
+                    SpeakersRecord::Label(l) => named(&l.person_id).is_some(),
+                    SpeakersRecord::Segment(s) => named(&s.person_id).is_some(),
+                    _ => false,
+                })
+            });
+            let speech = segs.iter().any(has_speech);
+            match mapping {
+                // No speech to attribute: the check cannot run when the golden
+                // set says people spoke.
+                _ if !speech => {
+                    if golden.transcript.speaker_count > 0 {
+                        run.gate_failures.push(format!(
+                            "audio.speaker_identity_error not evaluated: the transcript has no speech but the golden set has {} speaker(s)",
+                            golden.transcript.speaker_count
+                        ));
+                    }
+                }
+                Some(records) => {
+                    let a = speaker_attribution(records, segs);
+                    m.insert(
+                        "audio.speaker_identities".into(),
+                        (a.people + a.unresolved) as f64,
+                    );
+                    m.insert("audio.speaker_unresolved".into(), a.unresolved as f64);
+                    m.insert(
+                        "audio.speaker_identity_error".into(),
+                        (a.people as f64 - people).abs() + a.unresolved as f64,
+                    );
+                    if a.segments > 0 {
+                        m.insert(
+                            "audio.speaker_mapping_coverage".into(),
+                            a.named_segments as f64 / a.segments as f64,
+                        );
+                    }
+                    if a.people == 0 {
+                        run.gate_failures.push(
+                            "speaker mapping coverage: glassrip.speakers names nobody in the transcript's speech".into(),
+                        );
+                    }
+                }
+                None => run.gate_failures.push(
+                    "audio.speaker_identity_error not evaluated: the transcript has speech but glassrip.speakers names nobody".into(),
+                ),
+            }
             details.insert("hotwords".into(), json!(hw.per_word));
         }
         None => run
@@ -974,6 +1224,86 @@ pub fn run_meeting(
 mod tests {
     use super::*;
     use crate::metrics::board::{GoldEdge, GoldNode, LineStyle};
+
+    #[test]
+    fn speakers_are_counted_after_the_name_mapping() {
+        use crate::synth::run_artifacts as ra;
+        let seg = |id: &str, label: &str| -> TranscriptSegment {
+            serde_json::from_value(ra::segment(id, label, 0.0, 1.0, "x", &[])).unwrap()
+        };
+        let rec = |v: serde_json::Value| -> SpeakersRecord { serde_json::from_value(v).unwrap() };
+        let seg_rec = |id: &str, label: &str, person: Option<&str>| {
+            rec(json!({
+                "kind": "segment", "segment_id": id, "start_s": 0.0, "end_s": 1.0,
+                "label": label, "person_id": person, "confidence": 0.9,
+                "source": if person.is_some() { "label_map" } else { "unresolved" },
+                "scores": {}, "observations": []
+            }))
+        };
+        // Five diarizer labels for three people: S0 and S2 are the same person, S4
+        // was split off one person's voice, S3 stayed unresolved.
+        let segs: Vec<TranscriptSegment> = ["S0", "S1", "S2", "S3", "S4", "S0"]
+            .iter()
+            .enumerate()
+            .map(|(i, l)| seg(&format!("s{i}"), l))
+            .collect();
+        let records = vec![
+            rec(ra::speaker_label("S0", Some("avery"))),
+            rec(ra::speaker_label("S1", Some("jordan"))),
+            rec(ra::speaker_label("S2", Some("avery"))),
+            rec(ra::speaker_label("S3", None)),
+            rec(ra::speaker_label("S4", Some("riley"))),
+            // The last S0 segment was relabeled per segment to jordan.
+            seg_rec("s5", "S0", Some("jordan")),
+        ];
+        // avery, jordan, riley, and the unresolved S3 voice.
+        assert_eq!(speaker_identities(&records, &segs), 4);
+        let resolved: Vec<SpeakersRecord> = records
+            .into_iter()
+            .map(|r| match r {
+                SpeakersRecord::Label(mut l) if l.label == "S3" => {
+                    l.person_id = Some("riley".into());
+                    SpeakersRecord::Label(l)
+                }
+                r => r,
+            })
+            .collect();
+        assert_eq!(speaker_identities(&resolved, &segs), 3);
+        assert_eq!(speaker_identities(&[], &segs), 5, "no mapping: raw labels");
+    }
+
+    /// Kimi finding 6: speech the pipeline left unattributed is never folded into a
+    /// person or dropped.
+    #[test]
+    fn unattributed_speech_counts_as_its_own_voice() {
+        use crate::synth::run_artifacts as ra;
+        let seg = |id: &str, label: &str| -> TranscriptSegment {
+            serde_json::from_value(ra::segment(id, label, 0.0, 1.0, "x", &[])).unwrap()
+        };
+        let rec = |v: serde_json::Value| -> SpeakersRecord { serde_json::from_value(v).unwrap() };
+        let unresolved = |id: &str, label: &str| {
+            rec(json!({
+                "kind": "segment", "segment_id": id, "start_s": 0.0, "end_s": 1.0,
+                "label": label, "person_id": null, "confidence": 0.0,
+                "source": "unresolved", "scores": {}, "observations": []
+            }))
+        };
+        let segs = vec![seg("s0", "S0"), seg("s1", "S1"), seg("s2", "S1")];
+        let labels = vec![
+            rec(ra::speaker_label("S0", Some("avery"))),
+            rec(ra::speaker_label("S1", Some("jordan"))),
+        ];
+        assert_eq!(speaker_identities(&labels, &segs), 2);
+        // The pipeline explicitly left s2 unresolved: its label's mapping does not
+        // apply, so it is its own voice.
+        let mut with_seg = labels.clone();
+        with_seg.push(unresolved("s2", "S1"));
+        assert_eq!(speaker_identities(&with_seg, &segs), 3);
+        // A segment with no label and no person is still speech.
+        let mut segs = segs;
+        segs.push(seg("s3", " "));
+        assert_eq!(speaker_identities(&labels, &segs), 3);
+    }
 
     #[test]
     fn crop_rect_clamps() {

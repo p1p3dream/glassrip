@@ -9,7 +9,7 @@ use super::{
     ActionItem, Decision, DroppedItem, Evidence, OpenQuestion, QuestionSource, Quote, QuoteMatch,
     SummaryPoint, TimelineEntry,
 };
-use crate::board::{first_seen, BoardExt, BoardStateItem, EventKind, KeyframeTimes, StickyKind};
+use crate::board::{first_seen, BoardExt, BoardStateItem, KeyframeTimes, StickyKind};
 use crate::named::NamedLine;
 use crate::people::AliasTable;
 use crate::text::{
@@ -219,6 +219,11 @@ struct OwnerKey {
     name: Vec<String>,
     /// Content tokens of the target.
     target: Vec<String>,
+    /// The owner tag moved here from another target (a change the group made);
+    /// a plain owner tag only says who is responsible.
+    moved: bool,
+    /// The owner tag is still on the board at the end (a current task).
+    current: bool,
 }
 
 /// Words that state ownership or assignment ("Avery owns the kiosk", "take
@@ -273,11 +278,12 @@ impl OwnerKey {
 /// Validation switches (see [`super::candidates`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CheckOptions {
-    /// Decisions and action items may be supported by an owner-tag change on
-    /// the board instead of a transcript segment.
+    /// Action items may be supported by an owner tag on the board, and
+    /// decisions by an owner tag moved on the board, instead of a transcript
+    /// segment.
     pub board_support: bool,
-    /// Decisions need a speaker commitment in a cited segment, or an owner-tag
-    /// change on the board.
+    /// Decisions need a speaker commitment in a cited segment, or an owner tag
+    /// moved on the board.
     pub precision_guard: bool,
     /// Remove narrative prefixes ("The team decided to") from decisions and tasks.
     pub strip_prefix: bool,
@@ -336,12 +342,13 @@ impl Corpus {
                 let words = OwnerKey {
                     name: tokens(&o.display_name),
                     target: content_tokens(&crate::board::target_text(&o.target)),
+                    moved: o.moved_from.is_some(),
+                    current: o.valid_to_s >= b.end_s() - 0.5,
                 };
-                for e in b.events.iter().filter(|e| {
-                    matches!(e.kind, EventKind::OwnerAssigned | EventKind::OwnerMoved)
-                        && e.subject == o.person_id
-                        && (e.t_s - o.valid_from_s).abs() <= 30.0
-                }) {
+                // the owner events of this assignment (same person, same target
+                // by id, same kind, near its start): an event backs a move only
+                // through the move assignment it was matched to
+                for e in super::candidates::owner_events(b, o) {
                     owner_keys
                         .entry(e.event_id.clone())
                         .or_default()
@@ -901,6 +908,8 @@ pub fn check_with(
     // board support counts only when the item's own text refers to the
     // owner-tag change it cites (see OwnerKey::backs): a name-drop, one shared
     // target word or a generic word does not; the owner field is not text
+    // a decision needs an owner-tag move: a plain owner tag only says who is
+    // responsible, which is an action item, not a decision
     let item_words: BTreeSet<String> = tokens(&text).into_iter().collect();
     let board_backed = evidence
         .event_ids
@@ -908,6 +917,12 @@ pub fn check_with(
         .chain(&evidence.keyframe_ids)
         .filter_map(|id| corpus.owner_keys.get(id))
         .flatten()
+        .filter(|k| match section {
+            Section::Decisions => k.moved,
+            // a tag taken off before the end is not a current task
+            Section::ActionItems => k.current,
+            _ => true,
+        })
         .any(|k| k.backs(&item_words));
     let board_ok = opts.board_support
         && board_backed
@@ -924,7 +939,7 @@ pub fn check_with(
         });
         if !committed {
             reasons.push(
-                "a decision must cite a line where someone commits to it (or an owner-tag change on the board)"
+                "a decision must cite a line where someone commits to it (or an owner tag moved on the board)"
                     .into(),
             );
         }
@@ -1170,6 +1185,7 @@ pub fn dropped(section: Section, item: &DraftItem, reasons: Vec<String>) -> Drop
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::board::EventKind;
     use crate::named::NamedLine;
 
     fn line(id: &str, t: f64, text: &str, raw: &str) -> NamedLine {
@@ -1397,10 +1413,12 @@ mod tests {
         d.keyframe_ids = vec!["kf_000040".into()];
         let e = check_with(Section::Decisions, &d, &c, &all).unwrap_err();
         assert!(e.reasons.iter().any(|r| r.contains("commits")), "{e:?}");
-        // a decision about that owner tag's target is board-backed
+        // a plain owner tag backs an action, not a decision: "Avery owns the
+        // Kiosk App work" is who is responsible, not a choice the group made
         let mut d = item("Avery owns the Kiosk App work", &["s1"], "");
         d.keyframe_ids = vec!["kf_000040".into()];
-        assert!(check_with(Section::Decisions, &d, &c, &all).is_ok());
+        let e = check_with(Section::Decisions, &d, &c, &all).unwrap_err();
+        assert!(e.reasons.iter().any(|r| r.contains("commits")), "{e:?}");
         // personal activities are not tasks
         let coffee = DraftItem {
             owner: "Avery".into(),
@@ -1500,9 +1518,239 @@ mod tests {
         d.keyframe_ids = vec!["kf_000040".into()];
         let e = check_with(Section::Decisions, &d, &c, &ALL).unwrap_err();
         assert!(e.reasons.iter().any(|r| r.contains("commits")), "{e:?}");
-        // naming the target and the ownership is board support
+        // naming the target and the ownership backs an action, but a plain
+        // owner tag is not a decision
+        let a = DraftItem {
+            owner: "Avery".into(),
+            task: "Own the kiosk rollout".into(),
+            keyframe_ids: vec!["kf_000040".into()],
+            ..Default::default()
+        };
+        assert!(check_with(Section::ActionItems, &a, &c, &ALL).is_ok());
         let mut d = item("Avery owns the kiosk rollout", &[], "");
         d.keyframe_ids = vec!["kf_000040".into()];
+        let e = check_with(Section::Decisions, &d, &c, &ALL).unwrap_err();
+        assert!(
+            e.reasons.iter().any(|r| r.contains("transcript segment")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn only_a_moved_owner_tag_backs_a_decision() {
+        use crate::board::build;
+        let mut b = build::board("b", 100.0);
+        b.nodes = vec![
+            build::node("n1", "Ledger Store", 0.0, 100.0, None),
+            build::node("n2", "Kiosk App", 0.0, 100.0, None),
+        ];
+        let t1 = build::node_target(&b, "n1");
+        let t2 = build::node_target(&b, "n2");
+        let mut first = build::owner("mira-okafor", "Mira Okafor", t1.clone(), 10.0, 50.0, None);
+        first.opened_at_keyframe = "kf_000010".into();
+        let mut moved = build::owner("mira-okafor", "Mira Okafor", t2, 50.0, 100.0, Some(t1));
+        moved.opened_at_keyframe = "kf_000050".into();
+        b.owner_assignments = vec![first, moved];
+        b.events = vec![
+            build::event(
+                "ev-1",
+                EventKind::OwnerAssigned,
+                10.0,
+                "kf_000010",
+                "mira-okafor",
+                "Mira on Ledger Store",
+            ),
+            build::event(
+                "ev-2",
+                EventKind::OwnerMoved,
+                50.0,
+                "kf_000050",
+                "mira-okafor",
+                "Mira to Kiosk App",
+            ),
+        ];
+        let (n1, n2) = (build::node_target(&b, "n1"), build::node_target(&b, "n2"));
+        b.events[0].owner_target = Some(n1.clone());
+        b.events[1].owner_target = Some(n2);
+        b.events[1].owner_from = Some(n1);
+        let text = "The importer reads the ledger nightly.";
+        let c = Corpus::new(
+            &[line("s1", 5.0, text, text)],
+            &[b],
+            &KeyframeTimes::default(),
+            AliasTable::from_names(&["Mira Okafor"]),
+        );
+        // the move backs a decision by its event or by the keyframe that opened it
+        for (ev, kf) in [(vec!["ev-2"], vec![]), (vec![], vec!["kf_000050"])] {
+            let mut d = item("Mira moves to the Kiosk App", &[], "");
+            d.event_ids = ev.into_iter().map(String::from).collect();
+            d.keyframe_ids = kf.into_iter().map(String::from).collect();
+            assert!(
+                check_with(Section::Decisions, &d, &c, &ALL).is_ok(),
+                "{d:?}"
+            );
+        }
+        // the plain assignment is not a decision, and, taken off at 00:50, not
+        // a current task either
+        let mut d = item("Mira owns the Ledger Store", &[], "");
+        d.event_ids = vec!["ev-1".into()];
+        assert!(check_with(Section::Decisions, &d, &c, &ALL).is_err());
+        let action = |task: &str, ev: &str| DraftItem {
+            owner: "Mira".into(),
+            task: task.into(),
+            event_ids: vec![ev.into()],
+            ..Default::default()
+        };
+        let a = action("Own the Ledger Store", "ev-1");
+        assert!(check_with(Section::ActionItems, &a, &c, &ALL).is_err());
+        // the tag still on the board backs an action for its owner
+        let a = action("Own the Kiosk App", "ev-2");
+        assert!(check_with(Section::ActionItems, &a, &c, &ALL).is_ok());
+    }
+
+    #[test]
+    fn a_plain_owner_event_does_not_inherit_a_nearby_move() {
+        use crate::board::build;
+        // one person tagged on the Ledger Store, then (within 30 s) moved onto
+        // the Kiosk App from somewhere else: each event belongs to its target
+        let mut b = build::board("b", 100.0);
+        b.nodes = vec![
+            build::node("n1", "Ledger Store", 0.0, 100.0, None),
+            build::node("n2", "Kiosk App", 0.0, 100.0, None),
+            build::node("n3", "Badge Printer", 0.0, 100.0, None),
+        ];
+        let plain = build::owner(
+            "mira-okafor",
+            "Mira Okafor",
+            build::node_target(&b, "n1"),
+            40.0,
+            100.0,
+            None,
+        );
+        let moved = build::owner(
+            "mira-okafor",
+            "Mira Okafor",
+            build::node_target(&b, "n2"),
+            50.0,
+            100.0,
+            Some(build::node_target(&b, "n3")),
+        );
+        b.owner_assignments = vec![plain, moved];
+        b.events = vec![
+            build::event(
+                "ev-a",
+                EventKind::OwnerAssigned,
+                40.0,
+                "kf_000040",
+                "mira-okafor",
+                "Mira on Ledger Store",
+            ),
+            build::event(
+                "ev-m",
+                EventKind::OwnerMoved,
+                50.0,
+                "kf_000050",
+                "mira-okafor",
+                "Mira to Kiosk App",
+            ),
+        ];
+        b.events[0].owner_target = Some(build::node_target(&b, "n1"));
+        b.events[1].owner_target = Some(build::node_target(&b, "n2"));
+        b.events[1].owner_from = Some(build::node_target(&b, "n3"));
+        let text = "The importer reads the ledger nightly.";
+        let c = Corpus::new(
+            &[line("s1", 5.0, text, text)],
+            &[b],
+            &KeyframeTimes::default(),
+            AliasTable::from_names(&["Mira Okafor"]),
+        );
+        let decision = |ev: &str| {
+            let mut d = item("Mira moves to the Kiosk App", &[], "");
+            d.event_ids = vec![ev.into()];
+            check_with(Section::Decisions, &d, &c, &ALL)
+        };
+        assert!(decision("ev-m").is_ok());
+        assert!(
+            decision("ev-a").is_err(),
+            "the plain event is about the Ledger Store"
+        );
+    }
+
+    #[test]
+    fn a_move_to_ledger_store_does_not_back_the_plain_tag_on_ledger() {
+        use crate::board::{build, BoardEvent};
+        // Mira's plain tag on "Ledger" stays to the end; 10 s after it she is
+        // moved onto "Ledger Store" from the Kiosk App, and that tag is taken
+        // off at 01:10. The move event is about Ledger Store only: it cannot
+        // back a current task on Ledger.
+        let mut b = build::board("b", 100.0);
+        b.nodes = vec![
+            build::node("n1", "Ledger", 0.0, 100.0, None),
+            build::node("n2", "Ledger Store", 0.0, 100.0, None),
+            build::node("n3", "Kiosk App", 0.0, 100.0, None),
+        ];
+        let (n1, n2, n3) = (
+            build::node_target(&b, "n1"),
+            build::node_target(&b, "n2"),
+            build::node_target(&b, "n3"),
+        );
+        b.owner_assignments = vec![
+            build::owner("mira-okafor", "Mira Okafor", n1.clone(), 40.0, 100.0, None),
+            build::owner(
+                "mira-okafor",
+                "Mira Okafor",
+                n2.clone(),
+                50.0,
+                70.0,
+                Some(n3.clone()),
+            ),
+        ];
+        b.events = vec![
+            BoardEvent {
+                owner_target: Some(n1),
+                ..build::event(
+                    "ev-a",
+                    EventKind::OwnerAssigned,
+                    40.0,
+                    "kf_000040",
+                    "mira-okafor",
+                    "Mira Okafor -> Ledger",
+                )
+            },
+            BoardEvent {
+                owner_target: Some(n2),
+                owner_from: Some(n3),
+                ..build::event(
+                    "ev-m",
+                    EventKind::OwnerMoved,
+                    50.0,
+                    "kf_000050",
+                    "mira-okafor",
+                    "Mira Okafor -> Ledger Store",
+                )
+            },
+        ];
+        let text = "The importer reads the ledger nightly.";
+        let c = Corpus::new(
+            &[line("s1", 5.0, text, text)],
+            &[b],
+            &KeyframeTimes::default(),
+            AliasTable::from_names(&["Mira Okafor"]),
+        );
+        let action = |ev: &str| DraftItem {
+            owner: "Mira".into(),
+            task: "Own the Ledger".into(),
+            event_ids: vec![ev.into()],
+            ..Default::default()
+        };
+        assert!(check_with(Section::ActionItems, &action("ev-a"), &c, &ALL).is_ok());
+        assert!(
+            check_with(Section::ActionItems, &action("ev-m"), &c, &ALL).is_err(),
+            "the move event is about Ledger Store, whose tag was taken off"
+        );
+        // the move still backs the decision it is about
+        let mut d = item("Mira moves to the Ledger Store", &[], "");
+        d.event_ids = vec!["ev-m".into()];
         assert!(check_with(Section::Decisions, &d, &c, &ALL).is_ok());
     }
 
@@ -1520,7 +1768,9 @@ mod tests {
             build::node_target(&b, "n1"),
             40.0,
             100.0,
-            None,
+            // moved here, so it can back a decision (a plain tag cannot); the
+            // cases below test which words refer to it
+            Some(build::node_target(&b, "n2")),
         );
         o1.opened_at_keyframe = "kf_000040".into();
         let mut o2 = build::owner(

@@ -263,7 +263,7 @@ pub(crate) fn derive_groups(
     let mut cands: Vec<Cand> = Vec::new();
     for fi in 0..frames.len() {
         let mut items: Vec<(usize, BBox)> = Vec::new();
-        for (&ti, _) in final_sticky.iter() {
+        for &ti in final_sticky.keys() {
             if let Some(b) = tracks[ti]
                 .obs
                 .iter()

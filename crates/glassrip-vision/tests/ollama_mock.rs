@@ -789,3 +789,252 @@ async fn model_size_comes_from_tags_and_show() {
     assert_eq!(size.file_bytes, Some(21_000_000_000));
     assert_eq!(size.parameter_size_b, Some(32.8));
 }
+
+/// NDJSON body of a streamed chat reply: one line per piece, then the final line.
+fn stream_body(pieces: &[&str], done: bool) -> String {
+    let mut s = String::new();
+    for p in pieces {
+        s.push_str(
+            &json!({"model": MODEL, "message": {"role": "assistant", "content": p}, "done": false})
+                .to_string(),
+        );
+        s.push('\n');
+    }
+    if done {
+        s.push_str(
+            &json!({
+                "model": MODEL, "message": {"role": "assistant", "content": ""}, "done": true,
+                "done_reason": "stop", "prompt_eval_count": 612, "eval_count": 17,
+                "total_duration": 2_000_000_000u64
+            })
+            .to_string(),
+        );
+        s.push('\n');
+    }
+    s
+}
+
+fn guarded() -> VisionRequest {
+    let mut r = request();
+    r.repetition_guard = Some(glassrip_vision::repetition::RepetitionParams::default());
+    r
+}
+
+#[tokio::test]
+async fn guarded_requests_stream_and_forward_sampling_overrides() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .and(body_partial_json(json!({
+            "stream": true,
+            "options": {"repeat_penalty": 1.25, "repeat_last_n": 512}
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_string(stream_body(
+            &[
+                r#"{"dominant_color":"#,
+                r#""red","contains"#,
+                r#"_text":"no"}"#,
+            ],
+            true,
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut r = guarded();
+    r.sampling.repeat_penalty = Some(1.25);
+    r.sampling.repeat_last_n = Some(512);
+    let raw = backend(&server)
+        .infer(r, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(raw.raw_text, GOOD);
+    assert_eq!(raw.done_reason.as_deref(), Some("stop"));
+    assert_eq!(raw.eval_count, Some(17));
+    let answer: SelfTestAnswer = raw.decode().unwrap();
+    assert_eq!(answer.dominant_color, SelfTestColor::Red);
+}
+
+#[tokio::test]
+async fn a_looping_stream_is_stopped_before_it_ends() {
+    let server = MockServer::start().await;
+    // A node list, then edges stepping into ids it never declared.
+    let mut pieces: Vec<String> =
+        vec!["{\"nodes\": [{\"local_id\": \"n1\", \"text\": \"Api\"}], \"edges\": [".into()];
+    for k in 0..40 {
+        pieces.push(format!(
+            "{{\"src\": \"n{k}\", \"dst\": \"n{}\", \"label\": \"Relay\", \"style\": \"solid\"}},",
+            k + 1
+        ));
+    }
+    let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
+    let total: usize = refs.iter().map(|p| p.len()).sum();
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(stream_body(&refs, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    match backend(&server)
+        .infer(guarded(), CancellationToken::new())
+        .await
+    {
+        Err(VisionError::Repetition {
+            finding, raw_text, ..
+        }) => {
+            assert!(
+                raw_text.len() < total,
+                "stopped early: {} of {total}",
+                raw_text.len()
+            );
+            assert!(finding.repeats >= 6, "{finding:?}");
+            assert!(finding.pattern.contains("Relay"));
+        }
+        other => panic!("expected a repetition stop, got {other:?}"),
+    }
+    assert_eq!(
+        chat_requests(&server).await.len(),
+        1,
+        "a loop is not retried here"
+    );
+}
+
+#[tokio::test]
+async fn unguarded_requests_do_not_stream_or_send_overrides() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .and(body_partial_json(json!({"stream": false})))
+        .respond_with(chat_reply(GOOD))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let body = &{
+        backend(&server)
+            .infer(request(), CancellationToken::new())
+            .await
+            .unwrap();
+        chat_requests(&server).await
+    }[0];
+    let opts = body["options"].as_object().unwrap();
+    assert!(
+        !opts.contains_key("repeat_penalty"),
+        "no override, server default"
+    );
+}
+
+fn guarded_board() -> VisionRequest {
+    let mut r = VisionRequest::for_output::<glassrip_vision::board::BoardReadOutput>(
+        "Read the synthetic board.",
+        self_test_image().unwrap(),
+        GenerationOptions {
+            seed: 7,
+            num_predict: 2048,
+        },
+    )
+    .unwrap();
+    r.repetition_guard = Some(glassrip_vision::repetition::RepetitionParams::default());
+    r
+}
+
+/// Six identical cards in one row, sequential ids, evenly spaced boxes.
+fn card_row_pieces() -> Vec<String> {
+    let mut pieces = vec!["{\"nodes\": [".to_string()];
+    for c in 0..6u32 {
+        let x = 100 + c * 120;
+        pieces.push(format!(
+            "{}{{\"local_id\": \"n{}\", \"text\": \"Card\", \"bbox_2d\": [{x}, 900, {}, 930], \"conf\": 0.9}}",
+            if c == 0 { "" } else { ", " },
+            30 + c,
+            x + 80
+        ));
+    }
+    pieces.push(
+        "], \"edges\": [], \"stickies\": [], \"owner_tags\": [], \"other_visible_text\": [], \"confidence\": 0.9}"
+            .to_string(),
+    );
+    pieces
+}
+
+fn final_line(done_reason: &str) -> String {
+    let mut s = json!({
+        "model": MODEL, "message": {"role": "assistant", "content": ""}, "done": true,
+        "done_reason": done_reason, "prompt_eval_count": 612, "eval_count": 300,
+        "total_duration": 2_000_000_000u64
+    })
+    .to_string();
+    s.push('\n');
+    s
+}
+
+/// Codex 5 / GLM B1: a complete, valid reading of a regular board streams to the
+/// end and is accepted.
+#[tokio::test]
+async fn a_complete_regular_board_is_accepted() {
+    let server = MockServer::start().await;
+    let pieces = card_row_pieces();
+    let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(stream_body(&refs, true)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let raw = backend(&server)
+        .infer(guarded_board(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(raw.done_reason.as_deref(), Some("stop"));
+    assert_eq!(raw.json["nodes"].as_array().unwrap().len(), 6);
+}
+
+/// A complete reply that validates is accepted even when the detector would
+/// flag it: the guard stops runaway generations, it does not judge answers.
+#[tokio::test]
+async fn a_complete_valid_reply_is_never_rejected_for_repetition() {
+    let server = MockServer::start().await;
+    let edge = "{\"src\": \"n1\", \"dst\": \"n2\", \"label\": \"\", \"label_bbox_2d\": [0, 0, 0, 0], \"style\": \"solid\", \"conf\": 0.9}";
+    let body = format!(
+        "{{\"nodes\": [{{\"local_id\": \"n1\", \"text\": \"Api\", \"bbox_2d\": [10, 10, 90, 40], \"conf\": 0.9}}, {{\"local_id\": \"n2\", \"text\": \"Db\", \"bbox_2d\": [200, 10, 290, 40], \"conf\": 0.9}}], \"edges\": [{edge}, {edge}, {edge}], \"stickies\": [], \"owner_tags\": [], \"other_visible_text\": [], \"confidence\": 0.8}}"
+    );
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(stream_body(&[&body], true)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let raw = backend(&server)
+        .infer(guarded_board(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(raw.json["edges"].as_array().unwrap().len(), 3);
+}
+
+/// GLM B1: a reply cut off at the output limit inside a regular run is a
+/// truncation (the budget retry), not a repetition (the penalty retry).
+#[tokio::test]
+async fn a_regular_run_cut_at_the_limit_is_a_truncation() {
+    let server = MockServer::start().await;
+    let pieces = card_row_pieces();
+    let mut body = String::new();
+    for p in &pieces[..pieces.len() - 1] {
+        body.push_str(
+            &json!({"model": MODEL, "message": {"role": "assistant", "content": p}, "done": false})
+                .to_string(),
+        );
+        body.push('\n');
+    }
+    body.push_str(&final_line("length"));
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .expect(1)
+        .mount(&server)
+        .await;
+    match backend(&server)
+        .infer(guarded_board(), CancellationToken::new())
+        .await
+    {
+        Err(VisionError::Truncated { .. }) => {}
+        other => panic!("expected a truncation, got {other:?}"),
+    }
+}

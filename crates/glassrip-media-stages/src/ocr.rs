@@ -110,7 +110,7 @@ pub fn boxes_from_prob(
             out.push((b.w() as usize * b.h() as usize, b));
         }
     }
-    out.sort_by(|a, b| b.0.cmp(&a.0));
+    out.sort_by_key(|x| std::cmp::Reverse(x.0));
     out.into_iter().take(max).map(|(_, b)| b).collect()
 }
 

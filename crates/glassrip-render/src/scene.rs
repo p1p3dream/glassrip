@@ -194,6 +194,12 @@ pub struct EdgeArt {
     pub dash: Option<&'static str>,
     /// Label.
     pub label: Option<Pill>,
+    /// Further lines of a label wrapped to fit (drawn inside its pill, under the
+    /// first line).
+    pub label_lines: Vec<TextLine>,
+    /// Leader line `(x1, y1, x2, y2)` from a label placed away from its connector
+    /// back to the connector.
+    pub leader: Option<(f64, f64, f64, f64)>,
 }
 
 /// A sticky card.
@@ -676,6 +682,8 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
             .iter()
             .filter_map(|z| z.badge.as_ref().map(|b| b.r.inflate(2.0))),
     );
+    // Zone titles too: an edge label placed on one hides it.
+    taken.extend(zones.iter().map(|z| zone_title_r(z).inflate(2.0)));
     let mut edges = Vec::new();
     let mut edge_anchor: BTreeMap<String, (f64, f64, bool)> = BTreeMap::new();
     let mut channel = 0usize;
@@ -761,36 +769,121 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
         let horizontal = (p0.1 - p1.1).abs() < 0.5;
         let mid = ((p0.0 + p1.0) / 2.0, (p0.1 + p1.1) / 2.0);
         edge_anchor.insert(e.id.clone(), (mid.0, mid.1, horizontal));
+        let mut label_lines: Vec<TextLine> = Vec::new();
+        let mut leader: Option<(f64, f64, f64, f64)> = None;
         let label = Some(sanitize_dashes(e.label.trim()))
             .filter(|t| !t.is_empty())
             .map(|text| {
                 let relation = dashed || text.chars().count() > 22;
+                let place = |tw: f64, h: f64| -> (Vec<(f64, f64)>, Option<R>) {
+                    let around = |mid: (f64, f64), horizontal: bool| -> Vec<(f64, f64)> {
+                        if via_channel || (relation && horizontal) {
+                            vec![
+                                (mid.0 - tw / 2.0, mid.1 - h / 2.0),
+                                (mid.0 - tw / 2.0, mid.1 + 8.0),
+                            ]
+                        } else if horizontal {
+                            vec![
+                                (mid.0 - tw / 2.0, mid.1 - h - 6.0),
+                                (mid.0 - tw / 2.0, mid.1 + 6.0),
+                            ]
+                        } else {
+                            vec![
+                                (mid.0 + 8.0, mid.1 - h / 2.0),
+                                (mid.0 - tw - 8.0, mid.1 - h / 2.0),
+                            ]
+                        }
+                    };
+                    // The middle of the longest segment first, then points sliding
+                    // along every segment (longest first) when that spot is taken
+                    // (a card, another label, a zone title or badge).
+                    let mut candidates = around(mid, horizontal);
+                    let mut order: Vec<usize> = (0..pts.len() - 1).collect();
+                    let seg_len = |i: usize| {
+                        (pts[i + 1].0 - pts[i].0).abs() + (pts[i + 1].1 - pts[i].1).abs()
+                    };
+                    order.sort_by(|a, b| seg_len(*b).total_cmp(&seg_len(*a)));
+                    for i in order {
+                        let (a, b) = (pts[i], pts[i + 1]);
+                        let hz = (a.1 - b.1).abs() < 0.5;
+                        for t in [0.5, 0.3, 0.7, 0.15, 0.85] {
+                            let m = (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+                            candidates.extend(around(m, hz));
+                        }
+                    }
+                    let free = candidates
+                        .iter()
+                        .map(|(x, y)| R::new(*x, *y, tw, h))
+                        .find(|r| !taken.iter().any(|t| t.intersects(r)));
+                    (candidates, free)
+                };
                 let (h, tw) = if relation {
                     (24.0, text_width(&text, 12.0, false) + 24.0)
                 } else {
                     (18.0, text_width(&text, 11.0, true) + 16.0)
                 };
-                let candidates: Vec<(f64, f64)> = if via_channel || (relation && horizontal) {
-                    vec![
-                        (mid.0 - tw / 2.0, mid.1 - h / 2.0),
-                        (mid.0 - tw / 2.0, mid.1 + 8.0),
-                    ]
-                } else if horizontal {
-                    vec![
-                        (mid.0 - tw / 2.0, mid.1 - h - 6.0),
-                        (mid.0 - tw / 2.0, mid.1 + 6.0),
-                    ]
-                } else {
-                    vec![
-                        (mid.0 + 8.0, mid.1 - h / 2.0),
-                        (mid.0 - tw - 8.0, mid.1 - h / 2.0),
-                    ]
-                };
-                let r = candidates
-                    .iter()
-                    .map(|(x, y)| R::new(*x, *y, tw, h))
-                    .find(|r| !taken.iter().any(|t| t.intersects(r)))
-                    .unwrap_or_else(|| R::new(candidates[0].0, candidates[0].1, tw, h));
+                let (candidates, mut found) = place(tw, h);
+                // A long relation label with no free spot at full width is wrapped
+                // (at most 26 characters per line) and placed again.
+                let mut lines = vec![text.clone()];
+                if found.is_none() && relation {
+                    let wrapped = wrap(&text, 26);
+                    if wrapped.len() > 1 {
+                        let ww = wrapped
+                            .iter()
+                            .map(|l| text_width(l, 12.0, false))
+                            .fold(0.0, f64::max)
+                            + 24.0;
+                        let wh = 24.0 + 16.0 * (wrapped.len() - 1) as f64;
+                        if let (_, Some(r)) = place(ww, wh) {
+                            found = Some(r);
+                            lines = wrapped;
+                        }
+                    }
+                }
+                // Still nothing on the path: the nearest free spot around its
+                // middle (rings every 40 px out to 320 px), joined to the path by a
+                // leader line.
+                if found.is_none() {
+                    let (lw, lh) = if lines.len() > 1 {
+                        (
+                            lines
+                                .iter()
+                                .map(|l| text_width(l, 12.0, false))
+                                .fold(0.0, f64::max)
+                                + 24.0,
+                            24.0 + 16.0 * (lines.len() - 1) as f64,
+                        )
+                    } else {
+                        (tw, h)
+                    };
+                    'rings: for ring in 1..=8 {
+                        let rad = 40.0 * f64::from(ring);
+                        for step in 0..12 {
+                            let a = f64::from(step) * std::f64::consts::PI / 6.0;
+                            let c = (mid.0 + rad * a.cos(), mid.1 + rad * a.sin());
+                            let r = R::new(c.0 - lw / 2.0, c.1 - lh / 2.0, lw, lh);
+                            if r.x >= MARGIN / 2.0
+                                && r.right() <= width - MARGIN / 2.0
+                                && r.y >= LEGEND_BOTTOM
+                                && !taken.iter().any(|t| t.intersects(&r))
+                            {
+                                let near =
+                                    (mid.0.clamp(r.x, r.right()), mid.1.clamp(r.y, r.bottom()));
+                                leader = Some((near.0, near.1, mid.0, mid.1));
+                                found = Some(r);
+                                break 'rings;
+                            }
+                        }
+                    }
+                }
+                let r = found.unwrap_or_else(|| R::new(candidates[0].0, candidates[0].1, tw, h));
+                let text = lines[0].clone();
+                for (k, l) in lines.iter().enumerate().skip(1) {
+                    let mut t = tc(r.cx(), r.y + 16.0 + 16.0 * k as f64, l.clone(), "body");
+                    t.fill = Some("#5b21b6".into());
+                    label_lines.push(t);
+                }
                 let (class, fill, stroke) = if relation {
                     ("body", "#ffffff", "#7c3aed")
                 } else {
@@ -823,6 +916,8 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
             width: if dashed { 1.5 } else { 2.0 },
             dash: dashed.then_some("6,4"),
             label,
+            label_lines,
+            leader,
         });
     }
     let channels_bottom = if channel > 0 {
@@ -1201,6 +1296,7 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
         blocking.push((format!("card {}", c.id), c.r));
     }
     for z in &zones {
+        blocking.push((format!("zone title {}", z.label.text), zone_title_r(z)));
         if let Some(b) = &z.badge {
             blocking.push((format!("zone badge {}", z.label.text), b.r));
         }
@@ -1246,6 +1342,17 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
         blocking,
         unplaced,
     }
+}
+
+/// Box of a zone's title text (`section-label`: 18 px bold, baseline 28 px below
+/// the zone's top, starting 20 px in).
+fn zone_title_r(z: &Zone) -> R {
+    R::new(
+        z.r.x + 20.0,
+        z.r.y + 12.0,
+        text_width(&z.label.text, 18.0, true),
+        20.0,
+    )
 }
 
 /// Pairs of blocking boxes that overlap.

@@ -52,6 +52,7 @@ fn params(out: PathBuf) -> RenderParams {
         meta: MarkdownMeta {
             date: Some("2031-04-02, 10:00 to 10:02".into()),
             source: None,
+            media_duration_s: None,
         },
         fonts: bundled_fonts(),
         ..RenderParams::default()
@@ -124,6 +125,89 @@ fn coincident_boxes_are_separated() {
     }
     let scene = build_scene(&board, &notes);
     assert!(overlaps(&scene).is_empty(), "{:?}", overlaps(&scene));
+}
+
+#[test]
+fn edge_labels_never_cover_zone_titles() {
+    // Move each box over a grid of offsets: wherever an edge runs, its label must
+    // not land on a zone title, a card, or anything else (a long relation label
+    // wraps when it does not fit on one line).
+    let (notes, board) = inputs();
+    let mut titled = 0;
+    for i in 0..board.nodes.len() {
+        for dx in [-300.0, -150.0, 0.0, 150.0, 300.0] {
+            for dy in [-200.0, -100.0, 0.0, 100.0, 200.0] {
+                let mut b = board.clone();
+                if let Some(bb) = &mut b.nodes[i].bbox {
+                    *bb = glassrip_notes::board::BBox::new(
+                        bb.x1 + dx,
+                        bb.y1 + dy,
+                        bb.x2 + dx,
+                        bb.y2 + dy,
+                    );
+                }
+                let scene = build_scene(&b, &notes);
+                titled += scene
+                    .blocking
+                    .iter()
+                    .filter(|(n, _)| n.starts_with("zone title"))
+                    .count();
+                // Crowded positions may leave a note unplaced (reported, not
+                // drawn); what this checks is that no label covers anything.
+                let o: Vec<String> = overlaps(&scene)
+                    .into_iter()
+                    .filter(|m| m.contains("zone title") || m.contains("edge label"))
+                    .collect();
+                assert!(o.is_empty(), "node {i} moved by ({dx}, {dy}): {o:?}");
+            }
+        }
+    }
+    assert!(titled > 0, "the sweep produced zones with titles");
+}
+
+#[test]
+fn a_long_relation_label_between_touching_cards_is_placed_clear() {
+    // Put the design kit right next to the ledger: the dashed relation between
+    // them has no room on its path at full width.
+    let (notes, mut board) = inputs();
+    let ledger = board
+        .nodes
+        .iter()
+        .find(|n| n.text == "Ledger Service")
+        .and_then(|n| n.bbox)
+        .unwrap();
+    let w = ledger.x2 - ledger.x1;
+    for n in &mut board.nodes {
+        if n.text == "Design Kit" {
+            n.bbox = Some(glassrip_notes::board::BBox::new(
+                ledger.x2 + 0.05 * w,
+                ledger.y1,
+                ledger.x2 + 1.05 * w,
+                ledger.y2,
+            ));
+        }
+    }
+    let scene = build_scene(&board, &notes);
+    let o: Vec<String> = overlaps(&scene)
+        .into_iter()
+        .filter(|m| m.contains("edge label"))
+        .collect();
+    assert!(o.is_empty(), "{o:?}");
+    let e = scene
+        .edges
+        .iter()
+        .find(|e| {
+            e.label
+                .as_ref()
+                .is_some_and(|l| l.text.text.starts_with("Links between"))
+        })
+        .expect("the relation label is drawn");
+    if let Some((x1, y1, x2, y2)) = e.leader {
+        assert!(
+            (x1 - x2).abs() + (y1 - y2).abs() > 0.0,
+            "a leader has length"
+        );
+    }
 }
 
 /// Runs the render stage; returns the stage outcome and the records written.
@@ -245,4 +329,88 @@ fn em_dashes_in_board_text_are_sanitized() {
     assert!(svg.ok, "{svg:?}");
     assert!(!r.svg_text[0].1.contains('\u{2014}'));
     assert!(!r.markdown_text.contains('\u{2014}'));
+}
+
+/// Codex final round 3 MAJOR: the render stage's output is the files it writes
+/// outside the run directory, so a rerun never restores it from the cache: files
+/// deleted since the last run are written again, not reported from a cached
+/// artifact.
+#[tokio::test]
+async fn a_rerun_rewrites_the_rendered_files() {
+    let (notes, board) = inputs();
+    let dir = tempfile::tempdir().unwrap();
+    let run_path = dir.path().join("run");
+    let run = RunDir::open(&run_path, "synthetic", Producer::glassrip("0.1.0", None)).unwrap();
+    import::write_artifact(
+        &run,
+        schemas::MEETING_NOTES,
+        Version::new(1, 0, 0),
+        serde_json::json!({}),
+        vec![("meeting_notes".to_string(), notes)],
+    )
+    .unwrap();
+    import::import_boards(&run, &[board]).unwrap();
+    drop(run);
+    let out = dir.path().join("out");
+    let stage = RenderStage::new(RenderParams {
+        out_dir: out.clone(),
+        ..params(PathBuf::new())
+    });
+    let runner = || {
+        Runner::new(
+            RunDir::open(&run_path, "synthetic", Producer::glassrip("0.1.0", None)).unwrap(),
+            StageGraph::new(meeting_mode_stage_decls()).unwrap(),
+            // Selected without being forced (`from` would force it).
+            &Selection::default(),
+            Cache::in_workspace(dir.path()),
+            RunnerOptions::default(),
+            CancellationToken::new(),
+        )
+        .unwrap()
+    };
+    let files = |recs: &[Record<RenderResult>]| -> Vec<PathBuf> {
+        recs[0]
+            .outcome
+            .result
+            .as_ref()
+            .unwrap()
+            .files
+            .iter()
+            .map(|f| out.join(&f.name))
+            .collect()
+    };
+    let read = |r: &Runner| {
+        jsonl::read::<Record<RenderResult>>(
+            &r.run_dir().artifact_path(RENDER_SCHEMA),
+            &SchemaReq::new(RENDER_SCHEMA, 1),
+        )
+        .unwrap()
+        .items
+    };
+
+    let mut r = runner();
+    let rep = r.run_stage(&stage).await.unwrap();
+    assert_eq!(rep.items_error, 0);
+    let written = files(&read(&r));
+    assert_eq!(written.len(), 3);
+    drop(r);
+    assert!(
+        Cache::in_workspace(dir.path()).ls().unwrap().is_empty(),
+        "nothing is stored for a stage that is never restored"
+    );
+    for f in &written {
+        std::fs::remove_file(f).unwrap();
+    }
+
+    let mut r = runner();
+    assert!(!r.cache_hit(&stage), "render never restores from the cache");
+    let rep = r.run_stage(&stage).await.unwrap();
+    assert_ne!(
+        rep.status,
+        glassrip_core::manifest::StageStatus::Cached,
+        "{rep:?}"
+    );
+    for f in files(&read(&r)) {
+        assert!(f.is_file(), "{} was not rewritten", f.display());
+    }
 }

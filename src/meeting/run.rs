@@ -32,6 +32,7 @@ use glassrip_audio::gapfill::GapFillConfig;
 use glassrip_audio::stages::{
     AsrStage, AssignWordsParams, AssignWordsStage, AudioExtractStage, DiarizeStage, GapFillStage,
 };
+use glassrip_audio::types::TranscriptSegment;
 use glassrip_core::cache::{Cache, DEFAULT_CACHE_DIR};
 use glassrip_core::config::Config;
 use glassrip_core::envelope::{InputRef, Producer, Record, SchemaReq};
@@ -49,16 +50,24 @@ use glassrip_media_stages::pipeline::materialize;
 use glassrip_media_stages::probe::ProbeStage;
 use glassrip_media_stages::quad::{QuadParams, ScreenQuadStage};
 use glassrip_media_stages::rectify::{RectifyParams, RectifyStage};
-use glassrip_media_stages::schema::{FrameRecord, RectifiedKeyframe, FRAMES, RECTIFIED_KEYFRAMES};
+use glassrip_media_stages::schema::{
+    FrameRecord, MediaProbe, RectifiedKeyframe, FRAMES, MEDIA_PROBE, RECTIFIED_KEYFRAMES,
+};
 use glassrip_media_stages::scoring::ScoringParams;
 use glassrip_meeting::consolidate::ConsolidationParams;
 use glassrip_meeting::pixel_direction::PixelCheckParams;
 use glassrip_meeting::stages::{BoardStateStage, EdgeDirectionStage};
 use glassrip_meeting::text::{AliasTable, Participant};
 use glassrip_meeting::vlm_direction::VlmCheckParams;
-use glassrip_notes::notes::llm::OllamaTextConfig;
+use glassrip_notes::named::named_lines;
+use glassrip_notes::notes::llm::{
+    ChatRequest, ChatResponse, LlmError, LoadedModel, OllamaTextConfig, TextBackend,
+};
 use glassrip_notes::notes::{NotesParams, NotesStage};
-use glassrip_notes::speakers::{NameSpeakersParams, NameSpeakersStage};
+use glassrip_notes::schemas::{SPEAKERS, TRANSCRIPT};
+use glassrip_notes::speakers::{
+    NameSpeakersParams, NameSpeakersStage, SpeakersDoc, SpeakersRecord,
+};
 use glassrip_ocr::OcrConfig;
 use glassrip_render::markdown::MarkdownMeta;
 use glassrip_render::stage::RENDER_SCHEMA;
@@ -322,6 +331,81 @@ fn alias_table(participants: &[String]) -> AliasTable {
     )
 }
 
+/// The text backend when the text model is unavailable: every call fails with
+/// the reason. Board-only notes (no speech) never call it.
+struct NoTextModel(String);
+
+impl NoTextModel {
+    fn err(&self) -> LlmError {
+        LlmError::Protocol(format!("text model unavailable: {}", self.0))
+    }
+}
+
+#[async_trait::async_trait]
+impl TextBackend for NoTextModel {
+    async fn chat(&self, _model: &str, _req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+        Err(self.err())
+    }
+    async fn load(&self, _model: &str) -> Result<(), LlmError> {
+        Err(self.err())
+    }
+    async fn unload(&self, _model: &str) -> Result<(), LlmError> {
+        Err(self.err())
+    }
+    async fn loaded(&self) -> Result<Vec<LoadedModel>, LlmError> {
+        Err(self.err())
+    }
+    async fn digest(&self, _model: &str) -> Result<Option<String>, LlmError> {
+        Err(self.err())
+    }
+}
+
+/// Whether the run's transcript has speech, by the test `notes` applies (a
+/// named line with words). Unreadable inputs count as speech, so the text
+/// model is still required and `notes` reports its own input error.
+fn transcript_has_speech(runner: &Runner) -> bool {
+    let read = || -> Result<bool, glassrip_core::jsonl::JsonlError> {
+        let (transcript, speakers) = {
+            let dir = runner.run_dir();
+            (dir.artifact_path(TRANSCRIPT), dir.artifact_path(SPEAKERS))
+        };
+        let segments: Vec<TranscriptSegment> = glassrip_core::jsonl::read::<
+            Record<TranscriptSegment>,
+        >(
+            &transcript, &SchemaReq::new(TRANSCRIPT, 1)
+        )?
+        .items
+        .into_iter()
+        .filter_map(|r| r.outcome.result)
+        .collect();
+        let doc = SpeakersDoc::from_records(
+            glassrip_core::jsonl::read::<Record<SpeakersRecord>>(
+                &speakers,
+                &SchemaReq::new(SPEAKERS, 1),
+            )?
+            .items
+            .into_iter()
+            .filter_map(|r| r.outcome.result),
+        );
+        Ok(named_lines(&segments, &doc)
+            .iter()
+            .any(|l| !l.text.trim().is_empty()))
+    };
+    read().unwrap_or(true)
+}
+
+/// The recording's length from the media probe, when it has run.
+fn media_duration_s(runner: &Runner) -> Option<f64> {
+    let path = runner.run_dir().artifact_path(MEDIA_PROBE);
+    glassrip_core::jsonl::read::<Record<MediaProbe>>(&path, &SchemaReq::new(MEDIA_PROBE, 1))
+        .ok()?
+        .items
+        .into_iter()
+        .find_map(|r| r.outcome.result)
+        .map(|p| p.duration_s)
+        .filter(|d| d.is_finite() && *d > 0.0)
+}
+
 fn setup(e: impl std::fmt::Display) -> MeetingError {
     MeetingError::Setup(e.to_string())
 }
@@ -580,7 +664,10 @@ pub async fn run_meeting(
         }
         step(
             &runner,
-            &VocabularyStage::new(VocabularyParams::default()),
+            &VocabularyStage::new(VocabularyParams {
+                participants: opts.participants.clone(),
+                ..VocabularyParams::default()
+            }),
             &reports,
         )
         .await?;
@@ -741,8 +828,37 @@ pub async fn run_meeting(
     let t = Instant::now();
     drop(vision);
     let text = std::mem::replace(&mut backends.text, Err("released".into()));
-    let text_offline = backends.text_offline.clone();
-    if let Ok(text) = text {
+    // Why the text model cannot be asked (missing, or its server not used).
+    let (text, unavailable): (Arc<dyn TextBackend>, Option<String>) = match text {
+        Ok(t) => (t, backends.text_offline.clone()),
+        Err(reason) => (Arc::new(NoTextModel(reason.clone())), Some(reason)),
+    };
+    {
+        // The text model's digest keys the notes cache when the notes need the
+        // model (speech): the digest resolved when connecting (live, or recorded
+        // by an earlier run for an offline rerun, the same pinned-digest policy
+        // as the vision stages), else asked of the server and recorded so an
+        // offline rerun can key the same entry. A digest nobody can tell makes
+        // the notes not cacheable (see `NotesStage::cacheable`). Without speech
+        // the notes ask no model, so the key names none.
+        let speech = transcript_has_speech(&runner);
+        let text_model = cfg.models.text.clone();
+        let text_digest = if !speech {
+            None
+        } else if let Some(d) = backends.model_digests.get(&text_model) {
+            Some(d.clone())
+        } else if unavailable.is_none() {
+            let d = text.digest(&text_model).await.ok().flatten();
+            if let Some(d) = &d {
+                let (model, d) = (text_model.clone(), d.clone());
+                runner.run_dir_mut().update(|m| {
+                    m.model_digests.insert(model, d);
+                })?;
+            }
+            d
+        } else {
+            None
+        };
         let notes = NotesStage::new(
             NotesParams {
                 text_model: cfg.models.text.clone(),
@@ -758,7 +874,24 @@ pub async fn run_meeting(
             },
             text,
         );
-        require_cached(&runner, &notes, text_offline.as_deref())?;
+        let notes = if speech {
+            notes.with_text_digest(text_digest)
+        } else {
+            notes.without_text_model()
+        };
+        let selected = matches!(
+            runner.plan().decision("notes"),
+            Some(StageDecision::Run { .. })
+        );
+        match &unavailable {
+            // Without speech the notes come from the board alone and ask no
+            // model, so the text model is not needed.
+            Some(reason) if selected && !speech => tracing::info!(
+                %reason,
+                "no speech was transcribed: notes come from the board alone, no text model needed"
+            ),
+            _ => require_cached(&runner, &notes, unavailable.as_deref())?,
+        }
         step(&runner, &notes, &reports).await?;
     }
     lap(&mut outcome, "phase_c", t);
@@ -771,6 +904,7 @@ pub async fn run_meeting(
         meta: MarkdownMeta {
             date: None,
             source: video.file_name().map(|n| n.to_string_lossy().into_owned()),
+            media_duration_s: media_duration_s(&runner),
         },
         ..RenderParams::default()
     });
@@ -902,7 +1036,9 @@ mod tests {
         .unwrap_err();
         match err {
             MeetingError::Preflight(p) => {
-                assert!(p.iter().any(|m| m.starts_with("notes: absent")), "{p:?}");
+                assert!(p.iter().any(|m| m.starts_with("asr: absent")), "{p:?}");
+                // the text model is checked after transcription, not here
+                assert!(!p.iter().any(|m| m.starts_with("notes")), "{p:?}");
             }
             other => panic!("expected a preflight error, got {other}"),
         }

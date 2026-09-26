@@ -118,8 +118,14 @@
 {%- for a in e.arrows %}
   <polygon points="{{ a }}" fill="{{ e.color }}"/>
 {%- endfor %}
+{%- if e.leader %}
+  <line x1="{{ e.leader[0]|n }}" y1="{{ e.leader[1]|n }}" x2="{{ e.leader[2]|n }}" y2="{{ e.leader[3]|n }}" stroke="#94a3b8" stroke-width="1" stroke-dasharray="2,3"/>
+{%- endif %}
 {%- if e.label %}
   {{ pill(e.label) }}
+{%- for t in e.label_lines %}
+  {{ text(t) }}
+{%- endfor %}
 {%- endif %}
 {%- endfor %}
 

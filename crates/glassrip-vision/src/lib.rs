@@ -13,10 +13,12 @@ pub mod geometry;
 pub mod image_prep;
 pub mod ollama;
 pub mod pool;
+pub mod repetition;
 pub mod schema;
 
 pub use backend::{
-    BackendId, Durations, GenerationOptions, Placement, RawResponse, VisionBackend, VisionRequest,
+    BackendId, Durations, GenerationOptions, Placement, RawResponse, SamplingOverrides,
+    VisionBackend, VisionRequest,
 };
 pub use error::{FieldError, Result, VisionError};
 pub use geometry::BBox;

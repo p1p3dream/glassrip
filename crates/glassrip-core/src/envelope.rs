@@ -372,6 +372,38 @@ pub struct ErrorInfo {
     /// Raw text involved in the failure (model reply, stderr tail), if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_text: Option<String>,
+    /// The failure is a settled answer to the item's inputs: running the item
+    /// again with the same cache key would fail the same way. The runner caches
+    /// terminal failures like results and does not retry them on resume;
+    /// `--force-stage` (or forcing the item) retries them. Set directly only for
+    /// provably invalid inputs (an image or request that cannot be sent); a model
+    /// reply is never known to recur after one sighting, so a
+    /// [`recurrent`](Self::recurrent) failure becomes terminal only when the runner
+    /// sees it again, identically, on consecutive runs. Timeouts, cancellations,
+    /// and connection errors are never terminal.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub terminal: bool,
+    /// The failure is a model's answer to the item's content (a reply that failed
+    /// validation, was cut off, or looped): it may or may not recur, so it is
+    /// retried on the next run and becomes [`terminal`](Self::terminal) once the
+    /// same failure (code, message, and raw text) comes back on enough
+    /// consecutive runs (`RunnerOptions::terminal_after_repeats`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recurrent: bool,
+    /// Consecutive runs that ended the item with this same failure, counted by
+    /// the runner for [`recurrent`](Self::recurrent) failures.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub occurrences: u32,
+    /// What makes two recurrent failures the same when their text may differ (a
+    /// loop stopped at another byte of the same generation): compared instead of
+    /// the message and raw text when both failures carry one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl ErrorInfo {
@@ -381,13 +413,55 @@ impl ErrorInfo {
             code,
             message: message.into(),
             raw_text: None,
+            terminal: false,
+            recurrent: false,
+            occurrences: 0,
+            signature: None,
         }
+    }
+
+    /// Sets the [`signature`](Self::signature).
+    pub fn with_signature(mut self, signature: impl Into<String>) -> Self {
+        self.signature = Some(signature.into());
+        self
     }
 
     /// Adds raw text.
     pub fn with_raw_text(mut self, raw: impl Into<String>) -> Self {
         self.raw_text = Some(raw.into());
         self
+    }
+
+    /// Marks the failure terminal (see [`ErrorInfo::terminal`]). Cancellation and
+    /// timeouts stay retryable whatever the caller says.
+    pub fn terminal(mut self) -> Self {
+        self.terminal = !matches!(self.code, ErrorCode::Cancelled | ErrorCode::Timeout);
+        self
+    }
+
+    /// Marks the failure [`recurrent`](Self::recurrent): terminal only once it
+    /// recurs identically across runs. Cancellation and timeouts stay plainly
+    /// retryable.
+    pub fn terminal_if_repeated(mut self) -> Self {
+        self.recurrent = !matches!(self.code, ErrorCode::Cancelled | ErrorCode::Timeout);
+        self
+    }
+
+    /// Same failure as `other` for counting recurrences: equal codes, and equal
+    /// signatures when both have one, else equal messages and raw texts.
+    pub fn same_failure(&self, other: &ErrorInfo) -> bool {
+        self.code == other.code
+            && match (&self.signature, &other.signature) {
+                (Some(a), Some(b)) => a == b,
+                _ => self.message == other.message && self.raw_text == other.raw_text,
+            }
+    }
+
+    /// Settled under a recurrence threshold of `repeats`: terminal, and, when
+    /// recurrent, seen on at least `repeats` consecutive runs (a threshold raised
+    /// since the failure was recorded reopens it).
+    pub fn settled(&self, repeats: u32) -> bool {
+        self.terminal && !(self.recurrent && self.occurrences < repeats)
     }
 }
 

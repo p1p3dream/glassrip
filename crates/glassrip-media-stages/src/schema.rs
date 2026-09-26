@@ -379,6 +379,11 @@ pub struct Boundary {
     pub ink_change: Option<f64>,
     /// Pair-score alignment usable.
     pub align_ok: Option<bool>,
+    /// Ink-path alignment usable, when ink was computed. A failed ink alignment
+    /// reports `ink_change` 1.0 (a boundary), which measures no ink: consumers must
+    /// treat it as unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ink_align_ok: Option<bool>,
 }
 
 /// A singleton merged into this keyframe.

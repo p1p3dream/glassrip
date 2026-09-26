@@ -156,12 +156,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let store = RawStore::new(&args.raw_store);
     let (backend, probe, digest, server_version): ModelSetup = if args.replay {
-        (
-            Arc::new(ReplayBackend::new(&args.model, store.clone())),
-            Arc::new(StaticProbe),
-            None,
-            None,
-        )
+        // The store's digest keys the model stages, so two stores never share
+        // cached outputs.
+        let replay = ReplayBackend::new(&args.model, store.clone());
+        let digest = replay.id().digest;
+        (Arc::new(replay), Arc::new(StaticProbe), digest, None)
     } else {
         let mut cfg = OllamaConfig::new(&args.host, &args.model, 8192);
         cfg.slots = args.slots;

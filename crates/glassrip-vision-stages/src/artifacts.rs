@@ -324,6 +324,21 @@ pub struct RequestLog {
     /// retry (smaller list budgets); `request_key` is the retry's key.
     #[serde(default)]
     pub compact_retry: bool,
+    /// The first reply fell into a repetition loop (stopped while streaming, or
+    /// found in the returned text) and this is the retry with a repeat penalty;
+    /// `request_key` is the retry's key. Replay rebuilds the same retry from this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repetition: Option<glassrip_vision::repetition::RepetitionFinding>,
+    /// Sampling overrides of the request that produced the reading (set on the
+    /// repetition retry; part of its request key).
+    #[serde(
+        default,
+        skip_serializing_if = "glassrip_vision::SamplingOverrides::is_empty"
+    )]
+    pub sampling: glassrip_vision::SamplingOverrides,
+    /// Output budget of the request that produced the reading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_predict: Option<u32>,
 }
 
 /// Model identity.

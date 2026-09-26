@@ -34,6 +34,25 @@ pub struct BoundaryView {
     /// Aligned ink change against the previous run's anchor.
     #[serde(default)]
     pub ink_change: Option<f64>,
+    /// Pair-score alignment usable.
+    #[serde(default)]
+    pub align_ok: Option<bool>,
+    /// Ink-path alignment usable. When it failed, `ink_change` is the failure
+    /// value 1.0, not a measurement.
+    #[serde(default)]
+    pub ink_align_ok: Option<bool>,
+}
+
+impl BoundaryView {
+    /// The ink change as evidence: `None` unless it was measured on aligned frames.
+    /// A failed alignment (a pan or zoom the aligner could not follow) reports a
+    /// full change so that segmentation cuts there, which says nothing about ink.
+    pub fn measured_ink(&self) -> Option<f64> {
+        if self.align_ok == Some(false) || self.ink_align_ok == Some(false) {
+            return None;
+        }
+        self.ink_change
+    }
 }
 
 /// One keyframe (consumer view of `glassrip.keyframes`).

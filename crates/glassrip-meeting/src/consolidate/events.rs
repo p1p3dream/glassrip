@@ -3,6 +3,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::owners::OwnerTarget;
+
 /// Event kinds (spec 6.11).
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
@@ -48,6 +50,15 @@ pub struct BoardEvent {
     pub ink_change: Option<f64>,
     /// In the first board keyframe (initial content, not a change during the meeting).
     pub baseline: bool,
+    /// Owner events: the target the owner tag is on after the change, by id, so
+    /// consumers match an event to its assignment exactly (texts overlap: a tag
+    /// on "Ledger Store" is not a tag on "Ledger"). Absent on other kinds and in
+    /// states written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_target: Option<OwnerTarget>,
+    /// Owner moves: the target the tag left.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_from: Option<OwnerTarget>,
 }
 
 /// Why an event was not emitted.
@@ -143,6 +154,8 @@ mod tests {
             detail: String::new(),
             ink_change: ink,
             baseline,
+            owner_target: None,
+            owner_from: None,
         }
     }
 

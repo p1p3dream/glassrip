@@ -11,11 +11,32 @@
 //!    stickies, other text and edge labels share one pool, so an element read in
 //!    different lists in different keyframes is one track whose kind is the majority
 //!    list. Illegible or elided texts are not tracked.
-//! 3. Lifetimes and support ([`tracks::intervals`]); the final state is what is alive
-//!    in the last stable board window.
+//! 3. Lifetimes and support ([`tracks::intervals`]). The final state is what was
+//!    observed and not later removed: an element is final when its last supported
+//!    interval was never ended by a removal. Removal needs evidence: consecutive
+//!    later keyframes that cover the element's region and lack it. A keyframe covers
+//!    the region when the region lies inside its registered view, OCR read none of
+//!    the element's text there, and either the keyframe read another established
+//!    element near that place, which confirms the registration there, or (with a
+//!    [`RegionProbe`]) a well-supported registration maps the element's box onto
+//!    canvas pixels that lost the ink the box held where the element was last read
+//!    (a sparse board has no neighbor to confirm). Absence outside the view, or in a
+//!    view with nothing known read near the place and no pixel evidence, is not
+//!    removal. A keyframe whose whole canvas went blank (and whose OCR read none of
+//!    the element's text) covers every element read before it, registered or not:
+//!    erasing the last element leaves a view with nothing to register.
+//!    An element never placed on the board (text-only registration) seen in a
+//!    single keyframe cannot be checked against later views and is not final.
 //! 4. Edges are keyed by their two node tracks; an endpoint that is not a supported
 //!    node drops the edge (nodes are never created from endpoints). Directions come
-//!    from the weighted vote over `glassrip.edge_direction` evidence.
+//!    from the weighted vote over `glassrip.edge_direction` evidence. An edge is
+//!    absent from a keyframe that read (or covers) both of its ends without it only
+//!    with evidence that the connector is gone: readers often leave a connector out
+//!    of a reading. With a [`RegionProbe`], the straight corridor between the two
+//!    boxes decides when it held a line where the edge was last read: a line still
+//!    there keeps the edge whatever else changed on the board, a line gone removes
+//!    it. Otherwise (no pixels, or a routed connector the corridor does not follow)
+//!    the board's aligned ink must have changed since the edge was last read.
 //! 5. Owner tags become timed assignments ([`owners`]).
 //! 6. Events are computed from the state changes and gated on ink ([`events`]).
 
@@ -38,6 +59,7 @@ use crate::pixel_direction::exit_point;
 use crate::register::{
     map_bbox, register, Anchors, FrameRegistration, RegistrationMode, RegistrationParams,
 };
+use crate::similarity::Similarity;
 use crate::text::{clean_label, is_unreliable, normalize, AliasTable};
 
 use anchor::{anchor_tag, box_distance, AnchorParams, Anchored, EdgeGeom};
@@ -104,6 +126,154 @@ pub trait SecondReader: Send + Sync {
     fn confirms(&self, keyframe_id: &str, text: &str) -> bool;
 }
 
+/// Pixel evidence about regions of a keyframe's canvas (optional). Coordinates are
+/// the keyframe reading's canvas coordinates. `None` when the keyframe's pixels are
+/// unavailable or the region is degenerate.
+pub trait RegionProbe: Send + Sync {
+    /// Share of the pixels inside `region` that differ from the canvas background
+    /// (0 on blank canvas, near 1 over a filled card).
+    fn ink_share(&self, keyframe_id: &str, region: &BBox) -> Option<f64>;
+    /// Share of positions along the straight corridor from `a` to `b` (`half_width`
+    /// on each side; the ends, where the boxes sit, are skipped) at which ink crosses
+    /// the corridor: near 1 over a drawn straight connector, 0 on blank canvas.
+    fn line_cover(
+        &self,
+        keyframe_id: &str,
+        a: (f64, f64),
+        b: (f64, f64),
+        half_width: f64,
+    ) -> Option<f64>;
+    /// Traces ink from box `a` to box `b` inside `region`, whatever route it
+    /// takes: ink inside the two boxes and inside every box of `masks` (the other
+    /// elements read there) is ignored, and a connector must reach the band of
+    /// width `ring` around each box. `None` without pixels, for a degenerate
+    /// region, or when the two bands touch (nothing to trace between them).
+    fn stroke_between(
+        &self,
+        _keyframe_id: &str,
+        _a: &BBox,
+        _b: &BBox,
+        _region: &BBox,
+        _masks: &[BBox],
+        _ring: f64,
+    ) -> Option<StrokeTrace> {
+        None
+    }
+    /// True when [`RegionProbe::stroke_between`] traces strokes. A probe that
+    /// traces and still returns `None` for the keyframe that read a connector
+    /// cannot tell whether the connector went; one that does not trace leaves
+    /// the straight corridor to decide alone.
+    fn traces(&self) -> bool {
+        false
+    }
+    /// `Some(true)` when the keyframe's whole canvas is one flat color (no drawn
+    /// content, not even faint marks: near-zero luminance spread); `None` without
+    /// pixels.
+    fn uniform(&self, _keyframe_id: &str) -> Option<bool> {
+        None
+    }
+}
+
+/// What the pixels say about a connector's own traced stroke between the
+/// keyframe that read it and one that did not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Trace {
+    /// It joined the two boxes and no longer does, and its ink fell.
+    Gone,
+    /// It joined the two boxes and no longer does, without an ink drop.
+    Broken,
+    /// It still joins the two boxes.
+    Joined,
+    /// The probe does not trace strokes.
+    Untraced,
+    /// The pixels cannot tell (see `routed_trace`).
+    Inconclusive,
+}
+
+/// Result of [`RegionProbe::stroke_between`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StrokeTrace {
+    /// Connected ink (small gaps bridged) runs from the band around one box to
+    /// the band around the other.
+    pub joined: bool,
+    /// Share of the region holding ink outside the ignored boxes.
+    pub ink: f64,
+}
+
+/// Thresholds for [`RegionProbe`] evidence. Every comparison is between the same
+/// measure in two keyframes: where the element or edge was last read, and where it
+/// is missing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RegionProbeParams {
+    /// A corridor keeps at least this share of its line cover: the connector is
+    /// still drawn and the reading left it out.
+    pub still_drawn_ratio: f64,
+    /// A corridor or box keeps at most this share of its measure: the content is gone.
+    pub gone_ratio: f64,
+    /// The corridor speaks only when the line covered at least this share of it
+    /// where the edge was read (a routed connector leaves the straight corridor).
+    pub min_line_cover: f64,
+    /// The box speaks only when it held at least this ink share where the element
+    /// was read.
+    pub min_ink_share: f64,
+    /// Corridor half width as a share of the smaller end box height (at least 3 px).
+    pub corridor_half_width_share: f64,
+    /// Registration inliers a keyframe needs before its mapped box is trusted
+    /// without a neighboring established element (references always are).
+    pub min_registration_inliers: usize,
+    /// A routed connector (no corridor verdict) is removed on board ink only when
+    /// its traced stroke no longer joins its ends and the unmasked ink share of
+    /// the traced region fell by at least this much...
+    #[serde(default = "default_min_ink_drop")]
+    pub min_ink_drop: f64,
+    /// ...and by at least this share of its previous value.
+    #[serde(default = "default_min_ink_drop_share")]
+    pub min_ink_drop_share: f64,
+    /// A whole canvas under this ink share is blank: everything read on it before
+    /// is gone, even when the blank view cannot be registered.
+    #[serde(default = "default_blank_canvas_share")]
+    pub blank_canvas_share: f64,
+    /// A routed connector is traced inside the ends' union box grown by this share
+    /// of the taller end box on every side (a connector routed around a card
+    /// leaves the union box).
+    #[serde(default = "default_stroke_margin_share")]
+    pub stroke_margin_share: f64,
+}
+
+fn default_stroke_margin_share() -> f64 {
+    1.5
+}
+
+fn default_min_ink_drop() -> f64 {
+    0.002
+}
+
+fn default_min_ink_drop_share() -> f64 {
+    0.05
+}
+
+fn default_blank_canvas_share() -> f64 {
+    0.002
+}
+
+impl Default for RegionProbeParams {
+    fn default() -> Self {
+        Self {
+            still_drawn_ratio: 0.6,
+            gone_ratio: 0.25,
+            min_line_cover: 0.5,
+            min_ink_share: 0.04,
+            corridor_half_width_share: 0.25,
+            min_registration_inliers: 3,
+            min_ink_drop: default_min_ink_drop(),
+            min_ink_drop_share: default_min_ink_drop_share(),
+            blank_canvas_share: default_blank_canvas_share(),
+            stroke_margin_share: default_stroke_margin_share(),
+        }
+    }
+}
+
 /// Hooks from other stages.
 #[derive(Clone, Copy)]
 pub struct Hooks<'a> {
@@ -146,9 +316,19 @@ pub struct ConsolidationParams {
     /// span a few keyframes at the 2 s sampling grid, short enough to exclude earlier
     /// board states. Not a spec number; tune per corpus.
     pub final_window_s: f64,
-    /// The final window holds at least this many board keyframes when that many exist
-    /// (it is extended backward otherwise).
+    /// The final window holds at least this many board keyframes when its contiguous
+    /// run has that many (it is extended backward, never past the run's start). The
+    /// window only dates the final state
+    /// (`t_end_s`, "final board state at"); membership is "observed and not removed".
     pub min_final_keyframes: usize,
+    /// A keyframe that lacks an element evidences its removal only when it read
+    /// another established element (seen in at least two keyframes) within this
+    /// share of the reference diagonal of the element's center: nothing known read
+    /// near the place means the view did not really cover it, or was registered
+    /// wrongly there. A quarter of the diagonal reaches the neighbors of a box on a
+    /// sparse board.
+    #[serde(default = "default_coverage_radius_share")]
+    pub coverage_radius_share: f64,
     /// Reading confidence (element and board) a single sighting needs, together with
     /// the pixel check, to be kept.
     pub single_sighting_min_conf: f64,
@@ -161,6 +341,9 @@ pub struct ConsolidationParams {
     pub min_group_cards: usize,
     /// Aligned ink change needed for a content event.
     pub ink_event_threshold: f64,
+    /// Pixel evidence thresholds ([`RegionProbe`]).
+    #[serde(default)]
+    pub region_probe: RegionProbeParams,
     /// Share of the decisive weight a direction needs within a channel.
     pub vote_min_share: f64,
     /// Consecutive consistent keyframes to open or move an owner assignment.
@@ -191,10 +374,12 @@ impl Default for ConsolidationParams {
             removal_absent_keyframes: 2,
             final_window_s: 120.0,
             min_final_keyframes: 3,
+            coverage_radius_share: default_coverage_radius_share(),
             single_sighting_min_conf: 0.8,
             title_band_share: default_title_band_share(),
             min_group_cards: default_min_group_cards(),
             ink_event_threshold: 0.05,
+            region_probe: RegionProbeParams::default(),
             vote_min_share: 0.6,
             owner_confirm_keyframes: 2,
             owner_anchor: AnchorParams::default(),
@@ -202,6 +387,10 @@ impl Default for ConsolidationParams {
             backfill_untargeted_owners: false,
         }
     }
+}
+
+fn default_coverage_radius_share() -> f64 {
+    0.25
 }
 
 fn default_title_band_share() -> f64 {
@@ -617,10 +806,21 @@ fn median(mut v: Vec<f64>) -> f64 {
 
 /// Consolidate the keyframes of one board into its board state.
 pub fn consolidate(
+    frames: Vec<BoardFrame>,
+    board_id: &str,
+    params: &ConsolidationParams,
+    hooks: &Hooks<'_>,
+) -> BoardStateItem {
+    consolidate_with_probe(frames, board_id, params, hooks, None)
+}
+
+/// [`consolidate`] with pixel evidence about the keyframes' canvases.
+pub fn consolidate_with_probe(
     mut frames: Vec<BoardFrame>,
     board_id: &str,
     params: &ConsolidationParams,
     hooks: &Hooks<'_>,
+    probe: Option<&dyn RegionProbe>,
 ) -> BoardStateItem {
     let corroborator = hooks.corroborator;
     frames.sort_by(|a, b| a.t_rep_s.total_cmp(&b.t_rep_s));
@@ -856,6 +1056,176 @@ pub fn consolidate(
             Visibility::Unknown
         }
     };
+    // Coverage evidence per positioned keyframe, in its cluster's reference frame:
+    // the centers of the established elements it read (tracks seen in at least two
+    // keyframes, matched there by text and position, so the keyframe's registration
+    // agrees with theirs around that place), and the OCR anchors with their
+    // normalized text. Anchors never corroborate coverage on their own: a wrongly
+    // registered view carries its anchors along with it.
+    let mut content: Vec<Vec<(f64, f64)>> = vec![Vec::new(); n];
+    for t in &tracks {
+        if t.frames().len() < 2 {
+            continue;
+        }
+        for o in &t.obs {
+            if let Some(b) = o.bbox {
+                content[o.frame].push(((b.x1 + b.x2) / 2.0, (b.y1 + b.y2) / 2.0));
+            }
+        }
+    }
+    let ocr_ref: Vec<Vec<(String, BBox)>> = (0..n)
+        .map(|f| {
+            if !positioned(f) {
+                return Vec::new();
+            }
+            frames[f]
+                .ocr_anchors
+                .iter()
+                .map(|a| (normalize(&a.text), map_bbox(&regs[f].to_reference, &a.bbox)))
+                .filter(|(t, _)| t.chars().filter(|c| c.is_alphanumeric()).count() >= 3)
+                .collect()
+        })
+        .collect();
+    let coverage_radius = params.coverage_radius_share * ref_diag;
+    // OCR of keyframe `f` read `text` at (or around) reference box `b`.
+    let ocr_reads = |f: usize, text: &str, b: &BBox| -> bool {
+        let (bw, bh) = (b.width() * 0.5, b.height() * 0.5);
+        let near_box = BBox::new(b.x1 - bw, b.y1 - bh, b.x2 + bw, b.y2 + bh);
+        ocr_ref[f].iter().any(|(a, ab)| {
+            let c = ((ab.x1 + ab.x2) / 2.0, (ab.y1 + ab.y2) / 2.0);
+            c.0 >= near_box.x1
+                && c.0 <= near_box.x2
+                && c.1 >= near_box.y1
+                && c.1 <= near_box.y2
+                && (text.contains(a.as_str()) || a.contains(text))
+        })
+    };
+    // Region-local disappearance: a well-supported registration maps the track's
+    // reference box `b` into keyframe `f`, and those canvas pixels lost the ink the
+    // box held in the keyframe that last read the track.
+    let region_gone = |t: &Track, f: usize, b: &BBox| -> bool {
+        let Some(probe) = probe else {
+            return false;
+        };
+        let rp = &params.region_probe;
+        let r = &regs[f];
+        let trusted = r.mode == RegistrationMode::Reference
+            || (r.mode == RegistrationMode::Registered && r.inliers >= rp.min_registration_inliers);
+        if !trusted {
+            return false;
+        }
+        let Some(inv) = r.to_reference.inverse() else {
+            return false;
+        };
+        let Some((s, sb)) = t
+            .obs
+            .iter()
+            .filter(|o| o.frame < f)
+            .filter_map(|o| o.raw_bbox.map(|rb| (o.frame, rb)))
+            .max_by_key(|x| x.0)
+        else {
+            return false;
+        };
+        let before = probe.ink_share(&frames[s].keyframe_id, &sb);
+        let now = probe.ink_share(&frames[f].keyframe_id, &map_bbox(&inv, b));
+        match (before, now) {
+            (Some(before), Some(now)) => {
+                before >= rp.min_ink_share && now <= rp.gone_ratio * before
+            }
+            _ => false,
+        }
+    };
+    // The whole canvas of keyframe `f` is blank (and OCR read none of the track's
+    // text anywhere on it), while the track's box held ink where it was last read,
+    // and aligned ink links the two keyframes. Needs no registration: a view with
+    // nothing on it cannot be registered, and an erased last element leaves
+    // exactly that.
+    let canvas_blanked = |t: &Track, f: usize| -> bool {
+        let (Some(probe), Some(c)) = (probe, canvases[f]) else {
+            return false;
+        };
+        let rp = &params.region_probe;
+        let text = normalize(&t.text());
+        if frames[f].ocr_anchors.iter().any(|a| {
+            let a = normalize(&a.text);
+            !a.is_empty() && (text.contains(a.as_str()) || a.contains(text.as_str()))
+        }) {
+            return false;
+        }
+        let Some((s, sb)) = t
+            .obs
+            .iter()
+            .filter(|o| o.frame < f)
+            .filter_map(|o| o.raw_bbox.map(|rb| (o.frame, rb)))
+            .max_by_key(|x| x.0)
+        else {
+            return false;
+        };
+        // The blank view must be the same view: every board keyframe since the
+        // last sighting was compared with its predecessor on aligned ink (a pan
+        // or a cut the aligner cannot follow leaves the ink unknown), and the ink
+        // changed on the way. A flat canvas has nothing to align on, so a link
+        // between two adjacent keyframes that are both confidently blank is
+        // measured from the pixels instead: no change. A link from content into
+        // a blank view stays unknown when the aligner could not measure it: an
+        // erasure, a pan and a cut to empty canvas look the same there, and the
+        // element stays.
+        let kid = |k: usize| frames[k].keyframe_id.as_str();
+        let link = |k: usize| -> Option<f64> {
+            if let Some(x) = frames[k].ink_change {
+                return Some(x);
+            }
+            let adjacent = k > 0 && frames[k - 1].keyframe_index + 1 == frames[k].keyframe_index;
+            (adjacent
+                && probe.uniform(kid(k)) == Some(true)
+                && probe.uniform(kid(k - 1)) == Some(true))
+            .then_some(0.0)
+        };
+        let chain: Vec<Option<f64>> = (s + 1..=f).map(link).collect();
+        if !chain.iter().all(Option::is_some)
+            || !chain
+                .iter()
+                .flatten()
+                .any(|&x| x >= params.ink_event_threshold)
+        {
+            return false;
+        }
+        let whole = BBox::new(0.0, 0.0, c.width, c.height);
+        match (
+            probe.ink_share(&frames[s].keyframe_id, &sb),
+            probe.ink_share(&frames[f].keyframe_id, &whole),
+        ) {
+            (Some(before), Some(now)) => before >= rp.min_ink_share && now <= rp.blank_canvas_share,
+            _ => false,
+        }
+    };
+    // `Visible` only when keyframe `f` really covers the track's place: inside the
+    // view (`track_visible`), no OCR text of the track there, and either other
+    // content near or the place's pixels emptied.
+    let track_covered = |t: &Track, f: usize| -> Visibility {
+        if canvas_blanked(t, f) {
+            return Visibility::Visible;
+        }
+        if track_visible(t, f) != Visibility::Visible {
+            return Visibility::Unknown;
+        }
+        let Some(b) = t.bbox_in(regs[f].cluster) else {
+            return Visibility::Unknown;
+        };
+        if ocr_reads(f, &normalize(&t.text()), &b) {
+            return Visibility::Unknown;
+        }
+        let c = ((b.x1 + b.x2) / 2.0, (b.y1 + b.y2) / 2.0);
+        let corroborated = coverage_radius.is_finite()
+            && content[f]
+                .iter()
+                .any(|p| ((p.0 - c.0).powi(2) + (p.1 - c.1).powi(2)).sqrt() <= coverage_radius);
+        if corroborated || region_gone(t, f, &b) {
+            Visibility::Visible
+        } else {
+            Visibility::Unknown
+        }
+    };
     let support = SupportParams {
         min_keyframes: params.min_support_keyframes,
         min_density: params.min_support_density,
@@ -871,7 +1241,7 @@ pub fn consolidate(
                     if seen.binary_search(&f).is_ok() {
                         Visibility::Unknown
                     } else {
-                        track_visible(t, f)
+                        track_covered(t, f)
                     }
                 },
                 n,
@@ -894,7 +1264,8 @@ pub fn consolidate(
         .collect();
 
     // Final window: the last contiguous run of board keyframes, trimmed to
-    // `final_window_s` before its end.
+    // `final_window_s` before its end. It dates the final state; which elements
+    // belong to it is decided by removal evidence, not by this window.
     let final_frames: Vec<usize> = if n == 0 {
         Vec::new()
     } else {
@@ -908,7 +1279,9 @@ pub fn consolidate(
             .collect();
         let want = params.min_final_keyframes.max(1).min(n);
         if v.len() < want {
-            v = (n - want..n).collect();
+            // Extend backward within the contiguous run only: an earlier run is
+            // another stretch of the meeting (a classify switch between them).
+            v = ((n - want).max(start)..n).collect();
         }
         v
     };
@@ -929,14 +1302,12 @@ pub fn consolidate(
         keyframes: iv.count as u32,
         removed_at_s: iv.removed_at.map(|f| frames[f].t_start_s),
     };
-    let alive_in_final = |ivs: &[Interval]| -> bool {
-        let Some(w) = &window else {
-            return false;
-        };
-        ivs.iter().any(|iv| {
-            iv.removed_at.is_none()
-                && frames[iv.first].t_start_s <= w.end_s
-                && frames[iv.last].t_end_s >= w.start_s
+    // Final: observed and not later removed (see the module docs). A single
+    // sighting that was never placed on the board cannot be checked against later
+    // views, so it is not final.
+    let alive_in_final = |ivs: &[Interval], placed: bool| -> bool {
+        ivs.last().is_some_and(|iv| {
+            iv.removed_at.is_none() && (placed || iv.count >= params.min_support_keyframes)
         })
     };
     let largest_cluster = {
@@ -959,6 +1330,49 @@ pub fn consolidate(
     let mut sticky_id: HashMap<usize, String> = HashMap::new();
     let mut nodes: Vec<NodeState> = Vec::new();
     let mut stickies: Vec<StickyState> = Vec::new();
+    // A node read in a single keyframe with the text of an established node (seen
+    // in at least `min_support_keyframes` keyframes, and not read in that keyframe)
+    // is that node read at an imprecise place: it never becomes a second final
+    // element.
+    let mut established: HashMap<String, Vec<(usize, Vec<usize>)>> = HashMap::new();
+    for (ti, t) in tracks.iter().enumerate() {
+        if !track_intervals[ti].is_empty() && t.votes().kind() == ObsList::Node {
+            established
+                .entry(normalize(&t.text()))
+                .or_default()
+                .push((ti, t.frames()));
+        }
+    }
+    // OCR reading the text at the single sighting's own place says the element is
+    // really there (OCR boxes are pixel-accurate): a second element with that text,
+    // not an echo.
+    let ocr_at_own_place = |t: &Track| -> bool {
+        let text = normalize(&t.text());
+        t.obs.iter().any(|o| {
+            o.bbox.is_some_and(|b| {
+                ocr_ref[o.frame].iter().any(|(a, ab)| {
+                    let c = ((ab.x1 + ab.x2) / 2.0, (ab.y1 + ab.y2) / 2.0);
+                    c.0 >= b.x1
+                        && c.0 <= b.x2
+                        && c.1 >= b.y1
+                        && c.1 <= b.y2
+                        && (text.contains(a.as_str()) || a.contains(text.as_str()))
+                })
+            })
+        })
+    };
+    let echo_of_established = |ti: usize, t: &Track| -> bool {
+        let seen = t.frames();
+        seen.len() == 1
+            && !ocr_at_own_place(t)
+            && established.get(&normalize(&t.text())).is_some_and(|v| {
+                v.iter().any(|(u, frames)| {
+                    *u != ti
+                        && frames.len() >= params.min_support_keyframes
+                        && !frames.contains(&seen[0])
+                })
+            })
+    };
     for &ti in &order {
         let t = &tracks[ti];
         let ivs = &track_intervals[ti];
@@ -984,7 +1398,8 @@ pub fn consolidate(
                     variant_counts,
                     last_seen_s: lifetimes.iter().map(|l| l.last_seen_s).reduce(f64::max),
                     lifetimes,
-                    in_final: alive_in_final(ivs),
+                    in_final: alive_in_final(ivs, t.obs.iter().any(|o| o.bbox.is_some()))
+                        && !echo_of_established(ti, t),
                     registration: if t.obs.iter().any(|o| o.bbox.is_some()) {
                         ElementRegistration::Position
                     } else {
@@ -1012,7 +1427,7 @@ pub fn consolidate(
                     bbox: largest_cluster.and_then(|c| t.bbox_in(c)),
                     last_seen,
                     lifetimes,
-                    in_final: alive_in_final(ivs),
+                    in_final: alive_in_final(ivs, t.obs.iter().any(|o| o.bbox.is_some())),
                 });
             }
             ObsList::Other | ObsList::EdgeLabel => {}
@@ -1103,20 +1518,239 @@ pub fn consolidate(
             .unwrap_or_default()
     };
 
+    // Keyframe `s` coordinates to keyframe `f` coordinates through the cluster
+    // reference (both registered in one cluster), with the scale factor.
+    let s_to_f = |s: usize, f: usize| -> Option<(Similarity, f64)> {
+        if !(positioned(s) && positioned(f)) || regs[s].cluster != regs[f].cluster {
+            return None;
+        }
+        let t = regs[f]
+            .to_reference
+            .inverse()?
+            .compose(&regs[s].to_reference);
+        (t.scale.is_finite() && t.scale > 0.0).then_some((t, t.scale))
+    };
+    // The straight corridor between the boxes of tracks `a` and `b` as read in
+    // keyframe `s` (both read there): its two ends and half width, in `s`
+    // coordinates.
+    type Corridor = ((f64, f64), (f64, f64), f64);
+    let corridor_geom = |a: &Track, b: &Track, s: usize| -> Option<Corridor> {
+        let raw = |t: &Track| t.obs.iter().find(|o| o.frame == s).and_then(|o| o.raw_bbox);
+        let (ba, bb) = (raw(a)?, raw(b)?);
+        let (ca, cb) = (
+            ((ba.x1 + ba.x2) / 2.0, (ba.y1 + ba.y2) / 2.0),
+            ((bb.x1 + bb.x2) / 2.0, (bb.y1 + bb.y2) / 2.0),
+        );
+        let half =
+            (params.region_probe.corridor_half_width_share * ba.height().min(bb.height())).max(3.0);
+        Some((exit_point(&ba, cb), exit_point(&bb, ca), half))
+    };
+    // The straight corridor's line cover of the edge between `a` and `b`, read in
+    // keyframe `s` and missing in `f`, measured on the same board pixels in both
+    // keyframes (the geometry is taken where the edge was read and mapped into
+    // `f`, so reader box jitter in `f` does not move the corridor).
+    // `(cover_s, cover_f)`; `None` without pixels or a common registration.
+    let edge_cover = |a: &Track, b: &Track, s: usize, f: usize| -> Option<(f64, f64)> {
+        let probe = probe?;
+        let (p, q, half) = corridor_geom(a, b, s)?;
+        let (t, k) = s_to_f(s, f)?;
+        let (ks, kf) = (&frames[s].keyframe_id, &frames[f].keyframe_id);
+        Some((
+            probe.line_cover(ks, p, q, half)?,
+            probe.line_cover(kf, t.apply(p), t.apply(q), half * k)?,
+        ))
+    };
+    // A connector between tracks `a` and `b` (read in keyframe `s`) traced on the
+    // pixels, whatever route it takes: `Trace::Gone` when the stroke that joined
+    // the two boxes in `s` no longer joins them in `f` and the ink it was traced
+    // through fell; `Trace::Broken` when it no longer joins them but the ink did
+    // not fall (ink added nearby); `Trace::Joined` when it still joins them;
+    // `Trace::Untraced` when the probe does not trace strokes at all
+    // ([`RegionProbe::traces`]); `Trace::Inconclusive` when the pixels cannot
+    // tell: no trace in `s` from a probe that traces (a degenerate region, boxes
+    // too close to trace between), the stroke did not join the boxes in `s` (dashed, or occluded by a
+    // card read on its route), no common registration, an end read in `f` away
+    // from where `s` puts it (a moved card takes its connector along), or any
+    // other element over the traced region added, removed, moved or left unread
+    // between the two keyframes (a
+    // card placed on a connector hides part of it, a card moved off it may let it
+    // be rerouted through the place it left). The other elements are masked out at
+    // their boxes in each keyframe, so an unchanged card between the ends neither
+    // vetoes nor fakes the erasure, and an unread mark erased near the ends does
+    // not break a stroke that is still drawn. Traces in `s` are cached per
+    // (a, b, s).
+    let raw_at = |t: &Track, k: usize| t.obs.iter().find(|o| o.frame == k).and_then(|o| o.raw_bbox);
+    let others = |a: usize, b: usize| {
+        tracks
+            .iter()
+            .enumerate()
+            .filter(move |(i, _)| *i != a && *i != b)
+            .map(|(_, x)| x)
+    };
+    // (trace, traced region, band width) in the keyframe that read the edge.
+    type Traced = Option<(StrokeTrace, BBox, f64)>;
+    let traced: std::cell::RefCell<HashMap<(usize, usize, usize), Traced>> =
+        std::cell::RefCell::new(HashMap::new());
+    let routed_trace = |a: usize, b: usize, s: usize, f: usize| -> Trace {
+        let Some(probe) = probe else {
+            return Trace::Untraced;
+        };
+        let (ta, tb) = (&tracks[a], &tracks[b]);
+        let (Some(ba), Some(bb)) = (raw_at(ta, s), raw_at(tb, s)) else {
+            return Trace::Inconclusive;
+        };
+        let Some((t, k)) = s_to_f(s, f) else {
+            return Trace::Inconclusive;
+        };
+        let center = |r: &BBox| ((r.x1 + r.x2) / 2.0, (r.y1 + r.y2) / 2.0);
+        let inside =
+            |c: (f64, f64), m: &BBox| c.0 >= m.x1 && c.0 <= m.x2 && c.1 >= m.y1 && c.1 <= m.y2;
+        for (tr, bs) in [(ta, &ba), (tb, &bb)] {
+            if let Some(r) = raw_at(tr, f) {
+                if !inside(center(&r), &map_bbox(&t, bs)) {
+                    return Trace::Inconclusive;
+                }
+            }
+        }
+        let rp = &params.region_probe;
+        let before = *traced.borrow_mut().entry((a, b, s)).or_insert_with(|| {
+            let ring = (rp.corridor_half_width_share * ba.height().min(bb.height())).max(3.0);
+            let margin = rp.stroke_margin_share * ba.height().max(bb.height());
+            let region = BBox::new(
+                ba.x1.min(bb.x1) - margin,
+                ba.y1.min(bb.y1) - margin,
+                ba.x2.max(bb.x2) + margin,
+                ba.y2.max(bb.y2) + margin,
+            );
+            let masks: Vec<BBox> = others(a, b).filter_map(|x| raw_at(x, s)).collect();
+            probe
+                .stroke_between(&frames[s].keyframe_id, &ba, &bb, &region, &masks, ring)
+                .map(|x| (x, region, ring))
+        });
+        let Some((before, region, ring)) = before else {
+            return if probe.traces() {
+                Trace::Inconclusive
+            } else {
+                Trace::Untraced
+            };
+        };
+        if !before.joined {
+            return Trace::Inconclusive;
+        }
+        // Every other element over the traced region is read in both keyframes at
+        // the same place (within the band width).
+        let region_f = map_bbox(&t, &region);
+        let meets = |r: &BBox| {
+            r.x1 < region_f.x2 && region_f.x1 < r.x2 && r.y1 < region_f.y2 && region_f.y1 < r.y2
+        };
+        let mut masks = Vec::new();
+        for x in others(a, b) {
+            let (at_s, at_f) = (raw_at(x, s).map(|r| map_bbox(&t, &r)), raw_at(x, f));
+            if !(at_s.as_ref().is_some_and(meets) || at_f.as_ref().is_some_and(meets)) {
+                continue;
+            }
+            let (Some(ms), Some(rf)) = (at_s, at_f) else {
+                return Trace::Inconclusive;
+            };
+            let (cs, cf) = (center(&ms), center(&rf));
+            if (cs.0 - cf.0).hypot(cs.1 - cf.1) > ring * k {
+                return Trace::Inconclusive;
+            }
+            masks.push(rf);
+        }
+        let Some(now) = probe.stroke_between(
+            &frames[f].keyframe_id,
+            &map_bbox(&t, &ba),
+            &map_bbox(&t, &bb),
+            &region_f,
+            &masks,
+            ring * k,
+        ) else {
+            return Trace::Inconclusive;
+        };
+        if now.joined {
+            return Trace::Joined;
+        }
+        let fell = now.ink <= before.ink - rp.min_ink_drop.max(rp.min_ink_drop_share * before.ink);
+        if fell {
+            Trace::Gone
+        } else {
+            Trace::Broken
+        }
+    };
+
     let mut edges: Vec<EdgeState> = Vec::new();
     let mut edge_id_of: HashMap<(usize, usize), String> = HashMap::new();
     let mut edge_intervals: HashMap<(usize, usize), Vec<Interval>> = HashMap::new();
     for (&(a, b), list) in &edge_obs {
         let seen: Vec<usize> = list.iter().map(|o| o.frame).collect();
         let (ta, tb) = (&tracks[a], &tracks[b]);
+        // Pixel verdict for keyframe `f` against the last keyframe `s` that read the
+        // edge: `Some(true)` the straight line is still drawn, `Some(false)` it is
+        // gone, `None` when the corridor cannot tell (a routed connector leaves it).
+        let rp = &params.region_probe;
+        let last_read = |f: usize| seen.iter().rev().find(|&&s| s < f).copied();
+        let verdict = |f: usize| -> Option<bool> {
+            let (before, now) = edge_cover(ta, tb, last_read(f)?, f)?;
+            if before < rp.min_line_cover {
+                return None;
+            }
+            let ratio = now / before;
+            if ratio >= rp.still_drawn_ratio {
+                Some(true)
+            } else if ratio <= rp.gone_ratio {
+                Some(false)
+            } else {
+                None
+            }
+        };
         let ivs = intervals(
             &seen,
+            // An edge is absent from a keyframe that read both of its ends (or
+            // covers both places) without reading the edge only with evidence that
+            // the connector is gone: readers often leave a connector out of one
+            // reading. The corridor's pixels decide when they can; otherwise the
+            // board's aligned ink must have changed since the edge was last read,
+            // and (with pixels) the ink around the edge's ends must have fallen.
             |f| {
                 if seen.contains(&f) {
-                    Visibility::Unknown
-                } else if track_visible(ta, f) == Visibility::Visible
-                    && track_visible(tb, f) == Visibility::Visible
-                {
+                    return Visibility::Unknown;
+                }
+                let present = |t: &Track| {
+                    t.obs.iter().any(|o| o.frame == f && o.bbox.is_some())
+                        || track_covered(t, f) == Visibility::Visible
+                };
+                if !(present(ta) && present(tb)) {
+                    return Visibility::Unknown;
+                }
+                // A corridor that emptied needs evidence about the connector
+                // itself: its own traced stroke gone, or broken (a straight
+                // connector erased while ink is added near it). A stroke still
+                // joined, or a trace that cannot tell (the stroke never joined
+                // the boxes in `s`, being dashed or occluded by a card read on
+                // its route, or the region changed around it), keeps the
+                // connector: an unread straight mark erased across the corridor
+                // of a connector routed around it is not the connector. Only a
+                // probe that traces nothing leaves the corridor to decide alone.
+                let trace =
+                    || last_read(f).map_or(Trace::Inconclusive, |s| routed_trace(a, b, s, f));
+                let gone = match verdict(f) {
+                    Some(true) => false,
+                    Some(false) => matches!(trace(), Trace::Gone | Trace::Broken | Trace::Untraced),
+                    None => {
+                        let from = last_read(f).map_or(0, |s| s + 1);
+                        let inked = (from..=f).any(|k| {
+                            frames[k]
+                                .ink_change
+                                .is_some_and(|x| x >= params.ink_event_threshold)
+                        });
+                        // With pixels, the traced stroke must say the connector went
+                        // (pixels that cannot tell keep it); without pixels, the board
+                        // ink is all there is to go on.
+                        inked && (probe.is_none() || trace() == Trace::Gone)
+                    }
+                };
+                if gone {
                     Visibility::Visible
                 } else {
                     Visibility::Unknown
@@ -1205,7 +1839,7 @@ pub fn consolidate(
                 EdgeStyle::Solid
             },
             lifetimes: ivs.iter().map(lifetime).collect(),
-            in_final: alive_in_final(&ivs) && final_node(a) && final_node(b),
+            in_final: alive_in_final(&ivs, true) && final_node(a) && final_node(b),
         });
     }
 
@@ -1522,6 +2156,8 @@ pub fn consolidate(
         detail,
         ink_change: frames[f].ink_change,
         baseline: f == 0,
+        owner_target: None,
+        owner_from: None,
     };
     for &ti in &order {
         if lifted.contains(&ti) {
@@ -1588,12 +2224,16 @@ pub fn consolidate(
         } else {
             EventKind::OwnerAssigned
         };
-        gate.offer(event(
-            kind,
-            f,
-            &a.person_id,
-            format!("{} -> {}", a.display_name, a.target.texts().join(" - ")),
-        ));
+        gate.offer(BoardEvent {
+            owner_target: Some(a.target.clone()),
+            owner_from: a.moved_from.clone(),
+            ..event(
+                kind,
+                f,
+                &a.person_id,
+                format!("{} -> {}", a.display_name, a.target.texts().join(" - ")),
+            )
+        });
     }
     let (events, suppressed_events) = gate.finish();
     // Lifted tracks leave the node and sticky lists.

@@ -104,8 +104,14 @@ fn text(t: &str, x: u32, y: u32) -> Option<String> {
     })
 }
 
-/// A three-slide synthetic meeting (6 s each) with or without a tone.
-fn make_video(path: &Path, audio: bool) {
+/// A 440 Hz tone as the audio track.
+const TONE: &str = "sine=frequency=440:sample_rate=16000:duration=18";
+/// A silent audio track (an audio stream with no speech).
+const SILENCE: &str = "anullsrc=channel_layout=mono:sample_rate=16000";
+
+/// A three-slide synthetic meeting (6 s each) with an audio track from the
+/// given lavfi source, or none.
+fn make_video(path: &Path, audio: Option<&str>) {
     let board_a: Vec<String> = [
         Some(outline(LEDGER)),
         Some(outline(ORBIT)),
@@ -151,13 +157,8 @@ fn make_video(path: &Path, audio: bool) {
         "-filter_complex",
         &graph,
     ]);
-    if audio {
-        cmd.args([
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=frequency=440:sample_rate=16000:duration=18",
-        ]);
+    if let Some(src) = audio {
+        cmd.args(["-f", "lavfi", "-i", src]);
         cmd.args(["-map", "[v]", "-map", "0:a", "-c:a", "aac", "-shortest"]);
     } else {
         cmd.args(["-map", "[v]"]);
@@ -397,19 +398,69 @@ impl DiarizeEngine for ScriptedDiarizer {
     }
 }
 
+/// ASR on a silent track: voice activity detection finds no speech.
+struct SilentAsr;
+
+impl AsrEngine for SilentAsr {
+    fn describe(&self) -> Value {
+        json!({"engine": "silent-asr"})
+    }
+    fn transcribe(
+        &self,
+        samples: &[f32],
+        vocabulary: &[String],
+    ) -> glassrip_audio::Result<AsrOutput> {
+        assert!(!samples.is_empty(), "the silent track still has samples");
+        Ok(AsrOutput {
+            segments: vec![],
+            chunk_spans: vec![],
+            speech_regions: 0,
+            prompt_tokens: 0,
+            prompt_terms: vocabulary.to_vec(),
+            backend: "scripted".into(),
+        })
+    }
+}
+
+/// Diarization of a silent track: no turns and no labels.
+struct SilentDiarizer;
+
+impl DiarizeEngine for SilentDiarizer {
+    fn describe(&self) -> Value {
+        json!({"engine": "silent-diarizer"})
+    }
+    fn diarize(&self, _samples: &[f32]) -> glassrip_audio::Result<Diarization> {
+        Ok(Diarization {
+            turns: vec![],
+            labels: vec![],
+            talk_time_s: vec![],
+            num_clusters_raw: 0,
+            active_s: 0.0,
+            centroids: vec![],
+        })
+    }
+}
+
 /// Text model answering every notes call with the same cited draft; logs the
 /// phase C model sequence.
 struct ScriptedText {
     log: Mutex<Vec<String>>,
     resident: Mutex<Vec<String>>,
+    digest: String,
 }
 
 impl ScriptedText {
     fn new() -> Self {
+        Self::with_digest("sha256:scripted-text")
+    }
+
+    /// The same model name serving other weights (a retag).
+    fn with_digest(digest: &str) -> Self {
         Self {
             log: Mutex::new(Vec::new()),
             // The vision model is still loaded when phase C starts.
             resident: Mutex::new(vec![VISION_MODEL.into()]),
+            digest: digest.into(),
         }
     }
 }
@@ -465,7 +516,7 @@ impl TextBackend for ScriptedText {
             .collect())
     }
     async fn digest(&self, _model: &str) -> Result<Option<String>, LlmError> {
-        Ok(Some("sha256:scripted-text".into()))
+        Ok(Some(self.digest.clone()))
     }
 }
 
@@ -570,7 +621,7 @@ async fn meeting_mode_end_to_end_on_a_synthetic_video() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let video = root.join("weekly-sync.mp4");
-    make_video(&video, true);
+    make_video(&video, Some(TONE));
     let out = root.join("weekly-sync.glassrip");
     let log = out.join(meeting::logging::RUN_LOG);
 
@@ -739,6 +790,9 @@ async fn meeting_mode_end_to_end_on_a_synthetic_video() {
         ));
         b.text = Ok(Arc::new(DownText));
         b.text_offline = Some("server down in this test".into());
+        // As `Backends::connect` does offline: the recorded text digest keys notes.
+        b.model_digests
+            .insert(TEXT_MODEL.into(), recorded[TEXT_MODEL].clone());
         b
     };
     let cached = run_meeting(
@@ -765,6 +819,42 @@ async fn meeting_mode_end_to_end_on_a_synthetic_video() {
     assert!(
         matches!(&err, glassrip::meeting::MeetingError::Offline { stage, .. } if stage == "board_read"),
         "{err}"
+    );
+
+    // ---- Codex final round 3: other weights retagged under the same text model
+    // name do not restore the old notes; the notes are asked again.
+    let retagged = Arc::new(ScriptedText::with_digest("sha256:retagged-text"));
+    let rerun = run_meeting(
+        &opts,
+        backends(&out.join(meeting::RAW_RESPONSES_DIR), Arc::clone(&retagged)),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let status = |stage: &str| {
+        rerun
+            .reports
+            .iter()
+            .find(|r| r.stage == stage)
+            .map(|r| r.status)
+    };
+    assert_eq!(status("notes"), Some(StageStatus::Ok));
+    assert_eq!(status("board_state"), Some(StageStatus::Cached));
+    assert!(
+        retagged
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.starts_with("chat ")),
+        "the retagged model was asked"
+    );
+    assert_eq!(
+        manifest(&out)
+            .model_digests
+            .get(TEXT_MODEL)
+            .map(String::as_str),
+        Some("sha256:retagged-text")
     );
 
     // ---- --from-stage board_read with a large model that is not loaded yet:
@@ -813,7 +903,7 @@ async fn meeting_mode_end_to_end_on_a_synthetic_video() {
 
     // ---- a video without an audio stream: empty transcript, board-only notes.
     let silent = root.join("silent-board.mp4");
-    make_video(&silent, false);
+    make_video(&silent, None);
     let out2 = root.join("silent-board.glassrip");
     let outcome2 = run_meeting(
         &options(silent, out2.clone(), root),
@@ -907,10 +997,27 @@ async fn score_run_with_eval(root: &Path, run: &Path) {
     .unwrap()
     .args;
     let outcome = glassrip_eval::cli::run(args).await.unwrap();
-    assert!(outcome.passed, "{:?}", outcome.status);
     let report: Value =
         serde_json::from_slice(&std::fs::read(report_dir.join("eval_report.json")).unwrap())
             .unwrap();
+    // The scripted run names nobody (no tile names on the synthetic video), so the
+    // post-mapping speaker check has nothing to score and fails the suite; every
+    // other gate passes and every section is scored.
+    let failed: Vec<&Value> = report["gates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|g| g["pass"] != json!(true))
+        .collect();
+    assert!(!outcome.passed, "{:?}", outcome.status);
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert!(
+        failed[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("glassrip.speakers names nobody"),
+        "{failed:?}"
+    );
     let metric = |k: &str| {
         report["metrics"][k]["mean"]
             .as_f64()
@@ -923,4 +1030,153 @@ async fn score_run_with_eval(root: &Path, run: &Path) {
     assert_eq!(metric("notes.action.recall"), 1.0);
     assert_eq!(metric("audio.speaker_labels"), 2.0);
     assert_eq!(report["not_run"], json!([]), "{}", report["not_run"]);
+}
+
+/// A screencast with a silent audio track and no participant list: the audio
+/// chain runs and finds no speech, no participant names are known, and the run
+/// still names speakers (none), writes board-only notes and renders.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn meeting_mode_survives_a_silent_track_without_participants() {
+    if !require_ffmpeg() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let video = root.join("silent-talk.mp4");
+    make_video(&video, Some(SILENCE));
+    let out = root.join("silent-talk.glassrip");
+    let text = Arc::new(ScriptedText::new());
+    let mut b = backends(&out.join(meeting::RAW_RESPONSES_DIR), Arc::clone(&text));
+    b.asr = Ok(Arc::new(SilentAsr));
+    b.diarize = Ok(Arc::new(SilentDiarizer));
+    let mut opts = options(video, out.clone(), root);
+    opts.participants = vec![];
+    let outcome = run_meeting(&opts, b, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let audio: Vec<Value> = items(&out, "glassrip.audio");
+    assert_eq!(audio[0]["has_audio"], json!(true), "the track is there");
+    let transcript: Vec<Value> = items(&out, "glassrip.transcript");
+    assert!(
+        transcript.is_empty(),
+        "silence yields no transcript segments"
+    );
+    let m = manifest(&out);
+    for stage in ["name_speakers", "notes", "render"] {
+        assert_eq!(m.stages[stage].status, StageStatus::Ok, "{stage}");
+    }
+    let speakers: Vec<Value> = items(&out, "glassrip.speakers");
+    let kinds: Vec<&str> = speakers.iter().filter_map(|r| r["kind"].as_str()).collect();
+    assert_eq!(kinds, vec!["summary"], "{speakers:?}");
+    assert!(
+        speakers[0]["method"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("none: no transcript segments")),
+        "{speakers:?}"
+    );
+    assert!(
+        speakers[0]["notes"]
+            .as_str()
+            .is_some_and(|n| n.contains("no participant names")),
+        "no names were known either (the failing case): {speakers:?}"
+    );
+    let notes: Vec<MeetingNotes> = items(&out, "glassrip.meeting_notes");
+    assert_eq!(notes[0].caveats[0].kind, "no_audio");
+    assert!(notes[0].people.is_empty());
+    assert!(
+        !text
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("chat")),
+        "board-only notes call no model"
+    );
+    assert!(outcome
+        .outputs
+        .iter()
+        .any(|p| p.ends_with("silent-talk-meeting-notes.md")));
+}
+
+/// Final review (Codex 6): a recording without speech needs no text model.
+/// Preflight passes with the text model missing, the notes come from the
+/// board alone, and the rendered header has no empty participants row and
+/// takes its length from the media, not "0 min".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_silent_track_needs_no_text_model() {
+    if !require_ffmpeg() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let video = root.join("silent-demo.mp4");
+    make_video(&video, Some(SILENCE));
+    let out = root.join("silent-demo.glassrip");
+    let mut b = backends(
+        &out.join(meeting::RAW_RESPONSES_DIR),
+        Arc::new(ScriptedText::new()),
+    );
+    b.text = Err(format!("text model {TEXT_MODEL} is not available"));
+    b.asr = Ok(Arc::new(SilentAsr));
+    b.diarize = Ok(Arc::new(SilentDiarizer));
+    let mut opts = options(video, out.clone(), root);
+    opts.participants = vec![];
+    let outcome = run_meeting(&opts, b, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let m = manifest(&out);
+    for stage in ["notes", "render"] {
+        assert_eq!(m.stages[stage].status, StageStatus::Ok, "{stage}");
+    }
+    let notes: Vec<MeetingNotes> = items(&out, "glassrip.meeting_notes");
+    assert_eq!(notes[0].caveats[0].kind, "no_audio");
+    assert!(notes[0].transcript.is_empty() && notes[0].people.is_empty());
+    let md_path = outcome
+        .outputs
+        .iter()
+        .find(|p| p.ends_with("silent-demo-meeting-notes.md"))
+        .expect("rendered notes");
+    let md = std::fs::read_to_string(md_path).unwrap();
+    assert!(!md.contains("Participants"), "{md}");
+    assert!(md.contains("| **Length** | 18 s |"), "{md}");
+    assert!(!md.contains("0 min"), "{md}");
+}
+
+/// Final review (Codex 6), the other half: with speech, a missing text model
+/// still stops the run at `notes` with a clear error (it is no longer a
+/// preflight failure, because only the transcript tells whether it is needed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn speech_without_a_text_model_stops_at_notes() {
+    if !require_ffmpeg() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let video = root.join("spoken.mp4");
+    make_video(&video, Some(TONE));
+    let out = root.join("spoken.glassrip");
+    let mut b = backends(
+        &out.join(meeting::RAW_RESPONSES_DIR),
+        Arc::new(ScriptedText::new()),
+    );
+    b.text = Err(format!("text model {TEXT_MODEL} is not available"));
+    let opts = options(video, out.clone(), root);
+    let err = run_meeting(&opts, b, CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, glassrip::meeting::MeetingError::Offline { stage, reason }
+            if stage == "notes" && reason.contains("not available")),
+        "{err}"
+    );
+    let m = manifest(&out);
+    assert_eq!(m.stages["assign_words"].status, StageStatus::Ok);
+    assert!(
+        m.stages
+            .get("notes")
+            .is_none_or(|s| s.status != StageStatus::Ok),
+        "notes did not run"
+    );
 }

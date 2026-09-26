@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use glassrip_audio::types::TranscriptSegment;
 use glassrip_core::envelope::{ErrorCode, ErrorInfo};
 use glassrip_core::runner::{
-    ArtifactSpec, InputDecl, ItemContext, Stage, StageError, StageInputs, WorkItem,
+    ArtifactSpec, InputDecl, ItemContext, KeyExtras, Stage, StageError, StageInputs, WorkItem,
 };
 use schemars::JsonSchema;
 use semver::Version;
@@ -71,8 +71,9 @@ pub struct NotesParams {
     /// prefixes from decisions and tasks.
     #[serde(default)]
     pub concise_items: bool,
-    /// Give the model owner-tag facts from the board as candidate decisions and
-    /// action items, citable by event or keyframe id.
+    /// Give the model owner-tag facts from the board, citable by event or
+    /// keyframe id: owner tags as candidate action items for their owner, owner
+    /// moves as candidate decisions.
     #[serde(default)]
     pub board_candidates: bool,
     /// List each window's decision and question cue sentences for the model to
@@ -85,7 +86,7 @@ pub struct NotesParams {
     /// Tell the reduce call which open questions the board already has.
     #[serde(default)]
     pub board_questions_in_reduce: bool,
-    /// Decisions need a speaker commitment or an owner-tag change.
+    /// Decisions need a speaker commitment or an owner tag moved on the board.
     #[serde(default)]
     pub precision_guard: bool,
     /// Owner tags valid at the end become "Own <target>" action items when the
@@ -162,12 +163,46 @@ pub struct NotesInput {
 pub struct NotesStage {
     params: NotesParams,
     backend: Arc<dyn TextBackend>,
+    text_needed: bool,
+    text_digest: Option<String>,
 }
 
 impl NotesStage {
-    /// A stage using `backend` for the text model.
+    /// A stage using `backend` for the text model. Until
+    /// [`NotesStage::with_text_digest`] pins the model's weights (or
+    /// [`NotesStage::without_text_model`] says none is needed) the stage is not
+    /// cacheable: a key without the weights could restore notes another model
+    /// wrote under the same name.
     pub fn new(params: NotesParams, backend: Arc<dyn TextBackend>) -> Self {
-        Self { params, backend }
+        Self {
+            params,
+            backend,
+            text_needed: true,
+            text_digest: None,
+        }
+    }
+
+    /// The text model is needed (the transcript has speech) and its digest,
+    /// resolved before the run, is `digest`: it keys the cache (weights retagged
+    /// under the same name do not restore the old notes), and a server that
+    /// serves another digest, or cannot confirm this one, is refused instead of
+    /// writing output under the pinned key. `None` (the digest is unknown) makes
+    /// the stage not cacheable.
+    #[must_use]
+    pub fn with_text_digest(mut self, digest: Option<String>) -> Self {
+        self.text_needed = true;
+        self.text_digest = digest;
+        self
+    }
+
+    /// No text model is needed: the transcript has no speech and the notes come
+    /// from the board alone, so the cache key names no model weights. A run that
+    /// finds speech after all is refused.
+    #[must_use]
+    pub fn without_text_model(mut self) -> Self {
+        self.text_needed = false;
+        self.text_digest = None;
+        self
     }
 
     fn model_err(e: impl std::fmt::Display) -> ErrorInfo {
@@ -274,8 +309,9 @@ impl NotesStage {
         let p = &self.params;
         let doc = &input.speakers;
         let lines = named_lines(&input.segments, doc);
-        if lines.is_empty() {
-            // no audio stream (or no speech): notes from the board alone
+        if !has_speech(&lines) {
+            // no audio stream, no speech, or only blank segments: notes from the
+            // board alone
             return Ok(self.board_only(input, started));
         }
         let mut table = AliasTable::default();
@@ -285,12 +321,54 @@ impl NotesStage {
                 table.add_alias(i, a);
             }
         }
+        // the participants (from the speakers artifact) are the meeting's people
         let people = table.people().to_vec();
+        if doc.people.is_empty() {
+            // no participant list and no tile names: the owner tags on the board
+            // still name people, who can then own action items (they are not
+            // listed as participants: an owner tag does not show attendance)
+            for o in input.boards.iter().flat_map(|b| &b.owner_assignments) {
+                // add_person keeps one person per slug
+                if !o.display_name.trim().is_empty() {
+                    table.add_person(o.display_name.trim());
+                }
+            }
+        }
         let corpus = Corpus::new(&lines, &input.boards, &input.keyframes, table);
         let digest = board_digest(&input.boards, &input.keyframes);
 
+        if !self.text_needed {
+            return Err(ErrorInfo::new(
+                ErrorCode::ModelRequest,
+                "the notes were keyed without a text model, but the transcript has speech",
+            ));
+        }
         let placement = self.enter_phase_c().await?;
         let model_digest = self.backend.digest(&p.text_model).await.ok().flatten();
+        // Spec 8.1: the digest keyed before the run must be the one answering.
+        if let Some(pinned) = &self.text_digest {
+            match &model_digest {
+                Some(now) if now == pinned => {}
+                Some(now) => {
+                    return Err(ErrorInfo::new(
+                        ErrorCode::ModelRequest,
+                        format!(
+                            "text model {} changed digest during the run ({pinned} keyed, {now} served)",
+                            p.text_model
+                        ),
+                    ))
+                }
+                None => {
+                    return Err(ErrorInfo::new(
+                        ErrorCode::ModelRequest,
+                        format!(
+                            "text model {} digest {pinned} was keyed but the server cannot confirm it",
+                            p.text_model
+                        ),
+                    ))
+                }
+            }
+        }
 
         let mut calls = Vec::new();
         let wins = match p.window_s {
@@ -679,7 +757,12 @@ impl NotesStage {
         }
         let mut open_questions = Vec::new();
         let added = merge_board_questions(&mut open_questions, &input.boards);
-        let duration_s = input.boards.iter().map(|b| b.end_s()).fold(0.0, f64::max);
+        let duration_s = input
+            .segments
+            .iter()
+            .map(|s| s.end_s)
+            .chain(input.boards.iter().map(|b| b.end_s()))
+            .fold(0.0, f64::max);
         let mut caveats = vec![Caveat {
             kind: "no_audio".into(),
             text: "No speech was transcribed (the recording has no audio stream or no words were recognized). These notes come from the whiteboard only: decisions, action items and the transcript are not available.".into(),
@@ -691,6 +774,12 @@ impl NotesStage {
             });
         }
         let items_kept = timeline.len() + summary.len() + open_questions.len();
+        // nothing was heard and nothing was read: the notes are empty
+        let status = if items_kept == 0 {
+            NotesStatus::Degraded
+        } else {
+            NotesStatus::Ok
+        };
         MeetingNotes {
             title: p.title.clone(),
             duration_s,
@@ -705,7 +794,7 @@ impl NotesStage {
             speakers: vec![],
             transcript: vec![],
             report: NotesReport {
-                status: NotesStatus::Ok,
+                status,
                 model: p.text_model.clone(),
                 model_digest: None,
                 windows: 0,
@@ -722,6 +811,11 @@ impl NotesStage {
             },
         }
     }
+}
+
+/// Some transcript line has words (a transcript of blank segments is no speech).
+fn has_speech(lines: &[NamedLine]) -> bool {
+    lines.iter().any(|l| !l.text.trim().is_empty())
 }
 
 /// Caveats computed from the inputs (never from model text).
@@ -742,6 +836,12 @@ fn caveats(
                 "These notes are incomplete ({}). Check them against the transcript.",
                 alarm.join("; ")
             ),
+        });
+    }
+    if doc.people.is_empty() {
+        out.push(Caveat {
+            kind: "no_participants".into(),
+            text: "No participant names were known (no participant list was given and no names were read from video tiles), so speakers are shown by their diarization label. Action items can only be assigned to everyone or to a person named by an owner tag on the board.".into(),
         });
     }
     let unresolved: Vec<String> = doc
@@ -881,7 +981,13 @@ impl Stage for NotesStage {
         "notes"
     }
     fn version(&self) -> u32 {
-        1
+        // 2: owner tags offered as action items and owner moves as decisions;
+        // blank transcripts take the board-only path
+        // 3: owner events matched to assignments by structured target id
+        // (the text model digest joined the key through `key_extras`, not the
+        // version: the output is unchanged, and a keyed digest already misses
+        // every entry written without one)
+        3
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
@@ -911,6 +1017,20 @@ impl Stage for NotesStage {
     }
     fn params(&self) -> &NotesParams {
         &self.params
+    }
+    fn key_extras(&self) -> KeyExtras {
+        KeyExtras {
+            model_digest: self
+                .text_digest
+                .as_ref()
+                .map(|d| format!("{}@{d}", self.params.text_model)),
+            ..KeyExtras::default()
+        }
+    }
+    /// Cacheable when the key identifies what the output depends on: no text
+    /// model (board-only notes), or the pinned digest of the one used.
+    fn cacheable(&self) -> bool {
+        !self.text_needed || self.text_digest.is_some()
     }
     fn item_timeout(&self) -> Option<Duration> {
         Some(Duration::from_secs(3 * 3600))
