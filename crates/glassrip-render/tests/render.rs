@@ -52,6 +52,7 @@ fn params(out: PathBuf) -> RenderParams {
         meta: MarkdownMeta {
             date: Some("2031-04-02, 10:00 to 10:02".into()),
             source: None,
+            media_duration_s: None,
         },
         fonts: bundled_fonts(),
         ..RenderParams::default()

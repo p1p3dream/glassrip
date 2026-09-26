@@ -864,6 +864,7 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
                             let c = (mid.0 + rad * a.cos(), mid.1 + rad * a.sin());
                             let r = R::new(c.0 - lw / 2.0, c.1 - lh / 2.0, lw, lh);
                             if r.x >= MARGIN / 2.0
+                                && r.right() <= width - MARGIN / 2.0
                                 && r.y >= LEGEND_BOTTOM
                                 && !taken.iter().any(|t| t.intersects(&r))
                             {

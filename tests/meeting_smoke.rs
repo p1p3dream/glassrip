@@ -1035,3 +1035,85 @@ async fn meeting_mode_survives_a_silent_track_without_participants() {
         .iter()
         .any(|p| p.ends_with("silent-talk-meeting-notes.md")));
 }
+
+/// Final review (Codex 6): a recording without speech needs no text model.
+/// Preflight passes with the text model missing, the notes come from the
+/// board alone, and the rendered header has no empty participants row and
+/// takes its length from the media, not "0 min".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_silent_track_needs_no_text_model() {
+    if !require_ffmpeg() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let video = root.join("silent-demo.mp4");
+    make_video(&video, Some(SILENCE));
+    let out = root.join("silent-demo.glassrip");
+    let mut b = backends(
+        &out.join(meeting::RAW_RESPONSES_DIR),
+        Arc::new(ScriptedText::new()),
+    );
+    b.text = Err(format!("text model {TEXT_MODEL} is not available"));
+    b.asr = Ok(Arc::new(SilentAsr));
+    b.diarize = Ok(Arc::new(SilentDiarizer));
+    let mut opts = options(video, out.clone(), root);
+    opts.participants = vec![];
+    let outcome = run_meeting(&opts, b, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let m = manifest(&out);
+    for stage in ["notes", "render"] {
+        assert_eq!(m.stages[stage].status, StageStatus::Ok, "{stage}");
+    }
+    let notes: Vec<MeetingNotes> = items(&out, "glassrip.meeting_notes");
+    assert_eq!(notes[0].caveats[0].kind, "no_audio");
+    assert!(notes[0].transcript.is_empty() && notes[0].people.is_empty());
+    let md_path = outcome
+        .outputs
+        .iter()
+        .find(|p| p.ends_with("silent-demo-meeting-notes.md"))
+        .expect("rendered notes");
+    let md = std::fs::read_to_string(md_path).unwrap();
+    assert!(!md.contains("Participants"), "{md}");
+    assert!(md.contains("| **Length** | 18 s |"), "{md}");
+    assert!(!md.contains("0 min"), "{md}");
+}
+
+/// Final review (Codex 6), the other half: with speech, a missing text model
+/// still stops the run at `notes` with a clear error (it is no longer a
+/// preflight failure, because only the transcript tells whether it is needed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn speech_without_a_text_model_stops_at_notes() {
+    if !require_ffmpeg() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let video = root.join("spoken.mp4");
+    make_video(&video, Some(TONE));
+    let out = root.join("spoken.glassrip");
+    let mut b = backends(
+        &out.join(meeting::RAW_RESPONSES_DIR),
+        Arc::new(ScriptedText::new()),
+    );
+    b.text = Err(format!("text model {TEXT_MODEL} is not available"));
+    let opts = options(video, out.clone(), root);
+    let err = run_meeting(&opts, b, CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, glassrip::meeting::MeetingError::Offline { stage, reason }
+            if stage == "notes" && reason.contains("not available")),
+        "{err}"
+    );
+    let m = manifest(&out);
+    assert_eq!(m.stages["assign_words"].status, StageStatus::Ok);
+    assert!(
+        m.stages
+            .get("notes")
+            .is_none_or(|s| s.status != StageStatus::Ok),
+        "notes did not run"
+    );
+}
