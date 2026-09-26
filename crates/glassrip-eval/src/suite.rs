@@ -69,6 +69,9 @@ pub struct SuiteRun {
     pub latencies_s: Vec<f64>,
     /// Hard-gate failures detected while scoring (for example degraded notes).
     pub gate_failures: Vec<String>,
+    /// Things a reader should know that fail nothing (for example a golden section
+    /// scored on a clock it did not declare).
+    pub warnings: Vec<String>,
 }
 
 fn put_prf(m: &mut Metrics, prefix: &str, c: Counts) {
@@ -750,6 +753,7 @@ pub fn run_meeting(
             }
         }
     }
+    run.warnings.extend(golden.clock_warnings());
     let m = &mut run.metrics;
     // Each section joins on the clock its golden declares (PTS unless declared).
     let screen_clock = golden.clock(ClockSection::ScreenTypes);

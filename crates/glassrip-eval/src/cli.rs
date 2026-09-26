@@ -278,6 +278,7 @@ fn base_report(suite: Suite, mode: &str, model: &str, runs: &[SuiteRun]) -> Eval
         metrics,
         gates: Vec::new(),
         not_run: first.not_run,
+        warnings: first.warnings,
         errors: first.errors,
         bench: None,
         details: first.details,

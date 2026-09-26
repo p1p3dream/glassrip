@@ -534,11 +534,19 @@ fn nominal_grid_labels_join_where_their_frame_was_taken() {
     g.clocks.screen_types = None;
     g.frame_clock = Some(grid);
     assert_eq!(score(&g), 1.0);
-    // A golden with screen labels must say which clock they are on.
+    // A golden without any clock scores as before clocks existed (PTS), and the
+    // report says so.
     let mut v = serde_json::to_value(&g).unwrap();
     v.as_object_mut().unwrap().remove("frame_clock");
     let g: MeetingGolden = serde_json::from_value(v).unwrap();
-    assert!(g.validate().is_err());
+    g.validate().unwrap();
+    assert_eq!(score(&g), 0.0);
+    let run = run_meeting(&g, &RunArtifacts::scan(d).unwrap(), 2.0).unwrap();
+    assert!(
+        run.warnings.iter().any(|w| w.contains("screen_types")),
+        "{:?}",
+        run.warnings
+    );
 }
 
 /// Kimi finding 4, Codex round-1 M7 and M8: probes, assignment windows, moves,

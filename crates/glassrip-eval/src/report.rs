@@ -312,6 +312,9 @@ pub struct EvalReport {
     /// Sections that could not run.
     #[serde(default)]
     pub not_run: Vec<String>,
+    /// Warnings that fail nothing (first repetition).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     /// Case errors (first repetition).
     #[serde(default)]
     pub errors: Vec<String>,
@@ -437,6 +440,12 @@ pub fn render_markdown(r: &EvalReport) -> String {
             b.per_keyframe_s.map_or("n/a".into(), |v| format!("{v:.2}"))
         );
     }
+    if !r.warnings.is_empty() {
+        let _ = writeln!(s, "\nWarnings:");
+        for w in &r.warnings {
+            let _ = writeln!(s, "- {w}");
+        }
+    }
     if !r.not_run.is_empty() {
         let _ = writeln!(s, "\nNot run:");
         for n in &r.not_run {
@@ -521,6 +530,7 @@ mod tests {
                 detail: "ok".into(),
             }],
             not_run: vec!["x".into()],
+            warnings: vec![],
             errors: vec![],
             bench: None,
             details: Value::Null,

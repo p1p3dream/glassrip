@@ -126,10 +126,12 @@ pub struct Trap {
 /// `t + INTERVAL`. A label at nominal `t` then describes what was on screen just
 /// before `t + INTERVAL`, while the pipeline's keyframes carry true PTS times, so the
 /// join maps the label there. Whether a golden's times are grid names is a property
-/// of how that golden was authored, never of the eval: a golden with screen labels
-/// or traps must declare their clock (those times have had two defaults), and every
-/// other section is on [`FrameClock::Pts`], the only way it was ever scored, unless
-/// the golden declares otherwise ([`GoldenClocks`]).
+/// of how that golden was authored, never of the eval: a section that declares no
+/// clock ([`GoldenClocks`]) is on [`FrameClock::Pts`], the eval's scoring before
+/// clocks existed, so an old golden scores as it did until it opts in. Screen
+/// labels and traps without a declared clock are reported as warnings
+/// ([`MeetingGolden::clock_warnings`]), since those are the times a golden may have
+/// named on the prototype grid.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FrameClock {
@@ -225,10 +227,8 @@ impl ClockSection {
     }
 }
 
-/// Per-section clocks ([`ClockSection`]). `screen_types` and `traps` must be declared
-/// when those sections have times (or through the legacy `frame_clock`); any other
-/// section left out is on [`FrameClock::Pts`]. Transcript times (hotword windows,
-/// notes) are always PTS.
+/// Per-section clocks ([`ClockSection`]). A section left out is on
+/// [`FrameClock::Pts`]. Transcript times (hotword windows, notes) are always PTS.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GoldenClocks {
@@ -356,6 +356,25 @@ impl MeetingGolden {
             .then_some(self.frame_clock)
             .flatten();
         self.clocks.get(section).or(legacy)
+    }
+
+    /// Warnings for frame-named sections (screen labels, traps) that have times but
+    /// declare no clock: they are scored on PTS, which is right for a golden timed
+    /// on the recording and wrong for one named on the prototype grid.
+    pub fn clock_warnings(&self) -> Vec<String> {
+        [
+            (ClockSection::ScreenTypes, !self.screen_types.is_empty()),
+            (ClockSection::Traps, !self.traps.is_empty()),
+        ]
+        .into_iter()
+        .filter(|(s, present)| *present && self.declared_clock(*s).is_none())
+        .map(|(s, _)| {
+            format!(
+                "golden {0} declare no clock and are scored on PTS; set clocks.{0} to pts or prototype_grid to say which",
+                s.name()
+            )
+        })
+        .collect()
     }
 
     /// The clock of one section: [`Self::declared_clock`], else [`FrameClock::Pts`].
@@ -495,20 +514,6 @@ impl MeetingGolden {
         }
         if let Some(c) = self.frame_clock {
             c.validate("frame_clock")?;
-        }
-        // Frame-named times have had two defaults (PTS, then the prototype grid), so
-        // any default would silently re-score some golden: they must say which.
-        for (section, present) in [
-            (ClockSection::ScreenTypes, !self.screen_types.is_empty()),
-            (ClockSection::Traps, !self.traps.is_empty()),
-        ] {
-            if present && self.declared_clock(section).is_none() {
-                return Err(golden_err(format!(
-                    "{} has times but no declared clock; set clocks.{} to {{\"kind\": \"pts\"}} or {{\"kind\": \"prototype_grid\", \"interval_s\": ...}}",
-                    section.name(),
-                    section.name()
-                )));
-            }
         }
         for section in ClockSection::ALL {
             self.clock(section).validate(section.name())?;
@@ -750,10 +755,10 @@ mod tests {
         assert!(bad.validate().is_err());
     }
 
-    /// Kimi round-1 B1, Codex round-1 m11: screen labels and traps have had two
-    /// default clocks, so a golden with either must declare which it uses.
+    /// Kimi round-1 B1, Codex round-1 m11: screen labels and traps with no declared
+    /// clock score on PTS (the scoring before clocks existed) and are reported.
     #[test]
-    fn frame_named_sections_must_declare_a_clock() {
+    fn undeclared_frame_clocks_are_reported() {
         let mut g = minimal();
         g.screen_type_ranges.clear();
         g.screen_types.push(ScreenLabel {
@@ -761,18 +766,18 @@ mod tests {
             screen_type: ScreenType::Whiteboard,
             confirmed: true,
         });
-        g.validate().unwrap();
+        assert!(g.clock_warnings().is_empty(), "screen clock declared");
         g.clocks.screen_types = None;
-        let e = g.validate().unwrap_err().to_string();
-        assert!(
-            e.contains("screen_types has times but no declared clock"),
-            "{e}"
-        );
+        g.validate().unwrap();
+        assert_eq!(g.clock(ClockSection::ScreenTypes), FrameClock::Pts);
+        let w = g.clock_warnings();
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("screen_types declare no clock"), "{w:?}");
         g.frame_clock = Some(FrameClock::PrototypeGrid {
             interval_s: 2.0,
             lead_s: 0.05,
         });
-        g.validate().unwrap();
+        assert!(g.clock_warnings().is_empty());
         g.frame_clock = None;
         g.clocks.screen_types = Some(FrameClock::Pts);
         g.traps.push(Trap {
@@ -782,9 +787,9 @@ mod tests {
             kind: "sidebar_chrome".into(),
             note: "synthetic".into(),
         });
-        assert!(g.validate().is_err(), "traps need a clock too");
+        assert_eq!(g.clock_warnings().len(), 1, "traps too");
         g.clocks.traps = Some(FrameClock::Pts);
-        g.validate().unwrap();
+        assert!(g.clock_warnings().is_empty());
     }
 
     /// Kimi finding 2: an alias that drops the name of its item is rejected.
