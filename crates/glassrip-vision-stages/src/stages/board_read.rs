@@ -17,9 +17,11 @@
 //! - A complete reply that lists one text at many places (see
 //!   [`glassrip_vision::degenerate`], judged against the keyframe's OCR spans)
 //!   is retried once with the repeat-penalty retry. When no retry is left, the
-//!   retry fails, or its reply is degenerate too, the reply is kept with each
-//!   repeated text reduced to its best-supported copies, and the request log
-//!   records it as a warning.
+//!   retry fails, or its reply is degenerate too, the copies the reply
+//!   fabricated go (piled copies down to one per pile, copies outside the
+//!   requested image, or a text that ran its list to `maxItems` down to its
+//!   best-supported copies), and the request log records it as a warning;
+//!   copies side by side on the canvas stay as read.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -34,7 +36,7 @@ use glassrip_vision::board::{
     BoardReading, OwnerTag, Sticky, TextItem, BOARD_READ_PROMPT, COMPACT_RETRY_NOTE,
     COMPACT_RETRY_SCALE,
 };
-use glassrip_vision::degenerate::{self, DegenerateParams};
+use glassrip_vision::degenerate::{self, DegenerateParams, ListCaps, ReplyFrame};
 use glassrip_vision::image_prep::{
     prepare_board_image_with, prepare_long_edge, BoardSizing, BOARD_LONG_EDGE, LOW_RES_THRESHOLD,
     LOW_RES_UPSCALE,
@@ -139,6 +141,24 @@ pub fn repetition_retry(p: &BoardReadParams, request: &VisionRequest) -> VisionR
     retry.options.num_predict = scaled.max(p.min_num_predict.min(request.options.num_predict));
     retry.repetition_guard = Some(p.repetition);
     retry
+}
+
+/// The `maxItems` of each list in a board request's schema (`0` when absent):
+/// a compact retry's lists are shorter than the first request's.
+pub fn list_caps(request: &VisionRequest) -> ListCaps {
+    let props = &request.schema.json()["properties"];
+    let cap = |list: &str| {
+        props[list]["maxItems"]
+            .as_u64()
+            .map_or(0, |v| usize::try_from(v).unwrap_or(usize::MAX))
+    };
+    ListCaps {
+        nodes: cap("nodes"),
+        edges: cap("edges"),
+        stickies: cap("stickies"),
+        owner_tags: cap("owner_tags"),
+        other_visible_text: cap("other_visible_text"),
+    }
 }
 
 /// A failed retry that the raw store records as the model's answer (stopped at
@@ -572,16 +592,32 @@ impl BoardReadStage {
                 }
             }
             if !log.retried || degenerate::detect(&out, anchors, p).is_some() {
-                let (kept, collapsed) = degenerate::collapse(out, anchors, p);
+                // The evidence of fabrication is the reply's own: the image and
+                // the list limits of the request that produced it.
+                let frame = ReplyFrame {
+                    extent: region,
+                    caps: list_caps(&sent),
+                };
+                let (kept, collapsed) = degenerate::collapse(out, anchors, &frame, p);
                 out = kept;
-                tracing::warn!(
-                    role = ?role,
-                    finding = %log.finding,
-                    retried = log.retried,
-                    retry_error = log.retry_error.as_deref().unwrap_or(""),
-                    collapsed = collapsed.len(),
-                    "degenerate board reading kept with repeated texts collapsed"
-                );
+                if collapsed.is_empty() {
+                    tracing::info!(
+                        role = ?role,
+                        finding = %log.finding,
+                        retried = log.retried,
+                        retry_error = log.retry_error.as_deref().unwrap_or(""),
+                        "repeated texts of a board reading kept as read: no sign the reply made them up"
+                    );
+                } else {
+                    tracing::warn!(
+                        role = ?role,
+                        finding = %log.finding,
+                        retried = log.retried,
+                        retry_error = log.retry_error.as_deref().unwrap_or(""),
+                        collapsed = collapsed.len(),
+                        "degenerate board reading kept with fabricated repeated texts collapsed"
+                    );
+                }
                 log.collapsed = collapsed;
             }
             degenerate = Some(log);
@@ -634,7 +670,15 @@ impl Stage for BoardReadStage {
         // 7: copies side by side need the strong bound and the share, and an
         // OCR text read twice only counts once within one box; outputs of 6
         // may hold collapsed separate notes or wrongly supported copies.
-        7
+        // 8: only copies the reply fabricated are removed (each pile of copies
+        // keeps one; at least `min_repeats` copies wholly outside the requested
+        // image go; a list run to its `maxItems` with a repeated text last
+        // reduces that text, never for owner tags); copies side by side that
+        // the retry repeats are kept. Each OCR span backs its nearest matching
+        // item unless that item is backed or a span of its text at the same
+        // place backed one. Collapse records name their evidence. Outputs of 7
+        // may hold collapsed owner tags or cards.
+        8
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
@@ -1068,6 +1112,30 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn list_caps_follow_the_request_that_produced_the_reply() {
+        let normal = full_hd_board_request();
+        let caps = list_caps(&normal);
+        assert_eq!(
+            (
+                caps.nodes,
+                caps.edges,
+                caps.stickies,
+                caps.owner_tags,
+                caps.other_visible_text
+            ),
+            (60, 80, 60, 20, 20)
+        );
+        // The penalized retry keeps the schema; the compact retry halves it.
+        let p = BoardReadParams::default();
+        assert_eq!(list_caps(&repetition_retry(&p, &normal)), caps);
+        let img = prepare_board_image(&DynamicImage::ImageRgb8(RgbImage::new(1920, 1176))).unwrap();
+        let compact =
+            board_read_request_compact(&img, normal.options, p.compact_retry_scale).unwrap();
+        let half = list_caps(&compact);
+        assert_eq!((half.nodes, half.owner_tags), (30, 10));
     }
 
     #[test]
