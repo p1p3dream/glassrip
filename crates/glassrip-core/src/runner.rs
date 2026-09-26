@@ -742,18 +742,38 @@ impl Runner {
         self.opts.terminal_after_repeats.max(1)
     }
 
-    /// The item records of a cached output, when there is a valid one.
+    /// The item records of a validated cache entry, parsed from the same bytes
+    /// whose content hash was checked (the entry is not read a second time,
+    /// so a concurrent replacement cannot pair one entry's hash with another's
+    /// records).
     fn cached_records<S: Stage>(
-        &self,
-        name: &str,
-        key: &CacheKey,
+        c: &CachedArtifact,
         req: &SchemaReq,
     ) -> Option<Vec<Record<S::Output>>> {
-        let path = self.cache.get_path(name, key, OUTPUT_EXT).ok()??;
-        let bytes = fs_err::read(&path).ok()?;
-        jsonl::parse_bytes::<Record<S::Output>>(&path, &bytes, req)
+        let mut bytes = jsonl::header_line(&c.header).ok()?;
+        bytes.extend_from_slice(&c.body);
+        jsonl::parse_bytes::<Record<S::Output>>(Path::new("cache entry"), &bytes, req)
             .ok()
             .map(|(_, items)| items)
+    }
+
+    /// A stage's partial output file and the marker naming the cache entry it
+    /// was seeded from.
+    fn partial_paths(&self, name: &str, key: &CacheKey) -> (PathBuf, PathBuf) {
+        let partial = self
+            .with_run(|r| r.partials_dir())
+            .join(format!("{name}-{}.jsonl", &key.as_str()[..16]));
+        let marker = partial.with_extension("seed");
+        (partial, marker)
+    }
+
+    /// True when this run directory holds a partial seeded from the cache entry
+    /// with content hash `hash`: it holds that entry plus work finished after
+    /// it, so it is newer than the entry and is resumed instead.
+    fn seeded_from(&self, name: &str, key: &CacheKey, hash: &str) -> bool {
+        let (partial, marker) = self.partial_paths(name, key);
+        atomic::is_file(&partial).unwrap_or(false)
+            && fs_err::read_to_string(&marker).is_ok_and(|m| m.trim() == hash)
     }
 
     /// Looks up the cache. A missing entry is a miss; an unreadable or corrupt entry
@@ -902,9 +922,11 @@ impl Runner {
                     .force_items
                     .get(stage.name())
                     .is_none_or(BTreeSet::is_empty)
-                    && self
-                        .load_cached::<S>(&path, &req)
-                        .is_ok_and(|c| c.unsettled == 0 && !self.over_limit(&c))
+                    && self.load_cached::<S>(&path, &req).is_ok_and(|c| {
+                        c.unsettled == 0
+                            && !self.over_limit(&c)
+                            && !self.seeded_from(stage.name(), &k.key, &c.content_hash)
+                    })
             }
             _ => false,
         }
@@ -998,8 +1020,15 @@ impl Runner {
         } else {
             self.cache_lookup::<S>(name, &key, &out_req)
         };
+        // A partial seeded from this entry is newer than it (work finished
+        // after the seed, say a forced item, before a crash): resume it, even
+        // when the entry itself would restore as is.
         let cached = match cached {
-            Some(c) if !forced_items.is_empty() || c.unsettled > 0 => {
+            Some(c)
+                if !forced_items.is_empty()
+                    || c.unsettled > 0
+                    || self.seeded_from(name, &key, &c.content_hash) =>
+            {
                 info!(
                     stage = name,
                     key = %key,
@@ -1007,7 +1036,7 @@ impl Runner {
                     forced = forced_items.len(),
                     "restoring cached items and retrying the unsettled or forced ones"
                 );
-                seed = self.cached_records::<S>(name, &key, &out_req);
+                seed = Self::cached_records::<S>(&c, &out_req);
                 seed_hash = seed.as_ref().map(|_| c.content_hash.clone());
                 None
             }
@@ -1072,10 +1101,7 @@ impl Runner {
             content_hash: None,
             restored_from: None,
         };
-        let partial = self
-            .with_run(|r| r.partials_dir())
-            .join(format!("{name}-{}.jsonl", &key.as_str()[..16]));
-        let seed_marker = partial.with_extension("seed");
+        let (partial, seed_marker) = self.partial_paths(name, &key);
         let partial_exists = atomic::metadata_opt(&partial)
             .map_err(Self::io_err(&partial))?
             .is_some();
@@ -2379,6 +2405,72 @@ mod tests {
             (StageStatus::Cached, 19, 1)
         );
         assert_eq!(source.calls(), 23);
+    }
+
+    /// Codex runner review round 1: a forced item that recovers into a seeded
+    /// partial survives a crash before finalizing, even though the next run
+    /// forces nothing and the cache entry would restore as is.
+    #[tokio::test]
+    async fn a_forced_recovery_survives_a_crash_before_finalizing() {
+        let env = env();
+        let source = SourceStage::new(20);
+        {
+            let mut b = source.behavior.lock().unwrap();
+            b.fail = [2].into();
+            b.terminal = [2].into();
+        }
+        let mut r = runner(&env, "run-a", &Selection::default());
+        assert_eq!(r.run_stage(&source).await.unwrap().items_error, 1);
+        drop(r);
+
+        // Items 2 and 5 forced: 2 recovers, the run stops at 5.
+        let token = CancellationToken::new();
+        {
+            let mut b = source.behavior.lock().unwrap();
+            b.fail.clear();
+            b.cancel_at = Some((5, token.clone()));
+        }
+        let mut opts = RunnerOptions::default();
+        opts.force_items.insert(
+            "source".into(),
+            ["item-002".to_string(), "item-005".to_string()].into(),
+        );
+        let mut r = runner_with(&env, "run-b", &Selection::default(), opts, token);
+        assert!(matches!(
+            r.run_stage(&source).await,
+            Err(RunnerError::Cancelled { .. })
+        ));
+        drop(r);
+        assert_eq!(source.calls(), 22);
+
+        // Nothing forced now, and item 2 would fail again if asked.
+        {
+            let mut b = source.behavior.lock().unwrap();
+            b.fail = [2].into();
+            b.cancel_at = None;
+        }
+        let mut r = runner(&env, "run-b", &Selection::default());
+        assert!(
+            !r.cache_hit(&source),
+            "the newer partial is resumed, not the cache entry restored"
+        );
+        let rep = r.run_stage(&source).await.unwrap();
+        assert_eq!(
+            (
+                rep.status,
+                rep.items_ok,
+                rep.items_error,
+                rep.items_processed
+            ),
+            (StageStatus::Ok, 20, 0, 0)
+        );
+        assert_eq!(source.calls(), 22, "the recovery is kept, not asked again");
+        drop(r);
+
+        let mut r = runner(&env, "run-c", &Selection::default());
+        let rep = r.run_stage(&source).await.unwrap();
+        assert_eq!((rep.status, rep.items_ok), (StageStatus::Cached, 20));
+        assert_eq!(source.calls(), 22);
     }
 
     /// Codex review round 2: a settled output over the limit is not a hit that
