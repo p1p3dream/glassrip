@@ -1,12 +1,16 @@
 //! Raw model responses stored by request key, for offline replay.
 //!
 //! The key is derived from everything the server sees (model name, prompt,
-//! schema, image bytes, seed, `num_predict`), so a replay run that builds the
-//! same requests finds the same responses. [`RecordingBackend`] writes every
-//! successful response; [`ReplayBackend`] serves them without a server.
+//! schema, image bytes, seed, `num_predict`, sampling overrides) and, for a
+//! guarded request, the repetition guard's policy: a reply the guard stopped is an
+//! answer to the request *and* the guard, so a changed guard never follows a retry
+//! path an older guard chose. [`RecordingBackend`] writes every successful
+//! response and every truncation or repetition stop; [`ReplayBackend`] serves them
+//! without a server, and refuses records made under another model digest or
+//! another guard policy instead of mixing them into one run.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -19,9 +23,22 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 /// Replay key for a request. Sampling overrides are part of the key only when set,
-/// so requests without them keep their original keys. The repetition guard is not:
-/// the server sees the same request with or without it.
+/// so requests without them keep their original keys. The repetition guard's
+/// policy ([`RepetitionParams::policy_id`]) is part of the key when the request is
+/// guarded.
+///
+/// [`RepetitionParams::policy_id`]: glassrip_vision::repetition::RepetitionParams::policy_id
 pub fn request_key(model: &str, request: &VisionRequest) -> String {
+    key_of(model, request, true)
+}
+
+/// The key a request had before the guard policy joined it: records stored under
+/// it are recognized and refused explicitly.
+fn legacy_request_key(model: &str, request: &VisionRequest) -> String {
+    key_of(model, request, false)
+}
+
+fn key_of(model: &str, request: &VisionRequest, with_guard: bool) -> String {
     let mut body = json!({
         "domain": "glassrip.vision_request.v1",
         "model": model,
@@ -32,9 +49,12 @@ pub fn request_key(model: &str, request: &VisionRequest) -> String {
         "seed": request.options.seed,
         "num_predict": request.options.num_predict,
     });
-    if !request.sampling.is_empty() {
-        if let serde_json::Value::Object(map) = &mut body {
+    if let serde_json::Value::Object(map) = &mut body {
+        if !request.sampling.is_empty() {
             map.insert("sampling".into(), json!(request.sampling));
+        }
+        if let Some(guard) = request.repetition_guard.as_ref().filter(|_| with_guard) {
+            map.insert("repetition_guard".into(), json!(guard.policy_id()));
         }
     }
     let text = glassrip_core::canonical::canonical_value_string(&body);
@@ -58,6 +78,12 @@ pub struct RecordedResponse {
     /// [`VisionError::Repetition`] and this finding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repetition: Option<RepetitionFinding>,
+    /// Policy of the repetition guard the request carried
+    /// ([`RepetitionParams::policy_id`]), if any.
+    ///
+    /// [`RepetitionParams::policy_id`]: glassrip_vision::repetition::RepetitionParams::policy_id
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_policy: Option<String>,
 }
 
 /// The stored form of a reply cut off at the output limit (`done_reason`
@@ -167,6 +193,7 @@ impl VisionBackend for RecordingBackend {
     ) -> glassrip_vision::Result<RawResponse> {
         let id = self.inner.id();
         let key = request_key(&id.model, &request);
+        let guard_policy = request.repetition_guard.as_ref().map(|g| g.policy_id());
         let response = match self.inner.infer(request, cancel).await {
             Ok(r) => r,
             Err(e) => {
@@ -194,6 +221,7 @@ impl VisionBackend for RecordingBackend {
                         truncated: repetition.is_none(),
                         response,
                         repetition,
+                        guard_policy,
                     };
                     if let Err(w) = self.store.put(&entry) {
                         tracing::warn!(error = %w, "could not record stopped response");
@@ -209,6 +237,7 @@ impl VisionBackend for RecordingBackend {
             response: response.clone(),
             truncated: false,
             repetition: None,
+            guard_policy,
         };
         // A response that cannot be recorded is still a valid answer; replay
         // will report the missing key.
@@ -220,9 +249,17 @@ impl VisionBackend for RecordingBackend {
 }
 
 /// Serves recorded responses; never contacts a server.
+///
+/// Every record served in one replay must come from one model digest: the
+/// expected one ([`ReplayBackend::with_digest`]) or, without it, the first one
+/// served. A record from another digest, from another repetition guard policy, or
+/// a stored repetition stop the current guard would not make, is refused as
+/// incompatible (re-record it) rather than replayed.
 pub struct ReplayBackend {
     model: String,
     store: RawStore,
+    expected_digest: Option<String>,
+    seen_digest: Mutex<Option<String>>,
 }
 
 impl ReplayBackend {
@@ -230,7 +267,68 @@ impl ReplayBackend {
         Self {
             model: model.into(),
             store,
+            expected_digest: None,
+            seen_digest: Mutex::new(None),
         }
+    }
+
+    /// Refuse records made under any other model digest.
+    #[must_use]
+    pub fn with_digest(mut self, digest: impl Into<String>) -> Self {
+        let digest = digest.into();
+        *self
+            .seen_digest
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(digest.clone());
+        self.expected_digest = Some(digest);
+        self
+    }
+
+    fn incompatible(key: &str, why: impl std::fmt::Display) -> VisionError {
+        VisionError::Config(format!(
+            "recorded response {key} is incompatible with this replay: {why}; re-record it"
+        ))
+    }
+
+    /// Refuse a record from another digest or guard policy.
+    fn check(
+        &self,
+        key: &str,
+        entry: &RecordedResponse,
+        request: &VisionRequest,
+    ) -> glassrip_vision::Result<()> {
+        let policy = request.repetition_guard.as_ref().map(|g| g.policy_id());
+        if entry.guard_policy != policy {
+            return Err(Self::incompatible(
+                key,
+                format!(
+                    "recorded under repetition guard {:?}, the request carries {:?}",
+                    entry.guard_policy, policy
+                ),
+            ));
+        }
+        if let Some(d) = &entry.digest {
+            let mut seen = self
+                .seen_digest
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            match seen.as_ref() {
+                Some(s) if s != d => {
+                    return Err(Self::incompatible(
+                        key,
+                        format!("recorded with model digest {d}, this replay uses {s}"),
+                    ));
+                }
+                Some(_) => {}
+                None => *seen = Some(d.clone()),
+            }
+        } else if let Some(want) = &self.expected_digest {
+            return Err(Self::incompatible(
+                key,
+                format!("recorded without a model digest, this replay expects {want}"),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -240,7 +338,7 @@ impl VisionBackend for ReplayBackend {
         BackendId {
             backend: "replay".into(),
             model: self.model.clone(),
-            digest: None,
+            digest: self.expected_digest.clone(),
             server_version: None,
         }
     }
@@ -265,46 +363,64 @@ impl VisionBackend for ReplayBackend {
             return Err(VisionError::Cancelled);
         }
         let key = request_key(&self.model, &request);
-        match self.store.get(&key) {
-            Ok(Some(RecordedResponse {
-                repetition: Some(finding),
-                response,
-                ..
-            })) => Err(VisionError::Repetition {
+        let entry = match self.store.get(&key) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => {
+                let legacy = legacy_request_key(&self.model, &request);
+                if legacy != key && matches!(self.store.get(&legacy), Ok(Some(_))) {
+                    return Err(Self::incompatible(
+                        &legacy,
+                        "it was recorded before the repetition guard policy joined the request key",
+                    ));
+                }
+                return Err(VisionError::Config(format!(
+                    "no recorded response for request key {key}"
+                )));
+            }
+            Err(e) => return Err(VisionError::Protocol(e.to_string())),
+        };
+        self.check(&key, &entry, &request)?;
+        if let Some(finding) = entry.repetition {
+            // The stop must still be one the current guard makes on this text.
+            let again = request
+                .repetition_guard
+                .as_ref()
+                .and_then(|g| glassrip_vision::repetition::detect(&entry.response.raw_text, g));
+            if again.is_none() {
+                return Err(Self::incompatible(
+                    &key,
+                    format!("the current repetition guard does not stop its text ({finding})"),
+                ));
+            }
+            return Err(VisionError::Repetition {
                 num_predict: request.options.num_predict,
                 finding,
-                raw_text: response.raw_text,
-            }),
-            Ok(Some(entry)) if entry.truncated => {
-                // The live client checks a guarded reply for loops before calling
-                // it truncated; replay does the same.
-                glassrip_vision::ollama::repetition(&request, &entry.response.raw_text)?;
-                Err(VisionError::Truncated {
-                    num_predict: request.options.num_predict,
-                    eval_count: entry.response.eval_count,
-                    raw_text: entry.response.raw_text,
-                })
-            }
-            Ok(Some(entry)) => {
-                glassrip_vision::ollama::repetition(&request, &entry.response.raw_text)?;
-                // Validate against the request schema, as a live reply would be.
-                request
-                    .schema
-                    .validate(&entry.response.json)
-                    .map_err(|errors| VisionError::SchemaInvalid {
-                        attempts: 1,
-                        errors,
-                        raw_text: entry.response.raw_text.clone(),
-                    })?;
-                let mut r = entry.response;
-                r.durations.wall = Duration::ZERO;
-                Ok(r)
-            }
-            Ok(None) => Err(VisionError::Config(format!(
-                "no recorded response for request key {key}"
-            ))),
-            Err(e) => Err(VisionError::Protocol(e.to_string())),
+                raw_text: entry.response.raw_text,
+            });
         }
+        if entry.truncated {
+            // The live client checks a reply cut off at the limit for loops before
+            // calling it truncated; replay does the same.
+            glassrip_vision::ollama::repetition(&request, &entry.response.raw_text)?;
+            return Err(VisionError::Truncated {
+                num_predict: request.options.num_predict,
+                eval_count: entry.response.eval_count,
+                raw_text: entry.response.raw_text,
+            });
+        }
+        // Validate against the request schema, as a live reply would be; a reply
+        // that validates is accepted whatever the guard says, as live.
+        if let Err(errors) = request.schema.validate(&entry.response.json) {
+            glassrip_vision::ollama::repetition(&request, &entry.response.raw_text)?;
+            return Err(VisionError::SchemaInvalid {
+                attempts: 1,
+                errors,
+                raw_text: entry.response.raw_text.clone(),
+            });
+        }
+        let mut r = entry.response;
+        r.durations.wall = Duration::ZERO;
+        Ok(r)
     }
 }
 
@@ -312,6 +428,7 @@ impl VisionBackend for ReplayBackend {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use glassrip_vision::repetition::RepetitionParams;
     use glassrip_vision::{Durations, EncodedImage, GenerationOptions};
     use image::{DynamicImage, RgbImage};
     use schemars::JsonSchema;
@@ -379,19 +496,23 @@ mod tests {
     }
 
     #[test]
-    fn sampling_overrides_change_the_key_and_the_guard_does_not() {
+    fn sampling_overrides_and_the_guard_policy_change_the_key() {
         let plain = request(1);
         let base = request_key("m", &plain);
         let mut guarded = plain.clone();
         guarded.repetition_guard = Some(Default::default());
-        assert_eq!(
-            base,
-            request_key("m", &guarded),
-            "the server sees the same request"
-        );
+        let with_guard = request_key("m", &guarded);
+        assert_ne!(base, with_guard, "a guarded reply answers the guard too");
+        assert_eq!(legacy_request_key("m", &guarded), base);
+        let mut stricter = guarded.clone();
+        stricter.repetition_guard = Some(RepetitionParams {
+            min_templated_run: 8,
+            ..RepetitionParams::default()
+        });
+        assert_ne!(with_guard, request_key("m", &stricter));
         let mut penalized = guarded.clone();
         penalized.sampling.repeat_penalty = Some(1.3);
-        assert_ne!(base, request_key("m", &penalized));
+        assert_ne!(with_guard, request_key("m", &penalized));
         let mut windowed = plain;
         windowed.sampling.repeat_last_n = Some(512);
         assert_ne!(base, request_key("m", &windowed));
@@ -401,13 +522,20 @@ mod tests {
     /// Answers every request with a repetition stop.
     struct Looping;
 
-    fn finding() -> RepetitionFinding {
-        RepetitionFinding {
-            kind: glassrip_vision::repetition::RepetitionKind::Templated,
-            repeats: 6,
-            pattern: "{\"src\":\"n#\"}".into(),
-            at_bytes: 900,
+    /// One edge restated under new ids until stopped.
+    fn looping_text() -> String {
+        let mut s = String::from("{\"edges\": [");
+        for k in 15..25 {
+            s.push_str(&format!(
+                "{{\"src\": \"n{k}\", \"dst\": \"n{}\", \"label\": \"Relay\"}}, ",
+                k + 1
+            ));
         }
+        s
+    }
+
+    fn finding() -> RepetitionFinding {
+        glassrip_vision::repetition::detect(&looping_text(), &RepetitionParams::default()).unwrap()
     }
 
     #[async_trait]
@@ -426,7 +554,7 @@ mod tests {
             Err(VisionError::Repetition {
                 num_predict: r.options.num_predict,
                 finding: finding(),
-                raw_text: "{\"edges\": [".into(),
+                raw_text: looping_text(),
             })
         }
     }
@@ -451,10 +579,120 @@ mod tests {
                 ..
             }) => {
                 assert_eq!(f, finding());
-                assert_eq!(raw_text, "{\"edges\": [");
+                assert_eq!(raw_text, looping_text());
             }
             other => panic!("expected a replayed repetition stop, got {other:?}"),
         }
+    }
+
+    fn guarded(seed: u64) -> VisionRequest {
+        let mut r = request(seed);
+        r.repetition_guard = Some(RepetitionParams::default());
+        r
+    }
+
+    fn expect_incompatible(r: glassrip_vision::Result<RawResponse>, what: &str) {
+        match r {
+            Err(VisionError::Config(m)) if m.contains("incompatible") && m.contains(what) => {}
+            other => panic!("expected an incompatible record ({what}), got {other:?}"),
+        }
+    }
+
+    /// Codex 10 / GLM M2: a stop recorded under an older guard is not replayed
+    /// as if the current guard had made it.
+    #[tokio::test]
+    async fn a_stop_the_current_guard_would_not_make_is_incompatible() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RawStore::new(dir.path());
+        let req = guarded(7);
+        // A regular card row an older guard stopped as a "loop".
+        let row: String = (0..6)
+            .map(|c| {
+                format!(
+                    "{{\"local_id\": \"n{}\", \"text\": \"Card\", \"bbox_2d\": [{}, 900, {}, 930]}}, ",
+                    30 + c,
+                    100 + c * 120,
+                    180 + c * 120
+                )
+            })
+            .collect();
+        store
+            .put(&RecordedResponse {
+                key: request_key("m", &req),
+                model: "m".into(),
+                digest: Some("d".into()),
+                response: stopped_response(&format!("{{\"nodes\": [{row}"), None, "repetition"),
+                truncated: false,
+                repetition: Some(finding()),
+                guard_policy: Some(RepetitionParams::default().policy_id()),
+            })
+            .unwrap();
+        let replay = ReplayBackend::new("m", store);
+        expect_incompatible(
+            replay.infer(req, CancellationToken::new()).await,
+            "does not stop its text",
+        );
+    }
+
+    #[tokio::test]
+    async fn records_under_the_old_key_are_refused_explicitly() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RawStore::new(dir.path());
+        let req = guarded(7);
+        // A pre-policy store: the stop sits under the key without the guard.
+        store
+            .put(&RecordedResponse {
+                key: legacy_request_key("m", &req),
+                model: "m".into(),
+                digest: Some("d".into()),
+                response: stopped_response(&looping_text(), None, "repetition"),
+                truncated: false,
+                repetition: Some(finding()),
+                guard_policy: None,
+            })
+            .unwrap();
+        let replay = ReplayBackend::new("m", store);
+        expect_incompatible(
+            replay.infer(req, CancellationToken::new()).await,
+            "before the repetition guard policy",
+        );
+    }
+
+    #[tokio::test]
+    async fn one_replay_never_mixes_model_digests() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RawStore::new(dir.path());
+        let rec = RecordingBackend::new(Arc::new(Fixed), store.clone());
+        for seed in [1, 2] {
+            rec.infer(request(seed), CancellationToken::new())
+                .await
+                .unwrap();
+        }
+        // The model was retagged between recordings of two requests.
+        let key = request_key("m", &request(2));
+        let mut entry = store.get(&key).unwrap().unwrap();
+        entry.digest = Some("d-retagged".into());
+        store.put(&entry).unwrap();
+
+        let replay = ReplayBackend::new("m", store.clone());
+        replay
+            .infer(request(1), CancellationToken::new())
+            .await
+            .unwrap();
+        expect_incompatible(
+            replay.infer(request(2), CancellationToken::new()).await,
+            "model digest d-retagged",
+        );
+        let pinned = ReplayBackend::new("m", store).with_digest("d-retagged");
+        assert_eq!(pinned.id().digest.as_deref(), Some("d-retagged"));
+        expect_incompatible(
+            pinned.infer(request(1), CancellationToken::new()).await,
+            "model digest d,",
+        );
+        pinned
+            .infer(request(2), CancellationToken::new())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
