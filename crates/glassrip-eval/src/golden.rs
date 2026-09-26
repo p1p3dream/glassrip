@@ -14,6 +14,7 @@
 //! | `static_windows` | windows where only pans and zooms happen, with allowed real events |
 //! | `chrome_terms` | UI strings that must never become board content |
 //! | `transcript` | decisions, action items, open questions, negative action items, hotwords, speaker count |
+//! | `clocks` | per-section [`FrameClock`] (`screen_types`, `traps`, `owners`, `static_windows`); PTS unless declared |
 //!
 //! Authoring can use `screen_type_ranges` (inclusive `t_rep` ranges) instead of
 //! per-keyframe labels; the `golden_convert` example expands them against the
@@ -32,6 +33,7 @@ use crate::metrics::events::StaticWindow;
 use crate::metrics::notes::GoldItem;
 use crate::metrics::owners::{Assignment, Move, Target};
 use crate::metrics::screen::ScreenType;
+use crate::text::{claim_words, key_terms, Vocabulary};
 
 /// Current golden format version.
 pub const GOLDEN_VERSION: u32 = 1;
@@ -116,42 +118,129 @@ pub struct Trap {
     pub note: String,
 }
 
-/// Clock of the golden's frame-derived times (screen labels and traps).
+/// Clock of a golden section's times.
 ///
-/// Spec 9.2: golden `t_rep` values sit on the prototype's nominal frame grid. The
-/// prototype sampled with ffmpeg `fps=1/INTERVAL` and named each frame by its grid
-/// time, but the frame it keeps for grid time `t` is the last video frame before
-/// `t + INTERVAL` (checked on the reference recording: every frame compared matched
-/// the native frame 1.97 to 1.99 s after its name on the 2 s grid). A label at
-/// nominal `t` therefore describes what was on screen just before `t + INTERVAL`,
-/// and the pipeline's keyframes carry true PTS times, so the join maps the label
-/// there. Transcript-derived times (hotword windows, notes, owner assignments) are
-/// not frame names and are never shifted.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// Spec 9.2: golden `t_rep` values may sit on the prototype's nominal frame grid.
+/// The prototype sampled with ffmpeg `fps=1/INTERVAL` and named each frame by its
+/// grid time, but the frame it keeps for grid time `t` is the last video frame before
+/// `t + INTERVAL`. A label at nominal `t` then describes what was on screen just
+/// before `t + INTERVAL`, while the pipeline's keyframes carry true PTS times, so the
+/// join maps the label there. Whether a golden's times are grid names is a property
+/// of how that golden was authored, never of the eval: every section is on
+/// [`FrameClock::Pts`] (the eval's behavior before clocks existed) unless the golden
+/// declares otherwise ([`GoldenClocks`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FrameClock {
-    /// Frame times are nominal grid names (the default for the meeting golden).
+    /// Times are presentation times (the default).
+    #[default]
+    Pts,
+    /// Times are nominal grid names of prototype frames.
     PrototypeGrid {
         /// Grid interval, seconds.
         interval_s: f64,
+        /// How far before the next grid point the kept frame lies, seconds (default
+        /// 0.05: under one frame at 20 fps or more).
+        #[serde(default = "default_grid_lead_s")]
+        lead_s: f64,
     },
-    /// Frame times are presentation times (synthetic goldens).
-    Pts,
 }
 
-impl Default for FrameClock {
-    fn default() -> Self {
-        Self::PrototypeGrid { interval_s: 2.0 }
-    }
+fn default_grid_lead_s() -> f64 {
+    0.05
 }
 
 impl FrameClock {
-    /// Content time of a frame-derived golden time. On the prototype grid that is a
-    /// hair (50 ms, under one frame at 20 fps or more) before the next grid point.
+    /// Content time (PTS) of a golden time on this clock. On the prototype grid that
+    /// is `lead_s` before the next grid point.
     pub fn content_time(&self, t: f64) -> f64 {
         match self {
-            Self::PrototypeGrid { interval_s } => t + interval_s - 0.05,
+            Self::PrototypeGrid { interval_s, lead_s } => t + interval_s - lead_s,
             Self::Pts => t,
+        }
+    }
+
+    fn validate(&self, section: &str) -> Result<()> {
+        if let Self::PrototypeGrid { interval_s, lead_s } = *self {
+            if !(interval_s.is_finite() && interval_s > 0.0) {
+                return Err(golden_err(format!(
+                    "{section} clock: interval_s {interval_s} is not positive"
+                )));
+            }
+            if !(lead_s.is_finite() && (0.0..interval_s).contains(&lead_s)) {
+                return Err(golden_err(format!(
+                    "{section} clock: lead_s {lead_s} is not in [0, interval_s)"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A golden section whose times can be on a declared clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClockSection {
+    /// `screen_types[].t_rep_s`.
+    ScreenTypes,
+    /// `traps[]` times.
+    Traps,
+    /// `owners`: probe times, assignment windows, move times.
+    Owners,
+    /// `static_windows[]` bounds and allowed event times.
+    StaticWindows,
+}
+
+impl ClockSection {
+    /// Every section, in report order.
+    pub const ALL: [ClockSection; 4] = [
+        Self::ScreenTypes,
+        Self::Traps,
+        Self::Owners,
+        Self::StaticWindows,
+    ];
+
+    /// Field name in the golden file.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::ScreenTypes => "screen_types",
+            Self::Traps => "traps",
+            Self::Owners => "owners",
+            Self::StaticWindows => "static_windows",
+        }
+    }
+}
+
+/// Per-section clocks. A section left out is on [`FrameClock::Pts`]. Transcript
+/// times (hotword windows, notes) are always PTS.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoldenClocks {
+    /// Clock of `screen_types`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen_types: Option<FrameClock>,
+    /// Clock of `traps`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traps: Option<FrameClock>,
+    /// Clock of `owners`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owners: Option<FrameClock>,
+    /// Clock of `static_windows`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_windows: Option<FrameClock>,
+}
+
+impl GoldenClocks {
+    /// True when no section declares a clock.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    fn get(&self, s: ClockSection) -> Option<FrameClock> {
+        match s {
+            ClockSection::ScreenTypes => self.screen_types,
+            ClockSection::Traps => self.traps,
+            ClockSection::Owners => self.owners,
+            ClockSection::StaticWindows => self.static_windows,
         }
     }
 }
@@ -190,9 +279,13 @@ pub struct MeetingGolden {
     /// Media duration, seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_s: Option<f64>,
-    /// Clock of the frame-derived times ([`FrameClock`]).
-    #[serde(default)]
-    pub frame_clock: FrameClock,
+    /// Legacy single clock for `screen_types` and `traps` (the only sections it ever
+    /// covered). Declares both unless [`GoldenClocks`] names either; prefer `clocks`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_clock: Option<FrameClock>,
+    /// Per-section clocks ([`GoldenClocks`]).
+    #[serde(default, skip_serializing_if = "GoldenClocks::is_empty")]
+    pub clocks: GoldenClocks,
     /// Participants.
     pub participants: Vec<Participant>,
     /// Per-keyframe screen types.
@@ -226,6 +319,83 @@ fn golden_err(message: impl Into<String>) -> EvalError {
 }
 
 impl MeetingGolden {
+    /// The clock of one section: its `clocks` entry, else (screen types and traps
+    /// only) the legacy `frame_clock`, else [`FrameClock::Pts`].
+    pub fn clock(&self, section: ClockSection) -> FrameClock {
+        let legacy = matches!(section, ClockSection::ScreenTypes | ClockSection::Traps)
+            .then_some(self.frame_clock)
+            .flatten();
+        self.clocks.get(section).or(legacy).unwrap_or_default()
+    }
+
+    /// Participant and entity names for the notes matcher: every participant's
+    /// display name and aliases, and every final-board node label, node alias, and
+    /// hotword.
+    pub fn vocabulary(&self) -> Vocabulary {
+        let mut v = Vocabulary::default();
+        for p in &self.participants {
+            v.add_person(
+                &p.person_id,
+                std::iter::once(p.display_name.as_str())
+                    .chain(p.aliases.iter().map(String::as_str)),
+            );
+        }
+        for n in &self.final_board.nodes {
+            v.add_entity(&n.text);
+            for a in &n.aliases {
+                v.add_entity(a);
+            }
+        }
+        for h in &self.transcript.hotwords {
+            v.add_entity(&h.word);
+        }
+        v
+    }
+
+    /// Notes items whose phrasings carry no key term. They are matched strictly
+    /// (every claim word, [`crate::text::allowed_missing`]); listed in the report so
+    /// an author can see which items rely on wording alone.
+    pub fn unkeyed_notes_items(&self) -> Vec<String> {
+        let v = self.vocabulary();
+        self.notes_items()
+            .filter(|(_, item)| {
+                std::iter::once(&item.text)
+                    .chain(&item.aliases)
+                    .all(|t| key_terms(t, &v).is_empty())
+            })
+            .map(|(kind, item)| format!("{kind}: {}", item.text))
+            .collect()
+    }
+
+    fn notes_items(&self) -> impl Iterator<Item = (&'static str, &GoldItem)> {
+        let t = &self.transcript;
+        t.decisions
+            .iter()
+            .map(|i| ("decision", i))
+            .chain(t.action_items.iter().map(|i| ("action item", i)))
+            .chain(t.open_questions.iter().map(|i| ("open question", i)))
+    }
+
+    /// Every alias of a notes item names what its text names: an alias without one of
+    /// the text's key terms would match a claim about another person or system.
+    fn validate_notes_aliases(&self) -> Result<()> {
+        let v = self.vocabulary();
+        for (kind, item) in self.notes_items() {
+            let keys = key_terms(&item.text, &v);
+            for alias in &item.aliases {
+                let terms: BTreeSet<String> =
+                    claim_words(alias, &v).into_iter().map(|w| w.term).collect();
+                if let Some(missing) = keys.iter().find(|k| !terms.contains(*k)) {
+                    return Err(golden_err(format!(
+                        "{kind} `{}`: alias `{alias}` does not name `{missing}`, so it would match a claim about someone or something else",
+                        item.text
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Resolves a predicted person name or id to a participant id (exact id,
     /// else Jaro-Winkler >= 0.9 against display name, first name, or alias).
     pub fn resolve_person(&self, name: &str) -> Option<&str> {
@@ -263,7 +433,21 @@ impl MeetingGolden {
                 "screen_type_ranges are not expanded; run the golden_convert example first",
             ));
         }
+        if self.frame_clock.is_some()
+            && (self.clocks.screen_types.is_some() || self.clocks.traps.is_some())
+        {
+            return Err(golden_err(
+                "frame_clock and clocks.screen_types/clocks.traps both declare a clock; keep only `clocks`",
+            ));
+        }
+        if let Some(c) = self.frame_clock {
+            c.validate("frame_clock")?;
+        }
+        for section in ClockSection::ALL {
+            self.clock(section).validate(section.name())?;
+        }
         crate::fixture::validate_board("meeting golden", &self.final_board)?;
+        self.validate_notes_aliases()?;
         let people: BTreeSet<&str> = self
             .participants
             .iter()
@@ -434,13 +618,100 @@ mod tests {
     fn frame_clock_maps_nominal_grid_names_to_content_time() {
         let g: FrameClock = serde_json::from_value(serde_json::json!({"kind": "pts"})).unwrap();
         assert_eq!(g.content_time(24.0), 24.0);
-        let d = FrameClock::default();
-        assert!((d.content_time(24.0) - 25.95).abs() < 1e-9);
-        let five: FrameClock = serde_json::from_value(
-            serde_json::json!({"kind": "prototype_grid", "interval_s": 5.0}),
+        assert_eq!(
+            FrameClock::default(),
+            FrameClock::Pts,
+            "no clock is assumed"
+        );
+        let two: FrameClock = serde_json::from_value(
+            serde_json::json!({"kind": "prototype_grid", "interval_s": 2.0}),
         )
         .unwrap();
-        assert!((five.content_time(10.0) - 14.95).abs() < 1e-9);
+        assert!((two.content_time(24.0) - 25.95).abs() < 1e-9);
+        let five: FrameClock = serde_json::from_value(
+            serde_json::json!({"kind": "prototype_grid", "interval_s": 5.0, "lead_s": 0.5}),
+        )
+        .unwrap();
+        assert!((five.content_time(10.0) - 14.5).abs() < 1e-9);
+    }
+
+    /// GLM M3, Codex 11, Kimi 8: a golden that declares no clock is scored on PTS,
+    /// as before clocks existed; the legacy field covers only the sections it
+    /// covered; each section can declare its own.
+    #[test]
+    fn clocks_are_declared_per_section_and_default_to_pts() {
+        let mut g = minimal();
+        g.screen_type_ranges.clear();
+        let mut v = serde_json::to_value(&g).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.remove("frame_clock");
+        o.remove("clocks");
+        let g: MeetingGolden = serde_json::from_value(v.clone()).unwrap();
+        for s in ClockSection::ALL {
+            assert_eq!(g.clock(s), FrameClock::Pts, "{}", s.name());
+        }
+        let grid = FrameClock::PrototypeGrid {
+            interval_s: 2.0,
+            lead_s: 0.05,
+        };
+        v["frame_clock"] = serde_json::json!({"kind": "prototype_grid", "interval_s": 2.0});
+        let legacy: MeetingGolden = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(legacy.clock(ClockSection::ScreenTypes), grid);
+        assert_eq!(legacy.clock(ClockSection::Traps), grid);
+        assert_eq!(legacy.clock(ClockSection::Owners), FrameClock::Pts);
+        assert_eq!(legacy.clock(ClockSection::StaticWindows), FrameClock::Pts);
+        legacy.validate().unwrap();
+        // both forms at once are ambiguous
+        v["clocks"] = serde_json::json!({"screen_types": {"kind": "pts"}});
+        let both: MeetingGolden = serde_json::from_value(v.clone()).unwrap();
+        assert!(both.validate().is_err());
+        // per-section
+        v.as_object_mut().unwrap().remove("frame_clock");
+        v["clocks"] = serde_json::json!({"owners": {"kind": "prototype_grid", "interval_s": 2.0}});
+        let per: MeetingGolden = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(per.clock(ClockSection::Owners), grid);
+        assert_eq!(per.clock(ClockSection::ScreenTypes), FrameClock::Pts);
+        per.validate().unwrap();
+        // nonsense grids are rejected
+        v["clocks"] = serde_json::json!({"traps": {"kind": "prototype_grid", "interval_s": 0.0}});
+        let bad: MeetingGolden = serde_json::from_value(v).unwrap();
+        assert!(bad.validate().is_err());
+    }
+
+    /// Kimi finding 2: an alias that drops the name of its item is rejected.
+    #[test]
+    fn aliases_must_name_what_the_item_names() {
+        let item = |text: &str, aliases: &[&str]| GoldItem {
+            text: text.into(),
+            aliases: aliases.iter().map(|a| a.to_string()).collect(),
+            person_id: None,
+            t_s: None,
+        };
+        let mut g = minimal();
+        g.screen_type_ranges.clear();
+        g.transcript.decisions = vec![item(
+            "Avery moves from the importer to the dashboard work",
+            &["Aveery works on the dashboard instead"],
+        )];
+        g.validate().unwrap();
+        g.transcript.decisions = vec![item(
+            "Avery moves from the importer to the dashboard work",
+            &["dashboard work instead of the importer"],
+        )];
+        let e = g.validate().unwrap_err().to_string();
+        assert!(e.contains("does not name"), "{e}");
+        // the Ledger API entity is named even without capitals
+        g.transcript.decisions = vec![item("skip the Ledger step", &["the step is deferred"])];
+        assert!(g.validate().is_err());
+        g.transcript.decisions = vec![
+            item("Ship weekly builds", &[]),
+            item("skip the ledger step", &["ledger is deferred"]),
+        ];
+        g.validate().unwrap();
+        assert_eq!(
+            g.unkeyed_notes_items(),
+            vec!["decision: Ship weekly builds".to_string()]
+        );
     }
 
     fn minimal() -> MeetingGolden {
@@ -449,7 +720,8 @@ mod tests {
             meeting: "synthetic".into(),
             sources: vec![],
             duration_s: None,
-            frame_clock: FrameClock::Pts,
+            frame_clock: None,
+            clocks: GoldenClocks::default(),
             participants: vec![
                 Participant {
                     person_id: "avery".into(),

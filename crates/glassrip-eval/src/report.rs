@@ -175,10 +175,10 @@ pub const TARGETS: &[(&str, Op, f64, &str)] = &[
     ),
     ("audio.hotword_wer", Op::AtMost, 0.10, "9.3 hotword WER"),
     (
-        "audio.speaker_label_error",
+        "audio.speaker_identity_error",
         Op::AtMost,
         0.0,
-        "9.3 distinct speaker labels equal the people",
+        "9.3 distinct speakers after name mapping equal the people",
     ),
     (
         "bench.median_s",

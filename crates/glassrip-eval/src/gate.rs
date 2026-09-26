@@ -44,7 +44,12 @@ pub enum Rule {
 
 /// The gate rule of a metric name; `None` when the metric is unclassified.
 pub fn rule_for(name: &str) -> Option<Rule> {
-    const INFO: &[&str] = &["cases", "screen.unconfirmed_labels", "audio.speaker_labels"];
+    const INFO: &[&str] = &[
+        "cases",
+        "screen.unconfirmed_labels",
+        "audio.speaker_labels",
+        "audio.speaker_identities",
+    ];
     if INFO.contains(&name) || name.starts_with("bench.") {
         return Some(Rule::Info);
     }
@@ -87,6 +92,7 @@ pub fn rule_for(name: &str) -> Option<Rule> {
         "negative_hits",
         "negative_action_hits",
         "speaker_label_error",
+        "speaker_identity_error",
         "hallucinated_spans",
         "truncated_cells",
         "pages_missing",
@@ -327,6 +333,8 @@ mod tests {
             "audio.hotword_wer",
             "audio.speaker_labels",
             "audio.speaker_label_error",
+            "audio.speaker_identities",
+            "audio.speaker_identity_error",
             "bench.median_s",
             "docs.body_cer",
             "docs.body_cer_page_median",

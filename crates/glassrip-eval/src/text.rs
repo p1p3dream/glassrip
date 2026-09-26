@@ -8,10 +8,14 @@
 //!   divided by reference length) after whitespace normalization.
 //! - [`token_dice`]: Dice coefficient over normalized word multisets, used for
 //!   sentence-level items (decisions, action items, questions).
-//! - [`containment`]: share of a gold phrasing's content words stated by a
-//!   prediction (paraphrases inside longer sentences), gated by
-//!   [`CONTAINMENT_MIN_PRECISION`]; [`key_terms_present`] requires the names in the
-//!   gold phrasing to appear in the prediction.
+//! - [`claim_words`]: stemmed content words with their polarity (a negation governs
+//!   the rest of its clause), so a claim and its negation share no word.
+//! - [`claim_dice`] and [`containment`]: sentence similarity over claim words; the
+//!   second finds a paraphrase inside a longer sentence, bounded by
+//!   [`CONTAINMENT_MAX_EXPANSION`] and [`CONTAINMENT_MAX_SPREAD`]. [`covers`] requires
+//!   the gold claim words to be stated ([`allowed_missing`]), and
+//!   [`key_terms_present`] requires the names in the gold phrasing (known participants
+//!   and entities from a [`Vocabulary`], at any position) to appear in the prediction.
 
 use std::collections::BTreeMap;
 
@@ -206,11 +210,17 @@ pub fn content_dice(a: &str, b: &str) -> f64 {
     }
 }
 
-/// Smallest share of a prediction's content words that must come from the gold
-/// phrasing for [`containment`] to count. A prediction may carry up to ten times the
-/// gold's content (context, names, reasons) and still match, but a kitchen-sink
-/// sentence that happens to contain a short gold phrase does not.
-pub const CONTAINMENT_MIN_PRECISION: f64 = 0.1;
+/// Most distinct content words a prediction may carry, as a multiple of the gold
+/// phrasing's, for [`containment`] to count: the claim plus up to three times as
+/// much context (names, reasons, qualifiers). A longer sentence that happens to
+/// contain the gold words is a ramble, not a restatement.
+pub const CONTAINMENT_MAX_EXPANSION: usize = 4;
+
+/// Widest span, as a multiple of the gold phrasing's content-word count, in which
+/// [`containment`] must find the gold words in the prediction (counted in content
+/// words). A restatement keeps its words together; gold words scattered across a
+/// long prediction do not state the claim.
+pub const CONTAINMENT_MAX_SPREAD: usize = 2;
 
 /// Light suffix stripping so inflections of one word compare equal (`decided` and
 /// `decide`, `moves`, `moved`, `moving` and `move`, `skipped` and `skip`). Words of
@@ -248,6 +258,115 @@ pub fn stem(word: &str) -> String {
     w
 }
 
+/// Words that negate the rest of their clause ("do not ship", "we won't ship",
+/// "no weekly builds", "never ship"). Compared after removing apostrophes; any word
+/// ending in `n't` negates as well.
+pub const NEGATIONS: &[&str] = &[
+    "not", "no", "never", "cannot", "cant", "dont", "doesnt", "didnt", "wont", "wouldnt",
+    "shouldnt", "couldnt", "isnt", "arent", "wasnt", "werent", "hasnt", "havent", "hadnt",
+    "mustnt", "neednt", "without", "nor", "neither", "none", "nothing", "nobody",
+];
+
+/// Words that start a new clause and so end a negation's scope ("ship weekly builds
+/// but not nightly ones").
+const CLAUSE_WORDS: &[&str] = &[
+    "but", "however", "although", "though", "whereas", "while", "yet", "instead", "unless",
+];
+
+/// Names the golden set knows: participants (display names, first names, aliases) and
+/// entities (board node labels, hotwords). A word that is a known name is a key term
+/// wherever it stands in a sentence, first position included, and every spelling of
+/// one participant is the same term, so "Tam" in a prediction states "Tamsin".
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Vocabulary {
+    /// Normalized participant name word to its canonical term (`@<person_id>`).
+    people: BTreeMap<String, String>,
+    /// Stemmed entity words.
+    entities: std::collections::BTreeSet<String>,
+}
+
+impl Vocabulary {
+    /// Adds a participant: every non-stopword word of each name maps to `@person_id`.
+    pub fn add_person<'a>(&mut self, person_id: &str, names: impl IntoIterator<Item = &'a str>) {
+        let canon = format!("@{}", normalize_label(person_id).replace(' ', "_"));
+        for name in names {
+            for w in normalize_label(name).split(' ') {
+                if !w.is_empty() && !STOPWORDS.contains(&w) {
+                    self.people.insert(w.to_string(), canon.clone());
+                }
+            }
+        }
+    }
+
+    /// Adds an entity name (a board label, a hotword): each of its words is a key term.
+    pub fn add_entity(&mut self, name: &str) {
+        for w in normalize_label(name).split(' ') {
+            if !w.is_empty() && !STOPWORDS.contains(&w) && !self.people.contains_key(w) {
+                self.entities.insert(stem(w));
+            }
+        }
+    }
+
+    /// The comparison term of one normalized content word: a participant's canonical
+    /// term, else the word's [`stem`].
+    pub fn term(&self, word: &str) -> String {
+        self.people.get(word).cloned().unwrap_or_else(|| stem(word))
+    }
+
+    /// True when the term names a known participant or entity.
+    pub fn is_name(&self, term: &str) -> bool {
+        term.starts_with('@') || self.entities.contains(term)
+    }
+}
+
+/// One content word of a claim: its comparison term ([`Vocabulary::term`]) and
+/// whether a negation governs it. "ship weekly builds" and "do not ship weekly
+/// builds" share no claim word.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ClaimWord {
+    /// Stem or canonical participant term.
+    pub term: String,
+    /// Inside a negation's scope.
+    pub negated: bool,
+}
+
+/// Content words of a claim in order, each marked with its polarity. A negation
+/// ([`NEGATIONS`]) governs the words after it up to the end of its clause: a
+/// punctuation mark `, ; : . ! ?` or a clause word ("but", "instead"). Stopwords are
+/// dropped; words are compared as [`Vocabulary::term`]s.
+pub fn claim_words(text: &str, vocab: &Vocabulary) -> Vec<ClaimWord> {
+    let mut out = Vec::new();
+    let mut negated = false;
+    for raw in text.split_whitespace() {
+        let raw = raw.replace('\u{2019}', "'");
+        let trimmed = raw.trim_end_matches(|c: char| "\"')]}".contains(c));
+        let ends_clause = trimmed.ends_with(|c: char| ",;:.!?".contains(c));
+        let bare: String = raw
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .to_lowercase();
+        let squashed = bare.replace('\'', "");
+        if CLAUSE_WORDS.contains(&squashed.as_str()) {
+            negated = false;
+        }
+        if NEGATIONS.contains(&squashed.as_str()) || bare.ends_with("n't") {
+            negated = !ends_clause;
+            continue;
+        }
+        for part in normalize_label(&bare).split(' ') {
+            if !part.is_empty() && !STOPWORDS.contains(&part) {
+                out.push(ClaimWord {
+                    term: vocab.term(part),
+                    negated,
+                });
+            }
+        }
+        if ends_clause {
+            negated = false;
+        }
+    }
+    out
+}
+
 /// Stemmed content words (normalized, [`STOPWORDS`] removed), deduplicated.
 pub fn content_stems(text: &str) -> std::collections::BTreeSet<String> {
     normalize_label(text)
@@ -258,26 +377,31 @@ pub fn content_stems(text: &str) -> std::collections::BTreeSet<String> {
 }
 
 /// Key terms of a gold phrasing: words that name something specific, which a
-/// matching prediction must also name. A word is a key term when it is capitalized
-/// anywhere but the first position, is an acronym (two or more capitals), or holds a
-/// digit or underscore. Returned stemmed and lowercased. A sentence-initial word is
-/// capitalized by grammar, so a name in first position is not recognized; gold
-/// phrasings that hinge on a name should carry an alias that names it mid-sentence.
-pub fn key_terms(text: &str) -> std::collections::BTreeSet<String> {
+/// matching prediction must also name. A word is a key term when it is a known
+/// participant or entity name ([`Vocabulary`], at any position, first word
+/// included), is capitalized anywhere but the first position, is an acronym (two or
+/// more capitals), or holds a digit or underscore. Returned as comparison terms.
+pub fn key_terms(text: &str, vocab: &Vocabulary) -> std::collections::BTreeSet<String> {
     let mut out = std::collections::BTreeSet::new();
     for (i, raw) in text.split_whitespace().enumerate() {
         let w = raw.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
-        if w.is_empty() {
+        let lower = w.to_lowercase().replace('\u{2019}', "'");
+        let negation =
+            NEGATIONS.contains(&lower.replace('\'', "").as_str()) || lower.ends_with("n't");
+        if w.is_empty() || negation {
             continue;
         }
         let upper = w.chars().filter(char::is_ascii_uppercase).count();
         let capitalized = w.chars().next().is_some_and(char::is_uppercase);
         let special = w.chars().any(|c| c.is_ascii_digit() || c == '_');
-        if (capitalized && i > 0) || upper >= 2 || special {
-            for part in normalize_label(w).split(' ').filter(|p| !p.is_empty()) {
-                if !STOPWORDS.contains(&part) {
-                    out.insert(stem(part));
-                }
+        let shaped = (capitalized && i > 0) || upper >= 2 || special;
+        for part in normalize_label(w).split(' ').filter(|p| !p.is_empty()) {
+            if STOPWORDS.contains(&part) {
+                continue;
+            }
+            let term = vocab.term(part);
+            if shaped || vocab.is_name(&term) {
+                out.insert(term);
             }
         }
     }
@@ -285,26 +409,95 @@ pub fn key_terms(text: &str) -> std::collections::BTreeSet<String> {
 }
 
 /// Every key term of `gold` ([`key_terms`]) appears among the content words of `pred`.
-pub fn key_terms_present(gold: &str, pred: &str) -> bool {
-    let p = content_stems(pred);
-    key_terms(gold).iter().all(|k| p.contains(k))
+pub fn key_terms_present(gold: &str, pred: &str, vocab: &Vocabulary) -> bool {
+    let p: std::collections::BTreeSet<String> = claim_words(pred, vocab)
+        .into_iter()
+        .map(|w| w.term)
+        .collect();
+    key_terms(gold, vocab).iter().all(|k| p.contains(k))
 }
 
-/// How much of `gold` a prediction states: the share of the gold's stemmed content
-/// words found in `pred`. A paraphrase that restates the gold claim inside a longer
-/// sentence scores high here while its Dice coefficient stays low. Zero when the gold
-/// has fewer than two content words (too little to contain), or when under
-/// [`CONTAINMENT_MIN_PRECISION`] of the prediction's content words come from the gold.
-pub fn containment(gold: &str, pred: &str) -> f64 {
-    let (g, p) = (content_stems(gold), content_stems(pred));
-    if g.len() < 2 || p.is_empty() {
+/// Gold claim words a prediction may leave out and still state the claim: none for a
+/// phrasing of up to five content words or one without key terms, then one per five
+/// words. A short claim is its words ("skip the Ledger step" is not stated by "the
+/// Ledger step was hard"), and a phrasing without key terms has nothing else to pin
+/// its subject. Key terms themselves can never be left out ([`key_terms_present`]).
+pub fn allowed_missing(gold_words: usize, has_key_terms: bool) -> usize {
+    if has_key_terms {
+        gold_words.saturating_sub(1) / 5
+    } else {
+        0
+    }
+}
+
+/// Distinct gold claim words (same term and polarity) found in the prediction.
+fn polar_overlap(g: &[ClaimWord], p: &[ClaimWord]) -> (usize, usize, usize) {
+    let gs: std::collections::BTreeSet<&ClaimWord> = g.iter().collect();
+    let ps: std::collections::BTreeSet<&ClaimWord> = p.iter().collect();
+    (gs.intersection(&ps).count(), gs.len(), ps.len())
+}
+
+/// True when `pred` states enough of `gold`'s claim words with the same polarity
+/// ([`allowed_missing`]).
+pub fn covers(gold: &str, pred: &str, vocab: &Vocabulary) -> bool {
+    let (g, p) = (claim_words(gold, vocab), claim_words(pred, vocab));
+    let (inter, ng, _) = polar_overlap(&g, &p);
+    let keyed = !key_terms(gold, vocab).is_empty();
+    ng > 0 && ng - inter <= allowed_missing(ng, keyed)
+}
+
+/// Dice coefficient over distinct polar claim words ([`claim_words`]); when either
+/// side has no content word, [`token_dice`] on the full texts.
+pub fn claim_dice(gold: &str, pred: &str, vocab: &Vocabulary) -> f64 {
+    let (g, p) = (claim_words(gold, vocab), claim_words(pred, vocab));
+    if g.is_empty() || p.is_empty() {
+        return token_dice(gold, pred);
+    }
+    let (inter, ng, np) = polar_overlap(&g, &p);
+    2.0 * inter as f64 / (ng + np) as f64
+}
+
+/// How much of `gold` a prediction states inside a longer sentence: the share of the
+/// gold's claim words (same term, same polarity) found in `pred`. A paraphrase that
+/// restates the gold claim with context scores high here while its Dice coefficient
+/// stays low. Zero when the gold has fewer than two content words (too little to
+/// contain), when the prediction has more than [`CONTAINMENT_MAX_EXPANSION`] times
+/// the gold's distinct content words, or when the gold words found are spread over
+/// more than [`CONTAINMENT_MAX_SPREAD`] times the gold's length. Coverage itself is
+/// checked by [`covers`].
+pub fn containment(gold: &str, pred: &str, vocab: &Vocabulary) -> f64 {
+    let (g, p) = (claim_words(gold, vocab), claim_words(pred, vocab));
+    let (inter, ng, np) = polar_overlap(&g, &p);
+    if ng < 2 || inter == 0 || np > CONTAINMENT_MAX_EXPANSION * ng {
         return 0.0;
     }
-    let inter = g.intersection(&p).count() as f64;
-    if inter / (p.len() as f64) < CONTAINMENT_MIN_PRECISION {
+    let wanted: std::collections::BTreeSet<&ClaimWord> =
+        g.iter().filter(|w| p.contains(w)).collect();
+    if min_window(&p, &wanted) > CONTAINMENT_MAX_SPREAD * ng {
         return 0.0;
     }
-    inter / g.len() as f64
+    inter as f64 / ng as f64
+}
+
+/// Length of the shortest run of `seq` holding every word of `wanted`.
+fn min_window(seq: &[ClaimWord], wanted: &std::collections::BTreeSet<&ClaimWord>) -> usize {
+    let mut best = usize::MAX;
+    for start in 0..seq.len() {
+        if !wanted.contains(&seq[start]) {
+            continue;
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for (end, w) in seq.iter().enumerate().skip(start) {
+            if wanted.contains(w) {
+                seen.insert(w);
+                if seen.len() == wanted.len() {
+                    best = best.min(end - start + 1);
+                    break;
+                }
+            }
+        }
+    }
+    best
 }
 
 /// Median of a slice (average of the two middle values for even counts); `None` when empty.
@@ -343,32 +536,173 @@ mod tests {
         assert_eq!(stem("use"), "use");
     }
 
+    fn names() -> Vocabulary {
+        let mut v = Vocabulary::default();
+        v.add_person("tamsin", ["Tamsin Reed", "Tam"]);
+        v.add_person("quill", ["Quill Obi"]);
+        v.add_entity("Ledger API");
+        v
+    }
+
     #[test]
     fn key_terms_and_containment() {
-        let k = key_terms("Skip the Ledger step and ask QA about order_svc v2");
-        let want: std::collections::BTreeSet<String> = ["ledger", "qa", "order_svc", "v2"]
-            .iter()
-            .map(|s| stem(s))
-            .collect();
+        let none = Vocabulary::default();
+        let k = key_terms("Skip the Ledger step and ask QA about order_svc v2", &none);
         // order_svc normalizes to two words; both are kept.
+        for want in ["ledger", "qa", "order", "svc", "v2"] {
+            assert!(k.contains(want), "{want} in {k:?}");
+        }
         assert!(
-            k.contains("ledger") && k.contains("qa") && k.contains("v2"),
-            "{k:?}"
+            !k.contains("skip"),
+            "a capitalized first word is not a key term by shape"
         );
+        assert!(key_terms_present(
+            "ask Tamsin",
+            "we will ask tamsin today",
+            &none
+        ));
+        assert!(!key_terms_present(
+            "ask Tamsin",
+            "we will ask Quill today",
+            &none
+        ));
         assert!(
-            k.contains("order") && k.contains("svc"),
-            "{k:?} vs {want:?}"
-        );
-        assert!(!k.contains("skip"), "the first word is not a key term");
-        assert!(key_terms_present("ask Tamsin", "we will ask tamsin today"));
-        assert!(!key_terms_present("ask Tamsin", "we will ask Quill today"));
-        assert!(
-            (containment("skip importer", "we skip the importer this week") - 1.0).abs() < 1e-12
+            (containment("skip importer", "we skip the importer this week", &none) - 1.0).abs()
+                < 1e-12
         );
         assert_eq!(
-            containment("importer", "skip the importer"),
+            containment("importer", "skip the importer", &none),
             0.0,
             "one word is too short"
+        );
+    }
+
+    #[test]
+    fn known_names_are_key_terms_at_the_start_of_a_sentence() {
+        let v = names();
+        let gold = "Tamsin moves to dashboard work";
+        let k = key_terms(gold, &v);
+        assert!(k.contains("@tamsin"), "{k:?}");
+        assert!(!key_terms_present(
+            gold,
+            "Quill moves to dashboard work",
+            &v
+        ));
+        // any spelling of the same participant states the name
+        assert!(key_terms_present(
+            gold,
+            "Tam moved over to the dashboard work",
+            &v
+        ));
+        // an entity word is a key term even lower-case and first
+        assert!(key_terms("ledger is deferred", &v).contains("ledger"));
+        // a negation word is never a key term
+        assert!(key_terms("We Don't ship", &Vocabulary::default()).is_empty());
+    }
+
+    #[test]
+    fn negation_governs_the_rest_of_its_clause() {
+        let v = Vocabulary::default();
+        let polar = |t: &str| -> Vec<(String, bool)> {
+            claim_words(t, &v)
+                .into_iter()
+                .map(|w| (w.term, w.negated))
+                .collect()
+        };
+        assert!(polar("do not ship weekly builds").iter().all(|(_, n)| *n));
+        assert!(polar("we won't ship weekly builds").iter().all(|(_, n)| *n));
+        assert!(polar("ship weekly builds").iter().all(|(_, n)| !*n));
+        // the negation ends with its clause
+        let p = polar("ship weekly builds, not nightly ones");
+        assert_eq!(p[0], ("ship".into(), false));
+        assert_eq!(p.last().unwrap().1, true);
+        let p = polar("No, we ship weekly builds");
+        assert!(p.iter().all(|(_, n)| !*n), "{p:?}");
+        let p = polar("never the importer but ship the dashboard");
+        assert_eq!(p[0], ("importer".into(), true));
+        assert!(p[1..].iter().all(|(_, n)| !*n), "{p:?}");
+    }
+
+    #[test]
+    fn a_claim_and_its_negation_do_not_overlap() {
+        let v = Vocabulary::default();
+        assert!(!covers(
+            "ship weekly builds",
+            "do not ship weekly builds",
+            &v
+        ));
+        assert!(!covers(
+            "do not ship weekly builds",
+            "ship weekly builds",
+            &v
+        ));
+        assert_eq!(
+            containment("ship weekly builds", "we will not ship weekly builds", &v),
+            0.0
+        );
+        assert_eq!(
+            claim_dice("ship weekly builds", "do not ship weekly builds", &v),
+            0.0
+        );
+        assert!(covers(
+            "do not ship weekly builds",
+            "We decided we won't ship weekly builds.",
+            &v
+        ));
+        assert!(covers(
+            "ship weekly builds",
+            "ship weekly builds, not nightly ones",
+            &v
+        ));
+    }
+
+    #[test]
+    fn short_golds_need_every_claim_word() {
+        let v = names();
+        // Kimi reproducer: two of three gold words plus the name, no predicate.
+        let gold = "Skip the Ledger step for now";
+        let pred = "Ledger told us the step was hard";
+        assert!(!covers(gold, pred, &v));
+        assert!(!covers(
+            "Tamsin moves from the importer to the dashboard work",
+            "Tamsin complained about the importer and the dashboard work",
+            &v
+        ));
+        assert_eq!(allowed_missing(3, true), 0);
+        assert_eq!(allowed_missing(5, true), 0);
+        assert_eq!(allowed_missing(6, true), 1);
+        assert_eq!(
+            allowed_missing(6, false),
+            0,
+            "no key terms: nothing else pins the subject"
+        );
+        // a long keyed claim may drop one qualifier
+        assert!(covers(
+            "Tamsin moves the importer retries to the dashboard backlog this sprint",
+            "Tamsin moves the importer retries to the dashboard backlog",
+            &v
+        ));
+    }
+
+    #[test]
+    fn long_predictions_cannot_game_containment() {
+        let v = Vocabulary::default();
+        // 2-word gold inside a 20-word ramble (exactly the old 0.1 floor): no match.
+        let ramble = "ship builds hiring plans office seating travel budgets lunch vendors parking passes badge printers laptop refresh cycles conference talks onboarding";
+        assert_eq!(containment("ship builds", ramble, &v), 0.0);
+        // Up to four times the gold's content words, together: a restatement.
+        assert_eq!(
+            containment("ship builds", "we ship builds after the review", &v),
+            1.0
+        );
+        // The gold words scattered across the prediction: not a restatement.
+        assert_eq!(
+            containment(
+                "skip importer",
+                "skip lunch vendors travel parking importer",
+                &v
+            ),
+            0.0
         );
     }
 

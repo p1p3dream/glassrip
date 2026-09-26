@@ -224,9 +224,11 @@ fn meeting_suite_hand_computed() {
     // tolerance and fills the second slot. 3 speaker labels vs 2 people.
     assert_eq!(get("audio.hotword_wer"), 0.0);
     assert_eq!(get("audio.speaker_labels"), 3.0);
+    // Raw diarization: 3 labels for 2 people.
+    assert_eq!(get("audio.speaker_label_error"), 1.0);
     // After name mapping: avery, jordan, and the unresolved S2 voice.
     assert_eq!(get("audio.speaker_identities"), 3.0);
-    assert_eq!(get("audio.speaker_label_error"), 1.0);
+    assert_eq!(get("audio.speaker_identity_error"), 1.0);
     // Speakers: 3 labels, 2 mapped people, both in the golden set.
     assert_eq!(get("speakers.labels"), 3.0);
     assert_eq!(get("speakers.distinct_people"), 2.0);
@@ -468,13 +470,88 @@ fn nominal_grid_labels_join_where_their_frame_was_taken() {
             .unwrap()
             .metrics["screen.accuracy"]
     };
-    g.frame_clock = FrameClock::default();
+    let grid = FrameClock::PrototypeGrid {
+        interval_s: 2.0,
+        lead_s: 0.05,
+    };
+    g.clocks.screen_types = Some(grid);
     assert_eq!(score(&g), 1.0);
-    g.frame_clock = FrameClock::Pts;
+    g.clocks.screen_types = Some(FrameClock::Pts);
     assert_eq!(score(&g), 0.0);
-    // A golden without the field is on the prototype grid (spec 9.2).
+    // The legacy field still declares the screen clock.
+    g.clocks.screen_types = None;
+    g.frame_clock = Some(grid);
+    assert_eq!(score(&g), 1.0);
+    // A golden without any clock scores exactly as before clocks existed (PTS).
     let mut v = serde_json::to_value(&g).unwrap();
     v.as_object_mut().unwrap().remove("frame_clock");
     let g: MeetingGolden = serde_json::from_value(v).unwrap();
-    assert_eq!(g.frame_clock, FrameClock::default());
+    g.validate().unwrap();
+    assert_eq!(score(&g), 0.0);
+}
+
+/// Kimi finding 4: owner and static-window times join on their own declared clock,
+/// never on the screen clock.
+#[test]
+fn owner_and_static_window_clocks_are_declared_per_section() {
+    use glassrip_eval::golden::FrameClock;
+    let owned = |from: f64| {
+        ra::board(
+            "w1",
+            true,
+            Some(60.0),
+            nodes(&[("a", "Ledger API"), ("q", "Orbit Queue")]),
+            vec![],
+            vec![],
+            vec![
+                ra::owner("Avery", "Avery", ra::on_node("a", "Ledger API"), 0.0, from),
+                ra::owner(
+                    "Avery",
+                    "Avery",
+                    ra::on_node("q", "Orbit Queue"),
+                    from,
+                    3600.0,
+                ),
+            ],
+            vec![ra::event("E1", "NodeAdded", 29.0)],
+        )
+    };
+    let metrics = |g: &MeetingGolden| {
+        let dir = tempfile::tempdir().unwrap();
+        ra::write_artifact(
+            dir.path(),
+            schema::BOARD_STATE,
+            vec![("b".into(), owned(32.0))],
+        )
+        .unwrap();
+        run_meeting(g, &RunArtifacts::scan(dir.path()).unwrap(), 2.0)
+            .unwrap()
+            .metrics
+    };
+    let grid = FrameClock::PrototypeGrid {
+        interval_s: 5.0,
+        lead_s: 0.0,
+    };
+    // Gold move at 30 (PTS), predicted at 32: inside the 2 s tolerance.
+    let mut g = golden();
+    let pts = metrics(&g);
+    assert_eq!(pts["owners.move_error_max_s"], 0.0);
+    // The screen clock never moves owner or window times.
+    g.frame_clock = Some(grid);
+    assert_eq!(metrics(&g)["owners.move_error_max_s"], 0.0);
+    assert_eq!(
+        metrics(&g)["events.false_change"],
+        pts["events.false_change"]
+    );
+    // Owners on a 5 s grid: the move names 30, content time 35; error 3 - 2.
+    g.clocks.owners = Some(grid);
+    assert_eq!(metrics(&g)["owners.move_error_max_s"], 1.0);
+    // The static window 20..28 holds the event at 29 on PTS (29 <= 28 + 4 s
+    // tolerance). On a 10 s grid the window is 30..38, after the event.
+    assert_eq!(pts["events.false_change"], 1.0);
+    g.clocks.static_windows = Some(FrameClock::PrototypeGrid {
+        interval_s: 10.0,
+        lead_s: 0.0,
+    });
+    assert_eq!(metrics(&g)["events.false_change"], 0.0);
 }
