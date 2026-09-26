@@ -170,7 +170,7 @@ fn truncated_info(raw_text: &str) -> ErrorInfo {
         "generation stopped at the output limit (done_reason length)",
     )
     .with_raw_text(raw_text.to_string())
-    .terminal()
+    .terminal_if_repeated()
 }
 
 /// Why [`PlacementMonitor::infer_typed_detailed`] failed.
@@ -576,11 +576,15 @@ impl CloneDigest for VisionError {
 
 /// Map a vision error to an item error.
 ///
-/// Failures that are a deterministic answer to the request (requests run at
-/// temperature 0 with a fixed seed, and the cache key holds the model digest) are
-/// marked terminal ([`ErrorInfo::terminal`]): an invalid reply after the repair
-/// retry, a reply cut off at the output limit or stopped for repetition, and inputs
-/// that cannot be sent. Transport, server, and placement failures stay retryable.
+/// Only inputs that provably cannot be sent (an image over the encoder's token
+/// budget, a request whose estimate exceeds `num_ctx`, an image that does not
+/// decode) are terminal ([`ErrorInfo::terminal`]): they fail the same way before
+/// any model runs. A model's reply is content the next run may not repeat, even at
+/// temperature 0 with a fixed seed (batching and GPU kernels are not bit exact), so
+/// an invalid, undecodable, cut-off, or looping reply is recurrent
+/// ([`ErrorInfo::recurrent`]): the runner retries it on the next run and settles it
+/// only when the same failure comes back. Transport, server, and placement
+/// failures stay plainly retryable.
 pub fn vision_error_info(e: &VisionError) -> ErrorInfo {
     match e {
         VisionError::Cancelled => ErrorInfo::new(ErrorCode::Cancelled, e.to_string()),
@@ -588,15 +592,15 @@ pub fn vision_error_info(e: &VisionError) -> ErrorInfo {
         VisionError::SchemaInvalid { raw_text, .. } => {
             ErrorInfo::new(ErrorCode::SchemaParse, e.to_string())
                 .with_raw_text(raw_text.clone())
-                .terminal()
+                .terminal_if_repeated()
         }
         VisionError::Decode { .. } => {
-            ErrorInfo::new(ErrorCode::SchemaParse, e.to_string()).terminal()
+            ErrorInfo::new(ErrorCode::SchemaParse, e.to_string()).terminal_if_repeated()
         }
         VisionError::Truncated { raw_text, .. } | VisionError::Repetition { raw_text, .. } => {
             ErrorInfo::new(ErrorCode::ModelRequest, e.to_string())
                 .with_raw_text(raw_text.clone())
-                .terminal()
+                .terminal_if_repeated()
         }
         VisionError::Image(_)
         | VisionError::ImageTooManyTokens { .. }
@@ -674,6 +678,84 @@ mod tests {
             poll_interval: Duration::from_millis(5),
             max_pause,
             ..MonitorConfig::default()
+        }
+    }
+
+    /// Codex 6: model-reply failures are not settled by one sighting; only
+    /// inputs that cannot be sent are.
+    #[test]
+    fn only_unsendable_inputs_are_terminal() {
+        let finding = glassrip_vision::repetition::RepetitionFinding {
+            kind: glassrip_vision::repetition::RepetitionKind::Templated,
+            repeats: 6,
+            pattern: "#".into(),
+            at_bytes: 10,
+        };
+        let replies = [
+            VisionError::SchemaInvalid {
+                attempts: 2,
+                errors: Vec::new(),
+                raw_text: "{".into(),
+            },
+            VisionError::Decode { errors: Vec::new() },
+            VisionError::Truncated {
+                num_predict: 8,
+                eval_count: Some(8),
+                raw_text: "{".into(),
+            },
+            VisionError::Repetition {
+                num_predict: 8,
+                finding,
+                raw_text: "{".into(),
+            },
+        ];
+        for e in &replies {
+            let info = vision_error_info(e);
+            assert!(info.recurrent && !info.terminal, "{e}: {info:?}");
+        }
+        let truncated = check_usage(
+            &RawResponse {
+                raw_text: "{".into(),
+                json: serde_json::Value::Null,
+                prompt_eval_count: None,
+                eval_count: None,
+                durations: glassrip_vision::Durations::default(),
+                attempts: 1,
+                repaired: false,
+                done_reason: Some("length".into()),
+            },
+            8192,
+        )
+        .unwrap_err();
+        assert!(truncated.recurrent && !truncated.terminal);
+        for e in [
+            VisionError::ContextOverflow {
+                estimated: 9000,
+                num_ctx: 8192,
+            },
+            VisionError::ImageTooManyTokens {
+                width: 9000,
+                height: 9000,
+                tokens: 99_999,
+                max: 4096,
+            },
+        ] {
+            let info = vision_error_info(&e);
+            assert!(info.terminal && !info.recurrent, "{e}: {info:?}");
+        }
+        for e in [
+            VisionError::Cancelled,
+            VisionError::Timeout {
+                attempts: 1,
+                timeout: Duration::from_secs(1),
+            },
+            VisionError::RetriesExhausted {
+                attempts: 3,
+                last: "503".into(),
+            },
+        ] {
+            let info = vision_error_info(&e);
+            assert!(!info.terminal && !info.recurrent, "{e}: {info:?}");
         }
     }
 

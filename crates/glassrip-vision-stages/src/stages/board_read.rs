@@ -483,7 +483,9 @@ impl Stage for BoardReadStage {
         "board_read"
     }
     fn version(&self) -> u32 {
-        1
+        // 2: repetition guard and retry, and model-reply failures recurrent
+        // instead of terminal (outputs of 1 may cache a failure as permanent).
+        2
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
