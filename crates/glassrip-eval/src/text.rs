@@ -532,7 +532,8 @@ fn number_word(lower: &str) -> Option<&'static str> {
 
 /// The comparison terms of one word: a word with a decimal point or digit grouping
 /// whole (`2.5` and `v2.5` stay one term, `1,000` is `1000`, a plain decimal drops
-/// trailing zeros so `3.0` is `3`; "two or five" never states "2.5"), participant terms where
+/// trailing zeros so `3.0` is `3`, a version keeps its digits so `v3.10` is not
+/// `v3.1`; "two or five" never states "2.5"), participant terms where
 /// [`Vocabulary`] knows the name and the word may name someone ([`may_name`]),
 /// digits of number words ([`NUMBER_WORDS`]), stems of the other non-stopword parts.
 fn word_terms(word: &str, name_ok: bool, vocab: &Vocabulary) -> Vec<String> {
@@ -736,6 +737,12 @@ fn protected_words<'a>(
     head.into_iter().chain(predicate).collect()
 }
 
+/// Adverbs that do not change what a retraction is about ("we won't ship weekly
+/// builds anymore"); [`clause_retracts`] does not count them as words of its own.
+const NEUTRAL_ADVERBS: &[&str] = &[
+    "anymore", "again", "either", "ever", "really", "actually", "still", "longer",
+];
+
 /// In one unit of a prediction (a clause, or an "and" segment of one,
 /// [`claim_segments`]), a gold word is *flipped* when the unit states it with the
 /// opposite polarity, and *kept* when the unit states it with the gold's polarity
@@ -743,21 +750,25 @@ fn protected_words<'a>(
 /// "Tamsin does not ship weekly builds", "Tamsin's weekly builds" in "Tamsin's
 /// weekly builds do not ship"). An entity word is kept through a sibling word of the
 /// same entity ([`Vocabulary::names`]) only where the sibling ends its run of
-/// non-gold words ("the Ledger does not ship" keeps "Ledger API"; "the Ledger Queue
-/// does not ship" does not). A unit that names no participant or entity inherits
-/// the gold's participants ("she does not ship weekly builds" after "Tamsin ships
-/// weekly builds"). The unit retracts the claim when some gold word is flipped, no
-/// word of its own stands between its flipped gold words ("Tamsin doesn't ship
-/// nightly builds" is about other builds), the claim's protected words (head and
-/// predicate, [`covers`]) are flipped or kept, and
+/// non-gold words ("the Ledger does not ship" keeps "Ledger API"). A unit that names
+/// no participant or entity before its negation inherits the gold's participants it
+/// does not mention ("she does not ship Ledger builds" after "Tamsin ships Ledger
+/// builds").
+///
+/// A retraction restates the claim and nothing more: the unit does not retract when
+/// a word of its own (not a gold word, not one of [`NEUTRAL_ADVERBS`]) stands
+/// between or after its flipped gold words ("Tamsin doesn't ship nightly builds",
+/// "she does not ship weekly builds to production", "... do not ship after audit"),
+/// or, where no gold word is both flipped and kept, right next to a kept gold word
+/// other than a participant ("Tamsin's nightly builds do not ship", "the Ledger
+/// Queue does not ship"). Otherwise it retracts when some gold word is flipped, the
+/// claim's protected words (head and predicate, [`covers`]) are flipped or kept, and
 ///
 /// - when no gold word is both flipped and kept, the flipped and kept words together
 ///   number as many as [`covers`] needs, in any order ("weekly builds do not ship on
-///   Friday" retracts "weekly builds ship on Friday"). The one-word allowance of a
-///   long gold applies only when no word of the unit's own follows its flipped gold
-///   words: a retraction may be broader than the claim ("Tamsin's weekly builds do
-///   not ship to QA" retracts "Tamsin ships weekly release builds to QA") but not
-///   about something else ("... do not ship to staging" does not);
+///   Friday" retracts "weekly builds ship on Friday"; "Tamsin's weekly builds do not
+///   ship to QA", broader than the claim, retracts "Tamsin ships weekly release
+///   builds to QA");
 /// - when some gold word is both (the unit affirms and then negates it), and
 ///   `contrast_ok` (the unit is a single segment), every gold word from the first
 ///   flipped one in gold order onward is flipped and every one before it is kept,
@@ -767,10 +778,12 @@ fn protected_words<'a>(
 ///   doesn't ship nightly builds" and "... for review and Quill does not review
 ///   audit" do not retract.
 ///
-/// A unit that negates the predicate about something else does not retract ("we
-/// don't ship nightly builds; we ship weekly builds"). Polarity is lexical: a
-/// negation governs the rest of its clause, so an embedded affirmation under a
-/// negation ("nobody doubts Tamsin ships weekly builds") reads as a retraction.
+/// Polarity is lexical: a negation governs the rest of its clause, "and" included.
+/// So an embedded affirmation under a negation ("nobody doubts Tamsin ships weekly
+/// builds") and an affirmation coordinated after a negation ("Tamsin doesn't ship
+/// nightly and ships weekly builds") read as retractions, and a negation spread over
+/// coordinated objects ("she does not ship weekly and nightly builds") is judged per
+/// segment and does not.
 fn clause_retracts(
     gw: &[ClaimWord],
     need: usize,
@@ -783,16 +796,21 @@ fn clause_retracts(
     let g: BTreeSet<&ClaimWord> = gw.iter().collect();
     let all: BTreeSet<ClaimWord> = unit.iter().cloned().collect();
     let before_negation = unit.iter().position(|w| w.negated).unwrap_or(unit.len());
+    let prefix = &unit[..before_negation];
     let single = |x: &ClaimWord| BTreeSet::from([x.clone()]);
     let gold_term = |x: &ClaimWord| {
         g.iter()
             .any(|w| stated(w, &single(x), vocab) || stated(&flip(w), &single(x), vocab))
     };
-    let names_nothing = unit.iter().all(|x| !vocab.is_name(&x.term));
+    let own = |x: &ClaimWord| !gold_term(x) && !NEUTRAL_ADVERBS.iter().any(|a| stem(a) == x.term);
+    let names_nothing = prefix.iter().all(|x| !vocab.is_name(&x.term));
     let flipped = |w: &ClaimWord| stated(&flip(w), &all, vocab);
     let kept = |w: &ClaimWord| {
-        let prefix = &unit[..before_negation];
-        if prefix.contains(w) || (names_nothing && w.term.starts_with('@') && !w.negated) {
+        let inherited = names_nothing
+            && w.term.starts_with('@')
+            && !w.negated
+            && !unit.iter().any(|x| x.term == w.term);
+        if prefix.contains(w) || inherited {
             return true;
         }
         if w.term.starts_with('@') || !vocab.is_name(&w.term) {
@@ -808,11 +826,10 @@ fn clause_retracts(
         return false;
     };
     let flips_gold = |x: &ClaimWord| g.iter().any(|w| stated(&flip(w), &single(x), vocab));
-    let flip_at: Vec<usize> = (0..unit.len()).filter(|&j| flips_gold(&unit[j])).collect();
-    let (Some(&lo), Some(&hi)) = (flip_at.first(), flip_at.last()) else {
+    let Some(lo) = unit.iter().position(flips_gold) else {
         return false;
     };
-    if !unit[lo..=hi].iter().all(gold_term) {
+    if unit[lo..].iter().any(own) {
         return false;
     }
     if g.iter().any(|w| flipped(w) && kept(w)) {
@@ -828,11 +845,16 @@ fn clause_retracts(
             }
         });
     }
-    let need = if unit[hi + 1..].iter().all(gold_term) {
-        need
-    } else {
-        g.len()
+    let modifies_kept = |i: usize| {
+        [i.checked_sub(1), Some(i + 1)]
+            .into_iter()
+            .flatten()
+            .filter_map(|j| prefix.get(j))
+            .any(|y| !y.term.starts_with('@') && gold_term(y))
     };
+    if (0..prefix.len()).any(|i| own(&prefix[i]) && modifies_kept(i)) {
+        return false;
+    }
     let retracted = |w: &ClaimWord| flipped(w) || kept(w);
     anchors.iter().all(|w| retracted(w)) && g.iter().filter(|w| retracted(w)).count() >= need
 }
@@ -1438,6 +1460,18 @@ mod tests {
             "Tamsin ships weekly builds; she does not ship weekly builds",
             &v
         ));
+        // Kimi r2eval round 2 MAJOR 3: inheritance holds when the claim names an entity
+        assert!(!covers(
+            "Tamsin ships Ledger builds",
+            "Tamsin ships Ledger builds; she does not ship Ledger builds",
+            &v
+        ));
+        // a neutral adverb does not make the retraction about something else
+        assert!(!covers(
+            gold,
+            "Tamsin ships weekly builds; Tamsin won't ship weekly builds anymore",
+            &v
+        ));
         // Kimi r2eval round 1 MAJOR 4: object-fronted and passive retractions
         let none = Vocabulary::default();
         assert!(!covers(
@@ -1514,6 +1548,25 @@ mod tests {
                 "Tamsin ships weekly builds to the staging cluster",
                 "Tamsin ships weekly builds to the staging cluster; Tamsin does not ship weekly builds to the prod cluster",
             ),
+            // Kimi r2eval round 2 MAJOR 1: a word of the unit's own after the flipped
+            // gold words, even for a short gold with no allowance
+            (
+                "Tamsin ships weekly builds",
+                "Tamsin ships weekly builds; she does not ship weekly builds to production",
+            ),
+            (
+                "ship weekly builds",
+                "ship weekly builds; we do not ship weekly builds to production",
+            ),
+            // Kimi r2eval round 2 MAJOR 2: a word of its own next to a kept gold word
+            (
+                "Tamsin ships builds",
+                "Tamsin ships builds; Tamsin's nightly builds do not ship",
+            ),
+            (
+                "Ledger ships weekly builds",
+                "Ledger ships weekly builds; the Ledger Queue does not ship weekly builds",
+            ),
             // Kimi r2eval round 1 MAJOR 2: a sibling word inside another entity's
             // name does not keep the gold entity
             (
@@ -1563,6 +1616,7 @@ mod tests {
         assert!(covers("Ship v2.5 builds", "we ship v2.5 builds", &v));
         assert!(covers("wait 3.0 seconds", "wait 3 seconds", &v));
         assert!(!covers("wait 3.5 seconds", "wait 3 seconds", &v));
+        assert!(!covers("Ship v3.10 builds", "Ship v3.1 builds", &v));
     }
 
     /// Codex round-1 M4: a participant name is a name where it is capitalized, even
