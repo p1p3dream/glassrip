@@ -92,7 +92,8 @@ pub struct SvgChecks {
     pub style_violations: Vec<String>,
     /// Layout method.
     pub layout_method: String,
-    /// Annotations with no room on the board, listed below it instead
+    /// Annotations with no room on the board, listed below it instead, and
+    /// text other than the annotation list whose glyphs reach past the canvas
     /// (warnings: they do not fail validation).
     #[serde(default)]
     pub warnings: Vec<String>,
@@ -160,11 +161,13 @@ fn count_text(g: &usvg::Group, total: &mut usize, rendered: &mut usize) {
 }
 
 /// Text whose rendered glyphs reach outside the `w` x `h` canvas (measured
-/// with the fonts actually loaded, not estimated).
-fn text_outside(g: &usvg::Group, w: f32, h: f32, out: &mut Vec<String>) {
+/// with the fonts actually loaded, not estimated). Lines of the annotation
+/// list go to `strict` (its layout guarantees room, so a miss is a defect);
+/// other text, laid out from width estimates, goes to `warn`.
+fn text_outside(g: &usvg::Group, w: f32, h: f32, strict: &mut Vec<String>, warn: &mut Vec<String>) {
     for n in g.children() {
         match n {
-            usvg::Node::Group(g) => text_outside(g, w, h, out),
+            usvg::Node::Group(g) => text_outside(g, w, h, strict, warn),
             usvg::Node::Text(t) => {
                 let b = t.abs_bounding_box();
                 if b.width() > 0.0
@@ -181,7 +184,12 @@ fn text_outside(g: &usvg::Group, w: f32, h: f32, out: &mut Vec<String>) {
                         .chars()
                         .take(40)
                         .collect();
-                    out.push(format!("text \"{text}\" is outside the canvas"));
+                    let msg = format!("text \"{text}\" is outside the canvas");
+                    if t.id().starts_with(crate::scene::LIST_ID) {
+                        strict.push(msg);
+                    } else {
+                        warn.push(msg);
+                    }
                 }
             }
             _ => {}
@@ -365,6 +373,7 @@ pub fn validate_svg(svg: &str, scene: &Scene, fonts: &FontConfig) -> (SvgChecks,
         size_f.width(),
         size_f.height(),
         &mut checks.overlaps,
+        &mut checks.warnings,
     );
     let Some(mut pixmap) = tiny_skia::Pixmap::new(size.width(), size.height()) else {
         checks.parse_error = Some("zero-sized canvas".into());

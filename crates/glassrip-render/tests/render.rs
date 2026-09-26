@@ -323,11 +323,7 @@ fn a_crowded_board_lists_what_does_not_fit_below_it() {
     for n in 1..=f.items.len() {
         let w = &scene.degraded[n - 1];
         assert!(w.contains(&format!("as note {n}")), "{w}");
-        assert_eq!(
-            numbers.contains(&n),
-            !w.contains("no room for its marker"),
-            "{w}"
-        );
+        assert_eq!(numbers.contains(&n), !w.contains("(no marker"), "{w}");
     }
     // leaders have length and stay inside the canvas
     for l in &scene.leaders {
@@ -406,14 +402,32 @@ fn a_relation_label_in_the_rightmost_column_stays_inside_the_canvas() {
     assert!(r.ok, "{:?}", r.failures());
 }
 
-/// Text drawn past the canvas edge is a real defect and fails validation,
-/// measured on the rendered glyphs.
+/// Glyphs past the canvas: a defect in the annotation list (its layout
+/// guarantees room), a warning elsewhere (laid out from width estimates, and
+/// never a reason to fail a meeting run). Measured on the rendered glyphs.
 #[test]
-fn text_outside_the_canvas_fails() {
+fn text_outside_the_canvas_fails_only_in_the_list() {
+    let env = glassrip_render::svg::environment();
     let (notes, board) = inputs();
     let mut scene = build_scene(&board, &notes);
     scene.footer.x = scene.width + 200.0;
-    let env = glassrip_render::svg::environment();
+    let text = glassrip_render::svg::render_svg(&env, &scene).unwrap();
+    let (checks, _) = glassrip_render::svg::validate_svg(&text, &scene, &bundled_fonts());
+    assert!(checks.ok, "{:?}", checks.failures());
+    assert!(
+        checks
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("text \"Source:") && w.ends_with("outside the canvas")),
+        "{:?}",
+        checks.warnings
+    );
+
+    let (notes, board) = crowded_board();
+    let mut scene = build_scene(&board, &notes);
+    let width = scene.width;
+    let f = scene.footnotes.as_mut().unwrap();
+    f.items[0].lines[0].x = width + 200.0;
     let text = glassrip_render::svg::render_svg(&env, &scene).unwrap();
     let (checks, _) = glassrip_render::svg::validate_svg(&text, &scene, &bundled_fonts());
     assert!(!checks.ok);
@@ -421,7 +435,7 @@ fn text_outside_the_canvas_fails() {
         checks
             .overlaps
             .iter()
-            .any(|o| o.starts_with("text \"Source:") && o.ends_with("outside the canvas")),
+            .any(|o| o.starts_with("text \"Label on the") && o.ends_with("outside the canvas")),
         "{:?}",
         checks.overlaps
     );

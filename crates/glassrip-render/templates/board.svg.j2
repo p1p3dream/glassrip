@@ -1,5 +1,5 @@
 {%- macro text(t) -%}
-<text class="{{ t.class }}" x="{{ t.x|n }}" y="{{ t.y|n }}"{% if t.anchor == "middle" %} text-anchor="middle"{% endif %}{% if t.fill %} style="fill:{{ t.fill }}"{% endif %}>{{ t.text }}</text>
+<text class="{{ t.class }}"{% if t.id %} id="{{ t.id }}"{% endif %} x="{{ t.x|n }}" y="{{ t.y|n }}"{% if t.anchor == "middle" %} text-anchor="middle"{% endif %}{% if t.fill %} style="fill:{{ t.fill }}"{% endif %}>{{ t.text }}</text>
 {%- endmacro -%}
 {%- macro pill(p) -%}
 <rect x="{{ p.r.x|n }}" y="{{ p.r.y|n }}" width="{{ p.r.w|n }}" height="{{ p.r.h|n }}" rx="{{ p.rx|n }}" fill="{{ p.fill }}"{% if p.stroke %} stroke="{{ p.stroke }}"{% endif %}/>

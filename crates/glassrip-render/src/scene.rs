@@ -112,6 +112,9 @@ pub struct TextLine {
     pub anchor: &'static str,
     /// Extra fill color.
     pub fill: Option<String>,
+    /// Element id (lines of the annotation list, whose glyphs validation
+    /// requires inside the canvas).
+    pub id: Option<String>,
 }
 
 fn tl(x: f64, y: f64, text: impl Into<String>, class: &str) -> TextLine {
@@ -122,6 +125,7 @@ fn tl(x: f64, y: f64, text: impl Into<String>, class: &str) -> TextLine {
         class: class.into(),
         anchor: "start",
         fill: None,
+        id: None,
     }
 }
 
@@ -593,13 +597,18 @@ fn ring_spots(c: (f64, f64), w: f64, h: f64, radii: &[f64]) -> Vec<R> {
     out
 }
 
+/// Id prefix of the annotation list's text lines.
+pub const LIST_ID: &str = "annotation-list";
+
 /// Upper bound of a character's advance in the list's 12 px regular text, by
 /// width class (wide capitals and symbols, other capitals and digits, the
 /// rest); generous so a line never runs past the list.
 pub fn list_char_w(c: char) -> f64 {
     let em = match c {
         'W' | 'M' | 'm' | 'w' | '@' | '%' | '&' => 1.0,
-        c if c.is_uppercase() || c.is_ascii_digit() || !c.is_ascii() => 0.8,
+        // full-width scripts and emoji
+        c if !c.is_ascii() => 1.3,
+        c if c.is_uppercase() || c.is_ascii_digit() => 0.8,
         _ => 0.6,
     };
     12.0 * em
@@ -795,6 +804,8 @@ struct Pending {
     text: String,
     /// Marker spots, best first (sized for this footnote's number).
     spots: Vec<R>,
+    /// False when its element is not drawn on the board at all.
+    drawn: bool,
 }
 
 /// Builds the scene for one board.
@@ -1131,7 +1142,7 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
                                 && r.right() <= width - MARGIN / 2.0
                                 && r.y >= LEGEND_BOTTOM
                                 && !taken.iter().any(|t| t.intersects(r))
-                                && !leaders.iter().any(|l| line_hits(l, r))
+                                && !leaders.iter().any(|l| line_hits(l, &r.inflate(2.0)))
                         });
                     (candidates, free)
                 };
@@ -1185,7 +1196,7 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
                                 && r.right() <= width - MARGIN / 2.0
                                 && r.y >= LEGEND_BOTTOM
                                 && !taken.iter().any(|t| t.intersects(&r))
-                                && !leaders.iter().any(|l| line_hits(l, &r))
+                                && !leaders.iter().any(|l| line_hits(l, &r.inflate(2.0)))
                             {
                                 // the leader may cross nothing on its way back
                                 let l = leader_to(&r, mid);
@@ -1241,6 +1252,7 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
                     sanitize_dashes(&e.b_text)
                 ),
                 spots: beside_path(&pts, mw, mh),
+                drawn: true,
             });
         }
         edges.push(EdgeArt {
@@ -1322,6 +1334,7 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
                         pending.push(Pending {
                             text: format!("Owner {name} of {what}"),
                             spots: Vec::new(),
+                            drawn: false,
                         });
                         continue;
                     };
@@ -1353,6 +1366,7 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
                         pending.push(Pending {
                             text: format!("Owner {name} of {what}"),
                             spots: Vec::new(),
+                            drawn: false,
                         });
                         continue;
                     };
@@ -1407,6 +1421,7 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
                 pending.push(Pending {
                     text,
                     spots: marker_spots,
+                    drawn: true,
                 });
                 continue;
             };
@@ -1479,6 +1494,7 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
                         pending.push(Pending {
                             text: format!("Owner {name} of {what}: {txt}"),
                             spots,
+                            drawn: true,
                         });
                     }
                 }
@@ -1533,6 +1549,7 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
                     node_text.get(id.as_str()).cloned().unwrap_or_default()
                 ),
                 spots: around_card(&r, mw, mh),
+                drawn: true,
             });
             continue;
         };
@@ -1564,8 +1581,12 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
                     p.text
                 ));
             }
+            None if !p.drawn => degraded.push(format!(
+                "its element is not drawn on the board, listed below it as note {n} (no marker): {}",
+                p.text
+            )),
             None => degraded.push(format!(
-                "no room on the board, listed below it as note {n} (no room for its marker either): {}",
+                "no room on the board, listed below it as note {n} (no marker, no room for one): {}",
                 p.text
             )),
         }
@@ -1764,7 +1785,10 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
             let lines = wrap_px(&p.text, max_px)
                 .into_iter()
                 .enumerate()
-                .map(|(k, l)| tl(fx + 52.0, y + 13.0 + 18.0 * k as f64, l, "body"))
+                .map(|(k, l)| TextLine {
+                    id: Some(format!("{LIST_ID}-{}-{k}", i + 1)),
+                    ..tl(fx + 52.0, y + 13.0 + 18.0 * k as f64, l, "body")
+                })
                 .collect::<Vec<_>>();
             y += 18.0 * lines.len().max(1) as f64 + 8.0;
             items.push(Footnote { marker: m, lines });
@@ -1876,6 +1900,11 @@ pub fn build_scene(board: &BoardStateItem, notes: &MeetingNotes) -> Scene {
         blocking.push(("annotation list".into(), f.r));
     }
 
+    // edge label leaders are drawn with their edge
+    let leaders: Vec<Leader> = leaders
+        .into_iter()
+        .filter(|l| !edges.iter().any(|e| e.leader == Some(*l)))
+        .collect();
     Scene {
         width: width.round(),
         height: height.round(),
@@ -1994,6 +2023,45 @@ mod tests {
         // the horizontal leg gets spots above and below it
         assert!(short.iter().any(|s| s.bottom() <= 400.0 - PILL_GAP));
         assert!(short.iter().any(|s| s.y >= 400.0 + PILL_GAP));
+    }
+
+    #[test]
+    fn leaders_hit_box_interiors_only() {
+        let r = R::new(10.0, 10.0, 20.0, 20.0);
+        // through the middle, and a diagonal clipping a corner
+        assert!(line_hits(&(0.0, 20.0, 40.0, 20.0), &r));
+        assert!(line_hits(&(5.0, 20.0, 20.0, 5.0), &r));
+        // ending inside counts; ending on the border does not
+        assert!(line_hits(&(0.0, 20.0, 15.0, 20.0), &r));
+        assert!(!line_hits(&(0.0, 20.0, 10.0, 20.0), &r));
+        // along a border, beside it, stopping short, a point on the border
+        assert!(!line_hits(&(10.0, 0.0, 10.0, 40.0), &r));
+        assert!(!line_hits(&(0.0, 5.0, 40.0, 5.0), &r));
+        assert!(!line_hits(&(0.0, 20.0, 5.0, 20.0), &r));
+        assert!(!line_hits(&(10.0, 15.0, 10.0, 15.0), &r));
+        // a point inside is a hit
+        assert!(line_hits(&(15.0, 15.0, 15.0, 15.0), &r));
+        // a corner graze outside the box
+        assert!(!line_hits(&(0.0, 20.0, 20.0, 0.0), &r));
+    }
+
+    #[test]
+    fn the_list_wraps_wide_scripts_and_long_words_within_its_width() {
+        let cjk: String = "\u{4e2d}\u{6587}\u{5185}\u{5bb9}".repeat(60);
+        for text in [
+            format!("Owner \u{674e}\u{56db} of {cjk}"),
+            "W".repeat(400),
+            "https://example.com/".repeat(30),
+        ] {
+            let lines = wrap_px(&text, 600.0);
+            assert!(lines.len() > 1);
+            for l in &lines {
+                assert!(list_text_w(l) <= 600.0, "{l}");
+            }
+            assert_eq!(lines.concat().replace(' ', ""), text.replace(' ', ""));
+        }
+        // a full-width glyph is bounded above its real advance (about 1 em)
+        assert!(list_char_w('\u{4e2d}') >= 12.0);
     }
 
     #[test]
