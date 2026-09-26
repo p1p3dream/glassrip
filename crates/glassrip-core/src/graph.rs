@@ -429,6 +429,8 @@ pub fn meeting_mode_stage_decls() -> Vec<StageDecl> {
                 "glassrip.edge_direction",
                 "glassrip.keyframes",
                 "glassrip.ocr",
+                // canvas pixels decide removals (connector corridors, emptied boxes)
+                "glassrip.canvas_crop",
             ],
         ),
         d("audio_extract", "glassrip.audio", &["glassrip.media_probe"]),

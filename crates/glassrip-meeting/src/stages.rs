@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use glassrip_core::envelope::{ErrorCode, ErrorInfo};
 use glassrip_core::runner::{
@@ -23,8 +23,8 @@ use crate::artifacts::{
 };
 use crate::consolidate::owners::{Corroborator, NoCorroboration};
 use crate::consolidate::{
-    consolidate, split_boards, BoardFrame, BoardStateItem, ConsolidationParams, Hooks,
-    SecondReader, TextAnchor,
+    consolidate_with_probe, split_boards, BoardFrame, BoardStateItem, ConsolidationParams, Hooks,
+    RegionProbe, SecondReader, TextAnchor,
 };
 use crate::direction::{frame_weight, DirectionVotes};
 use crate::pixel_direction::{
@@ -651,6 +651,199 @@ impl Stage for EdgeDirectionStage {
 #[derive(Debug, Clone)]
 pub struct BoardStateWork {
     frames: Vec<BoardFrame>,
+    probe: Option<Arc<CropProbe>>,
+}
+
+/// Canvas pixels of one keyframe for [`CropProbe`].
+pub struct ProbeCanvas {
+    image: RgbImage,
+    background: [u8; 3],
+    /// Reading coordinates to image pixels.
+    sx: f64,
+    sy: f64,
+    tolerance: u8,
+}
+
+impl ProbeCanvas {
+    /// A pixel is ink when one of its channels differs from the canvas background
+    /// (the per-channel median of a sample grid) by more than this.
+    pub const DEFAULT_TOLERANCE: u8 = 48;
+
+    /// `image` is the canvas crop; `canvas` the size of the reading's coordinate
+    /// space (identity scale when unknown).
+    pub fn new(image: RgbImage, canvas: Option<CanvasDims>) -> Self {
+        let (w, h) = (image.width(), image.height());
+        let step = ((u64::from(w) * u64::from(h) / 10_000).max(1) as f64).sqrt() as u32;
+        let mut ch: [Vec<u8>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for y in (0..h).step_by(step.max(1) as usize) {
+            for x in (0..w).step_by(step.max(1) as usize) {
+                let p = image.get_pixel(x, y).0;
+                for c in 0..3 {
+                    ch[c].push(p[c]);
+                }
+            }
+        }
+        let background = ch.map(|mut v| {
+            v.sort_unstable();
+            v.get(v.len() / 2).copied().unwrap_or(255)
+        });
+        let (sx, sy) = match canvas {
+            Some(c) if c.width > 0.0 && c.height > 0.0 => {
+                (f64::from(w) / c.width, f64::from(h) / c.height)
+            }
+            _ => (1.0, 1.0),
+        };
+        Self {
+            image,
+            background,
+            sx,
+            sy,
+            tolerance: Self::DEFAULT_TOLERANCE,
+        }
+    }
+
+    fn ink_at(&self, x: f64, y: f64) -> bool {
+        if x < 0.0 || y < 0.0 {
+            return false;
+        }
+        let (x, y) = (x as u32, y as u32);
+        if x >= self.image.width() || y >= self.image.height() {
+            return false;
+        }
+        let p = self.image.get_pixel(x, y).0;
+        (0..3).any(|c| p[c].abs_diff(self.background[c]) > self.tolerance)
+    }
+
+    /// [`RegionProbe::ink_share`] on this canvas.
+    pub fn ink_share(&self, region: &BBox) -> Option<f64> {
+        // A non-finite region measures nothing (it must never read as emptied);
+        // checked before clamping, which would turn NaN into a bound.
+        if ![region.x1, region.y1, region.x2, region.y2]
+            .iter()
+            .all(|v| v.is_finite())
+        {
+            return None;
+        }
+        let x1 = (region.x1 * self.sx).max(0.0).floor();
+        let y1 = (region.y1 * self.sy).max(0.0).floor();
+        let x2 = (region.x2 * self.sx)
+            .min(f64::from(self.image.width()))
+            .ceil();
+        let y2 = (region.y2 * self.sy)
+            .min(f64::from(self.image.height()))
+            .ceil();
+        if x2 - x1 < 2.0 || y2 - y1 < 2.0 {
+            return None;
+        }
+        let (mut ink, mut all) = (0usize, 0usize);
+        let mut y = y1;
+        while y < y2 {
+            let mut x = x1;
+            while x < x2 {
+                all += 1;
+                if self.ink_at(x, y) {
+                    ink += 1;
+                }
+                x += 1.0;
+            }
+            y += 1.0;
+        }
+        Some(ink as f64 / all.max(1) as f64)
+    }
+
+    /// [`RegionProbe::line_cover`] on this canvas: the middle 70 % of the segment
+    /// is sampled every 1.5 px, and a sample is covered when ink lies within
+    /// `half_width` of the line across it.
+    pub fn line_cover(&self, a: (f64, f64), b: (f64, f64), half_width: f64) -> Option<f64> {
+        let pa = (a.0 * self.sx, a.1 * self.sy);
+        let pb = (b.0 * self.sx, b.1 * self.sy);
+        let (dx, dy) = (pb.0 - pa.0, pb.1 - pa.1);
+        let len = dx.hypot(dy);
+        if !len.is_finite() || len < 8.0 {
+            return None;
+        }
+        let (ux, uy) = (dx / len, dy / len);
+        let (nx, ny) = (-uy, ux);
+        let half = (half_width * (self.sx + self.sy) / 2.0).max(1.0).round() as i64;
+        let samples = ((0.7 * len) / 1.5).ceil().max(4.0) as usize;
+        let mut hits = 0usize;
+        for i in 0..samples {
+            let t = 0.15 + 0.7 * (i as f64 + 0.5) / samples as f64;
+            let (cx, cy) = (pa.0 + dx * t, pa.1 + dy * t);
+            if (-half..=half).any(|k| {
+                let k = k as f64;
+                self.ink_at(cx + nx * k, cy + ny * k)
+            }) {
+                hits += 1;
+            }
+        }
+        Some(hits as f64 / samples as f64)
+    }
+}
+
+/// Where [`CropProbe`] finds one keyframe's canvas.
+#[derive(Debug, Clone)]
+pub struct CropSource {
+    /// Canvas crop image.
+    pub path: PathBuf,
+    /// Crop box in frame pixels (the image may be the whole frame).
+    pub crop: Option<BBox>,
+    /// Size of the reading's coordinate space.
+    pub canvas: Option<CanvasDims>,
+}
+
+/// [`RegionProbe`] over the canvas crops, each loaded on first use.
+pub struct CropProbe {
+    sources: HashMap<String, CropSource>,
+    loaded: Mutex<HashMap<String, Option<Arc<ProbeCanvas>>>>,
+}
+
+impl std::fmt::Debug for CropProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CropProbe")
+            .field("keyframes", &self.sources.len())
+            .finish()
+    }
+}
+
+impl CropProbe {
+    /// Probe over `sources` (by keyframe id).
+    pub fn new(sources: HashMap<String, CropSource>) -> Self {
+        Self {
+            sources,
+            loaded: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn canvas(&self, keyframe_id: &str) -> Option<Arc<ProbeCanvas>> {
+        let mut loaded = self.loaded.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(c) = loaded.get(keyframe_id) {
+            return c.clone();
+        }
+        let c = self.sources.get(keyframe_id).and_then(|s| {
+            // An unreadable crop gives no pixel evidence (never removal evidence).
+            load_canvas(&s.path, s.crop)
+                .ok()
+                .map(|img| Arc::new(ProbeCanvas::new(img, s.canvas)))
+        });
+        loaded.insert(keyframe_id.to_string(), c.clone());
+        c
+    }
+}
+
+impl RegionProbe for CropProbe {
+    fn ink_share(&self, keyframe_id: &str, region: &BBox) -> Option<f64> {
+        self.canvas(keyframe_id)?.ink_share(region)
+    }
+    fn line_cover(
+        &self,
+        keyframe_id: &str,
+        a: (f64, f64),
+        b: (f64, f64),
+        half_width: f64,
+    ) -> Option<f64> {
+        self.canvas(keyframe_id)?.line_cover(a, b, half_width)
+    }
 }
 
 /// Consolidates the board keyframes into `glassrip.board_state`, one item per board.
@@ -811,7 +1004,9 @@ impl Stage for BoardStateStage {
     }
     fn version(&self) -> u32 {
         // 3: final state is "observed and not later removed", with coverage evidence.
-        3
+        // 4: canvas pixels decide removals (connector corridors, emptied boxes), and
+        // ink from a failed alignment is unknown.
+        4
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
@@ -835,6 +1030,10 @@ impl Stage for BoardStateStage {
             },
             InputDecl {
                 schema: OCR,
+                major: 1,
+            },
+            InputDecl {
+                schema: CANVAS_CROP,
                 major: 1,
             },
         ]
@@ -868,12 +1067,38 @@ impl Stage for BoardStateStage {
             })
             .collect();
         let frames = board_frames(&keyframes, boards, directions, ocr);
+        let root = run_root(inputs, CANVAS_CROP)?;
+        let mut crops: HashMap<String, (PathBuf, Option<BBox>)> = inputs
+            .read_ok::<CanvasCropView>(CANVAS_CROP)?
+            .into_iter()
+            .map(|(id, c)| {
+                (
+                    c.keyframe_id.unwrap_or(id),
+                    (resolve(&root, &c.path), c.crop),
+                )
+            })
+            .collect();
+        let sources: HashMap<String, CropSource> = frames
+            .iter()
+            .filter_map(|f| {
+                let (path, crop) = crops.remove(&f.keyframe_id)?;
+                let canvas = f
+                    .canvas
+                    .or_else(|| f.directions.as_ref().map(|d| d.canvas))
+                    .filter(|c| c.width > 0.0 && c.height > 0.0);
+                Some((f.keyframe_id.clone(), CropSource { path, crop, canvas }))
+            })
+            .collect();
+        let probe = Arc::new(CropProbe::new(sources));
         Ok(split_boards(frames, &self.params)
             .into_iter()
             .enumerate()
             .map(|(i, frames)| WorkItem {
                 id: format!("board-{}", i + 1),
-                work: BoardStateWork { frames },
+                work: BoardStateWork {
+                    frames,
+                    probe: Some(probe.clone()),
+                },
             })
             .collect())
     }
@@ -886,11 +1111,12 @@ impl Stage for BoardStateStage {
             corroborator: self.corroborator.as_ref(),
             second_reader: self.second_reader.as_deref(),
         };
-        Ok(consolidate(
+        Ok(consolidate_with_probe(
             work.frames,
             ctx.item_id(),
             &self.params,
             &hooks,
+            work.probe.as_deref().map(|p| p as &dyn RegionProbe),
         ))
     }
 }
@@ -1050,5 +1276,61 @@ mod tests {
         // Crop 1000x500 frame pixels onto a 500x250 canvas: half scale, origin shifted.
         assert_eq!(a[0].bbox, BBox::new(100.0, 50.0, 150.0, 60.0));
         assert!(ocr_anchors(&ocr, None).is_empty());
+    }
+
+    #[test]
+    fn probe_canvas_measures_connector_corridors_and_emptied_boxes() {
+        // White 400 x 200 canvas at half the reading's scale: two box outlines, a
+        // 2 px connector between them, and a filled card.
+        let mut img = RgbImage::from_pixel(400, 200, image::Rgb([250, 250, 250]));
+        let ink = image::Rgb([40, 40, 40]);
+        for x in 20..80 {
+            for y in [40u32, 90] {
+                img.put_pixel(x, y, ink);
+                img.put_pixel(x + 280, y, ink);
+            }
+        }
+        for x in 80..300 {
+            img.put_pixel(x, 65, ink);
+            img.put_pixel(x, 66, ink);
+        }
+        for x in 150..230 {
+            for y in 130..180 {
+                img.put_pixel(x, y, image::Rgb([250, 220, 90]));
+            }
+        }
+        let canvas = Some(CanvasDims {
+            width: 800.0,
+            height: 400.0,
+        });
+        let drawn = ProbeCanvas::new(img.clone(), canvas);
+        let (a, b) = ((160.0, 130.0), (560.0, 130.0));
+        let cover = drawn.line_cover(a, b, 8.0).unwrap();
+        assert!(cover > 0.95, "{cover}");
+        let card = BBox::new(300.0, 260.0, 460.0, 360.0);
+        let full = drawn.ink_share(&card).unwrap();
+        assert!(full > 0.9, "{full}");
+        // Erase the connector and the card.
+        for x in 80..300 {
+            img.put_pixel(x, 65, image::Rgb([250, 250, 250]));
+            img.put_pixel(x, 66, image::Rgb([250, 250, 250]));
+        }
+        for x in 150..230 {
+            for y in 130..180 {
+                img.put_pixel(x, y, image::Rgb([250, 250, 250]));
+            }
+        }
+        let erased = ProbeCanvas::new(img, canvas);
+        assert!(erased.line_cover(a, b, 8.0).unwrap() < 0.05);
+        assert!(erased.ink_share(&card).unwrap() < 0.01);
+        // Degenerate queries give no evidence.
+        assert!(erased.line_cover(a, (162.0, 131.0), 8.0).is_none());
+        assert!(erased
+            .ink_share(&BBox::new(10.0, 10.0, 11.0, 11.0))
+            .is_none());
+        assert!(erased
+            .ink_share(&BBox::new(f64::NAN, 10.0, 200.0, 200.0))
+            .is_none());
+        assert!(erased.line_cover((f64::NAN, 0.0), b, 8.0).is_none());
     }
 }
