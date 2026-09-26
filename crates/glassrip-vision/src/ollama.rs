@@ -1123,9 +1123,10 @@ fn final_line_buffered(pending: &[u8]) -> bool {
 /// A guarded request's returned text is checked once more (a non-streaming path, or
 /// a loop completed inside one chunk), but only when the reply is not a usable
 /// answer: cut off at the output limit (then a loop, not the budget, decides the
-/// retry) or invalid (a repair would echo the loop). A complete reply that
-/// validates is accepted whatever the detector says, so a regular board is never
-/// rejected for its regularity.
+/// retry) or invalid (a repair would echo the loop). A reply that completes and
+/// validates is accepted whatever the detector says. (While streaming, the guard
+/// may still stop a reply before it completes; the detector's rules are what keep
+/// a regular board from being stopped.)
 pub fn repetition(request: &VisionRequest, text: &str) -> Result<()> {
     if let Some(p) = &request.repetition_guard {
         if let Some(finding) = crate::repetition::detect(text, p) {

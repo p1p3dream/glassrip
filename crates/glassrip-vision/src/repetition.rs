@@ -14,10 +14,12 @@
 //!   unlabelled edge) has no place to compare, so its run counts only when its
 //!   new ids mostly name nothing that another array already read declares; before
 //!   any such array has been read, the run cannot be judged and is let through;
-//! - **a runaway run**: at least [`RepetitionParams::min_spatial_run`] such items
-//!   whose place does step evenly. A real row of evenly spaced cards is regular
-//!   too, so coordinates in arithmetic progression are never a loop by themselves;
-//!   only a run longer than any plausible single row of a board is; or
+//! - **a runaway run** (off by default): at least
+//!   [`RepetitionParams::min_spatial_run`] such items whose place does step
+//!   evenly. A real row of evenly spaced cards is regular too, so coordinates in
+//!   arithmetic progression are never a loop by themselves. A board read needs no
+//!   such rule: its schema bounds every list (`maxItems`), so the grammar itself
+//!   stops output from growing past a plausible board; or
 //! - **verbatim repeats**: one item, byte for byte, at least
 //!   [`RepetitionParams::min_exact_repeats`] times.
 //!
@@ -46,9 +48,10 @@ pub struct RepetitionParams {
     /// Consecutive templated items (one element restated under evenly stepped,
     /// undeclared ids, its place unchanged) that make a loop.
     pub min_templated_run: usize,
-    /// Consecutive evenly stepped items whose place steps too that make a loop:
-    /// longer than any single row or column of a real board (`0` disables).
-    #[serde(default = "default_min_spatial_run")]
+    /// Consecutive evenly stepped items whose place steps too that make a loop
+    /// (`0`, the default, disables the rule: list lengths are bounded by the
+    /// output schema instead, and a long regular row is a real board).
+    #[serde(default)]
     pub min_spatial_run: usize,
     /// Verbatim copies of one item in one array that make a loop.
     pub min_exact_repeats: usize,
@@ -56,15 +59,11 @@ pub struct RepetitionParams {
     pub check_every_bytes: usize,
 }
 
-fn default_min_spatial_run() -> usize {
-    24
-}
-
 impl Default for RepetitionParams {
     fn default() -> Self {
         Self {
             min_templated_run: 6,
-            min_spatial_run: default_min_spatial_run(),
+            min_spatial_run: 0,
             min_exact_repeats: 3,
             check_every_bytes: 256,
         }
@@ -89,9 +88,9 @@ impl RepetitionParams {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RepetitionKind {
-    /// One element restated under evenly stepped, undeclared ids.
+    /// One element restated in place under evenly stepped labels.
     Templated,
-    /// Evenly stepped items, place included, past any plausible board row.
+    /// Evenly stepped items, place included, past `min_spatial_run`.
     Runaway,
     /// One item repeated verbatim.
     Exact,
@@ -606,7 +605,7 @@ mod tests {
             .collect();
         let flow: Vec<String> = (1..6).map(|k| edge(k, k + 1, "", [0; 4])).collect();
         assert_eq!(detect(&board(&steps, &flow, true), &p), None);
-        // A long timeline row is still under the runaway limit.
+        // Nor is a long timeline row.
         let row: Vec<String> = (0..20)
             .map(|c| node(50 + c, "Week", 40 + c * 90, 200))
             .collect();
@@ -706,17 +705,47 @@ mod tests {
     }
 
     #[test]
-    fn a_stepped_run_past_any_board_row_is_a_runaway() {
+    fn a_stepped_run_is_a_runaway_only_when_enabled() {
         let row: Vec<String> = (0..40)
             .map(|c| node(100 + c, "Card", 10 + c * 60, 900))
             .collect();
-        let f = detect(&board(&row, &[], false), &RepetitionParams::default()).unwrap();
-        assert_eq!((f.kind, f.repeats), (RepetitionKind::Runaway, 24));
-        let off = RepetitionParams {
-            min_spatial_run: 0,
+        let on = RepetitionParams {
+            min_spatial_run: 24,
             ..RepetitionParams::default()
         };
-        assert_eq!(detect(&board(&row, &[], false), &off), None);
+        let f = detect(&board(&row, &[], false), &on).unwrap();
+        assert_eq!((f.kind, f.repeats), (RepetitionKind::Runaway, 24));
+        assert_eq!(
+            detect(&board(&row, &[], false), &RepetitionParams::default()),
+            None
+        );
+    }
+
+    /// GLM review M1: 31 day cells in one evenly stepped row are a real board.
+    #[test]
+    fn a_long_regular_row_is_not_a_loop_by_default() {
+        let days: Vec<String> = (1..=31)
+            .map(|d| node(d, &d.to_string(), 40 + (d - 1) * 90, 200))
+            .collect();
+        assert_eq!(
+            detect(&board(&days, &[], false), &RepetitionParams::default()),
+            None
+        );
+    }
+
+    /// GLM review M2: identical boxes under new ids are a loop even when a
+    /// fabricated edge chain "declares" every new id.
+    #[test]
+    fn restated_boxes_grounded_by_their_own_edges_are_a_loop() {
+        let nodes: Vec<String> = (10..16).map(|k| node(k, "Card", 300, 300)).collect();
+        let chain: Vec<String> = (10..15).map(|k| edge(k, k + 1, "", [0; 4])).collect();
+        let whole = format!(
+            "{{\"nodes\": [{}], \"edges\": [{}]}}",
+            nodes.join(", "),
+            chain.join(", ")
+        );
+        let f = detect(&whole, &RepetitionParams::default()).unwrap();
+        assert_eq!(f.kind, RepetitionKind::Templated);
     }
 
     #[test]

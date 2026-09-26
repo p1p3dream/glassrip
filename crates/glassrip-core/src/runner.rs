@@ -274,9 +274,7 @@ pub struct RunnerOptions {
     pub force_items: BTreeMap<String, BTreeSet<String>>,
 }
 
-/// Consecutive identical runs that settle a recurrent failure by default: one
-/// retry on the next run, then the answer stands.
-pub const DEFAULT_TERMINAL_AFTER_REPEATS: u32 = 2;
+pub use crate::config::DEFAULT_TERMINAL_AFTER_REPEATS;
 
 impl Default for RunnerOptions {
     fn default() -> Self {
@@ -294,7 +292,7 @@ impl RunnerOptions {
                 .and_then(|s| Duration::try_from_secs_f64(s).ok()),
             checkpoint_every: usize::try_from(cfg.checkpoint_every).unwrap_or(usize::MAX),
             tool_versions: BTreeMap::new(),
-            terminal_after_repeats: DEFAULT_TERMINAL_AFTER_REPEATS,
+            terminal_after_repeats: cfg.terminal_after_repeats,
             force_items: BTreeMap::new(),
         }
     }
@@ -999,6 +997,22 @@ impl Runner {
             other => other,
         };
         if let Some(cached) = cached {
+            #[allow(clippy::cast_precision_loss)]
+            let rate = if cached.total == 0 {
+                0.0
+            } else {
+                cached.counts.error as f64 / cached.total as f64
+            };
+            if rate > self.opts.max_item_error_rate {
+                // Only settled failures are restored; they fail the stage as they
+                // did when they were recorded.
+                return Err(RunnerError::ErrorRateExceeded {
+                    stage: name.to_string(),
+                    errors: cached.counts.error,
+                    total: cached.total,
+                    threshold: self.opts.max_item_error_rate,
+                });
+            }
             let mut header = cached.header.clone();
             header.restored_from = Some(RestoredFrom {
                 run_id: std::mem::take(&mut header.run_id),
@@ -1231,15 +1245,6 @@ impl Runner {
         } else {
             counts.error as f64 / total as f64
         };
-        if rate > self.opts.max_item_error_rate {
-            return Err(RunnerError::ErrorRateExceeded {
-                stage: name.to_string(),
-                errors: counts.error,
-                total,
-                threshold: self.opts.max_item_error_rate,
-            });
-        }
-
         // Finalize.
         let items: Vec<Record<S::Output>> = order.iter().filter_map(|id| done.remove(id)).collect();
         let hash = content_hash(
@@ -1270,6 +1275,28 @@ impl Runner {
                     .is_some_and(|e| !e.settled(repeats) && e.recurrent)
             })
             .count();
+        if rate > self.opts.max_item_error_rate {
+            // Cached all the same when nothing plainly retryable failed, so the
+            // next run (in any run directory) retries only the unsettled items
+            // and keeps counting their recurrences; a restored output over the
+            // limit fails the stage again (see the cache hit above).
+            if retryable == 0 {
+                let over = self
+                    .with_run(|r| r.partials_dir())
+                    .join(format!("{name}-{}.over-limit.jsonl", &key.as_str()[..16]));
+                jsonl::write_atomic(&over, &header, &items)?;
+                if let Err(e) = self.cache.put_file(name, &key, OUTPUT_EXT, &over) {
+                    warn!(stage = name, error = %e, "could not store output in cache");
+                }
+                fs_err::remove_file(&over).map_err(Self::io_err(&over))?;
+            }
+            return Err(RunnerError::ErrorRateExceeded {
+                stage: name.to_string(),
+                errors: counts.error,
+                total,
+                threshold: self.opts.max_item_error_rate,
+            });
+        }
         jsonl::write_atomic(&out_path, &header, &items)?;
         drop(writer);
         if retryable == 0 {
@@ -2139,6 +2166,50 @@ mod tests {
             StageStatus::Cached
         );
         assert_eq!(source.calls(), 12);
+    }
+
+    /// GLM review M3: over the error-rate limit, in a fresh run directory each
+    /// time (the CLI default), the failed item is retried alone and settles; the
+    /// rest is never recomputed.
+    #[tokio::test]
+    async fn over_the_error_rate_fresh_runs_retry_only_the_failure() {
+        let env = env();
+        let source = SourceStage::new(5);
+        {
+            let mut b = source.behavior.lock().unwrap();
+            b.fail = [2].into();
+            b.recurrent = [2].into();
+        }
+        for (run, calls) in [("run-a", 5), ("run-b", 6), ("run-c", 6)] {
+            let mut r = runner(&env, run, &Selection::default());
+            assert!(
+                matches!(
+                    r.run_stage(&source).await,
+                    Err(RunnerError::ErrorRateExceeded {
+                        errors: 1,
+                        total: 5,
+                        ..
+                    })
+                ),
+                "{run}"
+            );
+            assert_eq!(source.calls(), calls, "{run}");
+        }
+        // Once the item recovers (forced, since its failure settled), the stage
+        // passes and the rest is restored.
+        source.behavior.lock().unwrap().fail.clear();
+        let mut opts = RunnerOptions::default();
+        opts.force_items
+            .insert("source".into(), ["item-002".to_string()].into());
+        let mut r = runner_with(
+            &env,
+            "run-d",
+            &Selection::default(),
+            opts,
+            CancellationToken::new(),
+        );
+        let rep = r.run_stage(&source).await.unwrap();
+        assert_eq!((rep.items_ok, rep.items_processed), (5, 1));
     }
 
     /// Codex 6: a one-item stage over the error-rate limit used to keep its failed
