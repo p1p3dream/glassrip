@@ -216,7 +216,7 @@ fn owners_of_a_crowded_edge_slide_along_it() {
 
 /// The synthetic board with far more annotations than fit: 36 owner tags with
 /// long move notes split between one card and one edge, and an edge label that
-/// is one unbreakable token wider than the canvas.
+/// is one unbreakable token of wide glyphs, wider than the canvas.
 fn crowded_board() -> (MeetingNotes, BoardStateItem) {
     let (notes, mut board) = inputs();
     let node = board
@@ -261,7 +261,7 @@ fn crowded_board() -> (MeetingNotes, BoardStateItem) {
             o
         })
         .collect();
-    let long = "Z".repeat(320);
+    let long = "W".repeat(320);
     board
         .edges
         .iter_mut()
@@ -284,17 +284,17 @@ fn a_crowded_board_lists_what_does_not_fit_below_it() {
     assert!(scene
         .degraded
         .iter()
-        .any(|d| d.contains("Label on the") && d.contains("ZZZZ")));
+        .any(|d| d.contains("Label on the") && d.contains("WWWW")));
     assert!(scene.edges.iter().all(|e| e
         .label
         .as_ref()
-        .is_none_or(|l| !l.text.text.contains("ZZZZ"))));
+        .is_none_or(|l| !l.text.text.contains("WWWW"))));
     // entries are numbered in order, and every line stays inside the list
     for (i, it) in f.items.iter().enumerate() {
         assert_eq!(it.marker.text.text, (i + 1).to_string());
         assert!(it.marker.r.x >= f.r.x && it.marker.r.bottom() <= f.r.bottom());
         for l in &it.lines {
-            let right = l.x + l.text.chars().count() as f64 * glassrip_render::scene::LIST_CHAR_W;
+            let right = l.x + glassrip_render::scene::list_text_w(&l.text);
             assert!(l.x >= f.r.x && right <= f.r.right(), "{l:?} {:?}", f.r);
             assert!(l.y > f.r.y && l.y <= f.r.bottom(), "{l:?} {:?}", f.r);
         }
@@ -311,11 +311,31 @@ fn a_crowded_board_lists_what_does_not_fit_below_it() {
     for w in spans.windows(2) {
         assert!(w[0].1 <= w[1].0, "{spans:?}");
     }
-    // markers on the board point at the entries, one per number at most
+    // markers on the board point at the entries, one per number at most, and
+    // every entry without one says so in its warning
     assert!(!scene.markers.is_empty());
-    let mut numbers: Vec<&str> = scene.markers.iter().map(|m| m.text.text.as_str()).collect();
-    numbers.dedup();
+    let numbers: std::collections::BTreeSet<usize> = scene
+        .markers
+        .iter()
+        .map(|m| m.text.text.parse::<usize>().unwrap())
+        .collect();
     assert_eq!(numbers.len(), scene.markers.len());
+    for n in 1..=f.items.len() {
+        let w = &scene.degraded[n - 1];
+        assert!(w.contains(&format!("as note {n}")), "{w}");
+        assert_eq!(
+            numbers.contains(&n),
+            !w.contains("no room for its marker"),
+            "{w}"
+        );
+    }
+    // leaders have length and stay inside the canvas
+    for l in &scene.leaders {
+        assert!((l.0 - l.2).abs() + (l.1 - l.3).abs() > 0.0, "{l:?}");
+        for (x, y) in [(l.0, l.1), (l.2, l.3)] {
+            assert!(x >= 0.0 && x <= scene.width && y >= 0.0 && y <= scene.height);
+        }
+    }
     // the list sits below everything else and the canvas grew to hold it
     let (_, plain) = inputs();
     let plain = build_scene(&plain, &notes);
@@ -344,6 +364,67 @@ fn a_crowded_board_lists_what_does_not_fit_below_it() {
     let text = &r.svg_text[0].1;
     assert!(text.contains("Annotations without room on the board"));
     assert!(text.contains("Listed below the board"));
+    // the list's text renders inside the canvas with the real font
+    assert!(
+        r.svg[0].1.overlaps.iter().all(|o| !o.starts_with("text ")),
+        "{:?}",
+        r.svg[0].1.overlaps
+    );
+}
+
+/// Both reviewers of the first version: a relation label on a vertical edge in
+/// the rightmost column took its first spot, right of the edge, although that
+/// spot ran past the canvas, failing the run. Spots outside the canvas are
+/// never taken now; the label goes left, wraps, moves out, or is listed.
+#[test]
+fn a_relation_label_in_the_rightmost_column_stays_inside_the_canvas() {
+    let (notes, mut board) = inputs();
+    // Ledger above Design Kit at the far right: the dashed relation between
+    // them is a vertical edge in the rightmost column
+    for (text, cx, cy) in [
+        ("Ledger Service", 1300.0, 200.0),
+        ("Relay API", 250.0, 360.0),
+        ("Kiosk App", 800.0, 360.0),
+        ("Design Kit", 1300.0, 520.0),
+    ] {
+        let n = board.nodes.iter_mut().find(|n| n.text == text).unwrap();
+        let b = n.bbox.as_mut().unwrap();
+        (b.x1, b.y1, b.x2, b.y2) = (cx - 100.0, cy - 40.0, cx + 100.0, cy + 40.0);
+    }
+    let scene = build_scene(&board, &notes);
+    let dashed = scene.edges.iter().find(|e| e.dash.is_some()).unwrap();
+    assert_eq!(dashed.d.matches(" L ").count(), 1, "vertical: {}", dashed.d);
+    // the architecture spans the canvas: the right of the edge has no room
+    // for the label (the old first pick ran 147 px past the canvas)
+    let right = scene.cards.iter().map(|c| c.r.right()).fold(0.0, f64::max);
+    assert!(right >= scene.width - 80.0, "{right} {}", scene.width);
+    let l = dashed.label.as_ref().expect("placed, not listed");
+    assert!(l.r.x >= 0.0 && l.r.right() <= scene.width, "{:?}", l.r);
+    assert!(overlaps(&scene).is_empty(), "{:?}", overlaps(&scene));
+    let dir = tempfile::tempdir().unwrap();
+    let r = render_all(&notes, &[board], &params(dir.path().to_path_buf())).unwrap();
+    assert!(r.ok, "{:?}", r.failures());
+}
+
+/// Text drawn past the canvas edge is a real defect and fails validation,
+/// measured on the rendered glyphs.
+#[test]
+fn text_outside_the_canvas_fails() {
+    let (notes, board) = inputs();
+    let mut scene = build_scene(&board, &notes);
+    scene.footer.x = scene.width + 200.0;
+    let env = glassrip_render::svg::environment();
+    let text = glassrip_render::svg::render_svg(&env, &scene).unwrap();
+    let (checks, _) = glassrip_render::svg::validate_svg(&text, &scene, &bundled_fonts());
+    assert!(!checks.ok);
+    assert!(
+        checks
+            .overlaps
+            .iter()
+            .any(|o| o.starts_with("text \"Source:") && o.ends_with("outside the canvas")),
+        "{:?}",
+        checks.overlaps
+    );
 }
 
 #[test]

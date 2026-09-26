@@ -159,6 +159,36 @@ fn count_text(g: &usvg::Group, total: &mut usize, rendered: &mut usize) {
     }
 }
 
+/// Text whose rendered glyphs reach outside the `w` x `h` canvas (measured
+/// with the fonts actually loaded, not estimated).
+fn text_outside(g: &usvg::Group, w: f32, h: f32, out: &mut Vec<String>) {
+    for n in g.children() {
+        match n {
+            usvg::Node::Group(g) => text_outside(g, w, h, out),
+            usvg::Node::Text(t) => {
+                let b = t.abs_bounding_box();
+                if b.width() > 0.0
+                    && (b.left() < -0.5
+                        || b.top() < -0.5
+                        || b.right() > w + 0.5
+                        || b.bottom() > h + 0.5)
+                {
+                    let text: String = t
+                        .chunks()
+                        .iter()
+                        .map(|c| c.text())
+                        .collect::<String>()
+                        .chars()
+                        .take(40)
+                        .collect();
+                    out.push(format!("text \"{text}\" is outside the canvas"));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Fonts available to the SVG validation render.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct FontConfig {
@@ -328,6 +358,13 @@ pub fn validate_svg(svg: &str, scene: &Scene, fonts: &FontConfig) -> (SvgChecks,
         tree.root(),
         &mut checks.text_nodes,
         &mut checks.text_rendered,
+    );
+    let size_f = tree.size();
+    text_outside(
+        tree.root(),
+        size_f.width(),
+        size_f.height(),
+        &mut checks.overlaps,
     );
     let Some(mut pixmap) = tiny_skia::Pixmap::new(size.width(), size.height()) else {
         checks.parse_error = Some("zero-sized canvas".into());
