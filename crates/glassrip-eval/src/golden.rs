@@ -836,6 +836,34 @@ mod tests {
         g.transcript.decisions = vec![item("Do not ship Ledger", &["Ship Ledger"])];
         let e = g.validate().unwrap_err().to_string();
         assert!(e.contains("opposite polarity"), "{e}");
+        // Final review BLOCKER: an alias that states a name-headed or noun-headed
+        // claim and then retracts it is rejected; the retraction is anchored on the
+        // predicate, not the first word.
+        for (text, alias) in [
+            (
+                "Avery ships weekly builds",
+                "Avery ships weekly builds; Avery does not ship weekly builds",
+            ),
+            (
+                "weekly builds ship on Friday",
+                "weekly builds ship on Friday; weekly builds do not ship on Friday",
+            ),
+            (
+                "ship weekly builds",
+                "ship weekly builds; we never ship weekly builds",
+            ),
+        ] {
+            // the repaired direction on its own: the alias retracts the text
+            assert!(contradicts(text, alias, &g.vocabulary()), "{alias}");
+            g.transcript.decisions = vec![item(text, &[alias])];
+            let e = g.validate().unwrap_err().to_string();
+            assert!(e.contains("opposite polarity"), "{alias}: {e}");
+        }
+        g.transcript.decisions = vec![item(
+            "Avery ships weekly builds",
+            &["Avery will ship weekly builds"],
+        )];
+        g.validate().unwrap();
         // Codex round-1 M10: an alias may shorten an entity name to one of its words,
         // but not drop a second entity.
         g.transcript.decisions = vec![item("Skip Ledger API step", &["Skip Ledger step"])];

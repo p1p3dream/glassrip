@@ -11,14 +11,17 @@
 //! against one gold phrasing only when
 //!
 //! - every key term of the phrasing (a capitalized participant name or an entity
-//!   name at any position, a capitalized word after the first, an acronym, or an
-//!   identifier; [`crate::text::key_terms`]) appears in it: a decision about another
+//!   name at any position, a capitalized word after the first, an acronym, an
+//!   identifier, or a number in digits or as a single number word ("thirty" is
+//!   "30"; compounds such as "twenty five" are not folded);
+//!   [`crate::text::key_terms`]) appears in it: a decision about another
 //!   person or system is another decision, however similar the wording;
 //! - it states the phrasing's claim words with the same polarity
 //!   ([`crate::text::covers`]): all of them for a phrasing of up to five content
 //!   words or one without key terms, all but one per five words otherwise; and
-//! - it states none of them with the opposite polarity
-//!   ([`crate::text::contradicts`]).
+//! - it states none of them only with the opposite polarity, and no clause of it
+//!   restates the claim retracted, anchored on the claim's head and predicate
+//!   rather than its first word ([`crate::text::contradicts`]).
 //!
 //! The similarity is then the larger of the claim-word Dice coefficient
 //! ([`crate::text::claim_dice`]), which rewards the same wording at the same length,
