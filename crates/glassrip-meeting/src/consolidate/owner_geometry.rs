@@ -369,9 +369,13 @@ pub fn place(
         .iter()
         .map(|(pid, g, text)| {
             let c = center(g);
+            // Where OCR located the element, its text says where it is; the reader's
+            // box only for elements OCR did not locate.
             let mention = elements.iter().zip(&found).any(|(e, f)| {
-                let inside =
-                    in_window(c, &e.1, 0.0) || f.is_some_and(|f| in_margin(c, &f.text, line, line));
+                let inside = match f {
+                    Some(f) => in_margin(c, &f.text, line, line),
+                    None => in_window(c, &e.1, 0.0),
+                };
                 inside && names(e.0).as_deref() != Some(pid) && mentions(e.0, pid, names)
             });
             NameSpan {

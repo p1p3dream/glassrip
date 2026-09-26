@@ -411,7 +411,7 @@ fn default_owner_final_hold_s() -> f64 {
 }
 
 fn default_owner_tag_reach_share() -> f64 {
-    1.0
+    0.5
 }
 
 fn default_coverage_radius_share() -> f64 {
@@ -2196,13 +2196,14 @@ pub fn consolidate_with_probe(
                     physical: None,
                 };
                 // Several tags of one person in a keyframe are kept when their targets
-                // differ (multi-target owners); for one target the stronger evidence.
+                // differ (multi-target owners); for one target the stronger evidence,
+                // unless both are placed: two placed tags are two physical tags.
                 let strength = |s: &OwnerSighting| (s.ocr_located, s.name_read != NameRead::Reader);
-                match entry
-                    .1
-                    .iter()
-                    .position(|s| s.keyframe_id == f.keyframe_id && s.target == sighting.target)
-                {
+                match entry.1.iter().position(|s| {
+                    s.keyframe_id == f.keyframe_id
+                        && s.target == sighting.target
+                        && !(s.place.is_some() && sighting.place.is_some() && s.tag != sighting.tag)
+                }) {
                     None => entry.1.push(sighting),
                     Some(j) if strength(&sighting) > strength(&entry.1[j]) => entry.1[j] = sighting,
                     Some(_) => {}
@@ -2245,15 +2246,17 @@ pub fn consolidate_with_probe(
                 .any(|&t| tracks[t].obs.iter().any(|o| o.frame == *fi))
         })
     };
-    // The tag's registered position lies inside the keyframe's canvas (unknown
-    // position, registration, or canvas: assumed in view).
+    // The tag's registered position lies inside the keyframe's canvas. Without a
+    // known tag position the target alone decides; with one, a keyframe that cannot
+    // map it (not registered, another registration cluster, no canvas) is not
+    // evidence either way.
     let in_view = |fi: usize, place: Option<&TagPlace>| -> bool {
         let Some(p) = place else { return true };
         if !positioned(fi) || regs[fi].cluster != p.cluster {
-            return true;
+            return false;
         }
         let (Some(c), Some(inv)) = (canvases[fi], regs[fi].to_reference.inverse()) else {
-            return true;
+            return false;
         };
         let q = inv.apply((p.x, p.y));
         q.0 >= 0.0 && q.1 >= 0.0 && q.0 <= c.width && q.1 <= c.height

@@ -26,10 +26,14 @@
 //! are re-anchored to the edge ([`apply_alternation`]), so genuine moves such as
 //! A, A, B, B, A, A stay node assignments.
 //!
-//! A tag whose geometry fits both an edge and one of its end nodes (on the connector
-//! next to the node) carries the other as an alternate: when an alternate is already
-//! open (or else pending), the sighting counts for it. The incumbent wins ambiguous
-//! geometry, so an edge owner does not jump to the adjacent node on one tilted view.
+//! A person's OCR-read tags at one registered place are one physical tag, and every
+//! keyframe of it takes the target set most of them anchored to ([`consolidate_tags`]);
+//! consecutive keyframes confirm an opening only when they show the same physical tag.
+//! A tag without a known place whose geometry fits both an edge and one of its end
+//! nodes (on the connector next to the node) carries the other as an alternate: when
+//! an alternate is already open (or else pending), the sighting counts for it. The
+//! incumbent wins ambiguous geometry, so an edge owner does not jump to the adjacent
+//! node on one tilted view.
 //!
 //! Per person, keyframes with at least one target are replayed in time order
 //! ([`assign`]): a target opens after `confirm_keyframes` consecutive such keyframes
@@ -346,16 +350,24 @@ fn by_keyframe(sightings: &[OwnerSighting]) -> Vec<KeySight<'_>> {
 }
 
 /// A keyframe's targeted sightings with their effective targets: an alternate that is
-/// open (else pending) takes the sighting; one sighting per target, the strongest.
+/// open (else pending) takes the sighting; one sighting per target, the strongest,
+/// with the physical tags of all of them.
 fn resolve_targets(
     raw: &[&OwnerSighting],
     open: &[&OwnerTarget],
     pending: &[&OwnerTarget],
-) -> Vec<OwnerSighting> {
-    let mut out: Vec<OwnerSighting> = Vec::new();
+) -> Vec<(OwnerSighting, Vec<Option<usize>>)> {
+    let mut out: Vec<(OwnerSighting, Vec<Option<usize>>)> = Vec::new();
     for s in raw {
         let Some(primary) = &s.target else { continue };
-        let cands = || std::iter::once(primary).chain(&s.alternates);
+        // A placed tag is settled by its physical tag ([`consolidate_tags`]); at a new
+        // place it is a new tag, which may be a move.
+        let alternates: &[OwnerTarget] = if s.physical.is_none() {
+            &s.alternates
+        } else {
+            &[]
+        };
+        let cands = || std::iter::once(primary).chain(alternates);
         let chosen = cands()
             .find(|t| open.contains(t))
             .or_else(|| cands().find(|t| pending.contains(t)))
@@ -363,37 +375,52 @@ fn resolve_targets(
             .clone();
         let mut e = (*s).clone();
         e.target = Some(chosen);
-        match out.iter().position(|x| x.target == e.target) {
-            None => out.push(e),
-            Some(i) if e.strength() > out[i].strength() => out[i] = e,
-            Some(_) => {}
+        match out.iter().position(|x| x.0.target == e.target) {
+            None => {
+                let p = vec![e.physical];
+                out.push((e, p));
+            }
+            Some(i) => {
+                out[i].1.push(e.physical);
+                if e.strength() > out[i].0.strength() {
+                    out[i].0 = e;
+                }
+            }
         }
     }
     out
 }
 
-/// Keyframes of a run that confirm one physical tag: those of its most frequent
-/// physical tag plus those whose tag has no known place (neutral), and the index of
-/// the first such keyframe. Keyframes of other physical tags are the same target read
-/// at another place (a misregistered view, or another tag): no confirmation.
+/// The longest stretch of consecutive run keyframes that show one physical tag, and
+/// the index where it starts. A keyframe shows tag `p` when one of its sightings of the
+/// target belongs to `p`, or has no known place (neutral: it matches any tag). Other
+/// physical tags are the same target read at another place (a misregistered view, or
+/// another tag): they break the stretch.
 fn run_support(run: &[RunStep]) -> (usize, usize) {
-    let mut counts: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut ids: Vec<Option<usize>> = vec![None];
     for r in run {
-        if let Some(p) = r.sighting.physical {
-            *counts.entry(p).or_default() += 1;
+        for p in r.physicals.iter().flatten() {
+            if !ids.contains(&Some(*p)) {
+                ids.push(Some(*p));
+            }
         }
     }
-    // Most frequent; ties to the one seen first.
-    let first_seen = |p: usize| run.iter().position(|r| r.sighting.physical == Some(p));
-    let best = counts
-        .iter()
-        .max_by(|a, b| a.1.cmp(b.1).then(first_seen(*b.0).cmp(&first_seen(*a.0))))
-        .map(|(p, n)| (*p, *n));
-    let neutral = run.iter().filter(|r| r.sighting.physical.is_none()).count();
-    let counts_for =
-        |r: &RunStep| r.sighting.physical.is_none() || r.sighting.physical == best.map(|b| b.0);
-    let first = run.iter().position(counts_for).unwrap_or(0);
-    (neutral + best.map_or(0, |b| b.1), first)
+    let mut best = (0, 0);
+    for id in ids {
+        let shows = |r: &RunStep| r.physicals.contains(&None) || r.physicals.contains(&id);
+        let mut start = 0;
+        for (i, r) in run.iter().enumerate() {
+            if !shows(r) {
+                start = i + 1;
+                continue;
+            }
+            let len = i + 1 - start;
+            if len > best.0 || (len == best.0 && start < best.1) {
+                best = (len, start);
+            }
+        }
+    }
+    best
 }
 
 /// One keyframe of a pending run.
@@ -401,6 +428,8 @@ struct RunStep {
     keyframe_id: String,
     t_start_s: f64,
     sighting: OwnerSighting,
+    /// Physical tags of every sighting of the target in this keyframe.
+    physicals: Vec<Option<usize>>,
 }
 
 struct Open {
@@ -511,10 +540,12 @@ pub fn assign_with(
             }
             continue;
         }
-        let targets = {
+        let (targets, physicals): (Vec<OwnerSighting>, Vec<Vec<Option<usize>>>) = {
             let open_t: Vec<&OwnerTarget> = open.iter().map(|o| &o.target).collect();
             let pend_t: Vec<&OwnerTarget> = pending.keys().collect();
             resolve_targets(&k.targets, &open_t, &pend_t)
+                .into_iter()
+                .unzip()
         };
         let here: Vec<&OwnerTarget> = targets.iter().filter_map(|s| s.target.as_ref()).collect();
         for o in open.iter_mut() {
@@ -539,7 +570,7 @@ pub fn assign_with(
             // whatever opens next.
             presence.clear();
         }
-        for s in &targets {
+        for (s, phys) in targets.iter().zip(&physicals) {
             let Some(t) = &s.target else { continue };
             if open.iter().any(|o| &o.target == t) {
                 continue;
@@ -548,6 +579,7 @@ pub fn assign_with(
                 keyframe_id: k.keyframe_id.to_string(),
                 t_start_s: k.t_start_s,
                 sighting: s.clone(),
+                physicals: phys.clone(),
             });
         }
         // Closings by sustained absence (`closed_now` keeps the first missing
@@ -1559,7 +1591,7 @@ mod tests {
     #[test]
     fn sightings_of_one_target_at_two_places_do_not_confirm_each_other() {
         // Two keyframes read the name next to n1, but at places far apart (one view
-        // misregistered): no opening. A third keyframe at the first place confirms it.
+        // misregistered): no opening.
         let mut v = vec![
             at(s(0.0, Some(node("n1"))), 100.0, 100.0),
             at(s(10.0, Some(node("n1"))), 400.0, 300.0),
@@ -1577,12 +1609,6 @@ mod tests {
             )
         };
         assert!(run(&v).is_empty(), "{:#?}", run(&v));
-        let mut w = v.clone();
-        w.push(at(s(20.0, Some(node("n1"))), 102.0, 99.0));
-        consolidate_tags(&mut w, 1.0);
-        let a = run(&w);
-        assert_eq!(a.len(), 1, "{a:#?}");
-        assert_eq!(a[0].valid_from_s, 0.0);
     }
 
     #[test]
@@ -1616,5 +1642,41 @@ mod tests {
         let n3: Vec<_> = a.iter().filter(|x| x.target == node("n3")).collect();
         assert_eq!(n3.len(), 1, "{a:#?}");
         assert_eq!((n3[0].valid_from_s, n3[0].valid_to_s), (0.0, 100.0));
+    }
+
+    #[test]
+    fn support_needs_consecutive_keyframes_of_one_physical_tag() {
+        // Tags A, B, A (all anchored to n1): no two consecutive keyframes show one tag.
+        let mut v = vec![
+            at(s(0.0, Some(node("n1"))), 100.0, 100.0),
+            at(s(10.0, Some(node("n1"))), 400.0, 300.0),
+            at(s(20.0, Some(node("n1"))), 101.0, 100.0),
+        ];
+        consolidate_tags(&mut v, 0.5);
+        let run = |v: &[OwnerSighting]| {
+            assign(
+                "p1",
+                "Avery",
+                v,
+                100.0,
+                &params(),
+                &NoCorroboration,
+                &|_, _, _| true,
+            )
+        };
+        assert!(run(&v).is_empty(), "{:#?}", run(&v));
+        // A fourth keyframe of tag A: A, A in a row opens at the start of that stretch.
+        v.push(at(s(30.0, Some(node("n1"))), 99.0, 101.0));
+        consolidate_tags(&mut v, 0.5);
+        let a = run(&v);
+        assert_eq!(a.len(), 1, "{a:#?}");
+        assert_eq!(a[0].valid_from_s, 20.0);
+        // A keyframe with an unplaced sighting of the target continues any stretch.
+        let mut w = vec![
+            at(s(0.0, Some(node("n1"))), 100.0, 100.0),
+            s(10.0, Some(node("n1"))),
+        ];
+        consolidate_tags(&mut w, 0.5);
+        assert_eq!(run(&w)[0].valid_from_s, 0.0);
     }
 }

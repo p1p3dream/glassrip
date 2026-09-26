@@ -3411,3 +3411,45 @@ fn a_reader_tag_ocr_does_not_see_where_it_reads_the_name_is_dropped() {
         .iter()
         .any(|x| x.target.texts() == vec!["Ingest Gateway"] && x.valid_from_s == 0.0));
 }
+
+#[test]
+fn a_tag_moved_next_to_the_adjacent_node_is_a_move() {
+    // Avery's tag sits mid-connector for three keyframes, then is moved along it to
+    // touch Queue: a new place, so a new physical tag, anchored beside Queue.
+    let specs: Vec<Spec> = (0..6).map(|_| base()).collect();
+    let s = run(
+        frames_with_ocr(&specs, &|i| {
+            vec![("Avery", if i < 3 { ON_HTTP_EDGE } else { (560.0, 205.0) })]
+        }),
+        &params(),
+    );
+    let a = avery(&s);
+    assert_eq!(a.len(), 2, "{a:#?}");
+    assert_eq!(a[0].target.texts(), vec!["Ingest Gateway", "Queue"]);
+    assert_eq!(a[0].valid_to_s, 60.0);
+    assert_eq!(a[1].target.texts(), vec!["Queue"]);
+    assert!(a[1].moved_from.is_some());
+}
+
+#[test]
+fn two_tags_on_one_node_are_two_physical_tags() {
+    // Two Avery tags above Ingest Gateway (left and right of it) in keyframe 0; only
+    // the right one is read afterwards. The right one is seen twice in a row and opens.
+    let left = (140.0, 120.0);
+    let right = (290.0, 120.0);
+    let specs: Vec<Spec> = (0..2).map(|_| base()).collect();
+    let s = run(
+        frames_with_ocr(&specs, &|i| {
+            if i == 0 {
+                vec![("Avery", left), ("Avery", right)]
+            } else {
+                vec![("Avery", right)]
+            }
+        }),
+        &params(),
+    );
+    let a = avery(&s);
+    assert_eq!(a.len(), 1, "{a:#?}");
+    assert_eq!(a[0].target.texts(), vec!["Ingest Gateway"]);
+    assert_eq!(a[0].valid_from_s, 0.0);
+}
