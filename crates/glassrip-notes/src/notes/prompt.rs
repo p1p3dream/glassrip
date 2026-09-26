@@ -238,12 +238,18 @@ pub fn windows(lines: &[NamedLine], budget_tokens: usize, overlap: usize) -> Vec
 }
 
 fn participants_line(people: &[Person]) -> String {
+    if people.is_empty() {
+        return NO_PARTICIPANTS.into();
+    }
     people
         .iter()
         .map(|p| p.display_name.clone())
         .collect::<Vec<_>>()
         .join(", ")
 }
+
+/// Participants line when no names are known.
+pub const NO_PARTICIPANTS: &str = "none known (speakers are unnamed diarization labels; use everyone as the owner of an action item)";
 
 /// Map request for one window.
 /// `part` is (index, count) of the window.
@@ -476,6 +482,24 @@ mod tests {
             ws.iter().flat_map(|w| w.lines.clone()).collect();
         assert_eq!(covered.len(), 40);
         assert_eq!(windows(&lines[..3], 1_000_000, 2).len(), 1);
+    }
+
+    #[test]
+    fn no_participant_names_are_said_plainly() {
+        let lines: Vec<NamedLine> = (0..2).map(line).collect();
+        let win = Window { lines: vec![0, 1] };
+        let map = map_request(
+            (0, 1),
+            &win,
+            &lines,
+            "digest",
+            &[],
+            100,
+            &PromptExtras::default(),
+        );
+        assert!(map.messages[1]
+            .content
+            .starts_with(&format!("Participants: {NO_PARTICIPANTS}\n")));
     }
 
     #[test]

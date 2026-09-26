@@ -274,8 +274,9 @@ impl NotesStage {
         let p = &self.params;
         let doc = &input.speakers;
         let lines = named_lines(&input.segments, doc);
-        if lines.is_empty() {
-            // no audio stream (or no speech): notes from the board alone
+        if !has_speech(&lines) {
+            // no audio stream, no speech, or only blank segments: notes from the
+            // board alone
             return Ok(self.board_only(input, started));
         }
         let mut table = AliasTable::default();
@@ -691,6 +692,12 @@ impl NotesStage {
             });
         }
         let items_kept = timeline.len() + summary.len() + open_questions.len();
+        // nothing was heard and nothing was read: the notes are empty
+        let status = if items_kept == 0 {
+            NotesStatus::Degraded
+        } else {
+            NotesStatus::Ok
+        };
         MeetingNotes {
             title: p.title.clone(),
             duration_s,
@@ -705,7 +712,7 @@ impl NotesStage {
             speakers: vec![],
             transcript: vec![],
             report: NotesReport {
-                status: NotesStatus::Ok,
+                status,
                 model: p.text_model.clone(),
                 model_digest: None,
                 windows: 0,
@@ -722,6 +729,11 @@ impl NotesStage {
             },
         }
     }
+}
+
+/// Some transcript line has words (a transcript of blank segments is no speech).
+fn has_speech(lines: &[NamedLine]) -> bool {
+    lines.iter().any(|l| !l.text.trim().is_empty())
 }
 
 /// Caveats computed from the inputs (never from model text).
@@ -742,6 +754,12 @@ fn caveats(
                 "These notes are incomplete ({}). Check them against the transcript.",
                 alarm.join("; ")
             ),
+        });
+    }
+    if doc.people.is_empty() {
+        out.push(Caveat {
+            kind: "no_participants".into(),
+            text: "No participant names were known (no participant list was given and no names were read from video tiles), so speakers are shown by their diarization label and action items can only be assigned to everyone.".into(),
         });
     }
     let unresolved: Vec<String> = doc

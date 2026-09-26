@@ -112,6 +112,8 @@ impl NameSpeakersStage {
 
     async fn analyze(&self, data: &PlanData, ctx: &ItemContext) -> Result<Analysis, ErrorInfo> {
         let p = &self.params;
+        let no_speech = data.segments.is_empty();
+        let no_people = data.table.people().is_empty();
         let addresses = find_addresses(
             &data.segments,
             &data.table,
@@ -121,7 +123,13 @@ impl NameSpeakersStage {
         let plan = plan_samples(&data.segments, &p.vote);
         let mut frames: BTreeMap<i64, FrameObservation> = BTreeMap::new();
         let started = Instant::now();
-        if let (Some(src), Some(reader)) = (&self.frames, &self.reader) {
+        // with no participant names no tile can match, so frames are not decoded
+        let visual = if no_people {
+            None
+        } else {
+            self.frames.as_ref().zip(self.reader.as_ref())
+        };
+        if let Some((src, reader)) = visual {
             let sem = Arc::new(Semaphore::new(p.decode_concurrency.max(1)));
             let mut set = JoinSet::new();
             for t in plan.all_times() {
@@ -214,11 +222,35 @@ impl NameSpeakersStage {
                 SpeakersRecord::Segment(s),
             );
         }
-        let method = if self.frames.is_some() {
+        let method = if no_speech {
+            "none: no transcript segments (no speech)"
+        } else if no_people {
+            "none: no participant names (labels left unnamed)"
+        } else if self.frames.is_some() {
             "vote: visual tiles (on-demand frames) + direct address + role"
         } else {
             "vote: direct address + role (no video)"
         };
+        let mut notes = Vec::new();
+        if no_speech {
+            notes.push(
+                "no transcript segments (no speech detected), so there are no speakers to name"
+                    .to_string(),
+            );
+        }
+        if no_people {
+            notes.push(format!(
+                "no participant names (no --participants and no on-screen tile name seen in {} or more keyframes); {} diarization labels left unnamed",
+                p.ocr_min_keyframes,
+                out.labels.len()
+            ));
+        }
+        notes.push(format!(
+            "{} direct addresses; {} keyframes available; frame decode and read {:.1} s",
+            addresses.len(),
+            data.keyframes,
+            decode_s
+        ));
         records.insert(
             "summary".into(),
             SpeakersRecord::Summary(SpeakersSummary {
@@ -233,12 +265,7 @@ impl NameSpeakersStage {
                 relabeled_segments: relabeled,
                 presenter: out.presenter,
                 gap_fill: out.gap_fill,
-                notes: Some(format!(
-                    "{} direct addresses; {} keyframes available; frame decode and read {:.1} s",
-                    addresses.len(),
-                    data.keyframes,
-                    decode_s
-                )),
+                notes: Some(notes.join("; ")),
             }),
         );
         Ok(Analysis { records })
@@ -380,10 +407,13 @@ impl Stage for NameSpeakersStage {
             &ocr,
             self.params.ocr_min_keyframes,
         );
+        // No participant names is not an error: with no speech there is nothing
+        // to name, and with speech every label is left unnamed (see `analyze`).
         if table.people().is_empty() {
-            return Err(StageError::Invalid(
-                "no participants: pass --participants or provide OCR tile names".into(),
-            ));
+            tracing::warn!(
+                segments = segments.len(),
+                "no participant names (no --participants, no repeated OCR tile names); speakers stay unnamed"
+            );
         }
         let mut ids: Vec<String> = table
             .people()
