@@ -628,7 +628,8 @@ impl Stage for BoardReadStage {
         // with a repeat penalty, then collapsed; outputs of 4 may hold them.
         // 6: only texts at the repeat bound count towards the duplicate share,
         // the share needs piled copies (a row of identical cards OCR misses is
-        // no copy), and an invalid retry reply fails the item; outputs of 5 may
+        // no copy), an OCR text read twice backs one copy, and an invalid retry
+        // reply fails the item; outputs of 5 may
         // hold collapsed legitimate cards.
         6
     }

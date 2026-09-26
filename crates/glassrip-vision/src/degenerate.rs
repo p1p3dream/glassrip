@@ -163,10 +163,19 @@ fn center_inside(span: &BBox, b: &BBox, margin: f64) -> bool {
 }
 
 /// Per item: backed by an OCR span of its own. Each span backs at most one item:
-/// the nearest (by box center) matching item whose grown box holds the span.
+/// the nearest (by box center) matching item whose grown box holds the span. A
+/// span that repeats an earlier one (same text, stacked boxes: OCR read one
+/// text twice) backs nothing.
 fn supported(items: &[Item<'_>], anchors: &[(String, BBox)], margin: f64) -> Vec<bool> {
     let mut backed = vec![false; items.len()];
-    for (s, sb) in anchors {
+    for (k, (s, sb)) in anchors.iter().enumerate() {
+        let (ns, earlier) = (normalize(s), &anchors[..k]);
+        if earlier
+            .iter()
+            .any(|(t, tb)| stacked_pair(sb, tb) && normalize(t) == ns)
+        {
+            continue;
+        }
         let best = items
             .iter()
             .enumerate()
@@ -947,6 +956,42 @@ mod tests {
         let anchors = vec![span("Gateway", 100.0, 100.0)];
         let f = detect(&r, &anchors, &p()).expect("degenerate");
         assert_eq!(f.repeated[0].supported, 1);
+    }
+
+    #[test]
+    fn a_text_ocr_read_twice_backs_one_copy() {
+        // Four piled copies of one box; OCR reports its one text twice.
+        let mut r = reading();
+        for k in 0..4 {
+            r.nodes.push(node(
+                &format!("n{k}"),
+                "Gateway",
+                100.0 + f64::from(k),
+                100.0,
+            ));
+        }
+        let twice = vec![span("Gateway", 100.0, 100.0), span("gateway", 101.0, 100.0)];
+        let f = detect(&r, &twice, &p()).expect("degenerate");
+        assert_eq!(f.repeated[0].supported, 1);
+        // Two separate spans of one text still back two boxes.
+        let apart = vec![span("Gateway", 100.0, 100.0), span("Gateway", 400.0, 100.0)];
+        let items = node_items(&r);
+        assert_eq!(
+            supported(&items, &apart, 0.25)
+                .iter()
+                .filter(|b| **b)
+                .count(),
+            1
+        );
+        r.nodes[3].bbox = bb(400.0, 100.0);
+        let items = node_items(&r);
+        assert_eq!(
+            supported(&items, &apart, 0.25)
+                .iter()
+                .filter(|b| **b)
+                .count(),
+            2
+        );
     }
 
     #[test]
