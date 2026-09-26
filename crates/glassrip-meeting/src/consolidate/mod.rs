@@ -1070,9 +1070,10 @@ pub fn consolidate_with_probe(
         }
     };
     // The whole canvas of keyframe `f` is blank (and OCR read none of the track's
-    // text anywhere on it), while the track's box held ink where it was last read.
-    // Needs no registration: a view with nothing on it cannot be registered, and
-    // an erased last element leaves exactly that.
+    // text anywhere on it), while the track's box held ink where it was last read,
+    // and aligned ink links the two keyframes. Needs no registration: a view with
+    // nothing on it cannot be registered, and an erased last element leaves
+    // exactly that.
     let canvas_blanked = |t: &Track, f: usize| -> bool {
         let (Some(probe), Some(c)) = (probe, canvases[f]) else {
             return false;
@@ -1094,6 +1095,19 @@ pub fn consolidate_with_probe(
         else {
             return false;
         };
+        // The blank view must be the same view: every board keyframe since the
+        // last sighting was compared with its predecessor on aligned ink (a pan
+        // or a cut the aligner cannot follow leaves the ink unknown), and the ink
+        // changed on the way.
+        let chain: Vec<Option<f64>> = (s + 1..=f).map(|k| frames[k].ink_change).collect();
+        if !chain.iter().all(Option::is_some)
+            || !chain
+                .iter()
+                .flatten()
+                .any(|&x| x >= params.ink_event_threshold)
+        {
+            return false;
+        }
         let whole = BBox::new(0.0, 0.0, c.width, c.height);
         match (
             probe.ink_share(&frames[s].keyframe_id, &sb),
@@ -1488,8 +1502,9 @@ pub fn consolidate_with_probe(
         // edge: `Some(true)` the straight line is still drawn, `Some(false)` it is
         // gone, `None` when the corridor cannot tell.
         // With pixels but no corridor verdict (a routed connector), `local_drop`
-        // says whether the ink of the ends' union region fell: board ink added
-        // elsewhere never removes the edge.
+        // says whether the ink of the ends' union region fell with nothing else
+        // read inside it: board ink added elsewhere, or another element erased
+        // between the ends, never removes the edge.
         let rp = &params.region_probe;
         let verdict = |f: usize| -> (Option<bool>, Option<bool>) {
             let Some(s) = seen.iter().rev().find(|&&s| s < f).copied() else {
@@ -1498,7 +1513,23 @@ pub fn consolidate_with_probe(
             let Some(((before, now), (ink_s, ink_f))) = edge_pixels(ta, tb, s, f) else {
                 return (None, None);
             };
-            let local_drop = ink_f <= ink_s - (rp.min_ink_drop).max(rp.min_ink_drop_share * ink_s);
+            // Another element read inside the ends' union region could account
+            // for a drop there: the region cannot speak for the connector.
+            let crowded = corridor_geom(ta, tb, s).is_some_and(|(_, _, _, u)| {
+                tracks.iter().enumerate().any(|(i, t)| {
+                    i != a
+                        && i != b
+                        && t.obs.iter().any(|o| {
+                            o.frame == s
+                                && o.raw_bbox.is_some_and(|r| {
+                                    let c = ((r.x1 + r.x2) / 2.0, (r.y1 + r.y2) / 2.0);
+                                    c.0 >= u.x1 && c.0 <= u.x2 && c.1 >= u.y1 && c.1 <= u.y2
+                                })
+                        })
+                })
+            });
+            let local_drop =
+                !crowded && ink_f <= ink_s - (rp.min_ink_drop).max(rp.min_ink_drop_share * ink_s);
             if before < rp.min_line_cover {
                 return (None, Some(local_drop));
             }

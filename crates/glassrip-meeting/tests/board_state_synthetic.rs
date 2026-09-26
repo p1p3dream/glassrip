@@ -2037,6 +2037,73 @@ fn erasing_the_only_element_is_a_removal() {
     assert!(only(&run_probed(fr, &params(), &px)).in_final);
 }
 
+#[test]
+fn a_blank_view_that_aligned_ink_does_not_link_is_not_an_erasure() {
+    // The same empty canvas from keyframe 4, but reached by a pan or cut the
+    // aligner could not follow (ink unknown), or with no ink change at all:
+    // nothing proves it is the same view, so the card stays.
+    for ink in [None, Some(0.0)] {
+        let specs: Vec<Spec> = (0..8)
+            .map(|i| Spec {
+                nodes: vec![],
+                edges: vec![],
+                stickies: if i < 4 {
+                    vec![("Beta milestone in March", (800.0, 450.0))]
+                } else {
+                    vec![]
+                },
+                ink: if i < 4 { Some(0.2) } else { ink },
+                ..base()
+            })
+            .collect();
+        let mut fr = frames(&specs);
+        for f in &mut fr {
+            f.board.other_visible_text.clear();
+        }
+        let mut shares = vec![0.6; 8];
+        for v in shares.iter_mut().skip(4) {
+            *v = 0.0;
+        }
+        let px = Pixels {
+            line: vec![0.0; 8],
+            ink: shares,
+        };
+        let s = run_probed(fr, &params(), &px);
+        assert!(s.stickies[0].in_final, "{ink:?}: {:?}", s.stickies[0]);
+    }
+}
+
+#[test]
+fn erasing_another_card_between_a_routed_connector_s_ends_does_not_remove_it() {
+    // A card sits between Queue and Ledger Store and is erased at keyframe 5 (the
+    // ink around the ends falls, board ink 0.2) while the reader leaves the
+    // routed connector out: the drop belongs to the card.
+    let mut specs: Vec<Spec> = (0..9)
+        .map(|_| Spec {
+            ink: Some(0.01),
+            ..base()
+        })
+        .collect();
+    for s in specs.iter_mut().take(5) {
+        s.stickies.push(("Temp note", (950.0, 210.0)));
+    }
+    specs[5].ink = Some(0.2);
+    for s in specs.iter_mut().skip(5) {
+        s.edges.retain(|e| e.2 != "gRPC");
+    }
+    let mut ink = vec![0.3; 9];
+    for v in ink.iter_mut().skip(5) {
+        *v = 0.25;
+    }
+    let px = Pixels {
+        line: vec![0.1; 9],
+        ink,
+    };
+    let s = run_probed(frames(&specs), &params(), &px);
+    let e = s.edges.iter().find(|e| e.label == "gRPC").unwrap();
+    assert!(e.in_final, "{e:?}");
+}
+
 /// Pixels of one straight connector between two fixed points: a corridor query
 /// covers it only when its ends are within the corridor's half width of the
 /// connector's (a real corridor covers a line anywhere inside it).
