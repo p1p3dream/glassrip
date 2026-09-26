@@ -13,7 +13,8 @@
 //! - [`claim_dice`] and [`containment`]: sentence similarity over claim words; the
 //!   second finds a paraphrase inside a longer sentence, bounded by
 //!   [`CONTAINMENT_MAX_EXPANSION`] and [`CONTAINMENT_MAX_SPREAD`]. [`covers`] requires
-//!   the gold claim words to be stated ([`allowed_missing`]), and
+//!   the gold claim words to be stated ([`allowed_missing`], plus low-content
+//!   words dropped without a substitute, [`is_light`] and [`light_allowance`]), and
 //!   [`key_terms_present`] requires the names in the gold phrasing (known participants
 //!   and entities from a [`Vocabulary`], at any position) to appear in the prediction.
 
@@ -697,13 +698,115 @@ pub fn key_terms_present(gold: &str, pred: &str, vocab: &Vocabulary) -> bool {
 /// never be left out ([`key_terms_present`]), nor can the phrasing's head (its first
 /// content word) or its predicate (its first content word that is not a name), and a
 /// word stated with the opposite polarity is a contradiction, not an omission
-/// ([`contradicts`]).
+/// ([`contradicts`]). Low-content words dropped without a substitute are excused on
+/// top of this ([`light_allowance`]).
 pub fn allowed_missing(gold_words: usize, has_key_terms: bool) -> usize {
     if has_key_terms {
         gold_words.saturating_sub(1) / 5
     } else {
         0
     }
+}
+
+/// Light verbs: verbs that carry little meaning of their own, mostly heading a
+/// trailing purpose clause ("post the notes for the crew to use", "what the
+/// server needs to render").
+const LIGHT_VERBS: &[&str] = &[
+    "use", "make", "get", "take", "have", "give", "go", "keep", "let", "put", "help", "try",
+    "need", "want",
+];
+
+/// Placeholder nouns: nouns that stand for a part or aspect of something the claim
+/// already names ("the importer step", "the API side", "the dashboard work").
+const PLACEHOLDER_NOUNS: &[&str] = &[
+    "step", "side", "part", "piece", "portion", "bit", "thing", "stuff", "aspect", "stage",
+    "phase", "area", "item", "work",
+];
+
+/// Hedging and additive adverbs ("also", "maybe", "together"). Temporal adverbs
+/// ("later", "early") are left out on purpose: a stopword the matcher does not see
+/// ("now", "then") can contradict them.
+const HEDGE_ADVERBS: &[&str] = &[
+    "also",
+    "too",
+    "again",
+    "maybe",
+    "probably",
+    "basically",
+    "actually",
+    "really",
+    "anyway",
+    "together",
+];
+
+/// True when a claim term is a low-content word ([`LIGHT_VERBS`],
+/// [`PLACEHOLDER_NOUNS`], [`HEDGE_ADVERBS`]): a claim that loses it still says
+/// the same thing, as long as nothing else takes its place ([`covers`]).
+pub fn is_light(term: &str) -> bool {
+    LIGHT_VERBS
+        .iter()
+        .chain(PLACEHOLDER_NOUNS)
+        .chain(HEDGE_ADVERBS)
+        .any(|w| stem(w) == term)
+}
+
+/// Light gold words ([`is_light`]) a prediction may leave out on top of
+/// [`allowed_missing`], with or without key terms: one per three distinct claim
+/// words, so a prediction keeps at least two of every three gold words and a
+/// two-word claim loses none. The head, the predicate, and key terms are never
+/// excused, whatever their class.
+pub fn light_allowance(gold_words: usize) -> usize {
+    gold_words / 3
+}
+
+/// True when `pred` puts no word of its own where the omitted gold word `w` stood,
+/// so the omission is a drop and not a substitution. The slot is the stretch of the
+/// prediction between its statements of the nearest stated gold words before and
+/// after `w` (in gold order); with a stated neighbour on one side only, it runs from
+/// that neighbour to the end (or from the start) of the neighbour's clause. "post
+/// the notes for the crew" leaves the slot of "to use" empty; "post the notes for
+/// the crew to delete" fills it. A word of its own is any word that is not a gold
+/// word in either polarity (contradictions are [`contradicts`]'s business).
+fn slot_is_empty(
+    g: &[ClaimWord],
+    w: &ClaimWord,
+    clauses: &[Vec<ClaimWord>],
+    vocab: &Vocabulary,
+) -> bool {
+    let flat: Vec<(usize, &ClaimWord)> = clauses
+        .iter()
+        .enumerate()
+        .flat_map(|(c, ws)| ws.iter().map(move |x| (c, x)))
+        .collect();
+    let single = |x: &ClaimWord| std::collections::BTreeSet::from([x.clone()]);
+    let at = |gw: &ClaimWord| flat.iter().position(|(_, x)| stated(gw, &single(x), vocab));
+    let own = |x: &ClaimWord| {
+        !g.iter()
+            .any(|gw| stated(gw, &single(x), vocab) || stated(&flip(gw), &single(x), vocab))
+    };
+    let Some(i) = g.iter().position(|x| x == w) else {
+        return false;
+    };
+    let prev = g[..i].iter().rev().find_map(at);
+    let next = g[i + 1..].iter().find_map(at);
+    let range = match (prev, next) {
+        (Some(a), Some(b)) => a.min(b) + 1..a.max(b),
+        (Some(a), None) => {
+            let clause = flat[a].0;
+            let end = flat
+                .iter()
+                .rposition(|(c, _)| *c == clause)
+                .map_or(a + 1, |e| e + 1);
+            a + 1..end
+        }
+        (None, Some(b)) => {
+            let clause = flat[b].0;
+            let start = flat.iter().position(|(c, _)| *c == clause).unwrap_or(b);
+            start..b
+        }
+        (None, None) => return false,
+    };
+    flat[range].iter().all(|(_, x)| !own(x))
 }
 
 /// Distinct gold claim words (same term and polarity) found in the prediction, and
@@ -723,17 +826,20 @@ fn flip(w: &ClaimWord) -> ClaimWord {
 }
 
 /// The protected words of a gold phrasing's claim words `g`: its head (the first
-/// content word) and its predicate (the first content word that is not a name or a
-/// key term in `keys`). Both are the same word when the phrasing opens with a verb.
+/// content word) and its predicate (the first content word that is not a name, a
+/// key term in `keys`, or a hedge adverb, [`HEDGE_ADVERBS`]: "reviews" in "Quill also
+/// reviews the retries"). Both are the same word when the phrasing opens with a verb.
 fn protected_words<'a>(
     g: &'a [ClaimWord],
     keys: &std::collections::BTreeSet<String>,
     vocab: &Vocabulary,
 ) -> Vec<&'a ClaimWord> {
     let head = g.first();
-    let predicate = g
-        .iter()
-        .find(|w| !vocab.is_name(&w.term) && !keys.contains(&w.term));
+    let predicate = g.iter().find(|w| {
+        !vocab.is_name(&w.term)
+            && !keys.contains(&w.term)
+            && !HEDGE_ADVERBS.iter().any(|h| stem(h) == w.term)
+    });
     head.into_iter().chain(predicate).collect()
 }
 
@@ -866,12 +972,21 @@ fn clause_retracts(
     if unit[lo..].iter().any(own) {
         return false;
     }
+    // Light gold words the unit leaves out count as retracted, as far as [`covers`]
+    // would excuse them, so dropping "to use" from a retraction does not turn it
+    // into a restatement.
+    let light_skip: BTreeSet<&ClaimWord> = g
+        .iter()
+        .filter(|w| !flipped(w) && !kept(w) && is_light(&w.term) && !anchors.contains(w))
+        .take(light_allowance(g.len()))
+        .copied()
+        .collect();
     if g.iter().any(|w| flipped(w) && kept(w)) {
         if !contrast_ok {
             return false;
         }
         let subject: BTreeSet<&ClaimWord> = gw[..first].iter().collect();
-        return g.iter().all(|w| {
+        return g.iter().filter(|w| !light_skip.contains(*w)).all(|w| {
             if subject.contains(w) {
                 kept(w)
             } else {
@@ -891,7 +1006,8 @@ fn clause_retracts(
         return false;
     }
     let retracted = |w: &ClaimWord| flipped(w) || kept(w);
-    anchors.iter().all(|w| retracted(w)) && g.iter().filter(|w| retracted(w)).count() >= need
+    anchors.iter().all(|w| retracted(w))
+        && g.iter().filter(|w| retracted(w)).count() + light_skip.len() >= need
 }
 
 /// True when `pred` states some gold claim word only with the opposite polarity
@@ -948,20 +1064,36 @@ fn stated(w: &ClaimWord, p: &std::collections::BTreeSet<ClaimWord>, vocab: &Voca
 /// True when `pred` states the protected words of `gold` (its head, the first
 /// content word, and its predicate, the first content word that is not a name or
 /// key term) and enough of its other claim words with the same polarity
-/// ([`allowed_missing`]), and contradicts none of them ([`contradicts`]).
+/// ([`allowed_missing`], plus up to [`light_allowance`] light words, [`is_light`],
+/// that are not key terms and whose slot the prediction leaves empty,
+/// [`slot_is_empty`]), and contradicts none of them ([`contradicts`]).
 pub fn covers(gold: &str, pred: &str, vocab: &Vocabulary) -> bool {
     let g = claim_words(gold, vocab);
-    let p: std::collections::BTreeSet<ClaimWord> = claim_words(pred, vocab).into_iter().collect();
+    let clauses = claim_clauses(pred, vocab);
+    let p: std::collections::BTreeSet<ClaimWord> = clauses.iter().flatten().cloned().collect();
     let gs: std::collections::BTreeSet<&ClaimWord> = g.iter().collect();
     let keys = key_terms(gold, vocab);
-    let protected_stated = protected_words(&g, &keys, vocab)
-        .iter()
-        .all(|w| stated(w, &p, vocab));
-    let inter = gs.iter().filter(|w| stated(w, &p, vocab)).count();
+    let protected = protected_words(&g, &keys, vocab);
     let ng = gs.len();
-    ng > 0
-        && protected_stated
-        && ng - inter <= allowed_missing(ng, !keys.is_empty())
+    if ng == 0 || !protected.iter().all(|w| stated(w, &p, vocab)) {
+        return false;
+    }
+    let missing: Vec<&ClaimWord> = gs
+        .iter()
+        .copied()
+        .filter(|w| !stated(w, &p, vocab))
+        .collect();
+    let excused = missing
+        .iter()
+        .filter(|w| {
+            is_light(&w.term)
+                && !keys.contains(&w.term)
+                && !protected.contains(w)
+                && slot_is_empty(&g, w, &clauses, vocab)
+        })
+        .count()
+        .min(light_allowance(ng));
+    missing.len() - excused <= allowed_missing(ng, !keys.is_empty())
         && !contradicts(gold, pred, vocab)
 }
 
@@ -1204,6 +1336,98 @@ mod tests {
             "Tamsin moves the importer retries to the dashboard backlog",
             &v
         ));
+    }
+
+    /// A low-content word (light verb, placeholder noun, hedge) may be dropped, with
+    /// or without key terms, as long as nothing takes its place and the head,
+    /// predicate, content nouns, and key terms are all still stated.
+    #[test]
+    fn light_words_may_be_dropped_but_not_replaced() {
+        let v = names();
+        let gold = "Post the notes and slides for the crew to use";
+        assert!(key_terms(gold, &v).is_empty(), "an unkeyed gold");
+        // a trailing purpose clause of a light verb dropped
+        assert!(covers(gold, "Post the notes and slides for the crew", &v));
+        assert!(covers(
+            gold,
+            "Post notes and slides for the crew, as agreed",
+            &v
+        ));
+        // its slot filled by another word: a different purpose, not a drop
+        for pred in [
+            "Post the notes and slides for the crew to delete",
+            "Post the notes and slides for the crew to make",
+        ] {
+            assert!(!covers(gold, pred, &v), "{pred}");
+        }
+        // a content noun, or the head, is never excused
+        assert!(!covers(gold, "Post the slides for the crew", &v));
+        assert!(!covers(gold, "Share the notes and slides for the crew", &v));
+        // negation still fails, with the light word dropped or not
+        assert!(!covers(
+            gold,
+            "Do not post the notes and slides for the crew",
+            &v
+        ));
+        // a placeholder noun of a keyed gold; the key term still pins the entity
+        let gold = "Skip the Ledger step for now";
+        assert!(covers(gold, "Skip Ledger for now", &v));
+        assert!(!key_terms_present(gold, "Skip Orbit for now", &v));
+        assert!(!covers(gold, "Skip the Ledger rollout for now", &v));
+        // a hedge
+        assert!(covers(
+            "Quill also reviews the importer retries",
+            "Quill reviews the importer retries",
+            &v
+        ));
+        // the head or predicate of a gold is never excused, even when it is light
+        assert!(!covers(
+            "Use random ordering for the demo",
+            "Random ordering for the demo",
+            &v
+        ));
+        assert!(!covers(
+            "Tamsin takes the importer retries",
+            "Tamsin the importer retries",
+            &v
+        ));
+    }
+
+    /// The light-word allowance is bounded: one per three gold words.
+    #[test]
+    fn light_word_drops_are_bounded() {
+        let v = Vocabulary::default();
+        assert_eq!(light_allowance(2), 0);
+        assert_eq!(light_allowance(5), 1);
+        assert_eq!(light_allowance(6), 2);
+        // a two-word gold loses nothing
+        assert!(!covers("post work", "post", &v));
+        // five words, two of them light: only one may go
+        let gold = "Post the slides for the crew to use too";
+        assert!(covers(gold, "Post the slides for the crew to use", &v));
+        assert!(!covers(gold, "Post the slides for the crew", &v));
+    }
+
+    /// A retraction that drops a light word is still a retraction: the omission
+    /// allowance of [`covers`] is the omission allowance of [`contradicts`].
+    #[test]
+    fn a_retraction_that_drops_a_light_word_still_retracts() {
+        let v = names();
+        let gold = "Post the notes and slides for the crew to use";
+        for pred in [
+            "Post the notes and slides for the crew. Actually we won't post the notes and slides for the crew.",
+            "Tamsin said to post the notes and slides for the crew; later she said not to post the notes and slides for the crew",
+        ] {
+            assert!(contradicts(gold, pred, &v), "{pred}");
+            assert!(!covers(gold, pred, &v), "{pred}");
+        }
+        // the contrast path: affirmed, then negated in one segment
+        let gold = "Post the slides for the crew to use";
+        let pred = "Post the slides for the crew then never post the slides for the crew";
+        assert!(contradicts(gold, pred, &v), "{pred}");
+        assert!(!covers(gold, pred, &v));
+        // a restatement that keeps every word but the light one is not a retraction
+        assert!(!contradicts(gold, "Post the slides for the crew", &v));
     }
 
     /// Codex round-1 B2: a contraction joined to the next word still negates it.

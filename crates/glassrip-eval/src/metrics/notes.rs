@@ -18,7 +18,12 @@
 //!   person or system is another decision, however similar the wording;
 //! - it states the phrasing's claim words with the same polarity
 //!   ([`crate::text::covers`]): all of them for a phrasing of up to five content
-//!   words or one without key terms, all but one per five words otherwise; and
+//!   words or one without key terms, all but one per five words otherwise, and in
+//!   either case it may also drop one low-content word per three gold words (a light
+//!   verb such as the "to use" of a purpose clause, a placeholder noun such as
+//!   "step" or "side", a hedge such as "also"; [`crate::text::is_light`]) when it puts
+//!   no word of its own in that word's place and the word is neither the head, the
+//!   predicate, nor a key term; and
 //! - it states none of them only with the opposite polarity, and no clause of it
 //!   restates the claim retracted, anchored on the claim's head and predicate
 //!   rather than its first word ([`crate::text::contradicts`]).
@@ -333,6 +338,40 @@ mod tests {
         // Codex round-2 B1: repeating one distractor does not score through Dice.
         let pred = vec![p(&format!("ship builds {}", "lunch ".repeat(18)), None)];
         assert_eq!(score_items(&gold, &pred, 0.6, &none()).0.tp, 0);
+    }
+
+    /// Dropped low-content words at the item level: the drop matches, while another
+    /// participant, a substituted word, a negation, and a ramble still do not.
+    #[test]
+    fn dropped_light_words_match_and_guards_hold() {
+        let gold = vec![
+            g("Post the notes and slides for the crew to use", Some("p1")),
+            ga("Skip the Ledger step for now", &[]),
+            ga("Tamsin posts the notes for the crew to use", &[]),
+        ];
+        let pred = vec![
+            p("Post the notes and slides for the crew", Some("p1")),
+            p("Skip Ledger for now", None),
+            p("Tamsin posts the notes for the crew", None),
+        ];
+        assert_eq!(score_items(&gold, &pred, 0.6, &team()).0.tp, 3);
+        let pred = vec![
+            // the right words, the wrong owner
+            p("Post the notes and slides for the crew", Some("p2")),
+            // a substituted noun in the placeholder's slot
+            p("Skip the Ledger rollout for now", None),
+            // another participant
+            p("Quill posts the notes for the crew", None),
+            // the opposite claim
+            p("Do not post the notes and slides for the crew", Some("p1")),
+            // a ramble holding the words
+            p(
+                "We reviewed hiring plans, office seating, travel budgets, lunch vendors, parking passes, badge printers, laptop refresh cycles, conference talks, onboarding checklists, post the notes and slides for the crew, holiday calendars, desk moves, printer toner, coffee orders",
+                Some("p1"),
+            ),
+        ];
+        let (c, m) = score_items(&gold, &pred, 0.6, &team());
+        assert_eq!(c.tp, 0, "{m:?}");
     }
 
     #[test]
