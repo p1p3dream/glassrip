@@ -968,21 +968,24 @@ mod tests {
     /// it. The detour goes around them.
     #[test]
     fn past_the_grid_limit_a_fallback_detours_around_the_cards() {
-        // 300 small cards in a row need more grid lines than the search takes
+        // 300 cards in a row need more grid lines than the search takes (each
+        // is large enough for ports: a few of them route on the grid)
         let cards: Vec<R> = (0..300)
             .map(|i| R {
-                x: 40.0 + 10.0 * f64::from(i),
+                x: 40.0 + 50.0 * f64::from(i),
                 y: 600.0,
-                w: 4.0,
-                h: 4.0,
+                w: 40.0,
+                h: 40.0,
             })
             .collect();
         let wide = R {
             x: 0.0,
             y: 0.0,
-            w: 3200.0,
+            w: 15200.0,
             h: 1200.0,
         };
+        let mut few = Router::new(cards[..3].to_vec(), Vec::new(), Vec::new(), wide);
+        assert!(!few.route(0, 2, PORT_GAP).fallback);
         let mut r = Router::new(cards.clone(), Vec::new(), Vec::new(), wide);
         let out = r.route(0, 299, PORT_GAP);
         assert!(out.fallback);
