@@ -994,6 +994,8 @@ struct SampledModel {
     /// Fail only the first request of this read (whichever keyframe asks first).
     fail_first_of: Option<u64>,
     failed: std::sync::atomic::AtomicBool,
+    /// The retry of a failing read (seed above 2^32) answers.
+    retries_answer: bool,
 }
 
 impl SampledModel {
@@ -1002,6 +1004,7 @@ impl SampledModel {
             fail,
             fail_first_of: None,
             failed: std::sync::atomic::AtomicBool::new(false),
+            retries_answer: false,
         }
     }
 }
@@ -1047,14 +1050,21 @@ impl VisionBackend for SampledModel {
         if !board {
             return ScriptedModel.infer(request, cancel).await;
         }
-        // The run seed is 0 and keyframe salts are multiples of 16.
+        // The run seed is 0 and keyframe salts are multiples of 16; a retry
+        // adds 2^32 to its read's seed.
+        let retry = request.options.seed >> 32 > 0;
         let seed = request.options.seed % 16;
-        // Read 0 is greedy; the sampled reads carry the temperature.
-        assert_eq!(request.sampling.temperature.is_some(), seed > 0, "{seed}");
+        // Read 0 is greedy; the sampled reads (and every retry) carry the
+        // temperature.
+        assert_eq!(
+            request.sampling.temperature.is_some(),
+            seed > 0 || retry,
+            "{seed}"
+        );
         let first_of = self.fail_first_of.is_some_and(|k| {
             k == seed && !self.failed.swap(true, std::sync::atomic::Ordering::SeqCst)
         });
-        if self.fail.contains(&seed) || first_of {
+        if (self.fail.contains(&seed) && !(retry && self.retries_answer)) || first_of {
             return Err(VisionError::Protocol(format!(
                 "scripted failure of read {seed}"
             )));
@@ -1260,31 +1270,61 @@ async fn one_failed_read_leaves_two_that_must_agree_and_replays() {
         assert_eq!(c.failed.len(), 1);
         assert_eq!(c.failed[0].read, 1);
         assert_eq!((c.min_agree, c.low_confidence), (2, false));
+        // The quorum held: nothing is retried.
+        assert!(c.retried.is_empty());
         let texts: Vec<&str> = r.result.nodes.iter().map(|n| n.text.as_str()).collect();
         assert_eq!(texts, ["Order Service", "Ledger"]);
-        assert!(r.requests.iter().all(|l| l.read != 1));
+        assert!(r.requests.iter().all(|l| l.read != 1 && l.read < 3));
     }
     for ((_, a), (_, b)) in replay.iter().zip(&live) {
         same_reading(a, b);
     }
+}
 
-    // Reads 0 and 2 fail: read 1 is kept as it came, ghost included, and the
-    // reading is marked low confidence.
+/// Codex r5 integration, MAJOR 1: with reads 0 and 2 failing, read 1 was kept
+/// as it came (its ghost included) and only marked low confidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_short_of_the_quorum_is_retried_once_then_fails_the_item() {
+    // The retries fail too: both keyframes fail, in the replay as well.
+    let runs = consensus_record_and_replay(&[0, 2]).await;
+    assert!(
+        runs.live.is_empty() && runs.replay.is_empty(),
+        "{:?}",
+        runs.live
+    );
+    assert_eq!(runs.errors, 2, "both keyframes failed");
+
+    // The retries answer: reads 1, 3 (read 0 again) and 5 (read 2 again)
+    // vote, and the ghost only read 1 saw goes.
     let ConsensusRuns {
         live,
         replay,
         errors,
         ..
-    } = consensus_record_and_replay(&[0, 2]).await;
+    } = consensus_record_and_replay_with(SampledModel {
+        retries_answer: true,
+        ..SampledModel::failing(&[0, 2])
+    })
+    .await;
     assert_eq!(errors, 0);
     assert_eq!(live.len(), 2);
     for (_, r) in &live {
         let c = r.consensus.as_ref().unwrap();
-        assert_eq!(c.answered, [1]);
-        assert!(c.low_confidence);
+        assert_eq!(c.answered, [1, 3, 5]);
+        assert_eq!(c.retried, [0, 2]);
+        assert_eq!((c.min_agree, c.low_confidence), (2, false));
+        let failed: Vec<u32> = c.failed.iter().map(|f| f.read).collect();
+        assert_eq!(failed, [0, 2]);
         let texts: Vec<&str> = r.result.nodes.iter().map(|n| n.text.as_str()).collect();
-        assert_eq!(texts, ["Order Service", "Ghost Queue"]);
+        assert_eq!(texts, ["Order Service", "Ledger"]);
+        let reads: Vec<u32> = r.requests.iter().map(|l| l.read).collect();
+        assert_eq!(reads, [1, 3, 5]);
+        assert!(r
+            .requests
+            .iter()
+            .all(|l| l.sampling.temperature == Some(0.3)));
     }
+    assert_eq!(replay.len(), live.len());
     for ((_, a), (_, b)) in replay.iter().zip(&live) {
         same_reading(a, b);
     }
@@ -1408,6 +1448,7 @@ async fn a_failed_read_is_not_answered_by_another_keyframes_record() {
         fail: &[],
         fail_first_of: Some(1),
         failed: std::sync::atomic::AtomicBool::new(false),
+        retries_answer: false,
     })
     .await;
     assert_eq!(runs.errors, 0);

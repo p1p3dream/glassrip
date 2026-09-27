@@ -12,6 +12,11 @@
 //! 3. A node whose text is a near spelling of a participant name is rejected.
 //! 4. An edge label that repeats a sticky's text is cleared.
 //!
+//! A consensus reading kept on fewer answering reads than its quorum (one read
+//! kept unvoted and marked `low_confidence`, written by `board_read` before
+//! version 11 and still reachable through `--from-stage`) fails its item: an
+//! unconfirmed read never reaches the board state.
+//!
 //! Deferred to `edge_direction`: checking that an edge label lies on the edge path.
 
 use std::collections::HashMap;
@@ -37,7 +42,7 @@ use crate::layout::names_match;
 use crate::pixels::{self, ShapeThresholds};
 use crate::stages::board_read::canvas_image;
 use crate::stages::vocabulary::participants;
-use crate::stages::{input, internal, load_rgb};
+use crate::stages::{input, internal, invalid, load_rgb};
 
 /// Parameters.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -367,7 +372,8 @@ fn drop_tile_text(mut out: BoardReading, tiles: &[BBox]) -> (BoardReading, Vec<R
     (out, rejected)
 }
 
-/// Validate one reading against its canvas image.
+/// Validate one reading against its canvas image; a consensus reading short of
+/// its quorum is refused.
 ///
 /// `anchors` are the keyframe's OCR spans inside the canvas, in canvas pixels.
 pub fn validate_reading(
@@ -376,7 +382,18 @@ pub fn validate_reading(
     participants: &[String],
     anchors: &[(String, BBox)],
     p: &BoardValidateParams,
-) -> BoardValidateItem {
+) -> Result<BoardValidateItem, ErrorInfo> {
+    if let Some(c) = &reading.consensus {
+        if c.low_confidence || (c.answered.len() as u32) < c.min_agree {
+            return Err(invalid(format!(
+                "keyframe {}: a consensus reading kept on {} of {} reads without a quorum is \
+                 unconfirmed and not validated (rerun board_read)",
+                reading.keyframe_id,
+                c.answered.len(),
+                c.reads,
+            )));
+        }
+    }
     let all: Vec<String> = participants
         .iter()
         .chain(&p.validation.participant_names)
@@ -508,7 +525,7 @@ pub fn validate_reading(
             e.label_bbox = None;
         }
     }
-    BoardValidateItem {
+    Ok(BoardValidateItem {
         keyframe_id: reading.keyframe_id.clone(),
         source_frame_id: reading.source_frame_id.clone(),
         source_image_path: reading.source_image_path.clone(),
@@ -519,7 +536,7 @@ pub fn validate_reading(
         board,
         membership,
         extra_issues: extra,
-    }
+    })
 }
 
 /// The stage.
@@ -550,7 +567,10 @@ impl Stage for BoardValidateStage {
         "board_validate"
     }
     fn version(&self) -> u32 {
-        1
+        // 2: a consensus reading short of its quorum (board_read before 11
+        // kept one unvoted read, `low_confidence`) fails its item; outputs of 1
+        // may hold such a reading.
+        2
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
@@ -663,13 +683,7 @@ impl Stage for BoardValidateStage {
         tokio::task::spawn_blocking(move || {
             let canvas = canvas_image(&img, &crop)
                 .ok_or_else(|| crate::stages::invalid("canvas box is empty"))?;
-            Ok(validate_reading(
-                &w.reading,
-                &canvas,
-                &w.participants,
-                &w.anchors,
-                &params,
-            ))
+            validate_reading(&w.reading, &canvas, &w.participants, &w.anchors, &params)
         })
         .await
         .map_err(|e| internal(format!("validation task failed: {e}")))?
@@ -729,6 +743,61 @@ mod tests {
         }
     }
 
+    /// Codex r5 integration, MAJOR 1: a reading board_read kept on one of
+    /// three reads (`low_confidence`, before board_read 11) was validated like
+    /// a voted one and could become final state.
+    #[test]
+    fn an_unconfirmed_consensus_reading_is_refused() {
+        let out = BoardReading {
+            nodes: vec![BoardNode {
+                local_id: "n1".into(),
+                text: "Order Service".into(),
+                bbox: BBox::new(20.0, 20.0, 140.0, 80.0),
+                conf: 0.9,
+            }],
+            edges: vec![],
+            stickies: vec![],
+            owner_tags: vec![],
+            other_visible_text: vec![],
+            confidence: 0.8,
+        };
+        let log = crate::artifacts::ConsensusLog {
+            reads: 3,
+            answered: vec![1],
+            failed: vec![],
+            retried: vec![],
+            min_agree: 1,
+            low_confidence: true,
+            nodes: vec![],
+            edges: vec![],
+            stickies: vec![],
+            owner_tags: vec![],
+            other_visible_text: vec![],
+            dropped: crate::artifacts::DroppedCounts::default(),
+        };
+        let run = |log: crate::artifacts::ConsensusLog| {
+            let mut r = reading(out.clone());
+            r.consensus = Some(log);
+            validate_reading(
+                &r,
+                &board_image(),
+                &[],
+                &[],
+                &BoardValidateParams::default(),
+            )
+        };
+        let e = run(log.clone()).unwrap_err();
+        assert_eq!(e.code, glassrip_core::envelope::ErrorCode::InvalidInput);
+        // A voted reading (two of three answered, quorum two) is validated.
+        let voted = crate::artifacts::ConsensusLog {
+            answered: vec![0, 2],
+            min_agree: 2,
+            low_confidence: false,
+            ..log
+        };
+        assert_eq!(run(voted).unwrap().board.nodes.len(), 1);
+    }
+
     #[test]
     fn misfiled_elements_move_by_shape_and_color() {
         let out = BoardReading {
@@ -784,7 +853,8 @@ mod tests {
             &["Adaline Quill".to_string()],
             &[],
             &BoardValidateParams::default(),
-        );
+        )
+        .unwrap();
         let nodes: Vec<&str> = v.board.nodes.iter().map(|n| n.text.as_str()).collect();
         assert_eq!(nodes, vec!["Order Service", "Ledger"], "{:?}", v.membership);
         assert_eq!(v.board.stickies.len(), 1);
@@ -849,7 +919,8 @@ mod tests {
             &["Ada Quill".to_string(), "Bo Tran".to_string()],
             &[],
             &BoardValidateParams::default(),
-        );
+        )
+        .unwrap();
         let owners: Vec<&str> = v
             .board
             .owner_tags
@@ -905,7 +976,8 @@ mod tests {
             &["Ada Quill".to_string()],
             &anchors,
             &BoardValidateParams::default(),
-        );
+        )
+        .unwrap();
         assert!(v.board.nodes.is_empty(), "{:?}", v.membership);
         let stickies: Vec<&str> = v.board.stickies.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(stickies, vec!["Ship before launch?", "Unread notes"]);

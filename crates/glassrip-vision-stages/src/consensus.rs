@@ -23,8 +23,14 @@
 //!   with two reads' element twice.
 //! - Edges are matched by their endpoints mapped through the node matching
 //!   (then by label when a read has several edges between the same two nodes)
-//!   and kept with `min_agree` reads whose endpoints both survived. Direction
-//!   and style go by majority; a tie keeps the earliest read's and is flagged.
+//!   and kept with `min_agree` reads whose endpoints both survived: that votes
+//!   the connector's existence. Direction and style go by majority; a tie keeps
+//!   the earliest read's and is flagged. The label is voted on its own: the
+//!   most common normalized label is kept only when `min_agree` of the edge's
+//!   reads carry a label at least `text_ratio` similar to it (an empty label
+//!   agrees only with an empty one); otherwise the edge keeps no label and is
+//!   flagged, so two reads labeling one connector differently never present
+//!   either read's label as agreed.
 //! - An owner tag's node is the majority of the reads' nodes mapped through the
 //!   node matching; a tie leaves it unset (uncertain).
 //!
@@ -595,7 +601,17 @@ pub fn vote(reads: &[BoardReading], anchors: &[(String, BBox)], p: &VoteParams) 
             )
         });
         let labels: Vec<&str> = ms.iter().map(|m| edge(m).label.as_str()).collect();
-        let (label, label_votes) = vote_text(&labels, &around, anchors);
+        let (voted, _) = vote_text(&labels, &around, anchors);
+        let label_votes = labels
+            .iter()
+            .filter(|l| text_sim(l, &voted) >= p.text_ratio)
+            .count() as u32;
+        let label_uncertain = (label_votes as usize) < p.min_agree;
+        let (label, label_bbox) = if label_uncertain {
+            (String::new(), None)
+        } else {
+            (voted, label_bbox)
+        };
         let (src, dst) = if forward { (*a, *b) } else { (*b, *a) };
         edges.push(BoardEdge {
             src: format!("n{}", src + 1),
@@ -620,6 +636,7 @@ pub fn vote(reads: &[BoardReading], anchors: &[(String, BBox)], p: &VoteParams) 
             label_votes,
             direction_uncertain: dir.is_none(),
             style_uncertain: sty.is_none(),
+            label_uncertain,
         });
     }
 
@@ -845,6 +862,44 @@ mod tests {
         let e = &v.result.edges[0];
         let src = v.result.nodes.iter().find(|n| n.local_id == e.src).unwrap();
         assert_eq!(src.text, "Order Service", "the first read's direction");
+    }
+
+    /// Codex r5 integration, MAJOR 3: two reads labeling one connector
+    /// "deploys" and "blocks" (the third omits it) passed the edge vote with
+    /// one read's label presented as consensus.
+    #[test]
+    fn a_label_needs_min_agree_reads_of_its_own() {
+        let nodes = |x: f64| {
+            vec![
+                node("a", "Order Service", 100.0 + x, 100.0),
+                node("b", "Ledger", 400.0 + x, 100.0),
+            ]
+        };
+        let a = reading(nodes(0.0), vec![edge("a", "b", "deploys")]);
+        let b = reading(nodes(1.0), vec![edge("a", "b", "blocks")]);
+        let c = reading(nodes(2.0), vec![]);
+        let v = vote(&[a.clone(), b, c.clone()], &[], &p());
+        assert_eq!(
+            v.result.edges.len(),
+            1,
+            "the connector itself has two reads"
+        );
+        assert_eq!(v.result.edges[0].label, "", "{:?}", v.result.edges);
+        assert_eq!(v.result.edges[0].label_bbox, None);
+        assert!(v.edges[0].label_uncertain);
+        assert_eq!(v.edges[0].label_votes, 1);
+        // Labels at least text_ratio similar agree: the voted form is kept.
+        let d = reading(nodes(1.0), vec![edge("a", "b", "Deploys")]);
+        let v = vote(&[a.clone(), d, c.clone()], &[], &p());
+        assert_eq!(v.result.edges[0].label, "deploys");
+        assert!(!v.edges[0].label_uncertain);
+        assert_eq!(v.edges[0].label_votes, 2);
+        // A label one read gives and another read leaves off is not agreed.
+        let e = reading(nodes(1.0), vec![edge("a", "b", "")]);
+        let v = vote(&[a, e, c], &[], &p());
+        assert_eq!(v.result.edges.len(), 1);
+        assert_eq!(v.result.edges[0].label, "");
+        assert!(v.edges[0].label_uncertain);
     }
 
     #[test]

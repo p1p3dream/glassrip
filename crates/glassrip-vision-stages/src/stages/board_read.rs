@@ -33,9 +33,12 @@
 //!   answer. Every read goes through
 //!   the whole path above (tiles, retries, the degenerate rule) on its own, then
 //!   [`crate::consensus::vote`] keeps what `consensus.min_agree` reads agree on.
-//!   A failed read leaves the vote to the others, all of which must then agree
-//!   when fewer than `min_agree` remain; a single answering read is kept as read
-//!   and marked low confidence; with none the item fails.
+//!   The quorum holds: a failed read leaves the vote to the others while at
+//!   least `min_agree` (capped at `reads`) answered. With fewer, every failed
+//!   read is retried once, sampled, as read `reads + k` with its own seed (so a
+//!   replay reaches the retry's recorded reply); still short of the quorum, the
+//!   item fails. No reading is ever kept on fewer answering reads than the
+//!   quorum: an element one read alone saw never reaches the board.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -156,18 +159,33 @@ impl ConsensusParams {
     /// Seed of read `read` of the `job`th image (0: the overview, then the
     /// tiles; at most 256) of the `index`th planned keyframe: the run seed plus
     /// `(index + 1) * 4096 + job * 16 + read` (reads stay below 16), so no two
-    /// requests of a run share a seed. A single read keeps the run seed (the
-    /// request it always was).
+    /// requests of a run share a seed. Read `reads + k` is the retry of read
+    /// `k` (see [`BoardReadStage`]): read `k`'s seed plus `2^32`, a range no
+    /// first read reaches. A single read keeps the run seed (the request it
+    /// always was).
     pub fn seed(&self, base: u64, index: u64, job: u64, read: u32) -> u64 {
         if self.reads <= 1 {
             return base;
         }
+        let (read, retry) = if read >= self.reads {
+            (read - self.reads, 1u64 << 32)
+        } else {
+            (read, 0)
+        };
         base.wrapping_add((index + 1) << 12)
             .wrapping_add(job << 4)
             .wrapping_add(u64::from(read))
+            .wrapping_add(retry)
     }
 
-    /// Temperature override of read `k`: none (0, greedy) for read 0.
+    /// Reads that must answer for a vote: `min_agree`, capped at `reads`.
+    pub fn quorum(&self) -> u32 {
+        self.min_agree.clamp(1, self.reads.max(1))
+    }
+
+    /// Temperature override of read `k`: none (0, greedy) for read 0; a retry
+    /// (read `reads + k`) is always sampled (a greedy retry would repeat the
+    /// greedy failure).
     pub fn temperature(&self, read: u32) -> Option<f32> {
         (read > 0).then_some(self.temperature)
     }
@@ -765,25 +783,44 @@ fn single_votes(n: usize) -> Vec<ElementVote> {
     ]
 }
 
-/// The consensus of `answered` reads (read index, reading), in read order and
-/// at least one; `reads` were requested.
+/// The consensus of `answered` reads (read index, reading), in read order;
+/// `reads` were requested and the reads in `retried` were retried once. Fewer
+/// answering reads than the quorum ([`ConsensusParams::quorum`]) fail the item:
+/// the vote never lowers its bar to the reads that happened to answer.
 pub fn consensus_of(
     p: &BoardReadParams,
     reads: u32,
     answered: Vec<(u32, BoardReading)>,
     failed: Vec<FailedRead>,
+    retried: Vec<u32>,
     anchors: &[(String, BBox)],
-) -> (BoardReading, ConsensusLog) {
+) -> Result<(BoardReading, ConsensusLog), ErrorInfo> {
+    let quorum = p.consensus.min_agree.clamp(1, reads.max(1)) as usize;
+    if answered.len() < quorum {
+        let Some(first) = failed.first() else {
+            return Err(internal("too few consensus reads and none failed"));
+        };
+        let mut e = first.error.clone();
+        e.message = format!(
+            "{} of {reads} consensus reads answered, {quorum} needed (each failed read \
+             retried once); read {}: {}",
+            answered.len(),
+            first.read,
+            e.message
+        );
+        return Err(e);
+    }
     let indices: Vec<u32> = answered.iter().map(|(k, _)| *k).collect();
     let readings: Vec<BoardReading> = answered.into_iter().map(|(_, r)| r).collect();
     if let [single] = readings.as_slice() {
-        // Nothing to vote with: the read as it came, unconfirmed.
+        // A quorum of one: the read as it came.
         let log = ConsensusLog {
             reads,
             answered: indices,
             failed,
+            retried,
             min_agree: 1,
-            low_confidence: reads > 1,
+            low_confidence: false,
             nodes: single_votes(single.nodes.len()),
             edges: vec![
                 EdgeVote {
@@ -793,6 +830,7 @@ pub fn consensus_of(
                     label_votes: 1,
                     direction_uncertain: false,
                     style_uncertain: false,
+                    label_uncertain: false,
                 };
                 single.edges.len()
             ],
@@ -801,14 +839,13 @@ pub fn consensus_of(
             other_visible_text: single_votes(single.other_visible_text.len()),
             dropped: DroppedCounts::default(),
         };
-        return (single.clone(), log);
+        return Ok((single.clone(), log));
     }
-    let min_agree = (p.consensus.min_agree.max(1) as usize).min(readings.len());
     let v = vote(
         &readings,
         anchors,
         &VoteParams {
-            min_agree,
+            min_agree: quorum,
             merge_iou: p.merge_iou,
             text_ratio: p.merge_text_ratio,
         },
@@ -817,7 +854,8 @@ pub fn consensus_of(
         reads,
         answered: indices,
         failed,
-        min_agree: min_agree as u32,
+        retried,
+        min_agree: quorum as u32,
         low_confidence: false,
         nodes: v.nodes,
         edges: v.edges,
@@ -826,7 +864,7 @@ pub fn consensus_of(
         other_visible_text: v.other_visible_text,
         dropped: v.dropped,
     };
-    (v.result, log)
+    Ok((v.result, log))
 }
 
 impl Stage for BoardReadStage {
@@ -870,7 +908,13 @@ impl Stage for BoardReadStage {
         // tags vote together; elements match only with similar texts; the
         // fold needs a read listing one text twice; consensus seeds encode the
         // keyframe and image (outputs of 9 may share replies between them).
-        10
+        // 11: the quorum holds: with fewer than `min_agree` reads answering,
+        // each failed read is retried once (sampled, its own seed), and a
+        // keyframe still short of the quorum fails instead of keeping one
+        // unvoted read; an edge label is kept only when `min_agree` reads carry
+        // it (outputs of 10 may hold a single unconfirmed read, or a label one
+        // read gave to an edge the others labeled otherwise).
+        11
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
@@ -1004,7 +1048,10 @@ impl Stage for BoardReadStage {
         let mut answered = Vec::new();
         let mut logs = Vec::new();
         let mut failed = Vec::new();
-        for (k, r) in (0..reads).zip(outcomes) {
+        let mut collect = |k: u32,
+                           r: Result<(BoardReading, Vec<RequestLog>), ErrorInfo>,
+                           failed: &mut Vec<FailedRead>|
+         -> Result<(), ErrorInfo> {
             match r {
                 Ok((reading, l)) => {
                     answered.push((k, reading));
@@ -1013,39 +1060,49 @@ impl Stage for BoardReadStage {
                 Err(e) if e.code == ErrorCode::Cancelled || cancel.is_cancelled() => return Err(e),
                 Err(e) => failed.push(FailedRead { read: k, error: e }),
             }
+            Ok(())
+        };
+        for (k, r) in (0..reads).zip(outcomes) {
+            collect(k, r, &mut failed)?;
         }
-        if answered.is_empty() {
-            let Some(first) = failed.into_iter().next() else {
-                return Err(internal("no board read ran"));
-            };
-            let mut e = first.error;
-            if reads > 1 {
-                e.message = format!(
-                    "every one of {reads} consensus reads failed; read 0: {}",
-                    e.message
-                );
+        // Short of the quorum: each failed read is retried once, sampled, as
+        // read `reads + k` with its own seed.
+        let quorum = self.params.consensus.quorum() as usize;
+        let mut retried = Vec::new();
+        if reads > 1 && reads as usize - failed.len() < quorum {
+            retried = failed.iter().map(|f| f.read).collect::<Vec<u32>>();
+            let again = futures_util::future::join_all(retried.iter().map(|&k| {
+                self.read_board(index, reads + k, &jobs, tiled, &anchors, cancel.clone())
+            }))
+            .await;
+            if let Some(e) = self.monitor.abort_error() {
+                return Err(e);
             }
-            return Err(e);
+            for (&k, r) in retried.iter().zip(again) {
+                collect(reads + k, r, &mut failed)?;
+            }
         }
         for f in &failed {
             tracing::warn!(
                 keyframe = %crop.keyframe_id,
                 read = f.read,
                 error = %f.error.message,
-                "a consensus board read failed; voting with the others"
+                "a consensus board read failed"
             );
         }
         let (result, consensus) = if reads == 1 {
-            let (_, reading) = answered.remove(0);
-            (reading, None)
-        } else {
-            let (r, log) = consensus_of(&self.params, reads, answered, failed, &anchors);
-            if log.low_confidence {
-                tracing::warn!(
-                    keyframe = %crop.keyframe_id,
-                    "only one consensus board read answered; kept unconfirmed (low confidence)"
-                );
+            match answered.pop() {
+                Some((_, reading)) => (reading, None),
+                None => {
+                    return Err(failed
+                        .into_iter()
+                        .next()
+                        .map(|f| f.error)
+                        .unwrap_or_else(|| internal("no board read ran")))
+                }
             }
+        } else {
+            let (r, log) = consensus_of(&self.params, reads, answered, failed, retried, &anchors)?;
             (r, Some(log))
         };
         Ok(BoardReadingItem {
@@ -1391,9 +1448,12 @@ mod tests {
         assert_eq!(p.temperature(0), None);
         assert_eq!(p.temperature(2), Some(p.temperature));
         let mut seeds = std::collections::BTreeSet::new();
+        // Reads `reads..2 * reads` are the retries: sampled, with seeds of
+        // their own.
+        assert_eq!(p.temperature(p.reads), Some(p.temperature));
         for index in 0..300u64 {
             for job in 0..65u64 {
-                for read in 0..p.reads {
+                for read in 0..2 * p.reads {
                     assert!(seeds.insert(p.seed(7, index, job, read)));
                 }
             }
@@ -1416,25 +1476,72 @@ mod tests {
         assert!(retry.sampling.repeat_penalty.is_some());
     }
 
+    /// Codex r5 integration, MAJOR 1: one read answering of three (min_agree
+    /// 2) was kept in full as an unconfirmed reading.
     #[test]
-    fn a_single_answering_read_is_kept_and_marked_low_confidence() {
+    fn fewer_answering_reads_than_the_quorum_fail_the_item() {
         let mut r = empty();
         r.nodes = vec![
             node("a", "Order Service", BBox::new(100.0, 100.0, 300.0, 160.0)),
-            node("b", "Order Service", BBox::new(104.0, 100.0, 304.0, 160.0)),
+            node("b", "Ghost Queue", BBox::new(500.0, 400.0, 600.0, 450.0)),
         ];
         let failed = |k| FailedRead {
             read: k,
             error: ErrorInfo::new(ErrorCode::SchemaParse, "x"),
         };
         let p = BoardReadParams::default();
-        let (out, log) = consensus_of(&p, 3, vec![(1, r.clone())], vec![failed(0), failed(2)], &[]);
-        assert_eq!(out, r, "kept exactly as read");
-        assert!(log.low_confidence);
-        assert_eq!(log.answered, [1]);
-        assert_eq!(log.failed.len(), 2);
-        assert_eq!(log.nodes.len(), 2);
-        assert!(log.nodes.iter().all(|v| v.votes == 1));
+        // Reads 0 and 2 failed, and so did their retries (reads 3 and 5).
+        let e = consensus_of(
+            &p,
+            3,
+            vec![(1, r.clone())],
+            vec![failed(0), failed(2), failed(3), failed(5)],
+            vec![0, 2],
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(e.code, ErrorCode::SchemaParse);
+        assert!(
+            e.message
+                .contains("1 of 3 consensus reads answered, 2 needed"),
+            "{}",
+            e.message
+        );
+        // min_agree 3: two answering reads are not lowered to a quorum of two.
+        let mut three = p.clone();
+        three.consensus.min_agree = 3;
+        assert!(consensus_of(
+            &three,
+            3,
+            vec![(0, r.clone()), (2, r.clone())],
+            vec![failed(1), failed(4)],
+            vec![1],
+            &[],
+        )
+        .is_err());
+        // A retry that answers restores the quorum: read 1 and the retry of
+        // read 0 vote; the ghost only read 1 lists goes.
+        let mut other = r.clone();
+        other.nodes.pop();
+        let (out, log) = consensus_of(
+            &p,
+            3,
+            vec![(1, r), (3, other)],
+            vec![failed(0), failed(2), failed(5)],
+            vec![0, 2],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(out.nodes.len(), 1);
+        assert_eq!((log.min_agree, log.low_confidence), (2, false));
+        assert_eq!(log.answered, [1, 3]);
+        assert_eq!(log.retried, [0, 2]);
+        // The configured quorum of one keeps one read.
+        let mut one = p.clone();
+        one.consensus.min_agree = 1;
+        let (_, log) =
+            consensus_of(&one, 3, vec![(1, empty())], vec![failed(0)], vec![], &[]).unwrap();
+        assert_eq!(log.min_agree, 1);
     }
 
     #[test]
@@ -1457,15 +1564,25 @@ mod tests {
             3,
             vec![(0, with("Ledger")), (2, with("Ledger"))],
             failed.clone(),
+            vec![],
             &[],
-        );
+        )
+        .unwrap();
         assert_eq!(out.nodes.len(), 2);
         assert_eq!((log.min_agree, log.low_confidence), (2, false));
         assert_eq!(log.answered, [0, 2]);
         // A node only one of the two lists goes.
         let mut other = with("Ledger");
         other.nodes.pop();
-        let (out, log) = consensus_of(&p, 3, vec![(0, with("Ledger")), (2, other)], failed, &[]);
+        let (out, log) = consensus_of(
+            &p,
+            3,
+            vec![(0, with("Ledger")), (2, other)],
+            failed,
+            vec![],
+            &[],
+        )
+        .unwrap();
         assert_eq!(out.nodes.len(), 1);
         assert_eq!(log.dropped.nodes, 1);
         // With three answering, two agreeing are enough.
@@ -1476,8 +1593,10 @@ mod tests {
             3,
             vec![(0, with("Ledger")), (1, with("Ledger")), (2, third)],
             vec![],
+            vec![],
             &[],
-        );
+        )
+        .unwrap();
         assert_eq!(out.nodes.len(), 2);
         assert_eq!(log.min_agree, 2);
     }

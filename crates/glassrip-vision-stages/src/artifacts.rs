@@ -428,13 +428,22 @@ pub struct ConsensusLog {
     pub reads: u32,
     /// Reads that answered (indices, `requests[].read`).
     pub answered: Vec<u32>,
-    /// Reads that failed, with their errors.
+    /// Reads that failed, with their errors (a retry of read `k` is read
+    /// `reads + k`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failed: Vec<FailedRead>,
-    /// Reads an element needed to be kept (the configured `min_agree`, or every
-    /// answering read when fewer answered).
+    /// Reads retried once because fewer than the quorum answered; the retry
+    /// of read `k` is read `reads + k` in `answered`, `failed`, and
+    /// `requests[].read`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retried: Vec<u32>,
+    /// Reads an element needed to be kept: the configured `min_agree` capped at
+    /// `reads`, and at least this many reads answered (board_read before
+    /// version 11 lowered it to the reads that answered).
     pub min_agree: u32,
-    /// Only one read answered: `result` is that read as it came, unconfirmed.
+    /// Written only by board_read before version 11: one read answered and
+    /// `result` is that read as it came, unvoted. `board_validate` refuses such
+    /// a reading.
     #[serde(default, skip_serializing_if = "is_false")]
     pub low_confidence: bool,
     pub nodes: Vec<ElementVote>,
@@ -480,7 +489,9 @@ pub struct EdgeVote {
     pub direction_votes: u32,
     /// Reads whose style is the kept one.
     pub style_votes: u32,
-    /// Reads whose label is the kept one.
+    /// Reads whose label is similar to the voted one (normalized texts at
+    /// least `merge_text_ratio` similar; an empty label is similar only to an
+    /// empty one).
     pub label_votes: u32,
     /// The reads split evenly on the direction; the kept one is the first read's.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -488,6 +499,10 @@ pub struct EdgeVote {
     /// The reads split evenly on the style; the kept one is the first read's.
     #[serde(default, skip_serializing_if = "is_false")]
     pub style_uncertain: bool,
+    /// Fewer than `min_agree` reads carry the voted label: the edge exists (its
+    /// endpoints reached the quorum) but its label is cleared.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub label_uncertain: bool,
 }
 
 /// Elements dropped by the vote, per list.
