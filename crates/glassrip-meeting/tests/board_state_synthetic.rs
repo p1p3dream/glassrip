@@ -3684,3 +3684,32 @@ fn a_same_text_box_where_the_registration_is_off_merges() {
     let s = run(fr, &params());
     assert!(s.folded.iter().all(|f| f.reason != FoldReason::Duplicate));
 }
+
+#[test]
+fn a_connector_at_a_fragment_does_not_keep_a_marked_element_a_node() {
+    // "Pilot milestone in May" is read whole in keyframes 0-3; keyframe 4 reads only
+    // its fragment "Pilot milestone" over the element's place (offset, so a separate
+    // reading rather than a label change), with a connector from Queue. The fragment
+    // folds into the element; the element is a sticky.
+    let mut specs: Vec<Spec> = (0..5).map(|_| base()).collect();
+    for (i, s) in specs.iter_mut().enumerate() {
+        if i < 4 {
+            s.nodes
+                .push(("n8", "Pilot milestone in May".into(), (200.0, 450.0)));
+        } else {
+            s.nodes
+                .push(("n8", "Pilot milestone".into(), (280.0, 450.0)));
+            s.edges.push(("n2", "n8", ""));
+        }
+    }
+    let s = run(frames(&specs), &params());
+    let texts = node_texts(&s);
+    assert!(
+        !texts.iter().any(|t| t.starts_with("Pilot milestone")),
+        "{texts:?}"
+    );
+    assert!(s
+        .stickies
+        .iter()
+        .any(|x| x.text == "Pilot milestone in May" && x.kind == StickyKind::Milestone));
+}
