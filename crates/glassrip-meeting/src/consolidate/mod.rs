@@ -2151,9 +2151,6 @@ fn consolidate_pass(
             }
             let key = (s.min(d), s.max(d));
             let list = edge_obs.entry(key).or_default();
-            if list.iter().any(|o| o.frame == fi) {
-                continue;
-            }
             let evidence = f
                 .directions
                 .as_ref()
@@ -2178,7 +2175,7 @@ fn consolidate_pass(
                 }
                 _ => ((0.0, 0.0), (0.0, 0.0)),
             };
-            list.push(EdgeObs {
+            let candidate = EdgeObs {
                 frame: fi,
                 shares: edge_shares(fi, ei),
                 src: s,
@@ -2186,7 +2183,31 @@ fn consolidate_pass(
                 style: e.style,
                 evidence,
                 segment,
-            });
+            };
+            if let Some(existing) = list.iter_mut().find(|o| o.frame == fi) {
+                // One keyframe is one edge sighting. If the reading lists the
+                // same connector twice, keep the more strongly voted version,
+                // independently of list order.
+                let better = candidate
+                    .shares
+                    .share
+                    .total_cmp(&existing.shares.share)
+                    .then(
+                        candidate
+                            .shares
+                            .direction
+                            .total_cmp(&existing.shares.direction),
+                    )
+                    .then(candidate.shares.label.total_cmp(&existing.shares.label))
+                    .then(candidate.label.cmp(&existing.label))
+                    .then(candidate.src.cmp(&existing.src))
+                    .is_gt();
+                if better {
+                    *existing = candidate;
+                }
+            } else {
+                list.push(candidate);
+            }
         }
     }
     let dir_items: Vec<&EdgeDirectionItem> = frames
@@ -2497,9 +2518,10 @@ fn consolidate_pass(
             let w = weight_of(o.frame) * o.shares.share;
             let orient = |v: EndVerdict| if o.src == a { v } else { v.flipped() };
             // The reader's direction weighs the share of its reads that agreed on it.
-            votes
-                .reader
-                .add(orient(EndVerdict::Forward), o.shares.direction);
+            votes.reader.add(
+                orient(EndVerdict::Forward),
+                o.shares.share * o.shares.direction,
+            );
             if let Some(ev) = &o.evidence {
                 let (p, v) = ev.verdicts();
                 votes.pixel.add(orient(p), w);

@@ -4040,8 +4040,66 @@ fn edge_label_and_direction_follow_the_vote_weighted_majority() {
     let e = edge(&s);
     assert_eq!(e.label, "HTTP");
     assert_eq!(e.direction, EdgeOrientation::Forward);
+    // The reader's own orientation (Ingest Gateway -> Queue in every
+    // keyframe) weighs edge share times direction agreement: 4 x 1 + 3 x 2/3.
+    let reader = e.direction_votes.reader;
+    let a_is_gateway = e.a_text == "Ingest Gateway";
+    let (with, against) = if a_is_gateway {
+        (reader.a_to_b, reader.b_to_a)
+    } else {
+        (reader.b_to_a, reader.a_to_b)
+    };
+    assert!((with - 6.0).abs() < 1e-9, "{reader:?}");
+    assert!(against.abs() < 1e-9, "{reader:?}");
     let src = s.nodes.iter().find(|n| n.id == e.src).unwrap();
     assert_eq!(src.text, "Ingest Gateway");
+}
+
+#[test]
+fn duplicate_edges_in_one_reading_keep_the_stronger_vote_in_either_order() {
+    let run_order = |reverse: bool| {
+        let mut specs: Vec<Spec> = (0..4).map(|_| base()).collect();
+        for s in &mut specs {
+            s.edges.push(("n2", "n1", "strong"));
+        }
+        let mut fr = frames(&specs);
+        if reverse {
+            for f in &mut fr {
+                let a = f
+                    .board
+                    .edges
+                    .iter()
+                    .position(|e| e.label == "HTTP")
+                    .unwrap();
+                let b = f
+                    .board
+                    .edges
+                    .iter()
+                    .position(|e| e.label == "strong")
+                    .unwrap();
+                f.board.edges.swap(a, b);
+            }
+        }
+        let mut votes = unanimous(&fr);
+        for f in &fr {
+            let v = votes.get_mut(&f.keyframe_id).unwrap();
+            for (e, share) in f.board.edges.iter().zip(&mut v.edges) {
+                if e.label == "HTTP" {
+                    share.share = TWO_THIRDS;
+                }
+            }
+        }
+        let state = run_voted(fr, &votes, &params());
+        state
+            .edges
+            .iter()
+            .find(|e| e.a_text == "Ingest Gateway" || e.b_text == "Ingest Gateway")
+            .unwrap()
+            .label
+            .clone()
+    };
+    assert_eq!(run_order(false), "strong");
+    assert_eq!(run_order(true), "strong");
 }
 
 /// A reader owner tag no OCR span read corroborates only when every read

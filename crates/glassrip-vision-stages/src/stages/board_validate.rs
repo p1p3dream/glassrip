@@ -422,7 +422,12 @@ impl VotePool {
         let by_id = id.and_then(|id| {
             self.voted
                 .iter()
-                .position(|v| free(v) && v.id.as_deref() == Some(id) && normalize(&v.text) == key)
+                .enumerate()
+                .filter(|(_, v)| {
+                    free(v) && v.id.as_deref() == Some(id) && normalize(&v.text) == key
+                })
+                .min_by(|a, b| dist(&a.1.bbox).total_cmp(&dist(&b.1.bbox)))
+                .map(|(i, _)| i)
         });
         let by_text = || {
             self.voted
@@ -535,7 +540,20 @@ pub fn validated_votes(
             let same = |x: &glassrip_vision::board::BoardEdge| {
                 (x.src == e.src && x.dst == e.dst) || (x.src == e.dst && x.dst == e.src)
             };
-            match (0..r.edges.len()).find(|&i| !used[i] && same(&r.edges[i])) {
+            // Validation preserves an edge's orientation, but can remove other
+            // edges between the same endpoints. Match the directed pair first,
+            // then its label when several directed edges remain.
+            let match_edge = (0..r.edges.len())
+                .filter(|&i| !used[i] && same(&r.edges[i]))
+                .max_by_key(|&i| {
+                    let x = &r.edges[i];
+                    (
+                        x.src == e.src && x.dst == e.dst,
+                        !e.label.is_empty() && normalize(&x.label) == normalize(&e.label),
+                        std::cmp::Reverse(i),
+                    )
+                });
+            match match_edge {
                 Some(i) => {
                     used[i] = true;
                     let v = &c.edges[i];
@@ -1280,6 +1298,102 @@ mod tests {
         )
         .unwrap();
         assert!(single.votes.is_none());
+    }
+
+    #[test]
+    fn edge_votes_match_direction_and_label_after_other_edges_are_removed() {
+        let node = |id: &str, x: f64| BoardNode {
+            local_id: id.into(),
+            text: id.into(),
+            bbox: BBox::new(x, 20.0, x + 80.0, 80.0),
+            conf: 0.9,
+        };
+        let edge = |src: &str, dst: &str, label: &str| BoardEdge {
+            src: src.into(),
+            dst: dst.into(),
+            label: label.into(),
+            label_bbox: None,
+            style: EdgeStyle::Solid,
+            conf: 0.9,
+        };
+        let reading = BoardReading {
+            nodes: vec![node("n1", 20.0), node("n2", 200.0)],
+            edges: vec![
+                edge("n1", "n2", "first"),
+                edge("n2", "n1", "reverse"),
+                edge("n1", "n2", "second"),
+            ],
+            stickies: vec![],
+            owner_tags: vec![],
+            other_visible_text: vec![],
+            confidence: 0.9,
+        };
+        let element = crate::artifacts::ElementVote {
+            votes: 3,
+            text_votes: 3,
+            uncertain: false,
+        };
+        let vote = |votes| crate::artifacts::EdgeVote {
+            votes,
+            direction_votes: votes,
+            style_votes: votes,
+            label_votes: votes,
+            direction_uncertain: false,
+            style_uncertain: false,
+            label_uncertain: false,
+        };
+        let log = ConsensusLog {
+            reads: 3,
+            answered: vec![0, 1, 2],
+            failed: vec![],
+            retried: vec![],
+            min_agree: 2,
+            low_confidence: false,
+            nodes: vec![element.clone(), element],
+            edges: vec![vote(3), vote(2), vote(1)],
+            stickies: vec![],
+            owner_tags: vec![],
+            other_visible_text: vec![],
+            dropped: crate::artifacts::DroppedCounts::default(),
+        };
+        let mut board = validate_board(
+            reading.clone(),
+            CanvasSize {
+                width: 400.0,
+                height: 300.0,
+            },
+            &BoardValidationConfig::default(),
+        );
+        board.edges = vec![reading.edges[2].clone(), reading.edges[1].clone()];
+        let votes = validated_votes(&reading, &log, &board).unwrap();
+        assert_eq!(votes.edges[0].share, 1.0 / 3.0);
+        assert_eq!(votes.edges[1].share, 2.0 / 3.0);
+        assert_eq!(votes.unmatched, 0);
+    }
+
+    #[test]
+    fn duplicate_local_ids_match_the_nearest_voted_box() {
+        let box_at = |x| BBox::new(x, 20.0, x + 60.0, 80.0);
+        let mut pool = VotePool {
+            voted: vec![
+                Voted {
+                    id: Some("n1".into()),
+                    text: "Queue".into(),
+                    bbox: box_at(20.0),
+                    share: 1.0,
+                    used: false,
+                },
+                Voted {
+                    id: Some("n1".into()),
+                    text: "Queue".into(),
+                    bbox: box_at(200.0),
+                    share: 2.0 / 3.0,
+                    used: false,
+                },
+            ],
+            unmatched: 0,
+        };
+        assert_eq!(pool.take(Some("n1"), "Queue", &box_at(200.0)), 2.0 / 3.0);
     }
 
     #[test]
