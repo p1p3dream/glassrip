@@ -11,6 +11,7 @@ use glassrip_vision::BBox;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::consolidate::FrameVotes;
 use crate::direction::EndVerdict;
 use crate::pixel_direction::PixelEvidence;
 use crate::vlm_direction::VlmEvidence;
@@ -107,6 +108,9 @@ pub enum ValidateItemView {
         /// The validated board.
         #[serde(alias = "result")]
         board: ValidatedBoard,
+        /// Consensus vote shares of the board's elements, when it was voted.
+        #[serde(default)]
+        votes: Option<FrameVotes>,
     },
     /// The bare validated board.
     Bare(ValidatedBoard),
@@ -123,6 +127,8 @@ pub struct BoardItem {
     pub board_title: Option<String>,
     /// The validated board.
     pub board: ValidatedBoard,
+    /// Consensus vote shares of the board's elements, when it was voted.
+    pub votes: Option<FrameVotes>,
 }
 
 impl ValidateItemView {
@@ -134,17 +140,20 @@ impl ValidateItemView {
                 canvas,
                 board_title,
                 board,
+                votes,
             } => BoardItem {
                 keyframe_id,
                 canvas,
                 board_title,
                 board,
+                votes,
             },
             Self::Bare(board) => BoardItem {
                 keyframe_id: record_id.to_string(),
                 canvas: None,
                 board_title: None,
                 board,
+                votes: None,
             },
         }
     }

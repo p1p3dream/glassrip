@@ -48,6 +48,9 @@ pub struct Obs {
     /// This sighting alone may support the element (pixel check and reading
     /// confidence agree, plus the second reader pass when one is configured).
     pub single_ok: bool,
+    /// Consensus vote share of the reading in this keyframe: the share of the
+    /// answering reads that listed the element (1 for a single read).
+    pub weight: f64,
 }
 
 /// Votes over lists across all sightings.
@@ -186,6 +189,16 @@ impl Track {
             }
         }
         v
+    }
+
+    /// Vote share of the sighting in keyframe `frame` (the strongest, when the
+    /// track was read there twice); 0 where it was not read.
+    pub fn weight_at(&self, frame: usize) -> f64 {
+        self.obs
+            .iter()
+            .filter(|o| o.frame == frame)
+            .map(|o| o.weight)
+            .fold(0.0, f64::max)
     }
 
     /// Sorted keyframe indices.
@@ -370,6 +383,33 @@ pub struct SupportParams {
     pub min_density: f64,
     /// Consecutive visible-but-absent keyframes that end an interval.
     pub removal_absent: usize,
+    /// Minimum summed vote share of the interval's sightings.
+    pub min_weight: f64,
+    /// Minimum summed vote share per keyframe of the interval that could have
+    /// read the element (a sighting, or the element's place in view).
+    pub min_presence: f64,
+    /// Vote share a single confirmed sighting needs.
+    pub single_min_share: f64,
+    /// Presence is measured over at least this many board keyframes around the
+    /// interval (a short interval is widened on both sides), so two sightings
+    /// in a row among many views that lacked them are not dense support.
+    pub presence_window: usize,
+}
+
+impl SupportParams {
+    /// Counting support only: every sighting weighs 1 and presence is not
+    /// checked.
+    pub fn counting(min_keyframes: usize, min_density: f64, removal_absent: usize) -> Self {
+        Self {
+            min_keyframes,
+            min_density,
+            removal_absent,
+            min_weight: 0.0,
+            min_presence: 0.0,
+            single_min_share: 0.0,
+            presence_window: 1,
+        }
+    }
 }
 
 /// Build lifetime intervals from sightings and keep the supported ones.
@@ -377,14 +417,23 @@ pub struct SupportParams {
 /// Sightings are merged left to right while no removal (a run of `removal_absent`
 /// visible-but-absent keyframes) lies between them and the merged interval keeps at
 /// least `min_density` of the board keyframes it spans. An interval is supported with
-/// at least `min_keyframes` sightings; single sightings survive only when
-/// `confirm_single` says so (pixel check plus a second reader pass).
+/// at least `min_keyframes` sightings whose vote shares (`weight` of each sighting's
+/// keyframe) sum to at least `min_weight` and average at least `min_presence` over
+/// the keyframes that could have read the element (its sightings and the keyframes
+/// `in_view` says had its place in view) within the interval, widened to at least
+/// `presence_window` keyframes: an element the reads carried in few of the views
+/// that showed it is not established, however long it lingered or however close
+/// together its few sightings fell. A single sighting survives only when `confirm_single` says so (pixel
+/// check plus a second reader pass) and its share is at least `single_min_share`.
+#[allow(clippy::too_many_arguments)]
 pub fn intervals(
     seen: &[usize],
     visibility: impl Fn(usize) -> Visibility,
     n_frames: usize,
     p: &SupportParams,
     confirm_single: impl Fn(usize) -> bool,
+    weight: impl Fn(usize) -> f64,
+    in_view: impl Fn(usize) -> bool,
 ) -> Vec<Interval> {
     let removal_between = |from: usize, to: usize| -> Option<usize> {
         let mut run = 0usize;
@@ -445,9 +494,33 @@ pub fn intervals(
             ..c
         });
     }
-    out.into_iter()
-        .filter(|i| i.count >= p.min_keyframes || (i.count == 1 && confirm_single(i.first)))
-        .collect()
+    let supported = |i: &Interval| {
+        let within = || {
+            seen.iter()
+                .copied()
+                .filter(|&s| s >= i.first && s <= i.last)
+        };
+        let w: f64 = within().map(&weight).sum();
+        let (mut lo, mut hi) = (i.first, i.last);
+        while hi - lo + 1 < p.presence_window && (lo > 0 || hi + 1 < n_frames) {
+            lo = lo.saturating_sub(1);
+            if hi - lo + 1 < p.presence_window && hi + 1 < n_frames {
+                hi += 1;
+            }
+        }
+        let chances = (lo..=hi)
+            .filter(|&f| seen.contains(&f) || in_view(f))
+            .count()
+            .max(1);
+        let established = i.count >= p.min_keyframes
+            && w >= p.min_weight - 1e-9
+            && w / chances as f64 >= p.min_presence - 1e-9;
+        established
+            || (i.count == 1
+                && confirm_single(i.first)
+                && weight(i.first) >= p.single_min_share - 1e-9)
+    };
+    out.into_iter().filter(supported).collect()
 }
 
 #[cfg(test)]
@@ -455,21 +528,27 @@ mod tests {
     use super::*;
 
     fn sp() -> SupportParams {
-        SupportParams {
-            min_keyframes: 2,
-            min_density: 0.1,
-            removal_absent: 2,
-        }
+        SupportParams::counting(2, 0.1, 2)
+    }
+
+    /// Unweighted: every sighting weighs 1, nothing is known to be in view.
+    fn unweighted(
+        seen: &[usize],
+        vis: impl Fn(usize) -> Visibility,
+        n: usize,
+        p: &SupportParams,
+    ) -> Vec<Interval> {
+        intervals(seen, vis, n, p, |_| false, |_| 1.0, |_| false)
     }
 
     #[test]
     fn singles_are_dropped_and_sparse_sightings_split() {
-        let iv = intervals(&[3], |_| Visibility::Unknown, 50, &sp(), |_| false);
+        let iv = unweighted(&[3], |_| Visibility::Unknown, 50, &sp());
         assert!(iv.is_empty());
         // Two sightings 40 keyframes apart: density 2/41 < 10%, both singles.
-        let iv = intervals(&[2, 42], |_| Visibility::Unknown, 50, &sp(), |_| false);
+        let iv = unweighted(&[2, 42], |_| Visibility::Unknown, 50, &sp());
         assert!(iv.is_empty());
-        let iv = intervals(&[2, 4, 5, 9], |_| Visibility::Unknown, 50, &sp(), |_| false);
+        let iv = unweighted(&[2, 4, 5, 9], |_| Visibility::Unknown, 50, &sp());
         assert_eq!(iv.len(), 1);
         assert_eq!((iv[0].first, iv[0].last, iv[0].count), (2, 9, 4));
     }
@@ -483,7 +562,7 @@ mod tests {
                 Visibility::Unknown
             }
         };
-        let iv = intervals(&[1, 2, 3, 10, 11], vis, 20, &sp(), |_| false);
+        let iv = unweighted(&[1, 2, 3, 10, 11], vis, 20, &sp());
         assert_eq!(iv.len(), 2);
         assert_eq!(iv[0].removed_at, Some(6));
         assert_eq!(iv[1].first, 10);
@@ -495,10 +574,7 @@ mod tests {
                 Visibility::Unknown
             }
         };
-        assert_eq!(
-            intervals(&[1, 2, 3, 10, 11], one, 20, &sp(), |_| false).len(),
-            1
-        );
+        assert_eq!(unweighted(&[1, 2, 3, 10, 11], one, 20, &sp()).len(), 1);
     }
 
     #[test]
@@ -519,10 +595,135 @@ mod tests {
                 local_id: None,
                 color: None,
                 single_ok: false,
+                weight: 1.0,
             });
         }
         assert_eq!(t.votes().kind(), ObsList::Node);
         assert_eq!(t.text(), "Cache Layer");
         assert_eq!(t.frames(), vec![0, 1, 2]);
+    }
+
+    fn weighted() -> SupportParams {
+        SupportParams {
+            min_weight: 1.5,
+            min_presence: 0.3,
+            single_min_share: 1.0,
+            presence_window: 6,
+            ..sp()
+        }
+    }
+
+    /// Two sightings in a row (one of them on two of three reads) among views
+    /// that all showed the element's place weigh 5/3 over the six keyframes
+    /// around them: not dense support, though dense within their own two
+    /// keyframes. With nothing else in view they are supported, and so are two
+    /// unanimous sightings at the very end (the window widens backwards only).
+    #[test]
+    fn a_short_interval_is_measured_over_the_presence_window() {
+        let p = weighted();
+        let run = |seen: &[usize], share: &dyn Fn(usize) -> f64, view: &dyn Fn(usize) -> bool| {
+            intervals(
+                seen,
+                |_| Visibility::Unknown,
+                20,
+                &p,
+                |_| false,
+                share,
+                view,
+            )
+        };
+        let mixed = |f: usize| if f == 9 { 2.0 / 3.0 } else { 1.0 };
+        assert!(run(&[8, 9], &mixed, &|_| true).is_empty());
+        assert_eq!(run(&[8, 9], &mixed, &|f| (8..=9).contains(&f)).len(), 1);
+        assert_eq!(run(&[18, 19], &|_| 1.0, &|_| true).len(), 1);
+    }
+
+    /// A single keyframe that two of three reads carried never supports an
+    /// element, even with the single-sighting check passing; a unanimous one
+    /// may.
+    #[test]
+    fn a_borderline_single_sighting_is_not_supported() {
+        let p = weighted();
+        let single = |share: f64| {
+            intervals(
+                &[4],
+                |_| Visibility::Unknown,
+                10,
+                &p,
+                |_| true,
+                |_| share,
+                |_| true,
+            )
+        };
+        assert!(single(2.0 / 3.0).is_empty());
+        assert_eq!(single(1.0).len(), 1);
+        // Two borderline keyframes sum to 4/3: under the minimum weight.
+        let two = intervals(
+            &[4, 5],
+            |_| Visibility::Unknown,
+            10,
+            &p,
+            |_| false,
+            |_| 2.0 / 3.0,
+            |_| true,
+        );
+        assert!(two.is_empty());
+    }
+
+    /// Two of three reads in every keyframe that showed the element is
+    /// consistent support.
+    #[test]
+    fn consistent_two_of_three_support_is_kept() {
+        let p = weighted();
+        let iv = intervals(
+            &[2, 3, 4, 5],
+            |_| Visibility::Unknown,
+            10,
+            &p,
+            |_| false,
+            |_| 2.0 / 3.0,
+            |f| (2..=5).contains(&f),
+        );
+        assert_eq!(iv.len(), 1);
+        assert_eq!((iv[0].first, iv[0].last, iv[0].count), (2, 5, 4));
+    }
+
+    /// An element read in two of the twelve views that showed its place is
+    /// not established, while the same two sightings with nothing else in view
+    /// between them are.
+    #[test]
+    fn rare_sightings_among_many_views_are_not_supported() {
+        let p = weighted();
+        let rare = intervals(
+            &[2, 13],
+            |_| Visibility::Unknown,
+            20,
+            &p,
+            |_| false,
+            |_| 1.0,
+            |f| (2..=13).contains(&f),
+        );
+        assert!(rare.is_empty());
+        let clear = intervals(
+            &[2, 4],
+            |_| Visibility::Unknown,
+            20,
+            &p,
+            |_| false,
+            |_| 1.0,
+            |_| false,
+        );
+        assert_eq!(clear.len(), 1);
+        // Counting support ignores both.
+        let counting = intervals(
+            &[2, 13],
+            |_| Visibility::Unknown,
+            20,
+            &sp(),
+            |_| false,
+            |_| 1.0,
+            |_| true,
+        );
+        assert_eq!(counting.len(), 1);
     }
 }

@@ -23,8 +23,9 @@
 //!   side by side on the canvas stay as read, a full list or not (the
 //!   consensus vote below drops those only one read lists).
 //! - Consensus: with `consensus.reads > 1` the keyframe is read that many times,
-//!   concurrently. Read 0 is the greedy request (temperature 0); read `k` is
-//!   sampled at `consensus.temperature`, so its reply is an independent sample.
+//!   concurrently, every read at `consensus.temperature` (default 0: every read
+//!   greedy, so the reads differ only where the server itself is not bit exact,
+//!   and a sampled read cannot put a one-off element on the board).
 //!   Each request's seed encodes the keyframe's place in the plan, the
 //!   request's place among the keyframe's images (overview, tiles), and `k`
 //!   ([`ConsensusParams::seed`]), so every first request of the run has its own
@@ -35,7 +36,9 @@
 //!   [`crate::consensus::vote`] keeps what `consensus.min_agree` reads agree on.
 //!   The quorum holds: a failed read leaves the vote to the others while at
 //!   least `min_agree` (capped at `reads`) answered. With fewer, every failed
-//!   read is retried once, sampled, as read `reads + k` with its own seed (so a
+//!   read is retried once at `consensus.retry_temperature` (sampled by default:
+//!   a greedy retry repeats a greedy failure), as read `reads + k` with its own
+//!   seed (so a
 //!   replay reaches the retry's recorded reply); still short of the quorum, the
 //!   item fails. No reading is ever kept on fewer answering reads than the
 //!   quorum: an element one read alone saw never reaches the board.
@@ -128,8 +131,12 @@ pub struct ConsensusParams {
     pub reads: u32,
     /// Reads an element needs to be kept (capped at `reads`).
     pub min_agree: u32,
-    /// Sampling temperature of every read after the first (the first is greedy).
+    /// Sampling temperature of every consensus read (0: greedy). The reads
+    /// stay distinct requests through their seeds.
     pub temperature: f32,
+    /// Sampling temperature of the retry of a failed read (read `reads + k`):
+    /// a greedy retry would repeat a greedy failure.
+    pub retry_temperature: f32,
 }
 
 impl Default for ConsensusParams {
@@ -137,7 +144,8 @@ impl Default for ConsensusParams {
         Self {
             reads: 3,
             min_agree: 2,
-            temperature: 0.3,
+            temperature: 0.0,
+            retry_temperature: 0.3,
         }
     }
 }
@@ -145,8 +153,8 @@ impl Default for ConsensusParams {
 /// The consensus settings as one cache-key string.
 fn consensus_descriptor(c: &ConsensusParams) -> String {
     format!(
-        "reads={};min_agree={};temperature={}",
-        c.reads, c.min_agree, c.temperature
+        "reads={};min_agree={};temperature={};retry_temperature={}",
+        c.reads, c.min_agree, c.temperature, c.retry_temperature
     )
 }
 
@@ -190,11 +198,20 @@ impl ConsensusParams {
         self.min_agree.clamp(1, self.reads.max(1))
     }
 
-    /// Temperature override of read `k`: none (0, greedy) for read 0; a retry
-    /// (read `reads + k`) is always sampled (a greedy retry would repeat the
-    /// greedy failure).
+    /// Temperature override of read `k`: `temperature` for the consensus reads,
+    /// `retry_temperature` for a retry (read `reads + k`); none (the server's
+    /// greedy default) at 0, and always none for a single read (the request it
+    /// always was).
     pub fn temperature(&self, read: u32) -> Option<f32> {
-        (read > 0).then_some(self.temperature)
+        if self.reads <= 1 {
+            return None;
+        }
+        let t = if read >= self.reads {
+            self.retry_temperature
+        } else {
+            self.temperature
+        };
+        (t > 0.0).then_some(t)
     }
 }
 
@@ -924,7 +941,10 @@ impl Stage for BoardReadStage {
         // 12: a retry's seed sits 2^62 above its read's (11 used 2^32, which a
         // later keyframe's first read could reach); outputs of 11 may hold a
         // retry answered with another request's reply.
-        12
+        // 13: every consensus read at `consensus.temperature` (default 0, greedy;
+        // 12 sampled reads after the first at 0.3), retries of failed reads at
+        // `consensus.retry_temperature`; outputs of 12 hold sampled reads.
+        13
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
@@ -1075,8 +1095,8 @@ impl Stage for BoardReadStage {
         for (k, r) in (0..reads).zip(outcomes) {
             collect(k, r, &mut failed)?;
         }
-        // Short of the quorum: each failed read is retried once, sampled, as
-        // read `reads + k` with its own seed.
+        // Short of the quorum: each failed read is retried once (at the retry
+        // temperature) as read `reads + k` with its own seed.
         let quorum = self.params.consensus.quorum() as usize;
         let mut retried = Vec::new();
         if reads > 1 && reads as usize - failed.len() < quorum {
@@ -1449,18 +1469,34 @@ mod tests {
             f64::from(p.temperature) as f32,
             c.consensus_temperature as f32
         );
+        assert_eq!(
+            f64::from(p.retry_temperature) as f32,
+            c.retry_temperature as f32
+        );
         // A single read is the request it always was.
         let single = ConsensusParams::single();
         assert_eq!(single.seed(7, 3, 2, 0), 7);
         assert_eq!(single.temperature(0), None);
-        // Read 0 is greedy; the others are sampled; every read of every image
-        // of every keyframe has its own seed.
-        assert_eq!(p.temperature(0), None);
-        assert_eq!(p.temperature(2), Some(p.temperature));
+        // Every consensus read is greedy by default (the server's temperature
+        // 0); every read of every image of every keyframe has its own seed.
+        assert_eq!(p.temperature, 0.0);
+        for read in 0..p.reads {
+            assert_eq!(p.temperature(read), None);
+        }
         let mut seeds = std::collections::BTreeSet::new();
         // Reads `reads..2 * reads` are the retries: sampled, with seeds of
         // their own.
-        assert_eq!(p.temperature(p.reads), Some(p.temperature));
+        assert_eq!(p.temperature(p.reads), Some(p.retry_temperature));
+        assert!(p.retry_temperature > 0.0);
+        // A configured temperature applies to every consensus read alike.
+        let warm = ConsensusParams {
+            temperature: 0.2,
+            ..p
+        };
+        for read in 0..warm.reads {
+            assert_eq!(warm.temperature(read), Some(0.2));
+        }
+        assert_eq!(single.temperature(1), None);
         for index in 0..300u64 {
             for job in 0..65u64 {
                 for read in 0..2 * p.reads {

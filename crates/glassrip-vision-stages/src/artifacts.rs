@@ -586,4 +586,43 @@ pub struct BoardValidateItem {
     pub extra_issues: Vec<ExtraIssue>,
     /// `confidence == 0` or no content: the keyframe should be classified again.
     pub needs_reclassification: bool,
+    /// How strongly the consensus reads carried each validated element (a
+    /// consensus reading only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub votes: Option<ValidatedVotes>,
+}
+
+/// Consensus support of the validated elements: shares of the reads that
+/// answered, parallel to the lists of the validated board (entry `i` belongs
+/// to element `i`). An element validation moved to another list keeps the
+/// share it was voted with. Board state weighs each keyframe's sighting of an
+/// element by its share, so an element two of three reads listed counts for
+/// less than one every read listed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ValidatedVotes {
+    /// Reads that answered: the denominator of every share.
+    pub answered: u32,
+    pub nodes: Vec<f64>,
+    pub edges: Vec<EdgeShares>,
+    pub stickies: Vec<f64>,
+    pub owner_tags: Vec<f64>,
+    pub other_visible_text: Vec<f64>,
+    /// Validated elements no voted element matched; they keep share 1 (a
+    /// reading validated by this version always matches).
+    #[serde(default)]
+    pub unmatched: u32,
+}
+
+/// Consensus support of one validated edge.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeShares {
+    /// Share of the answering reads that listed the edge.
+    pub share: f64,
+    /// Share of the reads listing the edge whose direction is the kept one.
+    pub direction: f64,
+    /// Share of the answering reads that carry the kept label (0 when the
+    /// validated edge has no label).
+    pub label: f64,
 }

@@ -22,6 +22,10 @@
 //! `board_read` before 11 could keep) is cleared; a vote log that does not run
 //! parallel to the edges fails the item.
 //!
+//! A consensus reading's votes follow its elements through validation
+//! ([`validated_votes`]): each validated element carries the share of the
+//! answering reads that listed it, for board state to weigh.
+//!
 //! Deferred to `edge_direction`: checking that an edge label lies on the edge path.
 
 use std::collections::HashMap;
@@ -32,7 +36,7 @@ use glassrip_core::runner::{
 };
 use glassrip_vision::board::{
     normalize, validate_board, BoardNode, BoardReading, BoardValidationConfig, CanvasSize,
-    ElementList, OwnerTag, RejectReason, RejectedItem, Sticky,
+    ElementList, OwnerTag, RejectReason, RejectedItem, Sticky, ValidatedBoard,
 };
 use glassrip_vision::BBox;
 use image::RgbImage;
@@ -40,8 +44,9 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use crate::artifacts::{
-    self, BoardReadingItem, BoardValidateItem, CanvasCropItem, CanvasMethod, ExtraIssue,
-    MemberList, MembershipDecision, OcrKeyframe, ShapeClass, TextRegion,
+    self, BoardReadingItem, BoardValidateItem, CanvasCropItem, CanvasMethod, ConsensusLog,
+    EdgeShares, ExtraIssue, MemberList, MembershipDecision, OcrKeyframe, ShapeClass, TextRegion,
+    ValidatedVotes,
 };
 use crate::layout::names_match;
 use crate::pixels::{self, ShapeThresholds};
@@ -385,6 +390,191 @@ fn drop_tile_text(mut out: BoardReading, tiles: &[BBox]) -> (BoardReading, Vec<R
     (out, rejected)
 }
 
+/// One voted element of a reading, for matching a validated element back to it.
+struct Voted {
+    id: Option<String>,
+    text: String,
+    bbox: BBox,
+    share: f64,
+    used: bool,
+}
+
+/// The voted elements of a reading, taken by the validated ones.
+struct VotePool {
+    voted: Vec<Voted>,
+    unmatched: u32,
+}
+
+impl VotePool {
+    /// The share of the voted element a validated element came from: the node
+    /// with its `local_id` and text, else the nearest unused element with its
+    /// text in any list (validation moves elements between lists and may clamp
+    /// their boxes, never their texts), else the unused element its box
+    /// overlaps most (at least half); share 1 when nothing matches.
+    fn take(&mut self, id: Option<&str>, text: &str, bbox: &BBox) -> f64 {
+        let key = normalize(text);
+        let center = |b: &BBox| ((b.x1 + b.x2) / 2.0, (b.y1 + b.y2) / 2.0);
+        let dist = |b: &BBox| {
+            let (c, d) = (center(b), center(bbox));
+            (c.0 - d.0).hypot(c.1 - d.1)
+        };
+        let free = |v: &Voted| !v.used;
+        let by_id = id.and_then(|id| {
+            self.voted
+                .iter()
+                .position(|v| free(v) && v.id.as_deref() == Some(id) && normalize(&v.text) == key)
+        });
+        let by_text = || {
+            self.voted
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| free(v) && normalize(&v.text) == key)
+                .min_by(|a, b| dist(&a.1.bbox).total_cmp(&dist(&b.1.bbox)))
+                .map(|(i, _)| i)
+        };
+        let by_box = || {
+            self.voted
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| free(v) && v.bbox.iou(bbox) >= 0.5)
+                .max_by(|a, b| a.1.bbox.iou(bbox).total_cmp(&b.1.bbox.iou(bbox)))
+                .map(|(i, _)| i)
+        };
+        match by_id.or_else(by_text).or_else(by_box) {
+            Some(i) => {
+                self.voted[i].used = true;
+                self.voted[i].share
+            }
+            None => {
+                self.unmatched += 1;
+                1.0
+            }
+        }
+    }
+}
+
+/// The consensus support of every element of `board`, validated from
+/// `reading` whose vote is `c` (see [`ValidatedVotes`]); `None` when the vote
+/// lists do not run parallel to the reading's.
+pub fn validated_votes(
+    reading: &BoardReading,
+    c: &ConsensusLog,
+    board: &ValidatedBoard,
+) -> Option<ValidatedVotes> {
+    let r = reading;
+    let parallel = c.nodes.len() == r.nodes.len()
+        && c.edges.len() == r.edges.len()
+        && c.stickies.len() == r.stickies.len()
+        && c.owner_tags.len() == r.owner_tags.len()
+        && c.other_visible_text.len() == r.other_visible_text.len();
+    if !parallel {
+        return None;
+    }
+    let answered = (c.answered.len() as u32).max(1);
+    let share = |votes: u32| (f64::from(votes) / f64::from(answered)).clamp(0.0, 1.0);
+    let voted = |id: Option<&str>, text: &str, bbox: BBox, votes: u32| Voted {
+        id: id.map(str::to_string),
+        text: text.to_string(),
+        bbox,
+        share: share(votes),
+        used: false,
+    };
+    let mut pool = VotePool {
+        voted: r
+            .nodes
+            .iter()
+            .zip(&c.nodes)
+            .map(|(n, v)| voted(Some(&n.local_id), &n.text, n.bbox, v.votes))
+            .chain(
+                r.stickies
+                    .iter()
+                    .zip(&c.stickies)
+                    .map(|(s, v)| voted(None, &s.text, s.bbox, v.votes)),
+            )
+            .chain(
+                r.owner_tags
+                    .iter()
+                    .zip(&c.owner_tags)
+                    .map(|(o, v)| voted(None, &o.name_raw, o.bbox, v.votes)),
+            )
+            .chain(
+                r.other_visible_text
+                    .iter()
+                    .zip(&c.other_visible_text)
+                    .map(|(t, v)| voted(None, &t.text, t.bbox, v.votes)),
+            )
+            .collect(),
+        unmatched: 0,
+    };
+    let nodes = board
+        .nodes
+        .iter()
+        .map(|n| pool.take(Some(&n.local_id), &n.text, &n.bbox))
+        .collect();
+    let stickies = board
+        .stickies
+        .iter()
+        .map(|s| pool.take(None, &s.text, &s.bbox))
+        .collect();
+    let owner_tags = board
+        .owner_tags
+        .iter()
+        .map(|o| pool.take(None, &o.name_raw, &o.bbox))
+        .collect();
+    let other_visible_text = board
+        .other_visible_text
+        .iter()
+        .map(|t| pool.take(None, &t.text, &t.bbox))
+        .collect();
+    let mut used = vec![false; r.edges.len()];
+    let mut unmatched = pool.unmatched;
+    let edges = board
+        .edges
+        .iter()
+        .map(|e| {
+            let same = |x: &glassrip_vision::board::BoardEdge| {
+                (x.src == e.src && x.dst == e.dst) || (x.src == e.dst && x.dst == e.src)
+            };
+            match (0..r.edges.len()).find(|&i| !used[i] && same(&r.edges[i])) {
+                Some(i) => {
+                    used[i] = true;
+                    let v = &c.edges[i];
+                    EdgeShares {
+                        share: share(v.votes),
+                        direction: if v.votes == 0 {
+                            1.0
+                        } else {
+                            (f64::from(v.direction_votes) / f64::from(v.votes)).clamp(0.0, 1.0)
+                        },
+                        label: if e.label.trim().is_empty() {
+                            0.0
+                        } else {
+                            share(v.label_votes)
+                        },
+                    }
+                }
+                None => {
+                    unmatched += 1;
+                    EdgeShares {
+                        share: 1.0,
+                        direction: 1.0,
+                        label: if e.label.trim().is_empty() { 0.0 } else { 1.0 },
+                    }
+                }
+            }
+        })
+        .collect();
+    Some(ValidatedVotes {
+        answered,
+        nodes,
+        edges,
+        stickies,
+        owner_tags,
+        other_visible_text,
+        unmatched,
+    })
+}
+
 /// Validate one reading against its canvas image; a consensus reading short of
 /// its quorum is refused.
 ///
@@ -571,7 +761,12 @@ pub fn validate_reading(
             e.label_bbox = None;
         }
     }
+    let votes = reading
+        .consensus
+        .as_ref()
+        .and_then(|c| validated_votes(&reading.result, c, &board));
     Ok(BoardValidateItem {
+        votes,
         keyframe_id: reading.keyframe_id.clone(),
         source_frame_id: reading.source_frame_id.clone(),
         source_image_path: reading.source_image_path.clone(),
@@ -623,7 +818,9 @@ impl Stage for BoardValidateStage {
         // 4: the quorum is the run's, not capped at the reused reading's own read
         // count, and a single unvoted reading fails under a quorum above one;
         // outputs of 3 may hold a reading from a run with fewer reads.
-        4
+        // 5: each validated element carries its consensus vote share (`votes`),
+        // which board state weighs; outputs of 4 have none.
+        5
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
@@ -979,6 +1176,110 @@ mod tests {
         );
         // A vote log that is not parallel to the edges is refused.
         assert!(labels(vec![]).is_err());
+    }
+
+    /// Every validated element carries the vote share of the element it was
+    /// read as, also after validation moved it to another list.
+    #[test]
+    fn vote_shares_follow_elements_through_validation() {
+        let n = |id: &str, text: &str, b: BBox| BoardNode {
+            local_id: id.into(),
+            text: text.into(),
+            bbox: b,
+            conf: 0.9,
+        };
+        let out = BoardReading {
+            nodes: vec![
+                n("n1", "Order Service", BBox::new(20.0, 20.0, 140.0, 80.0)),
+                // A sticky read as a node: validation moves it to the stickies.
+                n(
+                    "n2",
+                    "Ship before launch?",
+                    BBox::new(200.0, 20.0, 300.0, 100.0),
+                ),
+                n("n3", "Ledger", BBox::new(20.0, 150.0, 140.0, 210.0)),
+            ],
+            edges: vec![BoardEdge {
+                src: "n1".into(),
+                dst: "n3".into(),
+                label: "posts".into(),
+                label_bbox: None,
+                style: EdgeStyle::Solid,
+                conf: 0.8,
+            }],
+            stickies: vec![],
+            owner_tags: vec![],
+            other_visible_text: vec![],
+            confidence: 0.8,
+        };
+        let element = |votes: u32| crate::artifacts::ElementVote {
+            votes,
+            text_votes: votes,
+            uncertain: false,
+        };
+        let log = crate::artifacts::ConsensusLog {
+            reads: 3,
+            answered: vec![0, 1, 2],
+            failed: vec![],
+            retried: vec![],
+            min_agree: 2,
+            low_confidence: false,
+            nodes: vec![element(3), element(2), element(2)],
+            edges: vec![crate::artifacts::EdgeVote {
+                votes: 3,
+                direction_votes: 2,
+                style_votes: 3,
+                label_votes: 2,
+                direction_uncertain: false,
+                style_uncertain: false,
+                label_uncertain: false,
+            }],
+            stickies: vec![],
+            owner_tags: vec![],
+            other_visible_text: vec![],
+            dropped: crate::artifacts::DroppedCounts::default(),
+        };
+        let mut r = reading(out.clone());
+        r.consensus = Some(log);
+        let v = validate_reading(
+            &r,
+            &board_image(),
+            &[],
+            &[],
+            &BoardValidateParams::default(),
+        )
+        .unwrap();
+        let texts: Vec<&str> = v.board.nodes.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(texts, ["Order Service", "Ledger"]);
+        assert_eq!(v.board.stickies[0].text, "Ship before launch?");
+        let votes = v.votes.expect("a consensus reading carries votes");
+        let third = |x: f64| (x * 3.0).round() as u32;
+        assert_eq!(votes.answered, 3);
+        assert_eq!(
+            votes.nodes.iter().map(|&x| third(x)).collect::<Vec<_>>(),
+            [3, 2]
+        );
+        assert_eq!(
+            votes.stickies.iter().map(|&x| third(x)).collect::<Vec<_>>(),
+            [2]
+        );
+        assert_eq!(votes.edges.len(), 1);
+        let e = votes.edges[0];
+        assert_eq!(
+            (third(e.share), third(e.direction), third(e.label)),
+            (3, 2, 2)
+        );
+        assert_eq!(votes.unmatched, 0);
+        // A single read carries no votes.
+        let single = validate_reading(
+            &reading(out),
+            &board_image(),
+            &[],
+            &[],
+            &single_read_params(),
+        )
+        .unwrap();
+        assert!(single.votes.is_none());
     }
 
     #[test]

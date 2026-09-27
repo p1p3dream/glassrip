@@ -15,7 +15,13 @@
 //!    of a second place ([`duplicates`]). A node-majority track that no connector
 //!    ends at is a sticky when it was read as a sticky at least as often, or when its
 //!    text carries a sticky marker (question, milestone).
-//! 3. Lifetimes and support ([`tracks::intervals`]). The final state is what was
+//! 3. Lifetimes and support ([`tracks::intervals`]). With a consensus reading
+//!    ([`FrameVotes`]) every sighting weighs the share of the answering reads that
+//!    listed the element: an interval needs `min_support_weight` in all, and
+//!    `min_presence_share` per keyframe that could have read it (its sightings and
+//!    the keyframes with its place in view), so an element the reads carried in a
+//!    few of the views that showed it, or in one keyframe on two of three reads,
+//!    does not decide the board. The final state is what was
 //!    observed and not later removed: an element is final when its last supported
 //!    interval was never ended by a removal. Removal needs evidence: consecutive
 //!    later keyframes that cover the element's region and lack it. A keyframe covers
@@ -32,8 +38,11 @@
 //!    An element never placed on the board (text-only registration) seen in a
 //!    single keyframe cannot be checked against later views and is not final.
 //! 4. Edges are keyed by their two node tracks; an endpoint that is not a supported
-//!    node drops the edge (nodes are never created from endpoints). Directions come
-//!    from the weighted vote over `glassrip.edge_direction` evidence. An edge is
+//!    node drops the edge (nodes are never created from endpoints). Edge support is
+//!    weighted like element support, over the keyframes that read both ends.
+//!    Directions come from the weighted vote over `glassrip.edge_direction` evidence
+//!    (the reader's channel weighted by how many reads agreed on the direction), and
+//!    the label is the one with the most label votes across keyframes. An edge is
 //!    absent from a keyframe that read (or covers) both of its ends without it only
 //!    with evidence that the connector is gone: readers often leave a connector out
 //!    of a reading. With a [`RegionProbe`], the straight corridor between the two
@@ -42,7 +51,9 @@
 //!    it. Otherwise (no pixels, or a routed connector the corridor does not follow)
 //!    the board's aligned ink must have changed since the edge was last read.
 //! 5. Owner tags become timed assignments ([`owners`]), anchored on the OCR positions of
-//!    tags and nodes where OCR read them ([`owner_geometry`]).
+//!    tags and nodes where OCR read them ([`owner_geometry`]). A reader tag OCR did
+//!    not read corroborates only when at least `owner_reader_min_share` of the reads
+//!    listed it.
 //! 6. Events are computed from the state changes and gated on ink ([`events`]).
 
 pub mod anchor;
@@ -112,6 +123,53 @@ pub struct BoardFrame {
     /// Texts from the app's title bar and board list (they name the board, and are
     /// never board content).
     pub title_hints: Vec<String>,
+}
+
+/// Consensus vote shares of one keyframe's validated reading (the `votes` of its
+/// `glassrip.board_validate` item): per element, the share of the answering reads
+/// that listed it, parallel to the reading's lists.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct FrameVotes {
+    /// Node shares.
+    pub nodes: Vec<f64>,
+    /// Edge shares.
+    pub edges: Vec<EdgeVoteShares>,
+    /// Sticky shares.
+    pub stickies: Vec<f64>,
+    /// Owner tag shares.
+    pub owner_tags: Vec<f64>,
+    /// Other text shares.
+    pub other_visible_text: Vec<f64>,
+}
+
+/// Consensus vote shares of one edge.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct EdgeVoteShares {
+    /// Share of the answering reads that listed the edge.
+    pub share: f64,
+    /// Share of the reads listing it whose direction is the kept one.
+    pub direction: f64,
+    /// Share of the answering reads that carry its label.
+    pub label: f64,
+}
+
+impl FrameVotes {
+    /// The votes run parallel to `board`'s lists (otherwise they are ignored).
+    pub fn fits(&self, board: &ValidatedBoard) -> bool {
+        self.nodes.len() == board.nodes.len()
+            && self.edges.len() == board.edges.len()
+            && self.stickies.len() == board.stickies.len()
+            && self.owner_tags.len() == board.owner_tags.len()
+            && self.other_visible_text.len() == board.other_visible_text.len()
+    }
+}
+
+/// A share as a sighting weight: within `[0, 1]`, and 1 when unknown.
+fn share_of(v: Option<&f64>) -> f64 {
+    v.copied()
+        .filter(|x| x.is_finite())
+        .map_or(1.0, |x| x.clamp(0.0, 1.0))
 }
 
 /// Keys used for tag geometry.
@@ -347,6 +405,37 @@ pub struct ConsolidationParams {
     pub min_support_keyframes: usize,
     /// Minimum share of board keyframes inside an interval that saw the element.
     pub min_support_density: f64,
+    /// Minimum summed consensus vote share of an interval's sightings (each
+    /// keyframe weighs the share of the answering reads that listed the element;
+    /// 1 for a single read). 1.5 needs two unanimous keyframes, or three at two of
+    /// three reads.
+    #[serde(default = "default_min_support_weight")]
+    pub min_support_weight: f64,
+    /// Minimum summed vote share per keyframe of an interval that could have read
+    /// the element: its sightings and the keyframes with its place in view.
+    #[serde(default = "default_min_presence_share")]
+    pub min_presence_share: f64,
+    /// The same for an edge, over the keyframes around its interval that read
+    /// both of its ends or had their places in view.
+    #[serde(default = "default_edge_min_presence_share")]
+    pub edge_min_presence_share: f64,
+    /// Presence is measured over at least this many board keyframes around an
+    /// interval (a short one is widened on both sides).
+    #[serde(default = "default_presence_window_keyframes")]
+    pub presence_window_keyframes: usize,
+    /// Vote share a single confirmed sighting needs to support an element alone.
+    #[serde(default = "default_single_min_share")]
+    pub single_min_share: f64,
+    /// A same-text node or sticky whose summed vote share is at most this share
+    /// of an established element's, and that was only read where the established
+    /// element's place was in view but unread, is that element at a displaced
+    /// place: never a second final element.
+    #[serde(default = "default_echo_max_weight_share")]
+    pub echo_max_weight_share: f64,
+    /// Vote share a reader tag OCR did not read needs to count as an owner
+    /// sighting.
+    #[serde(default = "default_owner_reader_min_share")]
+    pub owner_reader_min_share: f64,
     /// Consecutive visible-but-absent keyframes that remove an element.
     pub removal_absent_keyframes: usize,
     /// Length of the final stable board window, in seconds, measured back from the end
@@ -420,6 +509,13 @@ impl Default for ConsolidationParams {
             label_box_min_share: default_label_box_min_share(),
             min_support_keyframes: 2,
             min_support_density: 0.10,
+            min_support_weight: default_min_support_weight(),
+            min_presence_share: default_min_presence_share(),
+            edge_min_presence_share: default_edge_min_presence_share(),
+            presence_window_keyframes: default_presence_window_keyframes(),
+            single_min_share: default_single_min_share(),
+            echo_max_weight_share: default_echo_max_weight_share(),
+            owner_reader_min_share: default_owner_reader_min_share(),
             removal_absent_keyframes: 2,
             final_window_s: 120.0,
             min_final_keyframes: 3,
@@ -439,6 +535,34 @@ impl Default for ConsolidationParams {
             backfill_untargeted_owners: false,
         }
     }
+}
+
+fn default_min_support_weight() -> f64 {
+    1.5
+}
+
+fn default_min_presence_share() -> f64 {
+    0.3
+}
+
+fn default_edge_min_presence_share() -> f64 {
+    0.3
+}
+
+fn default_single_min_share() -> f64 {
+    1.0
+}
+
+fn default_presence_window_keyframes() -> usize {
+    6
+}
+
+fn default_echo_max_weight_share() -> f64 {
+    0.25
+}
+
+fn default_owner_reader_min_share() -> f64 {
+    1.0
 }
 
 fn default_owner_final_hold_s() -> f64 {
@@ -793,6 +917,8 @@ type Segment = ((f64, f64), (f64, f64));
 #[derive(Debug, Clone)]
 struct EdgeObs {
     frame: usize,
+    /// Consensus vote shares of the edge in this keyframe.
+    shares: EdgeVoteShares,
     /// Reader's tail track.
     src: usize,
     label: String,
@@ -878,6 +1004,32 @@ fn reading_tags(f: &BoardFrame, participants: &AliasTable) -> Vec<(String, Strin
     tags
 }
 
+/// Consensus vote shares of [`reading_tags`], in its order (a participant name
+/// rejected from the node list has no vote: 1).
+fn reading_tag_shares(
+    f: &BoardFrame,
+    votes: Option<&FrameVotes>,
+    participants: &AliasTable,
+) -> Vec<f64> {
+    let mut shares: Vec<f64> = (0..f.board.owner_tags.len())
+        .map(|i| share_of(votes.and_then(|v| v.owner_tags.get(i))))
+        .collect();
+    for r in &f.board.chrome_rejected {
+        if r.list == ElementList::Nodes
+            && r.reason == RejectReason::ParticipantName
+            && r.bbox.is_some()
+        {
+            shares.push(1.0);
+        }
+    }
+    for (i, nd) in f.board.nodes.iter().enumerate() {
+        if participants.resolve(&nd.text).is_some() {
+            shares.push(share_of(votes.and_then(|v| v.nodes.get(i))));
+        }
+    }
+    shares
+}
+
 /// Owner geometry of one keyframe for its reading's `tags`
 /// ([`owner_geometry::place`]).
 fn frame_geometry(
@@ -951,6 +1103,20 @@ pub fn consolidate_with_probe(
     hooks: &Hooks<'_>,
     probe: Option<&dyn RegionProbe>,
 ) -> BoardStateItem {
+    consolidate_voted(frames, &HashMap::new(), board_id, params, hooks, probe)
+}
+
+/// [`consolidate_with_probe`] with the consensus vote shares of the keyframes'
+/// readings, by keyframe id ([`FrameVotes`]; a keyframe without votes weighs
+/// every sighting 1).
+pub fn consolidate_voted(
+    frames: Vec<BoardFrame>,
+    votes: &HashMap<String, FrameVotes>,
+    board_id: &str,
+    params: &ConsolidationParams,
+    hooks: &Hooks<'_>,
+    probe: Option<&dyn RegionProbe>,
+) -> BoardStateItem {
     let second_reader = hooks.second_reader.map(|inner| MemoSecondReader {
         inner,
         answers: Mutex::new(BTreeMap::new()),
@@ -961,6 +1127,7 @@ pub fn consolidate_with_probe(
     };
     let orphaned = match consolidate_pass(
         frames.clone(),
+        votes,
         board_id,
         params,
         &memo_hooks,
@@ -970,7 +1137,15 @@ pub fn consolidate_with_probe(
         Ok(state) => return state,
         Err(orphaned) => orphaned,
     };
-    match consolidate_pass(frames, board_id, params, &memo_hooks, probe, &orphaned) {
+    match consolidate_pass(
+        frames,
+        votes,
+        board_id,
+        params,
+        &memo_hooks,
+        probe,
+        &orphaned,
+    ) {
         Ok(state) => state,
         Err(_) => unreachable!("a pass with fragment protection withdrawn cannot retry"),
     }
@@ -981,6 +1156,7 @@ pub fn consolidate_with_probe(
 /// fallback pass instead of an incomplete state.
 fn consolidate_pass(
     mut frames: Vec<BoardFrame>,
+    votes: &HashMap<String, FrameVotes>,
     board_id: &str,
     params: &ConsolidationParams,
     hooks: &Hooks<'_>,
@@ -991,6 +1167,25 @@ fn consolidate_pass(
     frames.sort_by(|a, b| a.t_rep_s.total_cmp(&b.t_rep_s));
     let n = frames.len();
     let fz = params.fuzzy_threshold;
+    // Consensus vote shares per keyframe (in time order), when they fit its reading.
+    let frame_votes: Vec<Option<&FrameVotes>> = frames
+        .iter()
+        .map(|f| votes.get(&f.keyframe_id).filter(|v| v.fits(&f.board)))
+        .collect();
+    let edge_shares = |fi: usize, ei: usize| -> EdgeVoteShares {
+        frame_votes[fi].and_then(|v| v.edges.get(ei)).map_or(
+            EdgeVoteShares {
+                share: 1.0,
+                direction: 1.0,
+                label: 1.0,
+            },
+            |e| EdgeVoteShares {
+                share: share_of(Some(&e.share)),
+                direction: share_of(Some(&e.direction)),
+                label: share_of(Some(&e.label)),
+            },
+        )
+    };
 
     // 0. Board title: title bar text and app panel text are never content.
     let titles = Titles::collect(&frames, params);
@@ -1087,7 +1282,8 @@ fn consolidate_pass(
         let to_ref = |b: &BBox| positioned(fi).then(|| map_bbox(&regs[fi].to_reference, b));
         let cluster = regs[fi].cluster;
         let mut obs: Vec<Obs> = Vec::new();
-        for nd in &f.board.nodes {
+        let fv = frame_votes[fi];
+        for (ni, nd) in f.board.nodes.iter().enumerate() {
             // A node whose text resolves to a participant (fuzzy, unlike the
             // validator's exact check) is an owner tag read in the wrong list.
             if is_unreliable(&nd.text)
@@ -1119,9 +1315,10 @@ fn consolidate_pass(
                 local_id: Some(nd.local_id.clone()),
                 color: None,
                 single_ok: pixel_ok && conf_ok && reader_ok,
+                weight: share_of(fv.and_then(|v| v.nodes.get(ni))),
             });
         }
-        for s in &f.board.stickies {
+        for (si, s) in f.board.stickies.iter().enumerate() {
             if is_unreliable(&s.text) || is_title(fi, &s.text, &s.bbox) {
                 continue;
             }
@@ -1135,9 +1332,10 @@ fn consolidate_pass(
                 local_id: None,
                 color: Some(s.color),
                 single_ok: false,
+                weight: share_of(fv.and_then(|v| v.stickies.get(si))),
             });
         }
-        for t in &f.board.other_visible_text {
+        for (xi, t) in f.board.other_visible_text.iter().enumerate() {
             if is_unreliable(&t.text) || is_title(fi, &t.text, &t.bbox) {
                 continue;
             }
@@ -1151,6 +1349,7 @@ fn consolidate_pass(
                 local_id: None,
                 color: None,
                 single_ok: false,
+                weight: share_of(fv.and_then(|v| v.other_visible_text.get(xi))),
             });
         }
         let mut merged: Vec<(usize, usize, BBox)> = Vec::new();
@@ -1161,12 +1360,14 @@ fn consolidate_pass(
                 continue;
             }
             let nl = normalize(l);
+            let label_share = edge_shares(fi, ei).label;
             match obs.iter().position(|o| normalize(&o.text) == nl) {
                 Some(oi) => {
                     let o = &mut obs[oi];
                     if !o.lists.contains(&ObsList::EdgeLabel) {
                         o.lists.push(ObsList::EdgeLabel);
                     }
+                    o.weight = o.weight.max(label_share);
                     if let Some(b) = o.raw_bbox {
                         merged.push((oi, ei, b));
                     }
@@ -1181,6 +1382,7 @@ fn consolidate_pass(
                     local_id: None,
                     color: None,
                     single_ok: false,
+                    weight: label_share,
                 }),
             }
         }
@@ -1661,6 +1863,10 @@ fn consolidate_pass(
         min_keyframes: params.min_support_keyframes,
         min_density: params.min_support_density,
         removal_absent: params.removal_absent_keyframes,
+        min_weight: params.min_support_weight,
+        min_presence: params.min_presence_share,
+        single_min_share: params.single_min_share,
+        presence_window: params.presence_window_keyframes.max(1),
     };
     let track_intervals: Vec<Vec<Interval>> = tracks
         .iter()
@@ -1678,6 +1884,8 @@ fn consolidate_pass(
                 n,
                 &support,
                 |f| t.obs.iter().any(|o| o.frame == f && o.single_ok),
+                |f| t.weight_at(f),
+                |f| track_visible(t, f) == Visibility::Visible,
             )
         })
         .collect();
@@ -1804,6 +2012,61 @@ fn consolidate_pass(
                 })
             })
     };
+    // A same-text node or sticky the reads carried at most `echo_max_weight_share`
+    // as strongly as an established element, read only in keyframes that had the
+    // established element's place in view and did not read it there, is that
+    // element read at a displaced place (a registration or box error): the
+    // established element it stands for. A sighting that is evidence of a second
+    // place (`apart_from`) makes it a second element.
+    let track_weight = |t: &Track| t.frames().iter().map(|&f| t.weight_at(f)).sum::<f64>();
+    // Sighting `o` of track `ti` is evidence of a place apart from established
+    // track `u` (the `Apart` verdict of the duplicate judge): OCR reads its text at
+    // its own box and not only inside `u`'s, on a trusted registration, a reliable
+    // reading, and a registration confirmed around the box.
+    let apart_from = |ti: usize, o: &Obs, u: usize| -> bool {
+        let Some((b, eb)) = o.bbox.and_then(|b| box_in(u, o.cluster).map(|eb| (b, eb))) else {
+            return false;
+        };
+        if same_place(&b, &eb) {
+            return false;
+        }
+        let text = normalize(&o.text);
+        let inside_established = ocr_hits(o.frame, &text, &eb, 0.0);
+        let own = ocr_hits(o.frame, &text, &b, 0.0)
+            .into_iter()
+            .any(|x| !inside_established.contains(&x));
+        own && trusted_registration(o.frame)
+            && !reading_bad[o.frame]
+            && !registration_off(o.frame, &b, [ti, u])
+    };
+    let displaced_echo = |ti: usize, t: &Track| -> Option<usize> {
+        let boxy = |x: &Track| matches!(x.kind(), ObsList::Node | ObsList::Sticky);
+        let seen = t.frames();
+        if seen.is_empty() || !boxy(t) {
+            return None;
+        }
+        let (w, text) = (track_weight(t), t.text());
+        tracks
+            .iter()
+            .enumerate()
+            .filter(|&(u, e)| {
+                u != ti
+                    && !track_intervals[u].is_empty()
+                    && boxy(e)
+                    && duplicates::same_text(&e.text(), &text, fz)
+                    && w <= params.echo_max_weight_share * track_weight(e) + 1e-9
+                    && seen.iter().all(|&f| {
+                        e.weight_at(f) == 0.0 && track_visible(e, f) == Visibility::Visible
+                    })
+                    && !t.obs.iter().any(|o| apart_from(ti, o, u))
+            })
+            .max_by(|a, b| {
+                track_weight(a.1)
+                    .total_cmp(&track_weight(b.1))
+                    .then(b.0.cmp(&a.0))
+            })
+            .map(|(u, _)| u)
+    };
     for &ti in &order {
         let t = &tracks[ti];
         let ivs = &track_intervals[ti];
@@ -1830,7 +2093,8 @@ fn consolidate_pass(
                     last_seen_s: lifetimes.iter().map(|l| l.last_seen_s).reduce(f64::max),
                     lifetimes,
                     in_final: alive_in_final(ivs, t.obs.iter().any(|o| o.bbox.is_some()))
-                        && !echo_of_established(ti, t),
+                        && !echo_of_established(ti, t)
+                        && displaced_echo(ti, t).is_none(),
                     registration: if t.obs.iter().any(|o| o.bbox.is_some()) {
                         ElementRegistration::Position
                     } else {
@@ -1858,7 +2122,8 @@ fn consolidate_pass(
                     bbox: largest_cluster.and_then(|c| t.bbox_in(c)),
                     last_seen,
                     lifetimes,
-                    in_final: alive_in_final(ivs, t.obs.iter().any(|o| o.bbox.is_some())),
+                    in_final: alive_in_final(ivs, t.obs.iter().any(|o| o.bbox.is_some()))
+                        && displaced_echo(ti, t).is_none(),
                 });
             }
             ObsList::Other | ObsList::EdgeLabel => {}
@@ -1874,7 +2139,7 @@ fn consolidate_pass(
             .iter()
             .map(|x| (x.local_id.as_str(), &x.bbox))
             .collect();
-        for e in &f.board.edges {
+        for (ei, e) in f.board.edges.iter().enumerate() {
             let (Some(&s), Some(&d)) = (
                 node_track.get(&(fi, e.src.clone())),
                 node_track.get(&(fi, e.dst.clone())),
@@ -1915,6 +2180,7 @@ fn consolidate_pass(
             };
             list.push(EdgeObs {
                 frame: fi,
+                shares: edge_shares(fi, ei),
                 src: s,
                 label: clean_label(&e.label),
                 style: e.style,
@@ -2110,6 +2376,10 @@ fn consolidate_pass(
         }
     };
 
+    let edge_support = SupportParams {
+        min_presence: params.edge_min_presence_share,
+        ..support
+    };
     let mut edges: Vec<EdgeState> = Vec::new();
     let mut edge_id_of: HashMap<(usize, usize), String> = HashMap::new();
     let mut edge_intervals: HashMap<(usize, usize), Vec<Interval>> = HashMap::new();
@@ -2188,8 +2458,22 @@ fn consolidate_pass(
                 }
             },
             n,
-            &support,
+            &edge_support,
             |_| false,
+            |f| {
+                list.iter()
+                    .filter(|o| o.frame == f)
+                    .map(|o| o.shares.share)
+                    .fold(0.0, f64::max)
+            },
+            // Both ends read, or with their places in view: the keyframe could
+            // have read the connector.
+            |f| {
+                let there = |t: &Track| {
+                    t.obs.iter().any(|o| o.frame == f) || track_visible(t, f) == Visibility::Visible
+                };
+                there(ta) && there(tb)
+            },
         );
         let Some(last_iv) = ivs.last().copied() else {
             continue;
@@ -2203,12 +2487,19 @@ fn consolidate_pass(
         // one, and the final direction agrees with the last detected reversal. A flip
         // seen in a single keyframe is not a reversal, so it neither emits an
         // EdgeReversed event nor restarts the vote window.
-        let since = reversals(list, a, params.vote_min_share).last().copied();
+        let since = reversals(list, a, params.vote_min_share, params.min_support_weight)
+            .last()
+            .copied();
         let mut votes = DirectionVotes::default();
         for o in list.iter().filter(|o| since.is_none_or(|f| o.frame >= f)) {
-            let w = weight_of(o.frame);
+            // A keyframe's evidence weighs its sharpness and zoom and the share of
+            // its reads that listed the edge.
+            let w = weight_of(o.frame) * o.shares.share;
             let orient = |v: EndVerdict| if o.src == a { v } else { v.flipped() };
-            votes.reader.add(orient(EndVerdict::Forward), 1.0);
+            // The reader's direction weighs the share of its reads that agreed on it.
+            votes
+                .reader
+                .add(orient(EndVerdict::Forward), o.shares.direction);
             if let Some(ev) = &o.evidence {
                 let (p, v) = ev.verdicts();
                 votes.pixel.add(orient(p), w);
@@ -2231,17 +2522,31 @@ fn consolidate_pass(
             EdgeDirection::Bidirectional => EdgeOrientation::Bidirectional,
             EdgeDirection::Uncertain => EdgeOrientation::Uncertain,
         };
-        let mut label_counts: BTreeMap<String, (String, u32)> = BTreeMap::new();
+        // The label with the most label votes across the interval's keyframes (a
+        // keyframe weighs the share of its reads that carried the label; ties go
+        // to the label read last).
+        let mut label_counts: BTreeMap<String, (String, f64, usize)> = BTreeMap::new();
         for o in in_iv.iter().filter(|o| !o.label.is_empty()) {
-            let e = label_counts
-                .entry(normalize(&o.label))
-                .or_insert((o.label.clone(), 0));
-            e.1 += 1;
+            let e =
+                label_counts
+                    .entry(normalize(&o.label))
+                    .or_insert((o.label.clone(), 0.0, o.frame));
+            e.1 += o.shares.label;
+            e.2 = o.frame;
             e.0.clone_from(&o.label);
         }
+        // A label needs support of its own: label votes of at least
+        // `min_support_weight`, and at least `min_presence_share` of the edge's own
+        // votes over the interval (a label read now and then on a connector read
+        // throughout is not its label).
+        let edge_weight: f64 = in_iv.iter().map(|o| o.shares.share).sum();
         let label = label_counts
             .into_values()
-            .max_by_key(|e| e.1)
+            .filter(|e| {
+                e.1 >= params.min_support_weight - 1e-9
+                    && e.1 >= params.min_presence_share * edge_weight - 1e-9
+            })
+            .max_by(|x, y| x.1.total_cmp(&y.1).then(x.2.cmp(&y.2)))
             .map(|e| e.0)
             .unwrap_or_default();
         let dashed = in_iv
@@ -2311,10 +2616,16 @@ fn consolidate_pass(
         })
     };
     // A node read once with the text of an established node, at an imprecise place,
-    // is that node (see `echo_of_established`): owner targets follow it there.
+    // is that node (see `echo_of_established`), as is a displaced echo of one (see
+    // `displaced_echo`): owner targets follow it there.
     let owner_track = |ti: usize| -> usize {
-        if tracks[ti].kind() != ObsList::Node || !echo_of_established(ti, &tracks[ti]) {
+        if tracks[ti].kind() != ObsList::Node {
             return ti;
+        }
+        if !echo_of_established(ti, &tracks[ti]) {
+            return displaced_echo(ti, &tracks[ti])
+                .filter(|u| node_id.contains_key(u) && tracks[*u].kind() == ObsList::Node)
+                .unwrap_or(ti);
         }
         let seen = tracks[ti].frames();
         established
@@ -2348,6 +2659,7 @@ fn consolidate_pass(
     for (fi, f) in frames.iter().enumerate() {
         let geo = geometry_ok(&f.board);
         let tags = reading_tags(f, &params.participants);
+        let tag_shares = reading_tag_shares(f, frame_votes[fi], &params.participants);
         let b = &f.board;
         for text in b
             .nodes
@@ -2457,6 +2769,10 @@ fn consolidate_pass(
                     NameRead::Ocr,
                 )),
                 None if people[i].as_deref().is_some_and(|p| ocr_people.contains(p)) => {}
+                // A reader tag no OCR span confirmed counts only when enough of the
+                // reads listed it.
+                None if tag_shares.get(i).copied().unwrap_or(1.0)
+                    < params.owner_reader_min_share - 1e-9 => {}
                 None => all.push((
                     name,
                     near,
@@ -2994,7 +3310,12 @@ fn consolidate_pass(
         }
         // Reversal: per-keyframe decisions that flip for two consecutive evidence frames.
         let list = edge_obs.get(&key).map(Vec::as_slice).unwrap_or(&[]);
-        for f in reversals(list, key.0, params.vote_min_share) {
+        for f in reversals(
+            list,
+            key.0,
+            params.vote_min_share,
+            params.min_support_weight,
+        ) {
             gate.offer(event(EventKind::EdgeReversed, f, &e.id, detail.clone()));
         }
     }
@@ -3087,8 +3408,12 @@ fn beside_link(b: &BBox, p: &BBox, q: &BBox) -> bool {
     dist <= 1.5 * b.height()
 }
 
-fn reversals(list: &[EdgeObs], a: usize, min_share: f64) -> Vec<usize> {
-    let mut per_frame: Vec<(usize, EdgeDirection)> = Vec::new();
+/// Keyframes where an edge's direction was reversed: a decisive direction other
+/// than the established one that the next deciding keyframe repeats, the two
+/// together carried by at least `min_weight` of vote shares (two borderline
+/// readings do not reverse an edge).
+fn reversals(list: &[EdgeObs], a: usize, min_share: f64, min_weight: f64) -> Vec<usize> {
+    let mut per_frame: Vec<(usize, EdgeDirection, f64)> = Vec::new();
     for o in list {
         let Some(ev) = &o.evidence else { continue };
         let orient = |v: EndVerdict| if o.src == a { v } else { v.flipped() };
@@ -3100,13 +3425,13 @@ fn reversals(list: &[EdgeObs], a: usize, min_share: f64) -> Vec<usize> {
         }
         let (d, _) = v.decide(min_share);
         if matches!(d, EdgeDirection::AToB | EdgeDirection::BToA) {
-            per_frame.push((o.frame, d));
+            per_frame.push((o.frame, d, o.shares.share));
         }
     }
     let mut out = Vec::new();
     let mut established = per_frame.first().map(|p| p.1);
     for w in per_frame.windows(2) {
-        if Some(w[0].1) != established && w[0].1 == w[1].1 {
+        if Some(w[0].1) != established && w[0].1 == w[1].1 && w[0].2 + w[1].2 >= min_weight - 1e-9 {
             out.push(w[0].0);
             established = Some(w[0].1);
         }
@@ -3263,6 +3588,23 @@ pub fn split_boards(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stability_defaults_match_the_run_config() {
+        let p = ConsolidationParams::default();
+        let c = glassrip_core::config::Config::default().board_state;
+        assert_eq!(p.min_support_weight, c.min_support_weight);
+        assert_eq!(p.min_presence_share, c.min_presence_share);
+        assert_eq!(p.edge_min_presence_share, c.edge_min_presence_share);
+        assert_eq!(p.single_min_share, c.single_min_share);
+        assert_eq!(p.owner_reader_min_share, c.owner_reader_min_share);
+        assert_eq!(
+            p.presence_window_keyframes,
+            c.presence_window_keyframes as usize
+        );
+        assert_eq!(p.echo_max_weight_share, c.echo_max_weight_share);
+        assert_eq!(p.min_support_keyframes, c.min_support_keyframes as usize);
+    }
 
     #[test]
     fn sticky_kinds() {
