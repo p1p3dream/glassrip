@@ -686,21 +686,41 @@ fn is_hedge_only(clause: &str) -> bool {
 /// with the second layout, though we should revisit it" commits, "I'll be
 /// right back" and "let's ship it if the tests pass" do not.
 pub fn has_commitment(text: &str) -> bool {
-    split_sentences(text).iter().any(|s| {
-        if is_question(s, &cue_text(s)) {
-            return false;
+    !committing_clauses(text).is_empty()
+}
+
+/// The clauses of `text` that commit, as [`has_commitment`] judges them.
+pub fn committing_clauses(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for s in split_sentences(text) {
+        if is_question(&s, &cue_text(&s)) {
+            continue;
         }
-        let cs = clauses(s);
-        (0..cs.len()).any(|i| {
+        let cs = clauses(&s);
+        for i in 0..cs.len() {
             let c = &cs[i];
             let w: Vec<&str> = c.split_whitespace().collect();
-            clause_commits(&w)
+            if clause_commits(&w)
                 && !has_any(c, HEDGES)
                 && !is_personal_activity(c)
                 && !(i > 0 && (is_conditional(&cs[i - 1]) || is_hedge_only(&cs[i - 1])))
                 && !cs.get(i + 1).is_some_and(|n| is_conditional(n))
-        })
-    })
+            {
+                out.push(c.clone());
+            }
+        }
+    }
+    out
+}
+
+/// The words of `text` that name a topic: content words that are not
+/// meeting-flow words ("now", "today", "next"), so "for now" in two lines
+/// does not make them about the same thing.
+pub fn topic_words(text: &str) -> BTreeSet<String> {
+    content_tokens(text)
+        .into_iter()
+        .filter(|t| !FLOW_WORDS.contains(&t.as_str()))
+        .collect()
 }
 
 /// Like [`has_commitment`], but a later sentence of the same text that
@@ -708,13 +728,31 @@ pub fn has_commitment(text: &str) -> bool {
 pub fn has_standing_commitment(text: &str) -> bool {
     let mut standing = false;
     for s in split_sentences(text) {
+        let prior = standing;
         if has_commitment(&s) {
             standing = true;
-        } else if is_retraction(&s) {
+        }
+        // A comma does not start a new sentence: "Let's ship it, scratch
+        // that" still takes the commitment back.
+        if is_retraction(&s) || (prior && is_objection(&s)) || reversed_in_sentence(&s) {
             standing = false;
         }
     }
     standing
+}
+
+/// A later negative clause in the same sentence reverses an earlier
+/// commitment. A standalone negative decision is not a retraction.
+fn reversed_in_sentence(sentence: &str) -> bool {
+    let mut prior = false;
+    for clause in clauses(sentence) {
+        if prior && is_objection(&clause) {
+            return true;
+        }
+        prior |= clause_commits(&clause.split_whitespace().collect::<Vec<_>>())
+            && !is_objection(&clause);
+    }
+    false
 }
 
 /// A second-person request or suggestion that names a work task: "can you
@@ -843,6 +881,15 @@ pub fn is_proposal(text: &str) -> bool {
                 && !is_personal_activity(c)
         })
     })
+}
+
+/// The last proposed clause in a line. An unqualified assent answers this
+/// offer, not an earlier offer elsewhere in the line.
+pub(crate) fn latest_proposal_clause(text: &str) -> Option<String> {
+    split_sentences(text)
+        .into_iter()
+        .flat_map(|s| clauses(&s))
+        .rfind(|c| is_proposal(c))
 }
 
 /// Modal words in a proposal between its subject and verb.
@@ -1007,7 +1054,24 @@ pub fn is_assent(text: &str) -> bool {
 /// The text objects: an objection phrase, or it opens with a plain "no".
 pub fn is_objection(text: &str) -> bool {
     let n = cue_text(text);
-    has_any(&n, OBJECTIONS) || (n.starts_with(" no ") && !has_any(&n, RETRACTIONS))
+    let w: Vec<&str> = n.split_whitespace().collect();
+    let negated_assent = ASSENTS.iter().any(|a| {
+        let seq: Vec<&str> = a.split(' ').collect();
+        (0..w.len()).any(|i| {
+            starts_with_seq(&w, i, &seq)
+                && w[i.saturating_sub(3)..i]
+                    .iter()
+                    .any(|t| NEGATIONS.contains(t))
+        })
+    });
+    let plain_no = text.split([',', ';', '.', '?', '!']).any(|part| {
+        let t = tokens(part);
+        matches!(t.join(" ").as_str(), "no" | "but no" | "actually no")
+    });
+    has_any(&n, OBJECTIONS)
+        || negated_assent
+        || plain_no
+        || (n.starts_with(" no ") && !has_any(&n, RETRACTIONS))
 }
 
 /// The text takes back what was just said ("Actually, scratch that").
@@ -1054,23 +1118,31 @@ fn turn_end(lines: &[NamedLine], i: usize) -> usize {
 fn replies(lines: &[NamedLine], i: usize) -> impl Iterator<Item = usize> + '_ {
     let k = turn_end(lines, i);
     let end = lines.get(k).map_or(f64::NEG_INFINITY, |l| l.end_s);
+    // A later line by the proposer must not extend an offer's lifetime
+    // indefinitely. The turn may last 120 seconds, but replies still need
+    // to be near the offer as well as near the end of that turn.
+    let offer_end = lines.get(i).map_or(f64::NEG_INFINITY, |l| l.end_s);
+    let deadline = (offer_end + TURN_MAX_S).min(end + REPLY_WINDOW_S);
     (i + 1..=k).filter(move |j| *j < lines.len()).chain(
         (k + 1..lines.len())
             .take(REPLY_MAX_LINES)
-            .take_while(move |j| lines[*j].start_s <= end + REPLY_WINDOW_S),
+            .take_while(move |j| lines[*j].start_s <= deadline),
     )
 }
 
-/// A line that can reply to `lines[i]` (see [`replies`]) retracts it.
+/// A line that can reply to `lines[i]` (see [`replies`]) retracts or objects
+/// to it.
 pub fn retracted_after(lines: &[NamedLine], i: usize) -> bool {
-    replies(lines, i).any(|j| is_retraction(&lines[j].text))
+    replies(lines, i).any(|j| is_retraction(&lines[j].text) || is_objection(&lines[j].text))
 }
 
 /// The proposal in `lines[i]` ([`is_proposal`], not taken back later in the
 /// line) was accepted: a different speaker agrees ([`is_assent`]) in a reply
 /// to it, before that nobody retracts it, no other speaker objects and no one
-/// makes a new proposal or request after the proposer's turn (the agreement
-/// would answer that one), and nobody retracts the agreement afterwards.
+/// makes a new proposal or request after the offering line (the agreement
+/// would answer that one; the proposer's further proposals in the same turn
+/// are parts of one plan when the turn puts it to the group with a check
+/// question), and nobody retracts the agreement afterwards.
 /// Returns the agreeing line.
 pub fn accepted_proposal(lines: &[NamedLine], i: usize) -> Option<usize> {
     agreed_to(lines, i, is_proposal)
@@ -1083,15 +1155,49 @@ pub fn accepted_request(lines: &[NamedLine], i: usize) -> Option<usize> {
 }
 
 /// See [`accepted_proposal`]: `offer` says what `lines[i]` must hold.
+/// Phrases of a question that puts what the speaker laid out to the group
+/// ("Does that work for everyone?", "Sound good?", "Thoughts?").
+const CHECK_CUES: &[&str] = &[
+    "does that",
+    "does this",
+    "sound good",
+    "sounds good",
+    "sound right",
+    "sounds right",
+    "make sense",
+    "makes sense",
+    "work for",
+    "agree",
+    "thoughts",
+    "okay with",
+    "good with",
+    "fine with",
+    "on board",
+];
+
+/// The text asks the others to agree with what the speaker laid out: a
+/// question sentence with a check phrase.
+fn is_check_question(text: &str) -> bool {
+    split_sentences(text).iter().any(|s| {
+        let n = cue_text(s);
+        is_question(s, &n) && has_any(&n, CHECK_CUES)
+    })
+}
+
 fn agreed_to(lines: &[NamedLine], i: usize, offer: fn(&str) -> bool) -> Option<usize> {
     let l = lines.get(i)?;
     // an offer the speaker takes back later in the same line is not open to
     // agree to
     let mut standing = false;
     for s in split_sentences(&l.text) {
+        let prior = standing;
         if offer(&s) {
             standing = true;
-        } else if is_retraction(&s) {
+        } else if is_proposal(&s) || is_request(&s) {
+            // A later offer of the other kind supersedes this one too.
+            standing = false;
+        }
+        if is_retraction(&s) || (prior && is_objection(&s)) || reversed_in_sentence(&s) {
             standing = false;
         }
     }
@@ -1099,17 +1205,20 @@ fn agreed_to(lines: &[NamedLine], i: usize, offer: fn(&str) -> bool) -> Option<u
         return None;
     }
     let who = speaker_key(l);
-    let turn = turn_end(lines, i);
     // an agreement answers the latest offer: a new proposal or request after
-    // the offering turn (by anyone) ends the search
+    // the offering line (by anyone) ends the search, except that a speaker
+    // who lays out a plan over several lines and then puts it to the group
+    // ("Does that work for everyone?") is agreed with on every part of it
     let new_offer = |t: &str| is_proposal(t) || is_request(t);
+    let turn = turn_end(lines, i);
+    let put_to_group = (i..=turn).any(|k| is_check_question(&lines[k].text));
     for j in replies(lines, i) {
         let r = &lines[j];
         if is_retraction(&r.text) {
             return None;
         }
         if speaker_key(r) == who {
-            if j > turn && new_offer(&r.text) {
+            if new_offer(&r.text) && !(put_to_group && j <= turn) {
                 return None;
             }
             continue;
@@ -1118,6 +1227,18 @@ fn agreed_to(lines: &[NamedLine], i: usize, offer: fn(&str) -> bool) -> Option<u
             return None;
         }
         if is_assent(&r.text) {
+            if new_offer(&r.text) {
+                // When one line contains both, an assent can answer this
+                // offer only if it precedes the next offer. A later "sounds
+                // good" answers the new one instead.
+                let first = split_sentences(&r.text)
+                    .into_iter()
+                    .flat_map(|s| clauses(&s))
+                    .find(|c| is_assent(c) || new_offer(c));
+                if !first.is_some_and(|c| is_assent(&c) && !new_offer(&c)) {
+                    return None;
+                }
+            }
             return (!retracted_after(lines, j)).then_some(j);
         }
         if new_offer(&r.text) {
@@ -1278,10 +1399,21 @@ fn placement(text: &str, first: &str, surname: Option<&String>) -> bool {
                 }
                 after += 1;
             }
-            w[after.min(w.len())..]
+            let tail = &w[after.min(w.len())..];
+            let pointing = tail
                 .iter()
                 .take(PLACEMENT_REACH)
-                .any(|t| DEICTICS.contains(&t.as_str()))
+                .any(|t| DEICTICS.contains(&t.as_str()));
+            // "We have Avery here" merely mentions Avery. "Have Avery
+            // own this" or "put Avery on this" actually assigns a target.
+            let assignment = w[i - 1] != "have"
+                || tail.iter().take(PLACEMENT_REACH).any(|t| {
+                    matches!(
+                        t.as_str(),
+                        "own" | "take" | "handle" | "lead" | "on" | "over"
+                    )
+                });
+            pointing && assignment
         })
     })
 }
@@ -2484,6 +2616,13 @@ mod tests {
                 "{reply}"
             );
         }
+        for reply in ["Not a good idea. Sounds good.", "Sounds good, but no."] {
+            assert_eq!(
+                accepted(&[(0.0, "avery", proposal), (6.0, "rohan", reply)]),
+                None,
+                "{reply}"
+            );
+        }
         // agreed, then taken back
         assert_eq!(
             accepted(&[
@@ -2500,6 +2639,16 @@ mod tests {
         // too late to refer to it
         assert_eq!(
             accepted(&[(0.0, "avery", proposal), (90.0, "rohan", "Sounds good.")]),
+            None
+        );
+        // An unrelated line by the proposer cannot move the reply window
+        // far from the original offer.
+        assert_eq!(
+            accepted(&[
+                (0.0, "avery", proposal),
+                (110.0, "avery", "The ledger is still offline."),
+                (130.0, "rohan", "Sounds good."),
+            ]),
             None
         );
         // questions, conditions and talk are not proposals
@@ -2526,6 +2675,63 @@ mod tests {
             (80.0, "rohan", "Sure, sounds good."),
         ]);
         assert_eq!(accepted_proposal(&lines, 0), Some(3));
+        // a plan laid out over several lines and put to the group: the
+        // agreement covers each part
+        let plan = dialog(&[
+            (0.0, "avery", proposal),
+            (
+                6.0,
+                "avery",
+                "And we probably need someone on the relay importer.",
+            ),
+            (12.0, "avery", "Does that work for everyone?"),
+            (16.0, "rohan", "Yes, sounds good."),
+        ]);
+        assert_eq!(accepted_proposal(&plan, 0), Some(3));
+        assert_eq!(accepted_proposal(&plan, 1), Some(3));
+        // A second offer inside the same speaker's turn, not put to the
+        // group, gets the assent.
+        assert_eq!(
+            accepted(&[
+                (0.0, "avery", proposal),
+                (
+                    6.0,
+                    "avery",
+                    "Maybe we should move the ledger to the kiosk."
+                ),
+                (10.0, "rohan", "Sounds good."),
+            ]),
+            None
+        );
+        assert_eq!(
+            accepted(&[
+                (0.0, "avery", proposal),
+                (
+                    6.0,
+                    "rohan",
+                    "Maybe we should move the ledger. Sounds good."
+                ),
+            ]),
+            None
+        );
+        assert_eq!(
+            accepted(&[
+                (0.0, "avery", proposal),
+                (6.0, "rohan", "Sounds good. I'll update the badge ledger."),
+            ]),
+            Some(1)
+        );
+        assert_eq!(
+            accepted(&[
+                (
+                    0.0,
+                    "avery",
+                    "Maybe we cache the badge photos. Can you send the ledger spec?"
+                ),
+                (6.0, "rohan", "Sounds good."),
+            ]),
+            None
+        );
         // an agreement answers the latest offer, not an earlier one
         assert_eq!(
             accepted(&[
@@ -2565,6 +2771,30 @@ mod tests {
         assert!(!has_standing_commitment(
             "Let's ship the importer on Friday. Actually, never mind."
         ));
+        assert!(!has_standing_commitment(
+            "Let's ship the importer on Friday, actually scratch that."
+        ));
+        assert!(!has_standing_commitment(
+            "Let's ship the importer on Friday, but let's not ship it."
+        ));
+        assert!(!has_standing_commitment(
+            "Let's ship the importer on Friday. Let's not ship it."
+        ));
+        assert!(has_standing_commitment("Let's not ship the importer."));
+        assert_eq!(
+            accepted_proposal(
+                &dialog(&[
+                    (
+                        0.0,
+                        "avery",
+                        "Maybe we cache the kiosk photos, scratch that."
+                    ),
+                    (5.0, "rohan", "Sounds good."),
+                ]),
+                0
+            ),
+            None
+        );
         // a retraction before the commitment does not
         assert!(has_standing_commitment(
             "Scratch that. Let's ship the importer on Monday."
@@ -2572,6 +2802,11 @@ mod tests {
         let lines = dialog(&[
             (0.0, "avery", "Let's ship the importer on Friday."),
             (5.0, "rohan", "Wait, no, legal has not signed off yet."),
+        ]);
+        assert!(retracted_after(&lines, 0));
+        let lines = dialog(&[
+            (0.0, "avery", "Let's ship the importer on Friday."),
+            (5.0, "rohan", "No, let's not ship it."),
         ]);
         assert!(retracted_after(&lines, 0));
         let lines = dialog(&[
@@ -2603,6 +2838,11 @@ mod tests {
         // no pointing word, no placement verb, too far from the tag
         assert!(one(110.0, "avery-quinn", "We'll put Rohan on the call.").is_empty());
         assert!(one(110.0, "rohan-dasgupta", "Rohan here, the build is green.").is_empty());
+        assert!(one(110.0, "avery-quinn", "We have Rohan here today.").is_empty());
+        assert_eq!(
+            one(110.0, "avery-quinn", "We have Rohan on this one.").len(),
+            1
+        );
         assert!(one(170.0, "avery-quinn", "Let's put Rohan on this one.").is_empty());
         // a first name that is a common word needs the surname
         let marks = &[("mark-ellery", "Mark Ellery", "Kiosk App")];

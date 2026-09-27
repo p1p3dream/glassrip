@@ -291,6 +291,27 @@ const OWNERSHIP_VERBS: &[&str] = &["own", "work", "lead", "handle", "manage", "t
 /// Words that only say "ownership" in an ownership task.
 const OWNERSHIP_FILLERS: &[&str] = &["ownership", "over", "owner", "responsibility"];
 
+/// Explicit negation changes the action even when the remaining content
+/// words are identical ("cache the photos" versus "do not cache the photos").
+fn explicitly_negated(text: &str) -> bool {
+    tokens(text).iter().any(|t| {
+        matches!(
+            t.as_str(),
+            "not"
+                | "no"
+                | "never"
+                | "dont"
+                | "doesnt"
+                | "wont"
+                | "cant"
+                | "cannot"
+                | "shouldnt"
+                | "wouldnt"
+                | "couldnt"
+        )
+    })
+}
+
 /// The content words an ownership task says the owner owns: the task opens
 /// (after "to", "will") with an ownership verb, and what follows is kept
 /// without stopwords and ownership fillers. `None` for other tasks.
@@ -477,14 +498,34 @@ impl Corpus {
         }
     }
 
-    /// A cited segment holds a commitment ([`super::candidates::has_standing_commitment`],
-    /// in its verbatim or corrected text) that no line in reply retracts.
-    fn commits(&self, id: &str) -> bool {
+    /// A cited segment holds a standing commitment that no reply retracts or
+    /// objects to, shares a topic word with the item (`words`, see
+    /// [`super::candidates::topic_words`]), and does not commit to the
+    /// opposite: when the committing clauses on the item's topic all have the
+    /// other polarity ("Let's not ship the importer" for "Ship the importer"),
+    /// the line does not support it. Polarity is judged per clause, so a
+    /// negation elsewhere in a long line does not flip it.
+    fn commits(&self, id: &str, claim: &str, words: &BTreeSet<String>) -> bool {
         let Some(s) = self.segs.get(id) else {
             return false;
         };
-        let committed = super::candidates::has_standing_commitment(&s.text)
-            || super::candidates::has_standing_commitment(&s.text_raw);
+        let supports = |source: &str| {
+            if !super::candidates::has_standing_commitment(source)
+                || super::candidates::topic_words(source).is_disjoint(words)
+            {
+                return false;
+            }
+            let on_topic: Vec<String> = super::candidates::committing_clauses(source)
+                .into_iter()
+                .filter(|c| !super::candidates::topic_words(c).is_disjoint(words))
+                .collect();
+            let opposite = !on_topic.is_empty()
+                && on_topic
+                    .iter()
+                    .all(|c| explicitly_negated(c) != explicitly_negated(claim));
+            !opposite
+        };
+        let committed = supports(&s.text) || supports(&s.text_raw);
         committed
             && !self
                 .line_index
@@ -494,17 +535,24 @@ impl Corpus {
     }
 
     /// The segment proposes something another speaker then agreed to
-    /// ([`super::candidates::accepted_proposal`]), and the proposal line
-    /// shares a content word with `words` (the item's): an agreement vouches
-    /// only for what was proposed. Returns the agreeing segment.
-    fn agreement(&self, id: &str, words: &BTreeSet<String>) -> Option<String> {
+    /// ([`super::candidates::accepted_proposal`]); the latest proposed clause
+    /// of the line (the one an agreement answers) shares at least two of the
+    /// item's topic words (`words`; all of them when it has fewer) and has the
+    /// same polarity. One shared word, or a negated proposal, does not back
+    /// the item. Returns the agreeing segment.
+    fn agreement(&self, id: &str, words: &BTreeSet<String>, claim: &str) -> Option<String> {
         self.line_index.get(id)?.iter().find_map(|i| {
             let l = &self.lines[*i];
-            let on_topic = content_tokens(&l.text)
-                .iter()
-                .chain(&content_tokens(&l.text_raw))
-                .any(|t| words.contains(t));
-            if !on_topic {
+            // Acceptance is evaluated on the corrected line, so a word that
+            // appears only in a different raw transcript cannot support it.
+            let proposal = super::candidates::latest_proposal_clause(&l.text)?;
+            let shared = super::candidates::topic_words(&proposal)
+                .intersection(words)
+                .count();
+            if words.is_empty()
+                || shared < words.len().min(2)
+                || explicitly_negated(claim) != explicitly_negated(&proposal)
+            {
                 return None;
             }
             super::candidates::accepted_proposal(&self.lines, *i)
@@ -1137,13 +1185,16 @@ pub fn check_with(
     // evidence once the item passes
     let mut agreed_segment = None;
     if opts.precision_guard && section == Section::Decisions && !board_backed {
-        let content_words: BTreeSet<String> = content_tokens(&text).into_iter().collect();
-        let committed = evidence.segment_ids.iter().any(|id| corpus.commits(id));
+        let content_words = super::candidates::topic_words(&text);
+        let committed = evidence
+            .segment_ids
+            .iter()
+            .any(|id| corpus.commits(id, &text, &content_words));
         if !committed {
             agreed_segment = evidence
                 .segment_ids
                 .iter()
-                .find_map(|id| corpus.agreement(id, &content_words));
+                .find_map(|id| corpus.agreement(id, &content_words, &text));
             if agreed_segment.is_none() {
                 reasons.push(
                     "a decision must cite a line where someone commits to it and does not take it back, or a proposal another participant agreed to (or an owner tag moved on the board)"
@@ -1266,6 +1317,9 @@ const DUP_JACCARD: f64 = 0.7;
 /// the kiosk app integration"). Items citing different evidence are kept
 /// apart however alike.
 fn restates(a: &Checked, b: &Checked) -> bool {
+    if explicitly_negated(&a.text) != explicitly_negated(&b.text) {
+        return false;
+    }
     let ids = |e: &Evidence| -> BTreeSet<String> {
         e.segment_ids
             .iter()
@@ -1309,6 +1363,7 @@ pub fn assemble(checked: Vec<Checked>) -> Sections {
         let same_owner = |a: &Checked| a.owners == c.owners;
         match list.iter_mut().find(|x| {
             same_owner(x)
+                && explicitly_negated(&x.text) == explicitly_negated(&c.text)
                 && (jaccard(&content_tokens(&x.text), &toks) >= DUP_JACCARD || restates(x, &c))
         }) {
             Some(x) => {
@@ -2282,6 +2337,64 @@ mod tests {
         ]);
         let other = item("Migrate the ledger service to the new cluster", &["s1"], "");
         assert!(check_with(Section::Decisions, &other, &c, &ALL).is_err());
+        // a paraphrase sharing two topic words with the proposal is backed
+        let para = item("Keep cached badge photos on each kiosk", &["s1"], "");
+        assert!(check_with(Section::Decisions, &para, &c, &ALL).is_ok());
+        // one shared topic word does not tie a decision to the proposal
+        let one_word = item("Remove the ledger photos", &["s1"], "");
+        assert!(check_with(Section::Decisions, &one_word, &c, &ALL).is_err());
+        let mut mixed = said("s1", 0.0, "avery-quinn", proposal);
+        mixed.text_raw = "Maybe we should remove the ledger.".into();
+        let c = talk(&[mixed, said("s2", 5.0, "rohan-dasgupta", "Sounds good.")]);
+        let invented = item("Cache the ledger", &["s1"], "");
+        assert!(check_with(Section::Decisions, &invented, &c, &ALL).is_err());
+        let c = talk(&[
+            said(
+                "s1",
+                0.0,
+                "avery-quinn",
+                "Maybe we cache the badge photos. Maybe we move the ledger.",
+            ),
+            said("s2", 5.0, "rohan-dasgupta", "Sounds good."),
+        ]);
+        assert!(check_with(Section::Decisions, &invented, &c, &ALL).is_err());
+        let c = talk(&[
+            said(
+                "s1",
+                0.0,
+                "avery-quinn",
+                "Maybe we should not cache the badge photos on the kiosk.",
+            ),
+            said("s2", 5.0, "rohan-dasgupta", "Sounds good."),
+        ]);
+        assert!(check_with(Section::Decisions, &d, &c, &ALL).is_err());
+        // Assent to a later offer in the same turn is not assent to this one.
+        let c = talk(&[
+            said("s1", 0.0, "avery-quinn", proposal),
+            said(
+                "s2",
+                5.0,
+                "avery-quinn",
+                "Maybe we should move the ledger to the kiosk.",
+            ),
+            said("s3", 9.0, "rohan-dasgupta", "Sounds good."),
+        ]);
+        assert!(check_with(Section::Decisions, &d, &c, &ALL).is_err());
+        let c = talk(&[
+            said("s1", 0.0, "avery-quinn", proposal),
+            said(
+                "s2",
+                5.0,
+                "rohan-dasgupta",
+                "Maybe we should move the ledger. Sounds good.",
+            ),
+        ]);
+        assert!(check_with(Section::Decisions, &d, &c, &ALL).is_err());
+        let c = talk(&[
+            said("s1", 0.0, "avery-quinn", proposal),
+            said("s2", 5.0, "rohan-dasgupta", "Not a good idea. Sounds good."),
+        ]);
+        assert!(check_with(Section::Decisions, &d, &c, &ALL).is_err());
         // an agreement elsewhere does not back a decision citing a line with no proposal
         let c = talk(&[
             said("s1", 0.0, "avery-quinn", "The kiosk demo runs on Friday."),
@@ -2308,6 +2421,18 @@ mod tests {
                 "avery-quinn",
                 "Let's ship the importer on Friday. Actually, never mind.",
             )],
+            vec![said(
+                "s1",
+                0.0,
+                "avery-quinn",
+                "Let's ship the importer on Friday, actually scratch that.",
+            )],
+            vec![said(
+                "s1",
+                0.0,
+                "avery-quinn",
+                "Let's ship the importer on Friday, but let's not ship it.",
+            )],
             vec![
                 said("s1", 0.0, "avery-quinn", commit),
                 said(
@@ -2317,9 +2442,33 @@ mod tests {
                     "Wait, no, legal has not signed off.",
                 ),
             ],
+            vec![
+                said("s1", 0.0, "avery-quinn", commit),
+                said("s2", 5.0, "rohan-dasgupta", "No, let's not ship it."),
+            ],
         ] {
             assert!(check_with(Section::Decisions, &d, &talk(&lines), &ALL).is_err());
         }
+        let c = talk(&[said(
+            "s1",
+            0.0,
+            "avery-quinn",
+            "Let's not ship the importer on Friday.",
+        )]);
+        assert!(check_with(Section::Decisions, &d, &c, &ALL).is_err());
+        // a negation in another clause of the line does not flip the claim
+        let c2 = talk(&[said(
+            "s1",
+            0.0,
+            "avery-quinn",
+            "Maybe we ship the kiosk build today, and we'll not touch the ledger at all.",
+        )]);
+        let kiosk = item("Ship the kiosk build today", &["s1"], "");
+        assert!(check_with(Section::Decisions, &kiosk, &c2, &ALL).is_ok());
+        let no_ship = item("Do not ship the importer on Friday", &["s1"], "");
+        assert!(check_with(Section::Decisions, &no_ship, &c, &ALL).is_ok());
+        let other = item("Move the badge printer to the kiosk", &["s1"], "");
+        assert!(check_with(Section::Decisions, &other, &c, &ALL).is_err());
     }
 
     #[test]
@@ -2548,6 +2697,12 @@ mod tests {
                 "Skip the ledger importer tests for the kiosk",
                 &["s2"],
             ),
+        ]);
+        assert_eq!(s.decisions.len(), 2);
+        // Negation is a stopword for similarity, but reverses the claim.
+        let s = assemble(vec![
+            get(Section::Decisions, "Ship the badge printer", &["s1"]),
+            get(Section::Decisions, "Do not ship the badge printer", &["s1"]),
         ]);
         assert_eq!(s.decisions.len(), 2);
         // ownership in other words, same line
