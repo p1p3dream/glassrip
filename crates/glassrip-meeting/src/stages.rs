@@ -1209,7 +1209,10 @@ impl Stage for BoardStateStage {
         // node-majority tracks read as stickies as often, or carrying a sticky marker,
         // with no connector are stickies; one physical owner tag holds at most one
         // tag per keyframe.
-        9
+        // 10: a connector read at a fragment counts for the element the fragment
+        // folds into, so that element stays a node and keeps the edge (outputs of
+        // 9 may have turned it into a sticky and dropped the connector).
+        10
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {

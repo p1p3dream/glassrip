@@ -1331,7 +1331,13 @@ pub fn consolidate_with_probe(
         }
         t
     };
-    // Connector ends as read, before fragments redirect them (kind override below).
+    for ti in node_track.values_mut() {
+        *ti = resolve(*ti);
+    }
+    // Connector ends through the same redirect the edges take (section 4): a
+    // fragment folds into its element because both are one card, so a connector
+    // read at the fragment ends at the element, and the element's kind must let
+    // that edge exist.
     let mut edge_ends: HashSet<usize> = HashSet::new();
     for (fi, f) in frames.iter().enumerate() {
         for e in &f.board.edges {
@@ -1342,17 +1348,13 @@ pub fn consolidate_with_probe(
             }
         }
     }
-    for ti in node_track.values_mut() {
-        *ti = resolve(*ti);
-    }
 
     // Kind beyond the list votes, decided after fragments are folded on the vote
-    // kinds. A connector end is a node (a connector read at the element's own
-    // readings; one read at a fragment of its text says nothing about the whole
-    // element); otherwise a node-majority track is a sticky when it was read as a
-    // sticky (a colored card) at least as often as a node, or when its text carries a
-    // sticky marker (a question or a milestone, spec 6.11): node labels name
-    // components.
+    // kinds. A connector end is a node (only nodes carry edges, so demoting it
+    // would drop a connector the board shows); otherwise a node-majority track is
+    // a sticky when it was read as a sticky (a colored card) at least as often as
+    // a node, or when its text carries a sticky marker (a question or a
+    // milestone, spec 6.11): node labels name components.
     for (ti, t) in tracks.iter_mut().enumerate() {
         let v = t.votes();
         if v.kind() != ObsList::Node || edge_ends.contains(&ti) {

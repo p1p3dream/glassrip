@@ -3685,15 +3685,20 @@ fn a_same_text_box_where_the_registration_is_off_merges() {
     assert!(s.folded.iter().all(|f| f.reason != FoldReason::Duplicate));
 }
 
+/// Codex r5 integration, MAJOR 2: connector ends were taken before fragments
+/// were redirected, so a connector read at a fragment did not keep the element
+/// it folds into a node; the element became a sticky and the edge was dropped.
 #[test]
-fn a_connector_at_a_fragment_does_not_keep_a_marked_element_a_node() {
-    // "Pilot milestone in May" is read whole in keyframes 0-3; keyframe 4 reads only
-    // its fragment "Pilot milestone" over the element's place (offset, so a separate
-    // reading rather than a label change), with a connector from Queue. The fragment
-    // folds into the element; the element is a sticky.
-    let mut specs: Vec<Spec> = (0..5).map(|_| base()).collect();
+fn a_connector_at_a_fragment_keeps_its_element_a_node_with_the_edge() {
+    // "Pilot milestone in May" is read whole in keyframes 0, 1, 4 and 5; keyframes 2
+    // and 3 read only its fragment "Pilot milestone" over the element's place (offset, so a
+    // separate reading rather than a label change), with a connector from Queue (two
+    // keyframes: an edge needs support). The fragment folds into the element, its
+    // connector with it: the element is a node (only nodes carry edges) and the
+    // connector survives.
+    let mut specs: Vec<Spec> = (0..6).map(|_| base()).collect();
     for (i, s) in specs.iter_mut().enumerate() {
-        if i < 4 {
+        if !(2..4).contains(&i) {
             s.nodes
                 .push(("n8", "Pilot milestone in May".into(), (200.0, 450.0)));
         } else {
@@ -3703,13 +3708,22 @@ fn a_connector_at_a_fragment_does_not_keep_a_marked_element_a_node() {
         }
     }
     let s = run(frames(&specs), &params());
+    assert!(s
+        .folded
+        .iter()
+        .any(|f| f.text == "Pilot milestone" && f.into == "Pilot milestone in May"));
     let texts = node_texts(&s);
     assert!(
-        !texts.iter().any(|t| t.starts_with("Pilot milestone")),
+        texts.contains(&"Pilot milestone in May".to_string()),
         "{texts:?}"
     );
-    assert!(s
+    assert!(!s
         .stickies
         .iter()
-        .any(|x| x.text == "Pilot milestone in May" && x.kind == StickyKind::Milestone));
+        .any(|x| x.text.starts_with("Pilot milestone")));
+    let edge = s.edges.iter().find(|e| {
+        let ends = [e.a_text.as_str(), e.b_text.as_str()];
+        ends.contains(&"Queue") && ends.contains(&"Pilot milestone in May")
+    });
+    assert!(edge.is_some(), "{:#?}", s.edges);
 }
