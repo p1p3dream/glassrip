@@ -75,21 +75,21 @@ expression: text
   <text class="subtitle" x="820" y="62" text-anchor="middle">Architecture as drawn on the board during the meeting (final state at 01:20)</text>
 
   <!-- legend -->
-  <g transform="translate(262, 76)">
-    <rect width="1116" height="44" rx="8" fill="#ffffff" fill-opacity="0.9" stroke="#e2e8f0"/>    <line x1="16" y1="22" x2="46" y2="22" stroke="#0f172a" stroke-width="2"/>
+  <g transform="translate(308, 76)">
+    <rect width="1025" height="44" rx="8" fill="#ffffff" fill-opacity="0.9" stroke="#e2e8f0"/>    <line x1="16" y1="22" x2="46" y2="22" stroke="#0f172a" stroke-width="2"/>
     <polygon points="56,22 45,16 45,28" fill="#0f172a"/>
-    <text class="body" x="64" y="26">Request (caller to callee)</text>    <line x1="263.6" y1="22" x2="291.6" y2="22" stroke="#7c3aed" stroke-width="1.5" stroke-dasharray="6,4"/>
-    <polygon points="301.6,22 290.6,16 290.6,28" fill="#7c3aed"/>
-    <text class="body" x="311.6" y="26">Proposed relationship</text>    <rect x="478.2" y="12" width="64" height="20" rx="10" fill="#16a34a"/>
-    <text class="pill-text" x="510.2" y="26" text-anchor="middle">Owner</text>
-    <text class="body" x="550.2" y="26">Owner tag on the board</text>    <rect x="723.4" y="12" width="76" height="20" rx="6" fill="#ef4444"/>
-    <text class="label" x="761.4" y="26" text-anchor="middle">DEFERRED</text>
-    <text class="body" x="807.4" y="26">Deferred by a decision</text>    <rect x="980.6" y="12" width="20" height="20" rx="3" fill="#fef9c3" stroke="#eab308"/>
-    <text class="body" x="1008.6" y="26">Board sticky</text>  </g>
+    <text class="body" x="64" y="26">Request (caller to callee)</text>    <line x1="230" y1="22" x2="258" y2="22" stroke="#7c3aed" stroke-width="1.5" stroke-dasharray="6,4"/>
+    <polygon points="268,22 257,16 257,28" fill="#7c3aed"/>
+    <text class="body" x="278" y="26">Proposed relationship</text>    <rect x="428" y="12" width="64" height="20" rx="10" fill="#16a34a"/>
+    <text class="pill-text" x="460" y="26" text-anchor="middle">Owner</text>
+    <text class="body" x="500" y="26">Owner tag on the board</text>    <rect x="661" y="12" width="76" height="20" rx="6" fill="#ef4444"/>
+    <text class="label" x="699" y="26" text-anchor="middle">DEFERRED</text>
+    <text class="body" x="745" y="26">Deferred by a decision</text>    <rect x="899" y="12" width="20" height="20" rx="3" fill="#fef9c3" stroke="#eab308"/>
+    <text class="body" x="927" y="26">Board sticky</text>  </g>
   <!-- zone: API -->
   <rect x="40" y="537" width="284" height="272" rx="12" fill="url(#zone-api)" stroke="#2563eb" stroke-width="2" stroke-dasharray="8,4"/>
-  <text class="section-label" x="60" y="565">API</text>  <rect x="60" y="577" width="56" height="24" rx="6" fill="#2563eb"/>
-  <text class="label" x="88" y="593" text-anchor="middle">FOCUS</text>  <!-- zone: Services -->
+  <text class="section-label" x="60" y="565">API</text>  <rect x="60" y="577" width="57" height="24" rx="6" fill="#2563eb"/>
+  <text class="label" x="89" y="593" text-anchor="middle">FOCUS</text>  <!-- zone: Services -->
   <rect x="40" y="148" width="284" height="272" rx="12" fill="url(#zone-processing)" stroke="#10b981" stroke-width="2" stroke-dasharray="8,4"/>
   <text class="section-label" x="60" y="176">Services</text>  <!-- zone: Client -->
   <rect x="708" y="537" width="892" height="272" rx="12" fill="url(#zone-client)" stroke="#0891b2" stroke-width="2" stroke-dasharray="8,4"/>
@@ -117,15 +117,15 @@ expression: text
     <rect x="1348" y="637" width="220" height="32" rx="10" fill="#0891b2"/>
     <rect x="1348" y="657" width="220" height="12" fill="#0891b2"/>
     <text class="heading" x="1360" y="658">Design Kit</text>    <text class="body" x="1360" y="695">Client</text>    <text class="small" x="1360" y="715">On the board from 00:10</text>    <text class="small" x="1360" y="733" style="fill:#b91c1c">Deferred at 00:26</text>  </g>
-  <!-- edges -->  <path d="M 182,637 L 182,391" stroke="#0f172a" stroke-width="2" fill="none"/>  <polygon points="182,380 188,391 176,391" fill="#0f172a"/>  <rect x="190" y="505" width="42" height="18" rx="4" fill="#ffffff" stroke="#cbd5e1"/>
-  <text class="edge-label" x="211" y="518" text-anchor="middle">REST</text>  <path d="M 292,314 L 1458,314 L 1458,626" stroke="#7c3aed" stroke-width="1.5" fill="none" stroke-dasharray="6,4"/>  <polygon points="1458,637 1452,626 1464,626" fill="#7c3aed"/>  <rect x="724" y="302" width="301" height="24" rx="6" fill="#ffffff" stroke="#7c3aed"/>
-  <text class="body" x="875" y="318" text-anchor="middle" style="fill:#5b21b6">Links between ledger entries + kit widgets</text>  <path d="M 740,703 L 303,703" stroke="#0f172a" stroke-width="2" fill="none"/>  <polygon points="292,703 303,697 303,709" fill="#0f172a"/>  <rect x="490" y="679" width="62" height="18" rx="4" fill="#ffffff" stroke="#cbd5e1"/>
-  <text class="edge-label" x="521" y="692" text-anchor="middle">GraphQL</text>  <path d="M 960,703 L 1337,703" stroke="#0f172a" stroke-width="2" fill="none"/>  <polygon points="1348,703 1337,709 1337,697" fill="#0f172a"/>
-  <!-- owners and badges -->  <rect x="493" y="713" width="57" height="24" rx="12" fill="#16a34a"/>
-  <text class="pill-text" x="522" y="729" text-anchor="middle">Rohan</text>  <rect x="740" y="603" width="57" height="24" rx="12" fill="#16a34a"/>
-  <text class="pill-text" x="769" y="619" text-anchor="middle">Avery</text>  <rect x="1348" y="603" width="56" height="24" rx="12" fill="#16a34a"/>
+  <!-- edges -->  <path d="M 182,637 L 182,391" stroke="#0f172a" stroke-width="2" fill="none"/>  <polygon points="182,380 188,391 176,391" fill="#0f172a"/>  <rect x="188" y="500" width="44" height="18" rx="4" fill="#ffffff" stroke="#cbd5e1"/>
+  <text class="edge-label" x="210" y="513" text-anchor="middle">REST</text>  <path d="M 292,314 L 1458,314 L 1458,626" stroke="#7c3aed" stroke-width="1.5" fill="none" stroke-dasharray="6,4"/>  <polygon points="1458,637 1452,626 1464,626" fill="#7c3aed"/>  <rect x="745" y="284" width="260" height="24" rx="6" fill="#ffffff" stroke="#7c3aed"/>
+  <text class="body" x="875" y="300" text-anchor="middle" style="fill:#5b21b6">Links between ledger entries + kit widgets</text>  <path d="M 740,703 L 303,703" stroke="#0f172a" stroke-width="2" fill="none"/>  <polygon points="292,703 303,697 303,709" fill="#0f172a"/>  <rect x="485" y="679" width="62" height="18" rx="4" fill="#ffffff" stroke="#cbd5e1"/>
+  <text class="edge-label" x="516" y="692" text-anchor="middle">GraphQL</text>  <path d="M 960,703 L 1337,703" stroke="#0f172a" stroke-width="2" fill="none"/>  <polygon points="1348,703 1337,709 1337,697" fill="#0f172a"/>
+  <!-- owners and badges -->  <rect x="488" y="713" width="57" height="24" rx="12" fill="#16a34a"/>
+  <text class="pill-text" x="517" y="729" text-anchor="middle">Rohan</text>  <rect x="740" y="603" width="56" height="24" rx="12" fill="#16a34a"/>
+  <text class="pill-text" x="768" y="619" text-anchor="middle">Avery</text>  <rect x="1348" y="603" width="56" height="24" rx="12" fill="#16a34a"/>
   <text class="pill-text" x="1376" y="619" text-anchor="middle">Mira</text>  <rect x="1205" y="603" width="135" height="24" rx="6" fill="#ef4444"/>
-  <text class="label" x="1272.5" y="619" text-anchor="middle">DEFERRED (00:26)</text>  <text class="small" x="1223" y="595">moved from Ledger Service (01:00)</text>  <!-- stickies -->  <g filter="url(#shadow-sm)">
+  <text class="label" x="1272.5" y="619" text-anchor="middle">DEFERRED (00:26)</text>  <text class="small" x="1239" y="595">moved from Ledger Service (01:00)</text>  <!-- stickies -->  <g filter="url(#shadow-sm)">
     <rect x="70" y="833" width="220" height="96" rx="6" fill="#fef9c3" stroke="#eab308"/>
     <rect x="70" y="833" width="220" height="24" rx="6" fill="#f59e0b"/>
     <rect x="70" y="849" width="220" height="8" fill="#f59e0b"/>

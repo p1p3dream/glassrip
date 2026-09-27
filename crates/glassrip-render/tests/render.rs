@@ -22,7 +22,7 @@ use glassrip_notes::import;
 use glassrip_notes::notes::MeetingNotes;
 use glassrip_notes::schemas;
 use glassrip_render::markdown::MarkdownMeta;
-use glassrip_render::scene::{build_scene, overlaps};
+use glassrip_render::scene::{build_scene, edge_defects, overlaps, Scene, R};
 use glassrip_render::stage::RENDER_SCHEMA;
 use glassrip_render::svg::FontConfig;
 use glassrip_render::{render_all, RenderParams, RenderResult, RenderStage};
@@ -123,9 +123,8 @@ fn owners_of_a_crowded_edge_slide_along_it() {
         let b = n.bbox.as_mut().unwrap();
         (b.x1, b.y1, b.x2, b.y2) = (cx - 100.0, cy - 40.0, cx + 100.0, cy + 40.0);
     }
-    // The dashed edge runs from the kit to the ledger: its direct route crosses
-    // the kiosk card, so it takes the channel below the cards and climbs back
-    // 12 px beside the Kiosk to Relay edge.
+    // The dashed edge runs from the kit to the ledger: a straight or L-shaped
+    // line would cross the kiosk card, so it is routed around the cards.
     let dashed = board
         .edges
         .iter_mut()
@@ -167,13 +166,18 @@ fn owners_of_a_crowded_edge_slide_along_it() {
     assert_eq!(board.current_owners().len(), 3);
 
     let scene = build_scene(&board, &notes);
-    // the crowding this reproduces: the dashed edge is routed via the channel
-    let channel = scene
+    // the dashed edge bends around the cards, through none of them
+    let dashed = scene
         .edges
         .iter()
         .find(|e| e.dash.is_some())
         .expect("dashed edge");
-    assert_eq!(channel.d.matches(" L ").count(), 3, "{}", channel.d);
+    assert!(dashed.d.matches(" L ").count() >= 2, "{}", dashed.d);
+    assert!(
+        edge_defects(&scene).is_empty(),
+        "{:?}",
+        edge_defects(&scene)
+    );
     assert!(
         scene.degraded.is_empty(),
         "{:?}\ncards {:?}\npills {:?}\nedges {:?}",
@@ -279,7 +283,14 @@ fn a_crowded_board_lists_what_does_not_fit_below_it() {
     assert!(overlaps(&scene).is_empty(), "{:?}", overlaps(&scene));
     let f = scene.footnotes.as_ref().expect("an annotation list");
     assert!(f.items.len() >= 3, "{}", f.items.len());
-    assert_eq!(f.items.len(), scene.degraded.len());
+    // one numbered note per footnote (an edge drawn straight for want of a
+    // route is a warning after them, with no number)
+    let numbered: Vec<&String> = scene
+        .degraded
+        .iter()
+        .filter(|d| d.contains(" as note "))
+        .collect();
+    assert_eq!(f.items.len(), numbered.len());
     // the unbreakable label is among them, split over lines inside the list
     assert!(scene
         .degraded
@@ -349,10 +360,16 @@ fn a_crowded_board_lists_what_does_not_fit_below_it() {
     let out = std::env::var("GLASSRIP_RENDER_DUMP_DIR")
         .map(|d| PathBuf::from(d).join("crowded"))
         .unwrap_or_else(|_| dir.path().to_path_buf());
-    let r = render_all(&notes, &[board], &params(out)).unwrap();
+    let r = render_all(&notes, std::slice::from_ref(&board), &params(out)).unwrap();
     assert!(r.ok, "{:?}", r.failures());
     let warnings = r.warnings();
-    assert_eq!(warnings.len(), scene.degraded.len());
+    // the render lays out with the real glyph widths
+    let measured = glassrip_render::scene::build_scene_with(
+        &board,
+        &notes,
+        &glassrip_render::svg::TextMeasure::new(&bundled_fonts()),
+    );
+    assert_eq!(warnings.len(), measured.degraded.len());
     assert!(
         warnings.iter().all(|w| w.starts_with("svg ")),
         "{warnings:?}"
@@ -402,25 +419,24 @@ fn a_relation_label_in_the_rightmost_column_stays_inside_the_canvas() {
     assert!(r.ok, "{:?}", r.failures());
 }
 
-/// Glyphs past the canvas: a defect in the annotation list (its layout
-/// guarantees room), a warning elsewhere (laid out from width estimates, and
-/// never a reason to fail a meeting run). Measured on the rendered glyphs.
+/// Glyphs past the canvas fail validation, wherever they are (measured on
+/// the rendered glyphs, not estimated).
 #[test]
-fn text_outside_the_canvas_fails_only_in_the_list() {
+fn text_outside_the_canvas_fails() {
     let env = glassrip_render::svg::environment();
     let (notes, board) = inputs();
     let mut scene = build_scene(&board, &notes);
     scene.footer.x = scene.width + 200.0;
     let text = glassrip_render::svg::render_svg(&env, &scene).unwrap();
     let (checks, _) = glassrip_render::svg::validate_svg(&text, &scene, &bundled_fonts());
-    assert!(checks.ok, "{:?}", checks.failures());
+    assert!(!checks.ok);
     assert!(
         checks
-            .warnings
+            .overlaps
             .iter()
-            .any(|w| w.starts_with("text \"Source:") && w.ends_with("outside the canvas")),
+            .any(|o| o.starts_with("text \"Source:") && o.ends_with("outside the canvas")),
         "{:?}",
-        checks.warnings
+        checks.overlaps
     );
 
     let (notes, board) = crowded_board();
@@ -439,6 +455,91 @@ fn text_outside_the_canvas_fails_only_in_the_list() {
         "{:?}",
         checks.overlaps
     );
+}
+
+/// The reproducer of the review: a label of wide glyphs on an edge in the
+/// rightmost column fit its estimated pill while its real glyphs ran past the
+/// canvas. Labels (and all other text) are sized by the real glyph widths
+/// now, so the render keeps every glyph inside the canvas and passes.
+#[test]
+fn wide_glyphs_at_the_right_edge_stay_inside_the_canvas() {
+    use glassrip_render::scene::{build_scene_with, Estimate, Measure};
+    use glassrip_render::svg::TextMeasure;
+    let label = "W".repeat(20);
+    let (notes, board) = board_of(
+        &[
+            ("Top", (1300.0, 200.0)),
+            ("Bottom", (1300.0, 700.0)),
+            ("Left", (100.0, 450.0)),
+        ],
+        &[(0, 1, &label, false), (2, 0, "", false)],
+    );
+    let measure = TextMeasure::new(&bundled_fonts());
+    // the estimate is far narrower than the real glyphs
+    let real = measure.width(&label, "edge-label");
+    assert!(real > Estimate.width(&label, "edge-label") + 40.0, "{real}");
+    let scene = build_scene_with(&board, &notes, &measure);
+    let e = scene.edges.iter().find(|e| e.label.is_some()).unwrap();
+    let l = e.label.as_ref().unwrap();
+    assert!(l.r.w >= real, "{:?} {real}", l.r);
+    assert!(l.r.x >= 0.0 && l.r.x + l.r.w <= scene.width, "{:?}", l.r);
+    let dir = tempfile::tempdir().unwrap();
+    let r = render_all(&notes, &[board], &params(dir.path().to_path_buf())).unwrap();
+    assert!(r.ok, "{:?}", r.failures());
+    assert!(
+        r.svg[0]
+            .1
+            .overlaps
+            .iter()
+            .all(|o| !o.ends_with("outside the canvas")),
+        "{:?}",
+        r.svg[0].1.overlaps
+    );
+}
+
+/// Long text of wide glyphs everywhere (title, card, sticky, decision) is
+/// fitted to its box by the real glyph widths: nothing leaves the canvas.
+#[test]
+fn wide_glyphs_everywhere_are_fitted() {
+    let (mut notes, mut board) = inputs();
+    let wide = "WMW@".repeat(40);
+    notes.title = Some(wide.clone());
+    for d in &mut notes.decisions {
+        d.text = wide.clone();
+    }
+    for n in &mut board.nodes {
+        n.text = format!("{wide} {}", n.text);
+    }
+    for s in &mut board.stickies {
+        s.text = wide.clone();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let r = render_all(&notes, &[board], &params(dir.path().to_path_buf())).unwrap();
+    assert!(r.ok, "{:?}", r.failures());
+}
+
+/// Owner names, history notes and the annotation list with wide glyphs on a
+/// crowded board: everything is fitted by the real glyph widths, the render
+/// passes, and what does not fit is listed below the board.
+#[test]
+fn wide_glyphs_in_annotations_are_fitted() {
+    let (notes, mut board) = crowded_board();
+    for (i, o) in board.owner_assignments.iter_mut().enumerate() {
+        o.display_name = format!("WMW{i:02}@WMWMW");
+        if let Some(OwnerTarget::Node { text, .. }) = o.moved_from.as_mut() {
+            *text = "WMWMWMWM@@ ".repeat(8);
+        }
+    }
+    for n in &mut board.nodes {
+        n.text = format!("{} WWMMWWMM@@", n.text);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let r = render_all(&notes, &[board], &params(dir.path().to_path_buf())).unwrap();
+    assert!(r.ok, "{:?}", r.failures());
+    assert!(!r.warnings().is_empty());
+    assert!(r.svg_text[0]
+        .1
+        .contains("Annotations without room on the board"));
 }
 
 #[test]
@@ -529,7 +630,11 @@ fn edge_labels_never_cover_zone_titles() {
                 // drawn); what this checks is that no label covers anything.
                 let o: Vec<String> = overlaps(&scene)
                     .into_iter()
-                    .filter(|m| m.contains("zone title") || m.contains("edge label"))
+                    .filter(|m| {
+                        m.contains("zone title")
+                            || m.contains("edge label")
+                            || m.contains("runs through card")
+                    })
                     .collect();
                 assert!(o.is_empty(), "node {i} moved by ({dx}, {dy}): {o:?}");
             }
@@ -797,4 +902,340 @@ async fn a_rerun_rewrites_the_rendered_files() {
     for f in files(&read(&r)) {
         assert!(f.is_file(), "{} was not rewritten", f.display());
     }
+}
+
+/// A board of `cards` (text, center on the board) and `links` (source,
+/// target, label, dashed), built from the synthetic board's own records, with
+/// no owners.
+fn board_of(
+    cards: &[(&str, (f64, f64))],
+    links: &[(usize, usize, &str, bool)],
+) -> (MeetingNotes, BoardStateItem) {
+    let (notes, mut board) = inputs();
+    let node0 = board.final_nodes()[0].clone();
+    let edge0 = board.final_edges()[0].clone();
+    board.nodes = cards
+        .iter()
+        .enumerate()
+        .map(|(i, (text, (cx, cy)))| {
+            let mut n = node0.clone();
+            n.id = format!("node-{i}");
+            n.text = (*text).into();
+            n.in_final = true;
+            n.bbox = Some(glassrip_notes::board::BBox::new(
+                cx - 100.0,
+                cy - 40.0,
+                cx + 100.0,
+                cy + 40.0,
+            ));
+            n
+        })
+        .collect();
+    board.edges = links
+        .iter()
+        .enumerate()
+        .map(|(k, (a, b, label, dashed))| {
+            let mut e = edge0.clone();
+            e.id = format!("edge-{k}");
+            (e.a, e.b) = (format!("node-{a}"), format!("node-{b}"));
+            (e.src, e.dst) = (e.a.clone(), e.b.clone());
+            (e.a_text, e.b_text) = (cards[*a].0.into(), cards[*b].0.into());
+            e.label = (*label).into();
+            e.style = if *dashed {
+                EdgeStyle::Dashed
+            } else {
+                EdgeStyle::Solid
+            };
+            e.in_final = true;
+            e
+        })
+        .collect();
+    board.owner_assignments.clear();
+    (notes, board)
+}
+
+/// Vertices of an edge's drawn path (`M x,y L x,y ...`).
+fn path_points(d: &str) -> Vec<(f64, f64)> {
+    d.split(['M', 'L'])
+        .filter_map(|p| {
+            let (x, y) = p.trim().split_once(',')?;
+            Some((x.parse().ok()?, y.parse().ok()?))
+        })
+        .collect()
+}
+
+fn card_r(scene: &Scene, i: usize) -> R {
+    scene
+        .cards
+        .iter()
+        .find(|c| c.id == format!("node-{i}"))
+        .unwrap()
+        .r
+}
+
+/// Every edge orthogonal, through no card, labels crossed by no edge, no
+/// overlaps, nothing drawn straight for want of a route, and the render
+/// passes strict validation.
+fn assert_clean(notes: &MeetingNotes, board: &BoardStateItem, scene: &Scene) {
+    assert!(overlaps(scene).is_empty(), "{:?}", overlaps(scene));
+    assert!(
+        scene.routes.iter().all(|r| !r.fallback),
+        "{:?}",
+        scene.degraded
+    );
+    for r in &scene.routes {
+        for w in r.points.windows(2) {
+            assert!(
+                (w[0].0 - w[1].0).abs() < 0.5 || (w[0].1 - w[1].1).abs() < 0.5,
+                "{} is not orthogonal: {:?}",
+                r.name,
+                r.points
+            );
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    // GLASSRIP_RENDER_DUMP_DIR keeps the files for a visual check
+    let out = std::env::var("GLASSRIP_RENDER_DUMP_DIR")
+        .map(|d| PathBuf::from(d).join(file_name(&board.nodes[0].text)))
+        .unwrap_or_else(|_| dir.path().to_path_buf());
+    let r = render_all(notes, std::slice::from_ref(board), &params(out)).unwrap();
+    assert!(r.ok, "{:?}", r.failures());
+}
+
+fn file_name(s: &str) -> String {
+    glassrip_render::file_safe(&s.to_lowercase())
+}
+
+#[test]
+fn an_edge_whose_straight_line_crosses_a_card_routes_around_it() {
+    let (notes, board) = board_of(
+        &[
+            ("Gateway", (250.0, 200.0)),
+            ("Queue", (250.0, 520.0)),
+            ("Store", (250.0, 840.0)),
+        ],
+        &[(0, 2, "writes", false), (0, 1, "", false)],
+    );
+    let scene = build_scene(&board, &notes);
+    let route = scene
+        .routes
+        .iter()
+        .find(|r| r.dst == "node-2")
+        .expect("the long edge");
+    // a straight line would run through the queue: the route bends around it
+    assert!(route.points.len() >= 4, "{:?}", route.points);
+    let queue = card_r(&scene, 1);
+    let beside = route
+        .points
+        .iter()
+        .any(|p| p.0 < queue.x || p.0 > queue.x + queue.w);
+    assert!(beside, "{:?} {queue:?}", route.points);
+    // the short edge keeps its straight line
+    let short = scene.routes.iter().find(|r| r.dst == "node-1").unwrap();
+    assert_eq!(short.points.len(), 2, "{:?}", short.points);
+    assert_clean(&notes, &board, &scene);
+}
+
+#[test]
+fn parallel_edges_keep_apart() {
+    let (notes, board) = board_of(
+        &[("Client", (250.0, 300.0)), ("Server", (900.0, 300.0))],
+        &[
+            (0, 1, "REST", false),
+            (0, 1, "gRPC", false),
+            (1, 0, "events", false),
+            (0, 1, "Shared schema between both", true),
+        ],
+    );
+    let scene = build_scene(&board, &notes);
+    assert_eq!(scene.routes.len(), 4);
+    // no two edges run along each other closer than a track apart, and no two
+    // share an end point on a card
+    for (i, a) in scene.routes.iter().enumerate() {
+        for b in scene.routes.iter().skip(i + 1) {
+            for s in a.points.windows(2) {
+                for t in b.points.windows(2) {
+                    let hz = |w: &[(f64, f64)]| (w[0].1 - w[1].1).abs() < 0.5;
+                    let vt = |w: &[(f64, f64)]| (w[0].0 - w[1].0).abs() < 0.5;
+                    let overlap = |a0: f64, a1: f64, b0: f64, b1: f64| {
+                        a0.max(a1).min(b0.max(b1)) - a0.min(a1).max(b0.min(b1))
+                    };
+                    if hz(s) && hz(t) && (s[0].1 - t[0].1).abs() < 12.0 {
+                        assert!(
+                            overlap(s[0].0, s[1].0, t[0].0, t[1].0) <= 0.0,
+                            "{a:?} {b:?}"
+                        );
+                    }
+                    if vt(s) && vt(t) && (s[0].0 - t[0].0).abs() < 12.0 {
+                        assert!(
+                            overlap(s[0].1, s[1].1, t[0].1, t[1].1) <= 0.0,
+                            "{a:?} {b:?}"
+                        );
+                    }
+                }
+            }
+            for p in [a.points[0], *a.points.last().unwrap()] {
+                for q in [b.points[0], *b.points.last().unwrap()] {
+                    assert!((p.0 - q.0).abs() + (p.1 - q.1).abs() >= 24.0, "{p:?} {q:?}");
+                }
+            }
+        }
+    }
+    assert!(scene.edges.iter().all(|e| e.label.is_some()));
+    assert_clean(&notes, &board, &scene);
+}
+
+#[test]
+fn a_label_on_a_vertical_edge_sits_beside_it() {
+    let (notes, board) = board_of(
+        &[("Frontend", (600.0, 200.0)), ("Backend", (600.0, 700.0))],
+        &[(0, 1, "GraphQL", false)],
+    );
+    let scene = build_scene(&board, &notes);
+    let e = &scene.edges[0];
+    let pts = path_points(&e.d);
+    assert_eq!(pts.len(), 2, "{}", e.d);
+    let x = pts[0].0;
+    assert!((pts[1].0 - x).abs() < 0.5, "vertical: {}", e.d);
+    let l = e.label.as_ref().unwrap().r;
+    // beside the line, not across it, close to it, and within its extent
+    assert!(l.x + l.w <= x - 4.0 || l.x >= x + 4.0, "{l:?} {x}");
+    assert!(
+        (l.x + l.w - x).abs() <= 8.0 || (l.x - x).abs() <= 8.0,
+        "{l:?} {x}"
+    );
+    let (y0, y1) = (pts[0].1.min(pts[1].1), pts[0].1.max(pts[1].1));
+    assert!(l.y >= y0 && l.y + l.h <= y1, "{l:?} {y0} {y1}");
+    assert!(e.leader.is_none());
+    assert_clean(&notes, &board, &scene);
+}
+
+#[test]
+fn a_dense_board_routes_every_edge_around_the_cards() {
+    let names = [
+        "Web", "Mobile", "Admin", "Partner", "Gateway", "Auth", "Billing", "Search", "Orders",
+        "Ledger", "Index", "Archive",
+    ];
+    let cards: Vec<(&str, (f64, f64))> = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            (
+                *n,
+                (
+                    150.0 + 400.0 * (i % 4) as f64,
+                    150.0 + 300.0 * (i / 4) as f64,
+                ),
+            )
+        })
+        .collect();
+    let links = [
+        (0, 4, "HTTPS", false),
+        (1, 4, "HTTPS", false),
+        (2, 4, "", false),
+        (3, 4, "webhook", false),
+        (4, 5, "token", false),
+        (4, 6, "", false),
+        (4, 7, "query", false),
+        (4, 8, "", false),
+        (5, 9, "", false),
+        (6, 9, "entries", false),
+        (8, 9, "", false),
+        (7, 10, "", false),
+        (10, 11, "", false),
+        (0, 11, "exports", true),
+        (3, 8, "", false),
+        (1, 10, "offline sync of cached data", true),
+        (2, 9, "", false),
+        (11, 5, "", false),
+        (6, 8, "", false),
+        (0, 3, "", false),
+    ];
+    let (notes, board) = board_of(&cards, &links);
+    let scene = build_scene(&board, &notes);
+    assert_eq!(scene.routes.len(), links.len());
+    assert_clean(&notes, &board, &scene);
+}
+
+/// Validation names an edge through a card and a label an edge runs through;
+/// an edge drawn straight for want of a route is a warning, not a failure.
+#[test]
+fn validation_fails_edges_through_cards_and_crossed_labels() {
+    let (notes, board) = inputs();
+    let clean = build_scene(&board, &notes);
+    assert!(
+        edge_defects(&clean).is_empty(),
+        "{:?}",
+        edge_defects(&clean)
+    );
+
+    // a route through a card that is not one of its ends
+    let mut scene = clean.clone();
+    let i = scene
+        .routes
+        .iter()
+        .position(|r| r.src != scene.cards[0].id && r.dst != scene.cards[0].id)
+        .unwrap();
+    let c = scene.cards[0].r;
+    scene.routes[i].points = vec![
+        (c.x - 50.0, c.y + c.h / 2.0),
+        (c.x + c.w + 50.0, c.y + c.h / 2.0),
+    ];
+    let d = edge_defects(&scene);
+    assert!(d.iter().any(|m| m.contains("runs through card")), "{d:?}");
+    let env = glassrip_render::svg::environment();
+    let text = glassrip_render::svg::render_svg(&env, &scene).unwrap();
+    let (checks, _) = glassrip_render::svg::validate_svg(&text, &scene, &bundled_fonts());
+    assert!(!checks.ok);
+    // the same line flagged as a fallback is left to the warning
+    scene.routes[i].fallback = true;
+    assert!(edge_defects(&scene)
+        .iter()
+        .all(|m| !m.contains("runs through card")));
+
+    // a label moved onto its own edge
+    let mut scene = clean.clone();
+    let k = scene.edges.iter().position(|e| e.label.is_some()).unwrap();
+    let (p, q) = (scene.routes[k].points[0], scene.routes[k].points[1]);
+    let l = scene.edges[k].label.as_mut().unwrap();
+    l.r.x = (p.0 + q.0) / 2.0 - l.r.w / 2.0;
+    l.r.y = (p.1 + q.1) / 2.0 - l.r.h / 2.0;
+    let d = edge_defects(&scene);
+    assert!(
+        d.iter().any(|m| m.ends_with("is crossed by its own edge")),
+        "{d:?}"
+    );
+}
+
+/// A history note ("moved from ...") sits right next to its owner pill.
+#[test]
+fn a_history_note_sits_next_to_its_owner_pill() {
+    let (notes, board) = inputs();
+    let scene = build_scene(&board, &notes);
+    let note = scene
+        .blocking
+        .iter()
+        .find(|(n, _)| n.starts_with("note "))
+        .map(|(_, r)| *r)
+        .expect("the moved-from note is on the board");
+    let gap = |a: &R, b: &R| {
+        let dx = (b.x - (a.x + a.w)).max(a.x - (b.x + b.w)).max(0.0);
+        let dy = (b.y - (a.y + a.h)).max(a.y - (b.y + b.h)).max(0.0);
+        dx.max(dy)
+    };
+    let nearest = scene
+        .pills
+        .iter()
+        .filter(|p| p.fill == "#16a34a")
+        .map(|p| gap(&p.r, &note))
+        .fold(f64::INFINITY, f64::min);
+    assert!(nearest <= 10.0, "{nearest} {note:?}");
+    // no leader needed
+    assert!(scene.leaders.iter().all(|l| {
+        let (x, y) = (l.0, l.1);
+        !(x >= note.x - 1.0
+            && x <= note.x + note.w + 1.0
+            && y >= note.y - 1.0
+            && y <= note.y + note.h + 1.0)
+    }));
 }
