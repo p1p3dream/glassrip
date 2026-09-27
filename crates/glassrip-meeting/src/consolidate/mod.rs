@@ -907,13 +907,46 @@ pub fn consolidate(
 }
 
 /// [`consolidate`] with pixel evidence about the keyframes' canvases.
+///
+/// A connector read only at fragments of an element keeps that element a node
+/// only when the edge builder draws one of its edges. Whether it does depends on
+/// evidence gathered after the kind decision (coverage, corridor probes, removal
+/// intervals), so the builder's own result decides: when an element kept a node
+/// only by fragment connectors ends with no edge, the board is consolidated
+/// again with that protection withdrawn. Withdrawing it only removes edges that
+/// were not drawn, so a second pass is the last.
 pub fn consolidate_with_probe(
-    mut frames: Vec<BoardFrame>,
+    frames: Vec<BoardFrame>,
     board_id: &str,
     params: &ConsolidationParams,
     hooks: &Hooks<'_>,
     probe: Option<&dyn RegionProbe>,
 ) -> BoardStateItem {
+    let (state, orphaned) = consolidate_pass(
+        frames.clone(),
+        board_id,
+        params,
+        hooks,
+        probe,
+        &BTreeSet::new(),
+    );
+    if orphaned.is_empty() {
+        return state;
+    }
+    consolidate_pass(frames, board_id, params, hooks, probe, &orphaned).0
+}
+
+/// One consolidation. Tracks in `withdrawn` are not kept nodes by connectors read
+/// at their fragments. Returns the state and the tracks a fragment connector kept
+/// a node that carry no drawn edge.
+fn consolidate_pass(
+    mut frames: Vec<BoardFrame>,
+    board_id: &str,
+    params: &ConsolidationParams,
+    hooks: &Hooks<'_>,
+    probe: Option<&dyn RegionProbe>,
+    withdrawn: &BTreeSet<usize>,
+) -> (BoardStateItem, BTreeSet<usize>) {
     let corroborator = hooks.corroborator;
     frames.sort_by(|a, b| a.t_rep_s.total_cmp(&b.t_rep_s));
     let n = frames.len();
@@ -1335,9 +1368,10 @@ pub fn consolidate_with_probe(
     // node. One read at a fragment reaches the element through the redirect the
     // edges take (section 4): it keeps the element a node when that edge, between
     // the resolved ends, was read in at least `min_support_keyframes` keyframes
-    // (what an edge needs to be kept). A connector the state would draw is then
-    // never lost to its end's kind, and one it would drop anyway cannot turn a
-    // marked sticky into a node.
+    // (necessary for an edge to be kept) and the edge builder draws an edge at the
+    // element (checked at the end, see `consolidate_with_probe`). A connector the
+    // state draws is then never lost to its end's kind, and one it drops cannot
+    // turn a marked sticky into a node.
     let mut edge_ends: HashSet<usize> = HashSet::new();
     let mut via_fragment: BTreeMap<(usize, usize), (BTreeSet<usize>, BTreeSet<usize>)> =
         BTreeMap::new();
@@ -1367,11 +1401,17 @@ pub fn consolidate_with_probe(
             }
         }
     }
+    let mut fragment_ends: BTreeSet<usize> = BTreeSet::new();
     for (read_in, ends) in via_fragment.values() {
         if read_in.len() >= params.min_support_keyframes {
-            edge_ends.extend(ends.iter().copied());
+            fragment_ends.extend(
+                ends.iter()
+                    .copied()
+                    .filter(|t| !edge_ends.contains(t) && !withdrawn.contains(t)),
+            );
         }
     }
+    edge_ends.extend(fragment_ends.iter().copied());
     for ti in node_track.values_mut() {
         *ti = resolve(*ti);
     }
@@ -2931,8 +2971,18 @@ pub fn consolidate_with_probe(
         .collect();
     nodes.retain(|n| !heading_ids.contains(&n.id));
     stickies.retain(|s| !heading_ids.contains(&s.id));
+    // Nodes kept only by fragment connectors whose edges were not drawn.
+    let orphaned: BTreeSet<usize> = fragment_ends
+        .iter()
+        .copied()
+        .filter(|t| {
+            node_id.get(t).is_some_and(|id| {
+                nodes.iter().any(|n| &n.id == id) && !edges.iter().any(|e| &e.a == id || &e.b == id)
+            })
+        })
+        .collect();
 
-    BoardStateItem {
+    let state = BoardStateItem {
         board_id: board_id.to_string(),
         board_title: titles.board_title(),
         groups,
@@ -2959,7 +3009,8 @@ pub fn consolidate_with_probe(
         rejected_owner_tags,
         events,
         suppressed_events,
-    }
+    };
+    (state, orphaned)
 }
 
 /// Keyframes where an edge's direction flips: per-keyframe decisions (pixel first,

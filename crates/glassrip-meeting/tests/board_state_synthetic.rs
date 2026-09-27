@@ -3757,3 +3757,44 @@ fn a_connector_read_once_at_a_fragment_does_not_keep_a_marked_element_a_node() {
         .iter()
         .any(|x| x.text == "Pilot milestone in May" && x.kind == StickyKind::Milestone));
 }
+
+/// Codex r5 fix round 3: two fragment-connector sightings met the keyframe
+/// count, but lying far apart they fail the edge's density rule, so no edge was
+/// drawn while the milestone was still kept a node.
+#[test]
+fn far_apart_fragment_connectors_that_draw_no_edge_leave_a_marked_element_a_sticky() {
+    // 25 keyframes: "Pilot milestone in May" whole everywhere but keyframes 2 and
+    // 24, which read its fragment with a connector from Queue; two sightings over
+    // 23 keyframes are below the support density, so the edge is not drawn.
+    let mut specs: Vec<Spec> = (0..25).map(|_| base()).collect();
+    for (i, s) in specs.iter_mut().enumerate() {
+        if i != 2 && i != 24 {
+            s.nodes
+                .push(("n8", "Pilot milestone in May".into(), (200.0, 450.0)));
+        } else {
+            s.nodes
+                .push(("n8", "Pilot milestone".into(), (280.0, 450.0)));
+            s.edges.push(("n2", "n8", ""));
+        }
+    }
+    let s = run(frames(&specs), &params());
+    assert!(
+        !s.edges
+            .iter()
+            .any(|e| e.a_text.starts_with("Pilot milestone")
+                || e.b_text.starts_with("Pilot milestone")),
+        "{:#?}",
+        s.edges
+    );
+    assert!(
+        !s.nodes
+            .iter()
+            .any(|n| n.text.starts_with("Pilot milestone")),
+        "{:?}",
+        node_texts(&s)
+    );
+    assert!(s
+        .stickies
+        .iter()
+        .any(|x| x.text == "Pilot milestone in May" && x.kind == StickyKind::Milestone));
+}

@@ -60,9 +60,12 @@ pub struct BoardValidateParams {
     pub participant_similarity: f64,
     /// Edge label at least this similar to a sticky text is cleared.
     pub label_sticky_similarity: f64,
-    /// The run's consensus quorum (`board_read.min_agree` capped at `reads`): a
-    /// consensus reading recorded with a lower `min_agree` (board_read before
-    /// version 11 lowered it to the reads that answered) is refused.
+    /// The run's consensus quorum (`board_read.min_agree` capped at the run's
+    /// `reads`): a reading voted on fewer reads (a consensus log with a lower
+    /// `min_agree`, as board_read before 11 wrote when it lowered the vote to the
+    /// reads that answered, or a reading from a run with fewer reads), or a single
+    /// unvoted read when the quorum is above one, is refused. The bar is the run's,
+    /// never the reused reading's own read count.
     pub consensus_quorum: u32,
 }
 
@@ -393,8 +396,15 @@ pub fn validate_reading(
     anchors: &[(String, BBox)],
     p: &BoardValidateParams,
 ) -> Result<BoardValidateItem, ErrorInfo> {
+    let quorum = p.consensus_quorum.max(1);
+    if reading.consensus.is_none() && quorum > 1 {
+        return Err(invalid(format!(
+            "keyframe {}: a single unvoted reading does not meet the run's consensus quorum \
+             of {quorum} (rerun board_read)",
+            reading.keyframe_id
+        )));
+    }
     if let Some(c) = &reading.consensus {
-        let quorum = p.consensus_quorum.clamp(1, c.reads.max(1));
         if c.low_confidence || c.min_agree < quorum || (c.answered.len() as u32) < c.min_agree {
             return Err(invalid(format!(
                 "keyframe {}: a consensus reading kept on {} of {} reads without a quorum is \
@@ -610,7 +620,10 @@ impl Stage for BoardValidateStage {
         // 3: a reading voted below the run's quorum (`consensus_quorum`) fails
         // too; outputs of 2 may hold one, or a label version 2 as first
         // committed did not yet clear.
-        3
+        // 4: the quorum is the run's, not capped at the reused reading's own read
+        // count, and a single unvoted reading fails under a quorum above one;
+        // outputs of 3 may hold a reading from a run with fewer reads.
+        4
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
@@ -759,6 +772,14 @@ mod tests {
         img
     }
 
+    /// A run of one greedy read per keyframe: no vote, quorum one.
+    fn single_read_params() -> BoardValidateParams {
+        BoardValidateParams {
+            consensus_quorum: 1,
+            ..BoardValidateParams::default()
+        }
+    }
+
     fn reading(result: BoardReading) -> BoardReadingItem {
         BoardReadingItem {
             keyframe_id: "k".into(),
@@ -847,6 +868,28 @@ mod tests {
             run(lowered).is_ok(),
             "quorum 2: two agreeing reads are voted"
         );
+        // Codex r5 fix round 3: a two-read reading, reused after the run was
+        // reconfigured to three reads and min_agree 3, passed because the
+        // quorum was capped at the reading's own two reads.
+        let two_reads = crate::artifacts::ConsensusLog {
+            reads: 2,
+            answered: vec![0, 1],
+            min_agree: 2,
+            low_confidence: false,
+            ..log.clone()
+        };
+        let mut r = reading(out.clone());
+        r.consensus = Some(two_reads);
+        assert!(validate_reading(&r, &board_image(), &[], &[], &three).is_err());
+        // A single unvoted read under a quorum above one is refused too; under
+        // a quorum of one it is validated.
+        let single = reading(out.clone());
+        assert!(validate_reading(&single, &board_image(), &[], &[], &three).is_err());
+        let one = BoardValidateParams {
+            consensus_quorum: 1,
+            ..BoardValidateParams::default()
+        };
+        assert!(validate_reading(&single, &board_image(), &[], &[], &one).is_ok());
         // A voted reading (two of three answered, quorum two) is validated.
         let voted = crate::artifacts::ConsensusLog {
             answered: vec![0, 2],
@@ -992,7 +1035,7 @@ mod tests {
             &board_image(),
             &["Adaline Quill".to_string()],
             &[],
-            &BoardValidateParams::default(),
+            &single_read_params(),
         )
         .unwrap();
         let nodes: Vec<&str> = v.board.nodes.iter().map(|n| n.text.as_str()).collect();
@@ -1058,7 +1101,7 @@ mod tests {
             &board_image(),
             &["Ada Quill".to_string(), "Bo Tran".to_string()],
             &[],
-            &BoardValidateParams::default(),
+            &single_read_params(),
         )
         .unwrap();
         let owners: Vec<&str> = v
@@ -1115,7 +1158,7 @@ mod tests {
             &img,
             &["Ada Quill".to_string()],
             &anchors,
-            &BoardValidateParams::default(),
+            &single_read_params(),
         )
         .unwrap();
         assert!(v.board.nodes.is_empty(), "{:?}", v.membership);

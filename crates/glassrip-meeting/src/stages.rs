@@ -1216,7 +1216,11 @@ impl Stage for BoardStateStage {
         // 11: that fragment connector needs keyframe support (`min_support_keyframes`
         // keyframes) to keep its element a node; outputs of 10 may hold a marked
         // sticky made a node by a connector read once at a fragment.
-        11
+        // 12: a fragment connector keeps its element a node only when the edge
+        // builder draws an edge at it (the board is consolidated again without that
+        // protection otherwise); outputs of 11 may hold a marked sticky made a node
+        // by fragment connectors whose edge failed the support density.
+        12
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {

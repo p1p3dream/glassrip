@@ -293,6 +293,10 @@ async fn run_branch_with(
             None,
         ),
         canvas: CanvasCropStage::new(CanvasCropParams::default()),
+        board_validate: BoardValidateStage::new(BoardValidateParams {
+            consensus_quorum: board_read.consensus.quorum(),
+            ..BoardValidateParams::default()
+        }),
         board_read: BoardReadStage::new(
             board_read,
             Arc::clone(&monitor),
@@ -300,7 +304,6 @@ async fn run_branch_with(
             None,
             None,
         ),
-        board_validate: BoardValidateStage::new(BoardValidateParams::default()),
     };
     let reports = branch.run(&mut runner, None).await;
     if let Ok(r) = &reports {
