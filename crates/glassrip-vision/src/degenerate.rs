@@ -969,7 +969,7 @@ mod tests {
         for k in 0..28 {
             r.nodes.push(node(
                 &format!("n{}", 8 + k),
-                "Mobile App",
+                "Kiosk App",
                 600.0 + f64::from(k) * 4.0,
                 500.0,
             ));
@@ -984,10 +984,7 @@ mod tests {
             bbox: bb(800.0, 600.0),
         }];
         // OCR reads the real box once, at the 5th copy's place.
-        let anchors = vec![
-            span("Mobile App", 616.0, 500.0),
-            span("Service 0", 0.0, 0.0),
-        ];
+        let anchors = vec![span("Kiosk App", 616.0, 500.0), span("Service 0", 0.0, 0.0)];
         (r, anchors)
     }
 
@@ -999,14 +996,14 @@ mod tests {
         let rep = &f.repeated[0];
         assert_eq!(
             (rep.list, rep.text.as_str(), rep.count, rep.supported),
-            (ElementList::Nodes, "mobile app", 28, 1)
+            (ElementList::Nodes, "kiosk app", 28, 1)
         );
         let (after, done) = collapse(r, &anchors, &frame(), &p());
         assert_eq!(after.nodes.len(), 8);
         let app: Vec<&BoardNode> = after
             .nodes
             .iter()
-            .filter(|n| n.text == "Mobile App")
+            .filter(|n| n.text == "Kiosk App")
             .collect();
         assert_eq!(app.len(), 1);
         assert_eq!(app[0].local_id, "n12", "the OCR-backed copy is kept");
@@ -1021,7 +1018,7 @@ mod tests {
             done,
             vec![CollapsedText {
                 list: ElementList::Nodes,
-                text: "mobile app".into(),
+                text: "kiosk app".into(),
                 before: 28,
                 after: 1,
                 evidence: vec![Fabrication::Piled],
@@ -1037,7 +1034,7 @@ mod tests {
         let app: Vec<&BoardNode> = after
             .nodes
             .iter()
-            .filter(|n| n.text == "Mobile App")
+            .filter(|n| n.text == "Kiosk App")
             .collect();
         assert_eq!(app.len(), 1);
         assert_eq!(app[0].local_id, "n8");
@@ -1275,7 +1272,7 @@ mod tests {
         let f = detect(&r, &anchors, &p()).expect("degenerate");
         assert_eq!(
             f.to_string(),
-            "Nodes \"mobile app\" x28 of 35 (1 OCR-backed)"
+            "Nodes \"kiosk app\" x28 of 35 (1 OCR-backed)"
         );
     }
 
@@ -1488,7 +1485,7 @@ mod tests {
             let x = 565.0 + f64::from(k) * 135.0;
             r.nodes.push(BoardNode {
                 local_id: format!("n{}", k + 3),
-                text: "Mobile App".into(),
+                text: "Kiosk App".into(),
                 bbox: BBox::new(x, 255.0, x + 80.0, 295.0),
                 conf: 0.9,
             });

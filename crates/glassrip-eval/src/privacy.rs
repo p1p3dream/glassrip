@@ -7,7 +7,7 @@
 //!    private term, normalized with [`normalize_term`] (NFKC, lowercase,
 //!    collapsed whitespace). Each tracked text file is split into paragraphs
 //!    (runs of non-blank lines, so a term broken across a line wrap is still
-//!    found), tokenized into alphanumeric words, and every 1 to 4 word n-gram is
+//!    found), tokenized into alphanumeric words, and every 1 to 5 word n-gram is
 //!    hashed joined by a space, a hyphen, and an underscore; any hit fails.
 //!    Findings never echo the term.
 //! 2. **Plaintext denylist** (whole worktree; only when the private root is
@@ -48,7 +48,7 @@ pub const HASHED_DENYLIST: &str = "tests/privacy/denylist.sha256";
 /// Allowlist, relative to the repository root.
 pub const ALLOWLIST: &str = "tests/privacy/allowlist.txt";
 /// Longest n-gram checked by the hashed scan.
-pub const MAX_HASHED_NGRAM: usize = 4;
+pub const MAX_HASHED_NGRAM: usize = 5;
 /// Joiners tried for every n-gram.
 pub const JOINERS: [&str; 3] = [" ", "-", "_"];
 
@@ -714,6 +714,30 @@ mod tests {
         assert!(scan_text(p, "quorralabs nimbus_cores", &m, &allow, "h").is_empty());
         // findings never echo the term
         assert!(!wrapped[0].what.contains("sky"));
+    }
+
+    #[test]
+    fn hashed_scan_matches_phrases_up_to_the_ngram_limit() {
+        let list = hashed("alpha bravo charlie delta echo\nkilo lima mike november oscar papa\n");
+        let m = Matcher::Hashed(&list);
+        let allow = Allowlist::default();
+        let p = Path::new("f.md");
+        assert_eq!(MAX_HASHED_NGRAM, 5);
+        // a five-word phrase is found inside a longer sentence, across a wrap
+        let hits = scan_text(
+            p,
+            "so Alpha, bravo charlie\ndelta-echo foxtrot",
+            &m,
+            &allow,
+            "h",
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].line, 1);
+        assert!(hits[0].what.contains("5 word"));
+        // a missing word breaks the phrase
+        assert!(scan_text(p, "alpha bravo delta echo", &m, &allow, "h").is_empty());
+        // a six-word phrase is past the hashed limit (the plaintext scan has none)
+        assert!(scan_text(p, "kilo lima mike november oscar papa", &m, &allow, "h").is_empty());
     }
 
     #[test]

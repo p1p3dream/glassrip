@@ -1367,8 +1367,8 @@ pub struct Sections {
 const DUP_JACCARD: f64 = 0.7;
 
 /// Two items restate one claim: they cite a common id, and the content
-/// words of one (at least two) are all in the other ("Skip the importer for
-/// now" and "Skip the importer for now to focus on the ledger", both citing
+/// words of one (at least two) are all in the other ("Archive the draft on
+/// Friday" and "Archive the draft on Friday after review", both citing
 /// the line that says it), or both are ownership tasks whose owned words are
 /// nested or share two words and differ by at most one on each side ("Own the
 /// Kiosk App", "Work on the Kiosk App"; "Own the kiosk app link", "Work on
@@ -1603,8 +1603,8 @@ mod tests {
             line(
                 "s3",
                 60.0,
-                "I'll see you guys later.",
-                "I'll see you guys later.",
+                "I'll see you folks tomorrow.",
+                "I'll see you folks tomorrow.",
             ),
         ];
         Corpus::new(
@@ -2263,7 +2263,7 @@ mod tests {
         assert_eq!(ok.owners[0].person_id.as_deref(), Some("rohan-dasgupta"));
         a.task = "Backend: the relay".into();
         assert!(check(Section::ActionItems, &a, &c).is_err());
-        a.task = "See you guys later".into();
+        a.task = "See you folks tomorrow".into();
         a.segment_ids = vec!["s3".into()];
         assert!(check(Section::ActionItems, &a, &c).unwrap_err().fatal);
         a.owner = "Everyone and Avery".into();
@@ -2291,13 +2291,13 @@ mod tests {
         let c = corpus();
         let a = check(
             Section::OpenQuestions,
-            &item("Which widgets does the kiosk need?", &["s1"], ""),
+            &item("Which widgets suit the kiosk?", &["s1"], ""),
             &c,
         )
         .unwrap();
         let b = check(
             Section::OpenQuestions,
-            &item("Which widgets does the kiosk need", &["s2"], ""),
+            &item("Which widgets suit the kiosk", &["s2"], ""),
             &c,
         )
         .unwrap();
@@ -2307,9 +2307,9 @@ mod tests {
         use crate::board::build;
         let mut board = build::board("b", 90.0);
         board.stickies = vec![
-            build::sticky("st1", "What widgets do we need for the kiosk?", 5.0, 90.0),
-            build::sticky("st2", "Do we change the badge flow?", 40.0, 90.0),
-            build::sticky("st3", "Clone the lobby page", 41.0, 90.0),
+            build::sticky("st1", "What widgets suit the kiosk?", 5.0, 90.0),
+            build::sticky("st2", "Does the badge flow need edits?", 40.0, 90.0),
+            build::sticky("st3", "Print the lobby maps", 41.0, 90.0),
         ];
         board.events = vec![build::event(
             "ev_1",
@@ -2317,7 +2317,7 @@ mod tests {
             40.0,
             "kf_2",
             "st2",
-            "Do we change the badge flow?",
+            "Does the badge flow need edits?",
         )];
         let added = merge_board_questions(&mut s.open_questions, &[board]);
         assert_eq!(added, 1);

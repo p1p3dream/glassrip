@@ -118,8 +118,8 @@ expression: text
     <rect x="1348" y="657" width="220" height="12" fill="#0891b2"/>
     <text class="heading" x="1360" y="658">Design Kit</text>    <text class="body" x="1360" y="695">Client</text>    <text class="small" x="1360" y="715">On the board from 00:10</text>    <text class="small" x="1360" y="733" style="fill:#b91c1c">Deferred at 00:26</text>  </g>
   <!-- edges -->  <path d="M 182,637 L 182,391" stroke="#0f172a" stroke-width="2" fill="none"/>  <polygon points="182,380 188,391 176,391" fill="#0f172a"/>  <rect x="188" y="500" width="44" height="18" rx="4" fill="#ffffff" stroke="#cbd5e1"/>
-  <text class="edge-label" x="210" y="513" text-anchor="middle">REST</text>  <path d="M 292,314 L 1458,314 L 1458,626" stroke="#7c3aed" stroke-width="1.5" fill="none" stroke-dasharray="6,4"/>  <polygon points="1458,637 1452,626 1464,626" fill="#7c3aed"/>  <rect x="745" y="284" width="260" height="24" rx="6" fill="#ffffff" stroke="#7c3aed"/>
-  <text class="body" x="875" y="300" text-anchor="middle" style="fill:#5b21b6">Links between ledger entries + kit widgets</text>  <path d="M 740,703 L 303,703" stroke="#0f172a" stroke-width="2" fill="none"/>  <polygon points="292,703 303,697 303,709" fill="#0f172a"/>  <rect x="485" y="679" width="62" height="18" rx="4" fill="#ffffff" stroke="#cbd5e1"/>
+  <text class="edge-label" x="210" y="513" text-anchor="middle">REST</text>  <path d="M 292,314 L 1458,314 L 1458,626" stroke="#7c3aed" stroke-width="1.5" fill="none" stroke-dasharray="6,4"/>  <polygon points="1458,637 1452,626 1464,626" fill="#7c3aed"/>  <rect x="764" y="284" width="222" height="24" rx="6" fill="#ffffff" stroke="#7c3aed"/>
+  <text class="body" x="875" y="300" text-anchor="middle" style="fill:#5b21b6">Sync of ledger entries + kit widgets</text>  <path d="M 740,703 L 303,703" stroke="#0f172a" stroke-width="2" fill="none"/>  <polygon points="292,703 303,697 303,709" fill="#0f172a"/>  <rect x="485" y="679" width="62" height="18" rx="4" fill="#ffffff" stroke="#cbd5e1"/>
   <text class="edge-label" x="516" y="692" text-anchor="middle">GraphQL</text>  <path d="M 960,703 L 1337,703" stroke="#0f172a" stroke-width="2" fill="none"/>  <polygon points="1348,703 1337,709 1337,697" fill="#0f172a"/>
   <!-- owners and badges -->  <rect x="488" y="713" width="57" height="24" rx="12" fill="#16a34a"/>
   <text class="pill-text" x="517" y="729" text-anchor="middle">Rohan</text>  <rect x="740" y="603" width="56" height="24" rx="12" fill="#16a34a"/>
@@ -129,11 +129,11 @@ expression: text
     <rect x="70" y="833" width="220" height="96" rx="6" fill="#fef9c3" stroke="#eab308"/>
     <rect x="70" y="833" width="220" height="24" rx="6" fill="#f59e0b"/>
     <rect x="70" y="849" width="220" height="8" fill="#f59e0b"/>
-    <text class="label" x="82" y="849">OPEN QUESTION</text>    <text class="sticky-text" x="82" y="879">Which widgets do we need</text>    <text class="sticky-text" x="82" y="897">for the kiosk?</text>  </g>  <g filter="url(#shadow-sm)">
+    <text class="label" x="82" y="849">OPEN QUESTION</text>    <text class="sticky-text" x="82" y="879">Which widgets suit the</text>    <text class="sticky-text" x="82" y="897">kiosk?</text>  </g>  <g filter="url(#shadow-sm)">
     <rect x="390" y="833" width="220" height="96" rx="6" fill="#fef9c3" stroke="#eab308"/>
     <rect x="390" y="833" width="220" height="24" rx="6" fill="#f59e0b"/>
     <rect x="390" y="849" width="220" height="8" fill="#f59e0b"/>
-    <text class="label" x="402" y="849">OPEN QUESTION</text>    <text class="sticky-text" x="402" y="879">Do we change the badge</text>    <text class="sticky-text" x="402" y="897">flow?</text>  </g>  <g filter="url(#shadow-sm)">
+    <text class="label" x="402" y="849">OPEN QUESTION</text>    <text class="sticky-text" x="402" y="879">Does the badge flow need</text>    <text class="sticky-text" x="402" y="897">edits?</text>  </g>  <g filter="url(#shadow-sm)">
     <rect x="710" y="833" width="220" height="96" rx="6" fill="#fef9c3" stroke="#eab308"/>
     <rect x="710" y="833" width="220" height="24" rx="6" fill="#6366f1"/>
     <rect x="710" y="849" width="220" height="8" fill="#6366f1"/>
@@ -141,7 +141,7 @@ expression: text
     <rect x="1030" y="833" width="220" height="96" rx="6" fill="#fef9c3" stroke="#eab308"/>
     <rect x="1030" y="833" width="220" height="24" rx="6" fill="#2563eb"/>
     <rect x="1030" y="849" width="220" height="8" fill="#2563eb"/>
-    <text class="label" x="1042" y="849">NOTE</text>    <text class="sticky-text" x="1042" y="879">Clone the lobby page</text>  </g>  <g filter="url(#shadow-sm)">
+    <text class="label" x="1042" y="849">NOTE</text>    <text class="sticky-text" x="1042" y="879">Print the lobby maps</text>  </g>  <g filter="url(#shadow-sm)">
     <rect x="1350" y="833" width="220" height="96" rx="6" fill="#fef9c3" stroke="#eab308"/>
     <rect x="1350" y="833" width="220" height="24" rx="6" fill="#0891b2"/>
     <rect x="1350" y="849" width="220" height="8" fill="#0891b2"/>
@@ -150,6 +150,6 @@ expression: text
     <rect x="40" y="953" width="1560" height="56" rx="10" fill="#fef3c7" stroke="#f59e0b" stroke-width="2"/>
   </g>
   <rect x="56" y="969" width="78" height="24" rx="6" fill="#f59e0b"/>
-  <text class="label" x="95" y="985" text-anchor="middle">DECISION</text>  <text class="body-strong" x="152" y="978">Park the Design Kit links for now and focus on the relay side (00:26 to 00:32)</text>  <text class="small" x="152" y="996" style="fill:#92400e">2 more decisions in the notes</text>  <!-- footer -->
+  <text class="label" x="95" y="985" text-anchor="middle">DECISION</text>  <text class="body-strong" x="152" y="978">Defer Design Kit links until June; focus on the relay side (00:26 to 00:32)</text>  <text class="small" x="152" y="996" style="fill:#92400e">2 more decisions in the notes</text>  <!-- footer -->
   <text class="small" x="820" y="1049" text-anchor="middle">Source: board read from the meeting recording (final state at 01:20); owners from name tags on the board; deferrals and the banner from decisions validated against the transcript.</text>
 </svg>

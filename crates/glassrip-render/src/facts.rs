@@ -337,7 +337,7 @@ mod tests {
     fn deferral_needs_the_verb_close_to_the_component() {
         let b = board();
         let d = vec![decision(
-            "Skip the Acme step for now and focus on the relay side",
+            "Defer Acme integration until June; focus testing on Relay API",
             30.0,
         )];
         let def = deferred_nodes(&b, &d);

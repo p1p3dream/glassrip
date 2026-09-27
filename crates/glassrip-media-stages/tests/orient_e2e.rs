@@ -97,12 +97,12 @@ const GLYPHS: [[&str; 7]; 26] = [
     ], // z
 ];
 
-const TEXT: &str = "the design review for the new home page will start after the team \
-    has read the project notes and the list of open items for this week we want to \
-    share the draft with every member of the board and update the status of each task \
-    before the next meeting so that people know what work is done and what is still \
-    in progress please add your comments to the document and let the group know when \
-    the first version of the mobile app is ready for a test";
+const TEXT: &str = "the museum catalog describes a new exhibit of coastal maps and old \
+    navigation tools each display case has a printed label with the origin and age \
+    of its objects a long hallway connects the galleries while skylights illuminate \
+    the drawings and models visitors can follow the numbered rooms in any order \
+    and compare the changing coastline across several centuries the storage archive \
+    holds more charts that will rotate into the exhibit later this year";
 
 /// A page of text lines drawn with the bitmap font at `scale`.
 fn page(w: u32, h: u32, scale: u32) -> RgbImage {

@@ -1439,8 +1439,8 @@ mod tests {
         ));
         // the head or predicate of a gold is never excused, even when it is light
         assert!(!covers(
-            "Use random ordering for the demo",
-            "Random ordering for the demo",
+            "Use random seating for the offsite",
+            "Random seating for the offsite",
             &v
         ));
         assert!(!covers(
@@ -2206,8 +2206,8 @@ mod tests {
             content_dice("defer the importer", "defer importer now"),
             1.0
         );
-        // {skip, sanity, step} vs {skip, step}: 2*2/5
-        assert!((content_dice("skip the sanity step", "skip that step") - 0.8).abs() < 1e-12);
+        // {skip, backup, step} vs {skip, step}: 2*2/5
+        assert!((content_dice("skip the backup step", "skip that step") - 0.8).abs() < 1e-12);
         // only stopwords on one side: full-text Dice fallback
         assert_eq!(content_dice("it is", "it is"), 1.0);
     }

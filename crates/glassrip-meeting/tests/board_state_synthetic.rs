@@ -1028,7 +1028,7 @@ fn grid_stickies_carry_boxes_and_form_a_group_with_its_heading() {
     let mut fr = frames(&specs);
     for f in &mut fr {
         f.board.other_visible_text.push(TextItem {
-            text: "Things to show first".into(),
+            text: "Ideas to try first".into(),
             bbox: BBox::new(900.0, 350.0, 1150.0, 380.0),
         });
     }
@@ -1052,11 +1052,11 @@ fn grid_stickies_carry_boxes_and_form_a_group_with_its_heading() {
             )
         });
     assert_eq!((g.rows, g.cols), (3, 3));
-    assert_eq!(g.title.as_deref(), Some("Things to show first"));
+    assert_eq!(g.title.as_deref(), Some("Ideas to try first"));
     let first = s.stickies.iter().find(|x| x.id == g.sticky_ids[0]).unwrap();
     assert_eq!(first.text, "Alpha card");
-    assert!(!s.stickies.iter().any(|x| x.text == "Things to show first"));
-    assert!(!s.nodes.iter().any(|x| x.text == "Things to show first"));
+    assert!(!s.stickies.iter().any(|x| x.text == "Ideas to try first"));
+    assert!(!s.nodes.iter().any(|x| x.text == "Ideas to try first"));
 }
 
 #[test]

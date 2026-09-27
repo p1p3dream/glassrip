@@ -31,8 +31,8 @@
 //! The similarity is then the larger of the claim-word Dice coefficient
 //! ([`crate::text::claim_dice`]), which rewards the same wording at the same length,
 //! and containment ([`crate::text::containment`]), which accepts a restatement
-//! inside a longer sentence ("The team decided to skip the importer step for now to
-//! focus on ..." for "skip the importer for now") when the prediction carries at
+//! inside a longer sentence ("The team decided to archive the draft on Friday
+//! after review" for "archive the draft on Friday") when the prediction carries at
 //! most four times as many content words as the gold (repeats counted) and keeps
 //! the gold words together.
 //! When the gold item names a person, the prediction must name the same person.
@@ -207,7 +207,7 @@ mod tests {
                 "Tamsin moves from the importer to the dashboard work",
                 &["Tamsin works on the dashboard instead"],
             ),
-            ga("Ordering can be random for the demo", &[]),
+            ga("Seating can be random for the offsite", &[]),
         ];
         let pred = vec![
             // Dice against the gold text is 0.5; containment is 1.0.
@@ -221,7 +221,7 @@ mod tests {
                 None,
             ),
             p(
-                "For the demo, the ordering of cards can simply be random.",
+                "For the offsite, the seating of guests can simply be random.",
                 None,
             ),
         ];
@@ -387,11 +387,14 @@ mod tests {
         assert!((content_dice("skip importer", "skip importer step") - 0.8).abs() < 1e-12);
         assert!((item_similarity(&gold[0], "skip importer step", &none()) - 1.0).abs() < 1e-12);
         let hits = negative_hits(
-            &["see you later".into()],
-            &[p("I'll see you guys later", None), p("write tests", None)],
+            &["see you tomorrow".into()],
+            &[
+                p("I'll see you folks tomorrow", None),
+                p("write tests", None),
+            ],
             0.6,
         );
-        // content words {see, later} vs {see, guys, later}: 4/5 = 0.8
-        assert_eq!(hits, vec!["I'll see you guys later".to_string()]);
+        // content words {see, tomorrow} vs {see, folks, tomorrow}: 4/5 = 0.8
+        assert_eq!(hits, vec!["I'll see you folks tomorrow".to_string()]);
     }
 }

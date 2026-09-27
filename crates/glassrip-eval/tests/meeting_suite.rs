@@ -62,7 +62,7 @@ fn golden() -> MeetingGolden {
             "decisions": [{"text": "defer the importer"}],
             "action_items": [{"text": "write the parser", "person_id": "jordan"}],
             "open_questions": [{"text": "who owns retries"}],
-            "negative_action_items": ["see you later"],
+            "negative_action_items": ["see you tomorrow"],
             "hotwords": [{"word": "Quorra", "exhaustive": true, "windows": [{"t_start_s": 0.0, "t_end_s": 10.0, "count": 2}]}],
             "speaker_count": 2
         }
@@ -175,7 +175,7 @@ fn meeting_suite_hand_computed() {
                 &["defer importer now", "lunch at noon"],
                 &[
                     (Some("Jordan"), "write the parser"),
-                    (Some("Avery"), "I'll see you guys later"),
+                    (Some("Avery"), "I'll see you folks tomorrow"),
                 ],
                 &["who owns the retries"],
             ),

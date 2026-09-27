@@ -243,15 +243,15 @@ mod tests {
     fn mmss_formats() {
         assert_eq!(mmss(0.0), "00:00");
         assert_eq!(mmss(28.74), "00:28");
-        assert_eq!(mmss(1847.0), "30:47");
+        assert_eq!(mmss(1851.0), "30:51");
         assert_eq!(mmss(3725.0), "1:02:05");
         assert_eq!(mmss(f64::NAN), "00:00");
     }
 
     #[test]
     fn jaccard_of_content_tokens() {
-        let a = content_tokens("Which widgets do we need for the demo?");
-        let b = content_tokens("What widgets does the demo need?");
+        let a = content_tokens("Which fonts do we pick for the menu?");
+        let b = content_tokens("What fonts does the menu pick?");
         assert!(jaccard(&a, &b) > 0.4);
         assert_eq!(jaccard(&[], &[]), 0.0);
     }

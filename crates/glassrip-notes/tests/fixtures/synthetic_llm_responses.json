@@ -1,7 +1,7 @@
 {
   "map": {
     "decisions": [
-      { "text": "Leave the badge flow alone for the pilot", "segment_ids": ["seg_00005"], "event_ids": [], "keyframe_ids": [], "quote": "leave the badge flow alone for the pilot" }
+      { "text": "Freeze the badge flow for the pilot", "segment_ids": ["seg_00005"], "event_ids": [], "keyframe_ids": [], "quote": "freeze the badge flow for the pilot" }
     ],
     "action_items": [
       { "owner": "Rohan", "task": "Design the relay storage schema this week", "segment_ids": ["seg_00007"], "event_ids": [], "keyframe_ids": [], "quote": "design the relay storage schema" }
@@ -16,30 +16,30 @@
   },
   "reduce": {
     "decisions": [
-      { "text": "Leave the badge flow alone for the pilot and focus on the relay side \u2014 badge changes wait", "segment_ids": ["seg_00005"], "event_ids": [], "keyframe_ids": [], "quote": "leave the badge flow alone for the pilot" },
+      { "text": "Freeze the badge flow for the pilot and focus on the relay side \u2014 badge changes wait", "segment_ids": ["seg_00005"], "event_ids": [], "keyframe_ids": [], "quote": "freeze the badge flow for the pilot" },
       { "text": "Rohan pairs with Mira on the relay tests", "segment_ids": ["seg_00008", "seg_00009"], "event_ids": [], "keyframe_ids": [], "quote": "pair with Mira on the relay tests" },
       { "text": "Ship the kiosk to every lobby next month", "segment_ids": ["seg_00042"], "event_ids": [], "keyframe_ids": [], "quote": "ship it next month" }
     ],
     "action_items": [
       { "owner": "Rohan", "task": "Design the relay storage schema this week", "segment_ids": ["seg_00007"], "event_ids": [], "keyframe_ids": [], "quote": "design the relay storage schema" },
-      { "owner": "Mira", "task": "Map ledger entries to kit widgets", "segment_ids": ["seg_00006"], "event_ids": ["EV_OWNERS"], "keyframe_ids": [], "quote": "map entries to kit widgets" },
+      { "owner": "Mira", "task": "Connect ledger records to kit widgets", "segment_ids": ["seg_00006"], "event_ids": ["EV_OWNERS"], "keyframe_ids": [], "quote": "connect ledger records to the kit widgets" },
       { "owner": "Rohan", "task": "Pair with Mira on the relay tests", "segment_ids": ["seg_00009"], "event_ids": [], "keyframe_ids": [], "quote": "" },
-      { "owner": "everyone", "task": "Publish each build to the tracker, even if it is rough", "segment_ids": ["seg_00011"], "event_ids": [], "keyframe_ids": [], "quote": "publish each build to the tracker" },
-      { "owner": "Mira", "task": "See you all later", "segment_ids": ["seg_00012"], "event_ids": [], "keyframe_ids": [], "quote": "" },
+      { "owner": "everyone", "task": "Publish each build to the tracker, even if it is unfinished", "segment_ids": ["seg_00011"], "event_ids": [], "keyframe_ids": [], "quote": "publish each build to the tracker" },
+      { "owner": "Mira", "task": "See you on Monday", "segment_ids": ["seg_00012"], "event_ids": [], "keyframe_ids": [], "quote": "" },
       { "owner": "Avery", "task": "Backend: relay side", "segment_ids": ["seg_00005"], "event_ids": [], "keyframe_ids": [], "quote": "" }
     ],
     "open_questions": [
-      { "text": "Which widgets does the kiosk need?", "segment_ids": ["seg_00010"], "event_ids": [], "keyframe_ids": ["KF_WIDGETS"], "quote": "Which widgets do we need for the kiosk" },
-      { "text": "Do we have to change anything in the badge flow?", "segment_ids": ["seg_00004"], "event_ids": ["EV_BADGE_Q"], "keyframe_ids": [], "quote": "change anything in the badge flow" }
+      { "text": "Which widgets suit the kiosk?", "segment_ids": ["seg_00010"], "event_ids": [], "keyframe_ids": ["KF_WIDGETS"], "quote": "Which widgets suit the kiosk" },
+      { "text": "Does the badge flow need edits?", "segment_ids": ["seg_00004"], "event_ids": ["EV_BADGE_Q"], "keyframe_ids": [], "quote": "Does the badge flow need edits" }
     ],
     "timeline": [
       { "text": "Avery walks through the relay, ledger and kiosk architecture", "segment_ids": ["seg_00000", "seg_00003"], "event_ids": ["EV_KIOSK"], "keyframe_ids": [] },
-      { "text": "Owners are assigned and the badge flow is left alone", "segment_ids": ["seg_00005", "seg_00006", "seg_00007"], "event_ids": ["EV_OWNERS"], "keyframe_ids": [] },
+      { "text": "Owners are assigned and the badge flow is frozen", "segment_ids": ["seg_00005", "seg_00006", "seg_00007"], "event_ids": ["EV_OWNERS"], "keyframe_ids": [] },
       { "text": "Pairing, open widget question and wrap-up", "segment_ids": ["seg_00008", "seg_00010", "seg_00011"], "event_ids": ["EV_MOVE"], "keyframe_ids": [] }
     ],
     "summary": [
       { "text": "The pilot focuses on the relay side; the badge flow stays as it is", "segment_ids": ["seg_00005"], "event_ids": [], "keyframe_ids": [] },
-      { "text": "Rohan owns the relay storage schema and Mira maps ledger entries to kit widgets", "segment_ids": ["seg_00006", "seg_00007"], "event_ids": ["EV_OWNERS"], "keyframe_ids": [] },
+      { "text": "Rohan owns the relay storage schema and Mira connects ledger records to kit widgets", "segment_ids": ["seg_00006", "seg_00007"], "event_ids": ["EV_OWNERS"], "keyframe_ids": [] },
       { "text": "Which kiosk widgets to build is still open", "segment_ids": ["seg_00010"], "event_ids": [], "keyframe_ids": ["KF_WIDGETS"] }
     ]
   },

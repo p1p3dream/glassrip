@@ -714,7 +714,7 @@ fn a_long_relation_label_between_touching_cards_is_placed_clear() {
         .find(|e| {
             e.label
                 .as_ref()
-                .is_some_and(|l| l.text.text.starts_with("Links between"))
+                .is_some_and(|l| l.text.text.starts_with("Sync of"))
         })
         .expect("the relation label is drawn");
     if let Some((x1, y1, x2, y2)) = e.leader {
@@ -848,7 +848,7 @@ fn board_text_with_css_like_words_passes_the_style_check() {
 fn em_dashes_in_board_text_are_sanitized() {
     let (notes, mut board) = inputs();
     // real boards carry titles like "Name \u{2014} Subtitle"
-    board.nodes[0].text = "Relay API \u{2014} Hackathon".into();
+    board.nodes[0].text = "Relay API \u{2014} Pilot".into();
     let dir = tempfile::tempdir().unwrap();
     let r = render_all(&notes, &[board], &params(dir.path().to_path_buf())).unwrap();
     let (_, svg) = &r.svg[0];

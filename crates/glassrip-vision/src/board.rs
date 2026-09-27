@@ -1026,10 +1026,7 @@ mod tests {
 
     #[test]
     fn edge_label_words_and_label_boxes() {
-        assert_eq!(
-            label_words("Links between Quarry content + Frontend component"),
-            6
-        );
+        assert_eq!(label_words("Quarry records + Widget panel sync map"), 6);
         assert_eq!(label_words("a - b"), 2);
         let mut out = empty_output();
         out.nodes = vec![
@@ -1040,14 +1037,10 @@ mod tests {
         let mut long = edge(
             "n1",
             "n2",
-            "Links between Quarry content + Frontend component, v2 draft notes",
+            "Quarry records + Widget panel sync map, v2 draft notes",
         );
         long.label_bbox = Some(BBox::new(300.0, 90.0, 700.0, 110.0));
-        let mut kept = edge(
-            "n1",
-            "n3",
-            "Links between Quarry content + Frontend component",
-        );
+        let mut kept = edge("n1", "n3", "Quarry records + Widget panel sync map");
         // Inverted label box, repairable (axis-order swap).
         kept.label_bbox = Some(BBox::new(300.0, 1000.0, 400.0, 420.0));
         let mut none = edge("n2", "n3", "");
@@ -1056,10 +1049,7 @@ mod tests {
         let v = validate_board(out, CANVAS, &cfg());
         assert_eq!(v.edges.len(), 3);
         assert!(v.edges[0].label.is_empty() && v.edges[0].label_bbox.is_none());
-        assert_eq!(
-            v.edges[1].label,
-            "Links between Quarry content + Frontend component"
-        );
+        assert_eq!(v.edges[1].label, "Quarry records + Widget panel sync map");
         assert_eq!(
             v.edges[1].label_bbox,
             Some(BBox::new(300.0, 400.0, 1000.0, 420.0))

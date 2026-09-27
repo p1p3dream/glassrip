@@ -48,7 +48,7 @@ const EDGES: [(&str, &str, &str, EdgeStyle, usize); 4] = [
     (
         "n_ledger",
         "n_kit",
-        "Links between ledger entries + kit widgets",
+        "Sync of ledger entries + kit widgets",
         EdgeStyle::Dashed,
         4,
     ),
@@ -56,14 +56,10 @@ const EDGES: [(&str, &str, &str, EdgeStyle, usize); 4] = [
 
 /// Stickies: (text, center, first keyframe).
 const STICKIES: [(&str, (f64, f64), usize); 5] = [
-    (
-        "Which widgets do we need for the kiosk?",
-        (1400.0, 180.0),
-        1,
-    ),
-    ("Do we change the badge flow?", (550.0, 780.0), 2),
+    ("Which widgets suit the kiosk?", (1400.0, 180.0), 1),
+    ("Does the badge flow need edits?", (550.0, 780.0), 2),
     ("Idea: visitors pick their badge color", (850.0, 780.0), 4),
-    ("Clone the lobby page", (1100.0, 780.0), 4),
+    ("Print the lobby maps", (1100.0, 780.0), 4),
     ("Pilot milestone in May", (1350.0, 780.0), 4),
 ];
 
