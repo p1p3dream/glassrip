@@ -11,8 +11,14 @@
 //! An edge leaves its source and enters its target perpendicular to one of the
 //! card's sides, at a port spaced from the other ports on that side; the side
 //! is the route's choice. Soft obstacles (zone titles and badges) are avoided
-//! when a route exists without them. When no route exists at all, the edge is
-//! drawn straight between the cards' borders and flagged as a fallback.
+//! when a route exists without them. When the grid finds no route (none
+//! exists, or the board is too dense to search), the edge is flagged as a
+//! fallback and drawn by a cheap detour: the straight line between the cards'
+//! borders, an L or Z of axis-aligned segments between the middles of their
+//! sides, or a path out to a ring around the architecture, along it and back
+//! in, whichever is shortest and clear of every card. With no clear detour it
+//! is drawn straight, and validation fails it for the card it crosses; a clear
+//! fallback is a warning.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -49,7 +55,8 @@ const PORT_INSET: f64 = 18.0;
 const MAX_AXIS: usize = 480;
 /// Hard limit of lines per grid axis: a board whose cards alone need more is
 /// not searched (bounded memory and time); its edges are drawn as declared
-/// fallbacks, which validation reports as warnings.
+/// fallbacks by [`Router::detour`] (linear in the cards), which validation
+/// reports as warnings unless one runs through a card.
 const MAX_GRID_AXIS: usize = 800;
 /// Distance of the ring lines around the architecture.
 const RING: [f64; 2] = [40.0, 80.0];
@@ -123,7 +130,8 @@ impl Side {
 pub struct Routed {
     /// Polyline from the source's border to the target's border.
     pub points: Vec<Pt>,
-    /// No orthogonal route existed: a straight line between the borders.
+    /// The grid found no route: a cheap detour, or a straight line between the
+    /// borders when no detour keeps clear of the cards.
     pub fallback: bool,
 }
 
@@ -377,10 +385,12 @@ impl Router {
                         (ra.cx(), ra.y),
                     ]
                 } else {
-                    vec![
-                        border_toward(&ra, (rb.cx(), rb.cy())),
-                        border_toward(&rb, (ra.cx(), ra.cy())),
-                    ]
+                    self.detour(a, b).unwrap_or_else(|| {
+                        vec![
+                            border_toward(&ra, (rb.cx(), rb.cy())),
+                            border_toward(&rb, (ra.cx(), ra.cy())),
+                        ]
+                    })
                 };
                 Routed {
                     points,
@@ -392,6 +402,152 @@ impl Router {
             self.segs.push((w[0], w[1]));
         }
         routed
+    }
+
+    /// The box around every card, when there is one.
+    fn extent(&self) -> Option<R> {
+        let first = self.cards.first()?;
+        Some(self.cards.iter().fold(*first, |u, r| {
+            let x = u.x.min(r.x);
+            let y = u.y.min(r.y);
+            R {
+                x,
+                y,
+                w: u.right().max(r.right()) - x,
+                h: u.bottom().max(r.bottom()) - y,
+            }
+        }))
+    }
+
+    /// A cheap route from card `a` to card `b` (`a != b`) for an edge the grid
+    /// could not route: the straight line between the borders, one-bend (L)
+    /// and two-bend (Z) axis-aligned paths between the middles of the cards'
+    /// sides, and paths from a side out to the first ring around the
+    /// architecture, along it (either way round) and in to a side. The
+    /// shortest (plus [`BEND`] per bend) that stays inside the bounds and out
+    /// of every card wins, preferring one that keeps [`CLEAR`] from the other
+    /// cards; `None` when every one crosses a card. Linear in the cards per
+    /// candidate (at most 49), with no grid, so it runs where the search would
+    /// not.
+    fn detour(&self, a: usize, b: usize) -> Option<Vec<Pt>> {
+        let (ra, rb) = (*self.cards.get(a)?, *self.cards.get(b)?);
+        let mid = |s: Side, r: &R| match s {
+            Side::Top | Side::Bottom => s.port(r, r.cx()),
+            Side::Left | Side::Right => s.port(r, r.cy()),
+        };
+        let across = |s: Side| matches!(s, Side::Left | Side::Right);
+        let mut cands: Vec<Vec<Pt>> = vec![vec![
+            border_toward(&ra, (rb.cx(), rb.cy())),
+            border_toward(&rb, (ra.cx(), ra.cy())),
+        ]];
+        for sa in Side::ALL {
+            for sb in Side::ALL {
+                let (p, q) = (mid(sa, &ra), mid(sb, &rb));
+                cands.push(match (across(sa), across(sb)) {
+                    (true, false) => vec![p, (q.0, p.1), q],
+                    (false, true) => vec![p, (p.0, q.1), q],
+                    (true, true) => {
+                        let x = (p.0 + q.0) / 2.0;
+                        vec![p, (x, p.1), (x, q.1), q]
+                    }
+                    (false, false) => {
+                        let y = (p.1 + q.1) / 2.0;
+                        vec![p, (p.0, y), (q.0, y), q]
+                    }
+                });
+            }
+        }
+        if let Some(all) = self.extent() {
+            let g = all.inflate(CLEAR + RING[0]);
+            // corners clockwise from the top left; side i runs from corner i
+            // to corner i + 1 (top, right, bottom, left)
+            let corner = |i: usize| match i % 4 {
+                0 => (g.x, g.y),
+                1 => (g.right(), g.y),
+                2 => (g.right(), g.bottom()),
+                _ => (g.x, g.bottom()),
+            };
+            let index = |s: Side| match s {
+                Side::Top => 0,
+                Side::Right => 1,
+                Side::Bottom => 2,
+                Side::Left => 3,
+            };
+            let onto = |s: Side, p: Pt| match s {
+                Side::Top => (p.0, g.y),
+                Side::Bottom => (p.0, g.bottom()),
+                Side::Left => (g.x, p.1),
+                Side::Right => (g.right(), p.1),
+            };
+            for sa in Side::ALL {
+                for sb in Side::ALL {
+                    let (p, q) = (mid(sa, &ra), mid(sb, &rb));
+                    let (ia, ib) = (index(sa), index(sb));
+                    let mut cw = vec![p, onto(sa, p)];
+                    let mut i = ia;
+                    while i != ib {
+                        i = (i + 1) % 4;
+                        cw.push(corner(i));
+                    }
+                    cw.extend([onto(sb, q), q]);
+                    let mut ccw = vec![p, onto(sa, p)];
+                    let mut i = ia;
+                    while i != ib {
+                        ccw.push(corner(i));
+                        i = (i + 3) % 4;
+                    }
+                    ccw.extend([onto(sb, q), q]);
+                    cands.push(cw);
+                    cands.push(ccw);
+                }
+            }
+        }
+        let bd = self.bounds;
+        let inside = |p: &Pt| {
+            p.0 >= bd.x - EPS
+                && p.0 <= bd.right() + EPS
+                && p.1 >= bd.y - EPS
+                && p.1 <= bd.bottom() + EPS
+        };
+        // the route's own cards: never through their interiors (it starts and
+        // ends on their borders); the others: kept `pad` away
+        let clear = |pts: &[Pt], pad: f64| {
+            pts.iter().all(inside)
+                && pts.windows(2).all(|w| {
+                    let l = (w[0].0, w[0].1, w[1].0, w[1].1);
+                    self.cards.iter().enumerate().all(|(i, c)| {
+                        let r = if i == a || i == b {
+                            c.inflate(-EPS)
+                        } else {
+                            c.inflate(pad)
+                        };
+                        !crate::scene::line_hits(&l, &r)
+                    })
+                })
+        };
+        let cost = |pts: &[Pt]| {
+            let len: f64 = pts
+                .windows(2)
+                .map(|w| ((w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2)).sqrt())
+                .sum();
+            len + BEND * pts.len().saturating_sub(2) as f64
+        };
+        let cands: Vec<Vec<Pt>> = cands
+            .iter()
+            .map(|c| simplify(c))
+            .filter(|c| c.len() >= 2)
+            .collect();
+        // then 2 px: a path along a card's border line touches it
+        for pad in [CLEAR, 2.0] {
+            let best = cands
+                .iter()
+                .filter(|c| clear(c, pad))
+                .min_by(|x, y| cost(x).total_cmp(&cost(y)));
+            if let Some(best) = best {
+                return Some(best.clone());
+            }
+        }
+        None
     }
 
     /// Adds the cost of running closer than [`TRACK`] along the axis-aligned
@@ -452,17 +608,7 @@ impl Router {
             v.extend(s.windows(2).map(|w| (w[0] + w[1]) / 2.0));
         }
         // rings around the whole architecture
-        if let Some(first) = self.cards.first() {
-            let all = self.cards.iter().fold(*first, |u, r| {
-                let x = u.x.min(r.x);
-                let y = u.y.min(r.y);
-                R {
-                    x,
-                    y,
-                    w: u.right().max(r.right()) - x,
-                    h: u.bottom().max(r.bottom()) - y,
-                }
-            });
+        if let Some(all) = self.extent() {
             for d in RING {
                 let g = all.inflate(CLEAR + d);
                 xs.extend([g.x, g.right()]);
@@ -815,6 +961,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Codex r5 integration, MAJOR 4: past the grid limit every edge was drawn
+    /// straight, through every card between its ends, and validation skipped
+    /// it. The detour goes around them.
+    #[test]
+    fn past_the_grid_limit_a_fallback_detours_around_the_cards() {
+        // 300 small cards in a row need more grid lines than the search takes
+        let cards: Vec<R> = (0..300)
+            .map(|i| R {
+                x: 40.0 + 10.0 * f64::from(i),
+                y: 600.0,
+                w: 4.0,
+                h: 4.0,
+            })
+            .collect();
+        let wide = R {
+            x: 0.0,
+            y: 0.0,
+            w: 3200.0,
+            h: 1200.0,
+        };
+        let mut r = Router::new(cards.clone(), Vec::new(), Vec::new(), wide);
+        let out = r.route(0, 299, PORT_GAP);
+        assert!(out.fallback);
+        assert!(orthogonal(&out.points), "{:?}", out.points);
+        for w in out.points.windows(2) {
+            for (i, c) in cards.iter().enumerate() {
+                assert!(
+                    !hits(w[0], w[1], c) || i == 0 || i == 299,
+                    "{:?} through card {i}",
+                    out.points
+                );
+            }
+        }
+        // neighbors with nothing between them: straight
+        let out = r.route(0, 1, PORT_GAP);
+        assert!(out.fallback);
+        assert_eq!(out.points.len(), 2, "{:?}", out.points);
     }
 
     #[test]

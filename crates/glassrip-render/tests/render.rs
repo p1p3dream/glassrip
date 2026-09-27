@@ -580,6 +580,43 @@ fn overlapping_primary_boxes_still_fail() {
     assert!(checks.warnings.is_empty());
 }
 
+/// Codex r5 integration, MAJOR 4: validation skipped every fallback edge, so
+/// a straight fallback over an unrelated card reported ok.
+#[test]
+fn a_fallback_edge_through_another_card_fails_validation() {
+    let (notes, board) = inputs();
+    let mut scene = build_scene(&board, &notes);
+    assert!(overlaps(&scene).is_empty(), "{:?}", overlaps(&scene));
+    let (src, dst) = (scene.routes[0].src.clone(), scene.routes[0].dst.clone());
+    let other = scene
+        .cards
+        .iter()
+        .find(|c| c.id != src && c.id != dst)
+        .expect("a third card")
+        .r;
+    // A fallback clear of every card is a warning, not a defect.
+    scene.routes[0].fallback = true;
+    scene.routes[0].points = vec![(2.0, 2.0), (6.0, 2.0)];
+    assert!(
+        edge_defects(&scene).is_empty(),
+        "{:?}",
+        edge_defects(&scene)
+    );
+    // One straight across an unrelated card fails.
+    let y = other.y + other.h / 2.0;
+    scene.routes[0].points = vec![(other.x - 30.0, y), (other.x + other.w + 30.0, y)];
+    let d = edge_defects(&scene);
+    assert!(
+        d.iter()
+            .any(|m| m.contains("runs through card") && m.contains("fallback")),
+        "{d:?}"
+    );
+    let env = glassrip_render::svg::environment();
+    let text = glassrip_render::svg::render_svg(&env, &scene).unwrap();
+    let (checks, _) = glassrip_render::svg::validate_svg(&text, &scene, &bundled_fonts());
+    assert!(!checks.ok);
+}
+
 #[test]
 fn missing_positions_fall_back_to_sugiyama() {
     let (notes, mut board) = inputs();
@@ -1158,7 +1195,8 @@ fn a_dense_board_routes_every_edge_around_the_cards() {
 }
 
 /// Validation names an edge through a card and a label an edge runs through;
-/// an edge drawn straight for want of a route is a warning, not a failure.
+/// an edge drawn without a route is a warning while it crosses no other card,
+/// and a failure once it does.
 #[test]
 fn validation_fails_edges_through_cards_and_crossed_labels() {
     let (notes, board) = inputs();
@@ -1187,11 +1225,15 @@ fn validation_fails_edges_through_cards_and_crossed_labels() {
     let text = glassrip_render::svg::render_svg(&env, &scene).unwrap();
     let (checks, _) = glassrip_render::svg::validate_svg(&text, &scene, &bundled_fonts());
     assert!(!checks.ok);
-    // the same line flagged as a fallback is left to the warning
+    // the same line flagged as a fallback still crosses a card that is not
+    // one of its ends
     scene.routes[i].fallback = true;
-    assert!(edge_defects(&scene)
-        .iter()
-        .all(|m| !m.contains("runs through card")));
+    let d = edge_defects(&scene);
+    assert!(
+        d.iter()
+            .any(|m| m.contains("runs through card") && m.contains("fallback")),
+        "{d:?}"
+    );
 
     // a label moved onto its own edge
     let mut scene = clean.clone();

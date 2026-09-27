@@ -116,7 +116,11 @@ impl Stage for RenderStage {
         // owner pill; validation fails an edge through a card or a label an
         // edge runs through. Text is sized and fitted by its measured glyph
         // widths, and any glyph past the canvas fails validation.
-        6
+        // 7: an edge the grid cannot route takes a cheap detour (L, Z, or around
+        // the architecture) clear of the cards before falling back to a straight
+        // line, and validation fails a fallback edge through another card
+        // (outputs of 6 may report ok with a straight edge over a card).
+        7
     }
     /// The markdown, SVG and PNG files are the stage's output and live outside
     /// the run directory: a cache hit would restore the artifact without

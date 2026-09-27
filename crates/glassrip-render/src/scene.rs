@@ -319,7 +319,8 @@ pub struct RouteInfo {
     pub dst: String,
     /// The full polyline, from border to border (arrow tips included).
     pub points: Vec<(f64, f64)>,
-    /// No route around the cards existed: drawn straight (a warning).
+    /// The router found no route around the cards: drawn by a cheap detour or
+    /// straight (a warning; through another card, a failure).
     pub fallback: bool,
 }
 
@@ -1367,8 +1368,13 @@ pub fn build_scene_with(board: &BoardStateItem, notes: &MeetingNotes, m: &dyn Me
             sanitize_dashes(&e.b_text)
         );
         if route.fallback {
+            let how = if route.points.len() == 2 {
+                "drawn straight"
+            } else {
+                "drawn with a simple detour"
+            };
             route_warnings.push(format!(
-                "no route around the cards for the {link} link: drawn straight"
+                "no route around the cards for the {link} link: {how}"
             ));
         }
         let full = route.points;
@@ -2356,32 +2362,35 @@ fn zone_title_r(z: &Zone) -> R {
 /// Blocking boxes outside the canvas and pairs that overlap, edges that run
 /// through a card, and edge labels an edge runs through. Annotations with no
 /// room are not listed: they are moved below the board (`Scene::degraded`);
-/// neither is an edge drawn straight for want of any route (a warning there).
+/// neither is a fallback edge clear of every other card (a warning there).
 pub fn overlaps(scene: &Scene) -> Vec<String> {
     let mut out = overlapping_boxes(scene);
     out.extend(edge_defects(scene));
     out
 }
 
-/// Routed edges through a card's interior (their own cards included: an edge
-/// only touches those at its ports), and edge labels crossed by any edge.
+/// Edges through a card's interior (a routed edge's own cards included: it
+/// only touches those at its ports; a fallback edge through any other card:
+/// its degraded route is a warning only while it obscures nothing), and edge
+/// labels crossed by any edge.
 pub fn edge_defects(scene: &Scene) -> Vec<String> {
     let mut out = Vec::new();
     for route in &scene.routes {
-        if route.fallback {
-            continue;
-        }
         for w in route.points.windows(2) {
             let l = (w[0].0, w[0].1, w[1].0, w[1].1);
             for c in &scene.cards {
-                if line_hits(&l, &c.r) {
-                    let own = if c.id == route.src || c.id == route.dst {
-                        " (its own)"
-                    } else {
-                        ""
-                    };
-                    out.push(format!("{} runs through card {}{own}", route.name, c.id));
+                let own = c.id == route.src || c.id == route.dst;
+                // a fallback's straight line leaves its own cards at computed
+                // border points: only the other cards are checked
+                if (route.fallback && own) || !line_hits(&l, &c.r) {
+                    continue;
                 }
+                let note = match (own, route.fallback) {
+                    (true, _) => " (its own)",
+                    (false, true) => " (a fallback with no route around the cards)",
+                    (false, false) => "",
+                };
+                out.push(format!("{} runs through card {}{note}", route.name, c.id));
             }
         }
     }
