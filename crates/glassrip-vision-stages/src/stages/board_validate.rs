@@ -15,7 +15,10 @@
 //! A consensus reading kept on fewer answering reads than its quorum (one read
 //! kept unvoted and marked `low_confidence`, written by `board_read` before
 //! version 11 and still reachable through `--from-stage`) fails its item: an
-//! unconfirmed read never reaches the board state.
+//! unconfirmed read never reaches the board state. An edge label its vote does
+//! not confirm (`label_uncertain`, or fewer than `min_agree` label votes, as
+//! `board_read` before 11 could keep) is cleared; a vote log that does not run
+//! parallel to the edges fails the item.
 //!
 //! Deferred to `edge_direction`: checking that an edge label lies on the edge path.
 
@@ -413,9 +416,34 @@ pub fn validate_reading(
             )
         })
         .collect();
-    let (result, tile_rejects) = drop_tile_text(reading.result.clone(), &tiles);
+    let mut result = reading.result.clone();
+    let mut label_issues = Vec::new();
+    if let Some(c) = &reading.consensus {
+        if c.edges.len() != result.edges.len() {
+            return Err(invalid(format!(
+                "keyframe {}: {} edge votes for {} edges",
+                reading.keyframe_id,
+                c.edges.len(),
+                result.edges.len()
+            )));
+        }
+        for (e, v) in result.edges.iter_mut().zip(&c.edges) {
+            if !e.label.is_empty() && (v.label_uncertain || v.label_votes < c.min_agree) {
+                label_issues.push(ExtraIssue {
+                    kind: "label_unconfirmed".into(),
+                    detail: format!(
+                        "label {:?} on {} -> {} had {} of {} votes: cleared",
+                        e.label, e.src, e.dst, v.label_votes, c.min_agree
+                    ),
+                });
+                e.label.clear();
+                e.label_bbox = None;
+            }
+        }
+    }
+    let (result, tile_rejects) = drop_tile_text(result, &tiles);
     let (mut moved, membership) = apply_membership(result, canvas, anchors, &aliases, &p.shape);
-    let mut extra = Vec::new();
+    let mut extra = label_issues;
     // A moved element can repeat one already in its new list: same text and
     // overlapping or adjacent boxes.
     let dup = |a: (&str, &glassrip_vision::BBox), b: (&str, &glassrip_vision::BBox)| {
@@ -568,8 +596,9 @@ impl Stage for BoardValidateStage {
     }
     fn version(&self) -> u32 {
         // 2: a consensus reading short of its quorum (board_read before 11
-        // kept one unvoted read, `low_confidence`) fails its item; outputs of 1
-        // may hold such a reading.
+        // kept one unvoted read, `low_confidence`) fails its item, and an edge
+        // label its vote does not confirm is cleared; outputs of 1 may hold
+        // such a reading or label.
         2
     }
     fn output(&self) -> ArtifactSpec {
@@ -796,6 +825,87 @@ mod tests {
             ..log
         };
         assert_eq!(run(voted).unwrap().board.nodes.len(), 1);
+    }
+
+    /// Codex r5 fix round 1: a board_read 10 reading reused through
+    /// `--from-stage` still carried labels one read gave (label_votes 1 of
+    /// min_agree 2, no `label_uncertain` field).
+    #[test]
+    fn an_edge_label_its_vote_does_not_confirm_is_cleared() {
+        // the two outlined boxes of `board_image`
+        let n = |id: &str, text: &str, y: f64| BoardNode {
+            local_id: id.into(),
+            text: text.into(),
+            bbox: BBox::new(20.0, y, 140.0, y + 60.0),
+            conf: 0.9,
+        };
+        let edge = |label: &str| BoardEdge {
+            src: "n1".into(),
+            dst: "n2".into(),
+            label: label.into(),
+            label_bbox: None,
+            style: EdgeStyle::Solid,
+            conf: 0.8,
+        };
+        let out = BoardReading {
+            nodes: vec![n("n1", "Order Service", 20.0), n("n2", "Ledger", 150.0)],
+            edges: vec![edge("deploys")],
+            stickies: vec![],
+            owner_tags: vec![],
+            other_visible_text: vec![],
+            confidence: 0.8,
+        };
+        let vote = |label_votes: u32| crate::artifacts::EdgeVote {
+            votes: 2,
+            direction_votes: 2,
+            style_votes: 2,
+            label_votes,
+            direction_uncertain: false,
+            style_uncertain: false,
+            label_uncertain: false,
+        };
+        let log = |votes: Vec<crate::artifacts::EdgeVote>| crate::artifacts::ConsensusLog {
+            reads: 3,
+            answered: vec![0, 1],
+            failed: vec![],
+            retried: vec![],
+            min_agree: 2,
+            low_confidence: false,
+            nodes: vec![],
+            edges: votes,
+            stickies: vec![],
+            owner_tags: vec![],
+            other_visible_text: vec![],
+            dropped: crate::artifacts::DroppedCounts::default(),
+        };
+        let labels = |votes: Vec<crate::artifacts::EdgeVote>| {
+            let mut r = reading(out.clone());
+            r.consensus = Some(log(votes));
+            validate_reading(
+                &r,
+                &board_image(),
+                &[],
+                &[],
+                &BoardValidateParams::default(),
+            )
+            .map(|v| {
+                (
+                    v.board
+                        .edges
+                        .iter()
+                        .map(|e| e.label.clone())
+                        .collect::<Vec<_>>(),
+                    v.extra_issues.iter().any(|i| i.kind == "label_unconfirmed"),
+                )
+            })
+        };
+        assert_eq!(labels(vec![vote(1)]).unwrap(), (vec![String::new()], true));
+        assert_eq!(
+            labels(vec![vote(2)]).unwrap(),
+            (vec!["deploys".to_string()], false)
+        );
+        // A vote log that is not parallel to the edges is refused.
+        assert!(labels(vec![]).is_err());
     }
 
     #[test]

@@ -1051,8 +1051,8 @@ impl VisionBackend for SampledModel {
             return ScriptedModel.infer(request, cancel).await;
         }
         // The run seed is 0 and keyframe salts are multiples of 16; a retry
-        // adds 2^32 to its read's seed.
-        let retry = request.options.seed >> 32 > 0;
+        // adds 2^62 to its read's seed.
+        let retry = request.options.seed >= 1 << 62;
         let seed = request.options.seed % 16;
         // Read 0 is greedy; the sampled reads (and every retry) carry the
         // temperature.

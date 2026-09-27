@@ -118,6 +118,9 @@ pub struct BoardReadParams {
     pub consensus: ConsensusParams,
 }
 
+/// Offset of a retry's seed from its read's seed (see [`ConsensusParams::seed`]).
+pub const RETRY_SEED: u64 = 1 << 62;
+
 /// Consensus reading (see [`crate::consensus`]).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, JsonSchema)]
 pub struct ConsensusParams {
@@ -160,15 +163,19 @@ impl ConsensusParams {
     /// tiles; at most 256) of the `index`th planned keyframe: the run seed plus
     /// `(index + 1) * 4096 + job * 16 + read` (reads stay below 16), so no two
     /// requests of a run share a seed. Read `reads + k` is the retry of read
-    /// `k` (see [`BoardReadStage`]): read `k`'s seed plus `2^32`, a range no
-    /// first read reaches. A single read keeps the run seed (the request it
-    /// always was).
+    /// `k` (see [`BoardReadStage`]): read `k`'s seed plus [`RETRY_SEED`]
+    /// (`2^62`). A first read's offset from the run seed is under `2^62` for
+    /// every index below `2^49` (a plan that long cannot be held in memory),
+    /// so no retry shares a seed with any first read, and seeds from the
+    /// default run seed stay below `i64::MAX` (the server's seed type). A
+    /// single read keeps the run seed (the request it always was).
     pub fn seed(&self, base: u64, index: u64, job: u64, read: u32) -> u64 {
         if self.reads <= 1 {
             return base;
         }
+        debug_assert!(index < 1 << 49 && job < 256 && read < 2 * self.reads);
         let (read, retry) = if read >= self.reads {
-            (read - self.reads, 1u64 << 32)
+            (read - self.reads, RETRY_SEED)
         } else {
             (read, 0)
         };
@@ -1462,6 +1469,27 @@ mod tests {
             seeds.iter().all(|&s| s != 7),
             "no consensus seed is the run seed"
         );
+        // Codex r5 fix round 1: a retry offset of 2^32 made read 0's retry of
+        // keyframe 0 the first read of keyframe 2^20. No retry seed is a first
+        // read's seed at any index a plan can hold, and every seed fits the
+        // server's signed seed.
+        let far = [0u64, 1, 299, 1 << 20, (1 << 20) - 1, 1 << 40, (1 << 49) - 1];
+        let first: std::collections::BTreeSet<u64> = far
+            .iter()
+            .flat_map(|&i| (0..65u64).flat_map(move |j| (0..3).map(move |r| (i, j, r))))
+            .map(|(i, j, r)| p.seed(0, i, j, r))
+            .collect();
+        for &i in &far {
+            for j in 0..65u64 {
+                for r in p.reads..2 * p.reads {
+                    let s = p.seed(0, i, j, r);
+                    assert!(!first.contains(&s), "retry {i} {j} {r}");
+                    assert!(s >= RETRY_SEED && s <= i64::MAX as u64);
+                }
+            }
+        }
+        assert!(first.iter().all(|&s| s < RETRY_SEED));
+        assert_eq!(p.seed(0, 0, 0, p.reads), p.seed(0, 0, 0, 0) + RETRY_SEED);
     }
 
     #[test]
