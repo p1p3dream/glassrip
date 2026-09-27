@@ -61,9 +61,10 @@ impl Default for GenerationOptions {
     }
 }
 
-/// Sampling settings a retry may change. Unset fields leave the server's
-/// defaults, and are left out of request keys, so requests without overrides keep
-/// the keys (and recorded responses) they always had.
+/// Sampling settings a retry or a sampled consensus read may change. Unset
+/// fields leave the server's defaults (temperature 0), and are left out of
+/// request keys, so requests without overrides keep the keys (and recorded
+/// responses) they always had.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SamplingOverrides {
@@ -74,12 +75,16 @@ pub struct SamplingOverrides {
     /// Ollama `repeat_last_n`: how many recent tokens the penalty looks back over
     /// (the server default is 64, shorter than one board list item).
     pub repeat_last_n: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Sampling temperature (unset: 0, greedy). A consensus board read samples
+    /// its independent reads above 0.
+    pub temperature: Option<f32>,
 }
 
 impl SamplingOverrides {
     /// No override set.
     pub fn is_empty(&self) -> bool {
-        self.repeat_penalty.is_none() && self.repeat_last_n.is_none()
+        self.repeat_penalty.is_none() && self.repeat_last_n.is_none() && self.temperature.is_none()
     }
 }
 

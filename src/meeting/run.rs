@@ -79,7 +79,8 @@ use glassrip_vision_stages::placement::{MonitorConfig, PlacementMonitor};
 use glassrip_vision_stages::stages::canvas_crop::CanvasCropParams;
 use glassrip_vision_stages::{
     BoardReadParams, BoardReadStage, BoardValidateParams, BoardValidateStage, CanvasCropStage,
-    ClassifyParams, ClassifyStage, OcrHarvestStage, VocabularyParams, VocabularyStage,
+    ClassifyParams, ClassifyStage, ConsensusParams, OcrHarvestStage, VocabularyParams,
+    VocabularyStage,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -465,6 +466,11 @@ fn vision_stages(v: VisionBackends, cfg: &Config) -> Result<VisionStages, Meetin
                 min_duplicate_share: br.degenerate_min_duplicate_share,
                 strong_repeats: br.degenerate_strong_repeats as usize,
                 ..DegenerateParams::default()
+            },
+            consensus: ConsensusParams {
+                reads: br.reads,
+                min_agree: br.min_agree,
+                temperature: br.consensus_temperature as f32,
             },
             ..BoardReadParams::default()
         },

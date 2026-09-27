@@ -4,6 +4,7 @@
 //! They accept unknown fields so upstream producers can add fields in minor
 //! versions; outputs are strict (`deny_unknown_fields`).
 
+use glassrip_core::envelope::ErrorInfo;
 use glassrip_vision::board::{BoardReading, CanvasSize, ValidatedBoard};
 use glassrip_vision::classify::{ClassifyMethod, RuleHit, ScreenType};
 use glassrip_vision::BBox;
@@ -344,6 +345,18 @@ pub struct RequestLog {
     /// same collapse from this and the recorded replies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degenerate: Option<DegenerateLog>,
+    /// Which consensus read made this request (0: the first, greedy read; see
+    /// [`ConsensusLog`]).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub read: u32,
+}
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 /// What the degenerate-reading rule did for one request.
@@ -397,8 +410,95 @@ pub struct BoardReadingItem {
     pub tiled: bool,
     pub requests: Vec<RequestLog>,
     pub participants: Vec<String>,
-    /// Reading in canvas pixels (merged over tiles when tiled).
+    /// Reading in canvas pixels (merged over tiles when tiled; with consensus,
+    /// the vote over the reads).
     pub result: BoardReading,
+    /// How the reads of a consensus reading voted; absent for a single read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consensus: Option<ConsensusLog>,
+}
+
+/// A consensus reading: the keyframe was read several times and `result` holds
+/// the elements enough reads agree on. The vote lists run parallel to the
+/// lists of `result` (entry `i` belongs to element `i`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ConsensusLog {
+    /// Reads requested.
+    pub reads: u32,
+    /// Reads that answered (indices, `requests[].read`).
+    pub answered: Vec<u32>,
+    /// Reads that failed, with their errors.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<FailedRead>,
+    /// Reads an element needed to be kept (the configured `min_agree`, or every
+    /// answering read when fewer answered).
+    pub min_agree: u32,
+    /// Only one read answered: `result` is that read as it came, unconfirmed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub low_confidence: bool,
+    pub nodes: Vec<ElementVote>,
+    pub edges: Vec<EdgeVote>,
+    pub stickies: Vec<ElementVote>,
+    pub owner_tags: Vec<ElementVote>,
+    pub other_visible_text: Vec<ElementVote>,
+    /// Elements some read listed that too few reads confirmed, per list.
+    pub dropped: DroppedCounts,
+}
+
+/// A read that failed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FailedRead {
+    pub read: u32,
+    pub error: ErrorInfo,
+}
+
+/// How one kept element was voted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ElementVote {
+    /// Reads that listed the element.
+    pub votes: u32,
+    /// Reads whose text is the kept text.
+    pub text_votes: u32,
+    /// The reads split evenly on the element's list (the earliest read's is
+    /// kept) or on an attribute (sticky color: the earliest read's; owner tag's
+    /// node: none), or an owner tag keeps no node though a read named one
+    /// (the node it named did not survive, or the other reads named none).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub uncertain: bool,
+}
+
+/// How one kept edge was voted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeVote {
+    /// Reads that listed an edge between the two nodes.
+    pub votes: u32,
+    /// Reads whose direction is the kept one.
+    pub direction_votes: u32,
+    /// Reads whose style is the kept one.
+    pub style_votes: u32,
+    /// Reads whose label is the kept one.
+    pub label_votes: u32,
+    /// The reads split evenly on the direction; the kept one is the first read's.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub direction_uncertain: bool,
+    /// The reads split evenly on the style; the kept one is the first read's.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub style_uncertain: bool,
+}
+
+/// Elements dropped by the vote, per list.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DroppedCounts {
+    pub nodes: u32,
+    pub edges: u32,
+    pub stickies: u32,
+    pub owner_tags: u32,
+    pub other_visible_text: u32,
 }
 
 /// Shape and color measured inside an element's box.
