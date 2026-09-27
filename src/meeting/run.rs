@@ -471,6 +471,7 @@ fn vision_stages(v: VisionBackends, cfg: &Config) -> Result<VisionStages, Meetin
                 reads: br.reads,
                 min_agree: br.min_agree,
                 temperature: br.consensus_temperature as f32,
+                retry_temperature: br.retry_temperature as f32,
             },
             ..BoardReadParams::default()
         },
@@ -830,6 +831,13 @@ pub async fn run_meeting(
             fuzzy_threshold: bs.fuzzy_ratio,
             min_support_keyframes: bs.min_support_keyframes as usize,
             min_support_density: bs.min_support_fraction,
+            min_support_weight: bs.min_support_weight,
+            min_presence_share: bs.min_presence_share,
+            edge_min_presence_share: bs.edge_min_presence_share,
+            presence_window_keyframes: bs.presence_window_keyframes as usize,
+            single_min_share: bs.single_min_share,
+            echo_max_weight_share: bs.echo_max_weight_share,
+            owner_reader_min_share: bs.owner_reader_min_share,
             owner_confirm_keyframes: bs.owner_min_keyframes as usize,
             ..ConsolidationParams::default()
         });

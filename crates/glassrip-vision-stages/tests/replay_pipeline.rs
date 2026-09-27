@@ -1057,13 +1057,9 @@ impl VisionBackend for SampledModel {
         // adds 2^62 to its read's seed.
         let retry = request.options.seed >= 1 << 62;
         let seed = request.options.seed % 16;
-        // Read 0 is greedy; the sampled reads (and every retry) carry the
-        // temperature.
-        assert_eq!(
-            request.sampling.temperature.is_some(),
-            seed > 0 || retry,
-            "{seed}"
-        );
+        // Every consensus read is greedy (the server default); only a retry
+        // of a failed read carries a temperature.
+        assert_eq!(request.sampling.temperature.is_some(), retry, "{seed}");
         let first_of = self.fail_first_of.is_some_and(|k| {
             k == seed && !self.failed.swap(true, std::sync::atomic::Ordering::SeqCst)
         });
@@ -1093,10 +1089,11 @@ impl VisionBackend for SampledModel {
 
 fn consensus_params() -> BoardReadParams {
     BoardReadParams {
+        // The defaults: three greedy reads (distinct seeds), sampled retries.
         consensus: ConsensusParams {
             reads: 3,
             min_agree: 2,
-            temperature: 0.3,
+            ..ConsensusParams::default()
         },
         ..BoardReadParams::default()
     }
@@ -1223,9 +1220,10 @@ async fn consensus_reads_vote_record_three_replies_and_replay() {
         let keys: std::collections::BTreeSet<&str> =
             r.requests.iter().map(|l| l.request_key.as_str()).collect();
         assert_eq!(keys.len(), 3, "three distinct recorded replies");
-        assert_eq!(r.requests[0].sampling.temperature, None);
-        assert_eq!(r.requests[1].sampling.temperature, Some(0.3));
-        assert_eq!(r.requests[2].sampling.temperature, Some(0.3));
+        // Three greedy reads, three distinct requests (their seeds).
+        for l in &r.requests {
+            assert_eq!(l.sampling.temperature, None);
+        }
         // The ghost box one sampled read made up is gone; the ledger two reads
         // saw stays, with its edge.
         let texts: Vec<&str> = r.result.nodes.iter().map(|n| n.text.as_str()).collect();
@@ -1322,10 +1320,9 @@ async fn a_read_short_of_the_quorum_is_retried_once_then_fails_the_item() {
         assert_eq!(texts, ["Order Service", "Ledger"]);
         let reads: Vec<u32> = r.requests.iter().map(|l| l.read).collect();
         assert_eq!(reads, [1, 3, 5]);
-        assert!(r
-            .requests
-            .iter()
-            .all(|l| l.sampling.temperature == Some(0.3)));
+        // Read 1 is a greedy consensus read; the retries are sampled.
+        let temps: Vec<Option<f32>> = r.requests.iter().map(|l| l.sampling.temperature).collect();
+        assert_eq!(temps, [None, Some(0.3), Some(0.3)]);
     }
     assert_eq!(replay.len(), live.len());
     for ((_, a), (_, b)) in replay.iter().zip(&live) {
@@ -1468,5 +1465,56 @@ async fn a_failed_read_is_not_answered_by_another_keyframes_record() {
     assert_eq!(sorted, [vec![], vec![1]], "one keyframe lost read 1");
     for ((_, a), (_, b)) in runs.replay.iter().zip(&runs.live) {
         same_reading(a, b);
+    }
+}
+
+/// The consensus temperatures are part of board_read's cache key: a run with
+/// other temperatures never restores another run's readings.
+#[test]
+fn consensus_temperatures_are_in_the_cache_key() {
+    use glassrip_core::runner::Stage;
+    let stage = |temperature: f32, retry_temperature: f32| {
+        let client = VisionClient::new(Arc::new(ScriptedModel), 4).unwrap();
+        let monitor = Arc::new(PlacementMonitor::new(
+            Arc::new(StaticProbe),
+            client,
+            MonitorConfig::default(),
+        ));
+        BoardReadStage::new(
+            BoardReadParams {
+                consensus: ConsensusParams {
+                    temperature,
+                    retry_temperature,
+                    ..ConsensusParams::default()
+                },
+                ..BoardReadParams::default()
+            },
+            monitor,
+            "scripted-vl",
+            None,
+            None,
+        )
+    };
+    let key = |s: &BoardReadStage| {
+        (
+            s.key_extras().tool_versions["glassrip.board_read.consensus"].clone(),
+            serde_json::to_value(s.params()).unwrap()["consensus"].clone(),
+        )
+    };
+    let default = key(&stage(0.0, 0.3));
+    assert_eq!(
+        default.0,
+        "reads=3;min_agree=2;temperature=0;retry_temperature=0.3"
+    );
+    assert_eq!(default.1["temperature"], json!(0.0));
+    assert_eq!(
+        default.1["retry_temperature"]
+            .as_f64()
+            .map(|t| (t * 10.0).round()),
+        Some(3.0)
+    );
+    for other in [key(&stage(0.3, 0.3)), key(&stage(0.0, 0.0))] {
+        assert_ne!(other.0, default.0);
+        assert_ne!(other.1, default.1);
     }
 }

@@ -1,7 +1,7 @@
 //! Board-state consolidation on synthetic reading sequences (fictional board and names).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use glassrip_meeting::artifacts::{CanvasDims, EdgeDirectionItem, EdgeEvidence};
@@ -12,9 +12,9 @@ use glassrip_meeting::consolidate::owners::{
     OwnerTarget,
 };
 use glassrip_meeting::consolidate::{
-    consolidate, consolidate_with_probe, split_boards, BoardFrame, BoardStateItem, CanvasSource,
-    ConsolidationParams, EdgeOrientation, FoldReason, Hooks, RegionProbe, SecondReader, StickyKind,
-    TextAnchor,
+    consolidate, consolidate_voted, consolidate_with_probe, split_boards, BoardFrame,
+    BoardStateItem, CanvasSource, ConsolidationParams, EdgeOrientation, EdgeVoteShares, FoldReason,
+    FrameVotes, Hooks, RegionProbe, SecondReader, StickyKind, TextAnchor,
 };
 use glassrip_meeting::direction::{DirectionBasis, EdgeDirection, EndVerdict};
 use glassrip_meeting::pixel_direction::{EndEvidence, PixelEvidence, PixelStatus};
@@ -3880,4 +3880,260 @@ fn fragment_fallback_calls_each_external_hook_only_once() {
             .all(|(i, t)| !corroborations[..i].contains(t)),
         "{corroborations:?}"
     );
+}
+
+// ---- Consensus vote shares (board_validate `votes`).
+
+const TWO_THIRDS: f64 = 2.0 / 3.0;
+
+/// Every element of every keyframe carried by all its reads.
+fn unanimous(fr: &[BoardFrame]) -> HashMap<String, FrameVotes> {
+    fr.iter()
+        .map(|f| {
+            let b = &f.board;
+            (
+                f.keyframe_id.clone(),
+                FrameVotes {
+                    nodes: vec![1.0; b.nodes.len()],
+                    edges: vec![
+                        EdgeVoteShares {
+                            share: 1.0,
+                            direction: 1.0,
+                            label: 1.0,
+                        };
+                        b.edges.len()
+                    ],
+                    stickies: vec![1.0; b.stickies.len()],
+                    owner_tags: vec![1.0; b.owner_tags.len()],
+                    other_visible_text: vec![1.0; b.other_visible_text.len()],
+                },
+            )
+        })
+        .collect()
+}
+
+fn run_voted(
+    fr: Vec<BoardFrame>,
+    votes: &HashMap<String, FrameVotes>,
+    p: &ConsolidationParams,
+) -> BoardStateItem {
+    consolidate_voted(fr, votes, "board-1", p, &hooks(&NoCorroboration), None)
+}
+
+/// A box read in one keyframe only, which two of three reads listed, passes the
+/// single-sighting checks (traced connector, confident reading) yet never
+/// reaches the board; every read listing it, it does, as before.
+#[test]
+fn a_borderline_single_keyframe_element_does_not_reach_the_board() {
+    let make = |share: f64| {
+        let mut specs: Vec<Spec> = (0..5).map(|_| base()).collect();
+        specs[2]
+            .nodes
+            .push(("n9", "Late Box".into(), (1400.0, 450.0)));
+        specs[2].edges.push(("n3", "n9", ""));
+        let mut fr = frames(&specs);
+        fr[2].directions = Some(dir_item(
+            "kf02",
+            vec![evidence("n3", "n9", EndVerdict::Forward, None)],
+        ));
+        let mut votes = unanimous(&fr);
+        let i = fr[2]
+            .board
+            .nodes
+            .iter()
+            .position(|n| n.text == "Late Box")
+            .unwrap();
+        votes.get_mut("kf02").unwrap().nodes[i] = share;
+        run_voted(fr, &votes, &params())
+    };
+    let has = |s: &BoardStateItem| s.nodes.iter().any(|n| n.text == "Late Box");
+    assert!(has(&make(1.0)));
+    assert!(!has(&make(TWO_THIRDS)));
+}
+
+/// A sticky two of three reads carried in every keyframe since it was drawn is
+/// consistent support; the same sticky in two scattered keyframes, each on two
+/// of three reads, is the kind of borderline reading that flips between runs
+/// and stays off the board. Unanimous, those two keyframes still keep it.
+#[test]
+fn consistent_two_of_three_support_is_kept_and_scattered_borderline_sightings_are_not() {
+    let make = |seen: &[usize], share: f64| {
+        let mut specs: Vec<Spec> = (0..8).map(|_| base()).collect();
+        for &i in seen {
+            specs[i]
+                .stickies
+                .push(("Cache the totals?", (400.0, 400.0)));
+        }
+        let fr = frames(&specs);
+        let mut votes = unanimous(&fr);
+        for &i in seen {
+            let k = fr[i]
+                .board
+                .stickies
+                .iter()
+                .position(|x| x.text == "Cache the totals?")
+                .unwrap();
+            votes.get_mut(&fr[i].keyframe_id).unwrap().stickies[k] = share;
+        }
+        let s = run_voted(fr, &votes, &params());
+        s.stickies
+            .iter()
+            .any(|x| x.text == "Cache the totals?" && x.in_final)
+    };
+    assert!(make(&[2, 3, 4, 5, 6, 7], TWO_THIRDS));
+    assert!(!make(&[5, 7], TWO_THIRDS));
+    assert!(make(&[5, 7], 1.0));
+}
+
+/// The edge label is the one with the most label votes across keyframes, not
+/// the one read in the most keyframes, and each keyframe's direction evidence
+/// weighs the share of its reads that listed the edge.
+#[test]
+fn edge_label_and_direction_follow_the_vote_weighted_majority() {
+    let mut specs: Vec<Spec> = (0..7).map(|_| base()).collect();
+    for s in specs.iter_mut().skip(3) {
+        for e in &mut s.edges {
+            if e.0 == "n1" {
+                e.2 = "REST";
+            }
+        }
+    }
+    let mut fr = frames(&specs);
+    // Arrowhead at Queue in the even keyframes, at Ingest Gateway in the odd
+    // ones (never twice in a row: no reversal).
+    for (i, f) in fr.iter_mut().enumerate() {
+        let v = if i % 2 == 0 {
+            EndVerdict::Forward
+        } else {
+            EndVerdict::Reverse
+        };
+        f.directions = Some(dir_item(
+            &f.keyframe_id,
+            vec![evidence("n1", "n2", v, None)],
+        ));
+    }
+    let mut votes = unanimous(&fr);
+    for (i, f) in fr.iter().enumerate() {
+        let k = f.board.edges.iter().position(|e| e.src == "n1").unwrap();
+        let e = &mut votes.get_mut(&f.keyframe_id).unwrap().edges[k];
+        if i % 2 == 1 {
+            e.share = TWO_THIRDS;
+        }
+        if i >= 3 {
+            e.label = TWO_THIRDS;
+        }
+    }
+    let edge = |s: &BoardStateItem| {
+        s.edges
+            .iter()
+            .find(|e| e.a_text == "Ingest Gateway" || e.b_text == "Ingest Gateway")
+            .cloned()
+            .expect("the Ingest Gateway edge")
+    };
+    // Unweighted: REST is read in four keyframes, HTTP in three; the arrowheads
+    // split four to three, short of the vote share.
+    let plain = edge(&run(fr.clone(), &params()));
+    assert_eq!(plain.label, "REST");
+    assert_eq!(plain.direction, EdgeOrientation::Uncertain);
+    // Weighted: HTTP 3 against REST 4 x 2/3; arrowheads 4 against 3 x 2/3.
+    let s = run_voted(fr, &votes, &params());
+    let e = edge(&s);
+    assert_eq!(e.label, "HTTP");
+    assert_eq!(e.direction, EdgeOrientation::Forward);
+    // The reader's own orientation (Ingest Gateway -> Queue in every
+    // keyframe) weighs edge share times direction agreement: 4 x 1 + 3 x 2/3.
+    let reader = e.direction_votes.reader;
+    let a_is_gateway = e.a_text == "Ingest Gateway";
+    let (with, against) = if a_is_gateway {
+        (reader.a_to_b, reader.b_to_a)
+    } else {
+        (reader.b_to_a, reader.a_to_b)
+    };
+    assert!((with - 6.0).abs() < 1e-9, "{reader:?}");
+    assert!(against.abs() < 1e-9, "{reader:?}");
+    let src = s.nodes.iter().find(|n| n.id == e.src).unwrap();
+    assert_eq!(src.text, "Ingest Gateway");
+}
+
+#[test]
+fn duplicate_edges_in_one_reading_keep_the_stronger_vote_in_either_order() {
+    let run_order = |reverse: bool| {
+        let mut specs: Vec<Spec> = (0..4).map(|_| base()).collect();
+        for s in &mut specs {
+            s.edges.push(("n2", "n1", "strong"));
+        }
+        let mut fr = frames(&specs);
+        if reverse {
+            for f in &mut fr {
+                let a = f
+                    .board
+                    .edges
+                    .iter()
+                    .position(|e| e.label == "HTTP")
+                    .unwrap();
+                let b = f
+                    .board
+                    .edges
+                    .iter()
+                    .position(|e| e.label == "strong")
+                    .unwrap();
+                f.board.edges.swap(a, b);
+            }
+        }
+        let mut votes = unanimous(&fr);
+        for f in &fr {
+            let v = votes.get_mut(&f.keyframe_id).unwrap();
+            for (e, share) in f.board.edges.iter().zip(&mut v.edges) {
+                if e.label == "HTTP" {
+                    share.share = TWO_THIRDS;
+                }
+            }
+        }
+        let state = run_voted(fr, &votes, &params());
+        state
+            .edges
+            .iter()
+            .find(|e| e.a_text == "Ingest Gateway" || e.b_text == "Ingest Gateway")
+            .unwrap()
+            .label
+            .clone()
+    };
+    assert_eq!(run_order(false), "strong");
+    assert_eq!(run_order(true), "strong");
+}
+
+/// A reader owner tag no OCR span read corroborates only when every read
+/// listed it: tags two of three reads listed open nothing.
+#[test]
+fn borderline_reader_owner_tags_do_not_open_an_assignment() {
+    let make = |share: f64| {
+        let mut specs: Vec<Spec> = (0..6).map(|_| base()).collect();
+        for s in &mut specs {
+            s.owners.push(("Avery", (200.0, 120.0), ""));
+        }
+        let fr = frames(&specs);
+        let mut votes = unanimous(&fr);
+        for v in votes.values_mut() {
+            v.owner_tags = vec![share; v.owner_tags.len()];
+        }
+        run_voted(fr, &votes, &params()).owner_assignments
+    };
+    let full = make(1.0);
+    assert_eq!(full.len(), 1);
+    assert_eq!(full[0].target.texts(), vec!["Ingest Gateway"]);
+    assert!(make(TWO_THIRDS).is_empty());
+}
+
+/// Votes that do not run parallel to a keyframe's reading are ignored (every
+/// sighting weighs 1), and no votes at all consolidate as before.
+#[test]
+fn votes_that_do_not_fit_the_reading_are_ignored() {
+    let fr = frames(&(0..4).map(|_| base()).collect::<Vec<_>>());
+    let plain = run(fr.clone(), &params());
+    let mut votes = unanimous(&fr);
+    for v in votes.values_mut() {
+        v.nodes = vec![0.0];
+    }
+    assert_eq!(run_voted(fr.clone(), &votes, &params()), plain);
+    assert_eq!(run_voted(fr, &HashMap::new(), &params()), plain);
 }

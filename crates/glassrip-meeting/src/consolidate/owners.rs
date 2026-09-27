@@ -37,7 +37,9 @@
 //!
 //! Per person, keyframes with at least one target are replayed in time order
 //! ([`assign`]): a target opens after `confirm_keyframes` consecutive such keyframes
-//! show it, or after one that a [`Corroborator`] confirms (for example a transcript
+//! show it (`confirm_keyframes` keyframes between two of them that showed the
+//! target, and the tag's place, with the person named nowhere break the run, as
+//! they would close an open target: [`Absent`]), or after one that a [`Corroborator`] confirms (for example a transcript
 //! cue), or after one strong sighting that no later keyframe can confirm: in the last
 //! board keyframe, held for at least `final_hold_min_s`, anchored by geometry with
 //! the tag and its target both placed on OCR text ([`OpenReason::FinalHold`]). A
@@ -575,7 +577,29 @@ pub fn assign_with(
             if open.iter().any(|o| &o.target == t) {
                 continue;
             }
-            pending.entry(t.clone()).or_default().push(RunStep {
+            let run = pending.entry(t.clone()).or_default();
+            // As many keyframes since the run's last step as it takes to close an
+            // open target (`confirm_keyframes`) that showed the target (and the
+            // tag's place) with the person named nowhere break the run: its steps
+            // were not consecutive views of the tag.
+            if let Some(last) = run.last() {
+                let place = last.sighting.place.or(s.place);
+                let mut after = last.sighting.t_end_s;
+                let mut absences = 0;
+                while absences < confirm {
+                    match absent(t, place.as_ref(), after, k.t_start_s) {
+                        Some(x) if x >= after - 1e-9 => {
+                            absences += 1;
+                            after = x + 1e-6;
+                        }
+                        _ => break,
+                    }
+                }
+                if absences >= confirm {
+                    run.clear();
+                }
+            }
+            run.push(RunStep {
                 keyframe_id: k.keyframe_id.to_string(),
                 t_start_s: k.t_start_s,
                 sighting: s.clone(),
@@ -1454,6 +1478,45 @@ mod tests {
         assert_eq!(a[0].valid_to_s, 40.0);
         assert_eq!(a[1].valid_from_s, 60.0);
         assert_eq!(a[1].moved_from, Some(node("n1")));
+    }
+
+    /// Two sightings of a target far apart are consecutive keyframes of the
+    /// person only while fewer keyframes between them than it takes to close an
+    /// open target showed the target with the person named nowhere: that many
+    /// restart the run, and the target opens at the next two consecutive
+    /// sightings. One such keyframe does not.
+    #[test]
+    fn a_keyframe_showing_the_target_untagged_breaks_a_pending_run() {
+        let v = vec![
+            s(10.0, Some(node("n1"))),
+            s(500.0, Some(node("n1"))),
+            s(520.0, Some(node("n1"))),
+        ];
+        let run = |absent: &Absent<'_>| {
+            assign_with(
+                "p1",
+                "Avery",
+                &v,
+                600.0,
+                &params(),
+                &NoCorroboration,
+                &|_, _, _| true,
+                absent,
+            )
+        };
+        let a = run(&|_, _, _, _| None);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].valid_from_s, 10.0);
+        let untagged_at = |at: &'static [f64]| {
+            move |_: &OwnerTarget, _: Option<&TagPlace>, after: f64, before: f64| {
+                at.iter().copied().find(|&x| after <= x && x < before)
+            }
+        };
+        let a = run(&untagged_at(&[200.0]));
+        assert_eq!(a[0].valid_from_s, 10.0, "one absence is not a break");
+        let a = run(&untagged_at(&[200.0, 300.0]));
+        assert_eq!(a.len(), 1, "{a:#?}");
+        assert_eq!(a[0].valid_from_s, 500.0);
     }
 
     fn read_by(mut x: OwnerSighting, by: NameRead) -> OwnerSighting {

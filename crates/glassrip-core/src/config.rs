@@ -476,10 +476,14 @@ pub struct BoardReadConfig {
     /// Reads an element needs to be kept (capped at `reads`).
     #[garde(range(min = 1, max = 9))]
     pub min_agree: u32,
-    /// Sampling temperature of every read after the first (the first is
-    /// greedy), so the reads are independent samples.
+    /// Sampling temperature of every consensus read (0: greedy; the reads
+    /// stay distinct requests through their seeds).
     #[garde(range(min = 0.0, max = 2.0))]
     pub consensus_temperature: f64,
+    /// Sampling temperature of the one retry of a failed read (a greedy retry
+    /// would repeat a greedy failure).
+    #[garde(range(min = 0.0, max = 2.0))]
+    pub retry_temperature: f64,
 }
 
 impl Default for BoardReadConfig {
@@ -498,7 +502,8 @@ impl Default for BoardReadConfig {
             // glassrip_vision_stages::stages::board_read::ConsensusParams::default()
             reads: 3,
             min_agree: 2,
-            consensus_temperature: 0.3,
+            consensus_temperature: 0.0,
+            retry_temperature: 0.3,
         }
     }
 }
@@ -537,6 +542,31 @@ pub struct BoardStateConfig {
     /// Alternatively, fraction of board keyframes in the interval.
     #[garde(range(min = 0.0, max = 1.0))]
     pub min_support_fraction: f64,
+    /// Summed consensus vote share an element's keyframes need (each keyframe
+    /// weighs the share of the answering reads that listed the element).
+    #[garde(range(min = 0.0, max = 1000.0))]
+    pub min_support_weight: f64,
+    /// Summed vote share per keyframe that could have read the element (its
+    /// sightings and the keyframes with its place in view).
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub min_presence_share: f64,
+    /// The same for an edge, over the keyframes that read both of its ends.
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub edge_min_presence_share: f64,
+    /// Presence is measured over at least this many board keyframes around an
+    /// element's interval.
+    #[garde(range(min = 1, max = 1000))]
+    pub presence_window_keyframes: u32,
+    /// Vote share a single confirmed sighting needs to support an element alone.
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub single_min_share: f64,
+    /// A same-text element read only where an established one was in view but
+    /// unread, with at most this share of its votes, is that element displaced.
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub echo_max_weight_share: f64,
+    /// Vote share a reader owner tag that OCR did not read needs to count.
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub owner_reader_min_share: f64,
     /// Consistent keyframes needed to open or move an owner tag.
     #[garde(range(min = 1, max = 1000))]
     pub owner_min_keyframes: u32,
@@ -548,6 +578,14 @@ impl Default for BoardStateConfig {
             fuzzy_ratio: 0.85,
             min_support_keyframes: 2,
             min_support_fraction: 0.10,
+            // glassrip_meeting::consolidate::ConsolidationParams::default()
+            min_support_weight: 1.5,
+            min_presence_share: 0.3,
+            edge_min_presence_share: 0.3,
+            presence_window_keyframes: 6,
+            single_min_share: 1.0,
+            echo_max_weight_share: 0.25,
+            owner_reader_min_share: 1.0,
             owner_min_keyframes: 2,
         }
     }

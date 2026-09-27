@@ -178,6 +178,7 @@ mod tests {
                     local_id: None,
                     color: None,
                     single_ok: false,
+                    weight: 1.0,
                 })
                 .collect(),
             kind_override: None,

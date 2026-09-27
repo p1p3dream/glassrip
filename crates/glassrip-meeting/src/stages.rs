@@ -23,8 +23,8 @@ use crate::artifacts::{
 };
 use crate::consolidate::owners::{Corroborator, NoCorroboration};
 use crate::consolidate::{
-    consolidate_with_probe, split_boards, BoardFrame, BoardStateItem, ConsolidationParams, Hooks,
-    RegionProbe, SecondReader, StrokeTrace, TextAnchor,
+    consolidate_voted, split_boards, BoardFrame, BoardStateItem, ConsolidationParams, FrameVotes,
+    Hooks, RegionProbe, SecondReader, StrokeTrace, TextAnchor,
 };
 use crate::direction::{frame_weight, DirectionVotes};
 use crate::pixel_direction::{
@@ -652,6 +652,8 @@ impl Stage for EdgeDirectionStage {
 pub struct BoardStateWork {
     frames: Vec<BoardFrame>,
     probe: Option<Arc<CropProbe>>,
+    /// Consensus vote shares of the readings, by keyframe id.
+    votes: Arc<HashMap<String, FrameVotes>>,
 }
 
 /// Canvas pixels of one keyframe for [`CropProbe`].
@@ -1223,7 +1225,19 @@ impl Stage for BoardStateStage {
         // 13: the fallback reuses second-reader answers and waits to call owner
         // corroboration until the final pass; outputs of 12 can vary with hook
         // side effects.
-        13
+        // 14: sightings weigh their consensus vote shares (board_validate 5):
+        // support needs `min_support_weight` and `min_presence_share` per
+        // keyframe that could have read the element over at least
+        // `presence_window_keyframes` (edges: `edge_min_presence_share` over
+        // keyframes with both ends read or in view), a single sighting needs
+        // `single_min_share`; a weak same-text element read only where an
+        // established one was in view but unread is not final
+        // (`echo_max_weight_share`); an edge label needs support of its own and
+        // the label and direction votes are weighted; a reversal needs
+        // `min_support_weight`; a reader-only owner tag needs
+        // `owner_reader_min_share`, and `confirm_keyframes` absences break a
+        // pending owner run. Outputs of 13 count every sighting as 1.
+        14
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
@@ -1264,12 +1278,18 @@ impl Stage for BoardStateStage {
             .into_iter()
             .map(|(_, k)| k)
             .collect();
-        let boards = inputs
+        let mut boards: Vec<BoardItem> = inputs
             .read_ok::<ValidateItemView>(BOARD_VALIDATE)?
             .into_iter()
             .map(|(id, v)| v.into_item(&id))
             .filter(|b| !b.board.needs_reclassification)
             .collect();
+        let votes: Arc<HashMap<String, FrameVotes>> = Arc::new(
+            boards
+                .iter_mut()
+                .filter_map(|b| b.votes.take().map(|v| (b.keyframe_id.clone(), v)))
+                .collect(),
+        );
         let directions = inputs
             .read_ok::<EdgeDirectionBatch>(EDGE_DIRECTION)?
             .into_iter()
@@ -1315,6 +1335,7 @@ impl Stage for BoardStateStage {
                 work: BoardStateWork {
                     frames,
                     probe: Some(probe.clone()),
+                    votes: Arc::clone(&votes),
                 },
             })
             .collect())
@@ -1328,8 +1349,9 @@ impl Stage for BoardStateStage {
             corroborator: self.corroborator.as_ref(),
             second_reader: self.second_reader.as_deref(),
         };
-        Ok(consolidate_with_probe(
+        Ok(consolidate_voted(
             work.frames,
+            &work.votes,
             ctx.item_id(),
             &self.params,
             &hooks,
@@ -1412,6 +1434,7 @@ mod tests {
             canvas: None,
             board_title: None,
             board: board(&[(10.0, 10.0, 100.0, 60.0)]),
+            votes: None,
         }
     }
 
