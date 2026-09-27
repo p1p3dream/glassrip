@@ -234,6 +234,12 @@ struct OwnerKey {
     moved: bool,
     /// The owner tag is still on the board at the end (a current task).
     current: bool,
+    /// Content tokens of the target the tag moved from (empty: not a move).
+    from: Vec<String>,
+    /// The target the tag moved from, as text.
+    from_text: String,
+    /// When the tag appeared here, seconds.
+    since_s: f64,
 }
 
 /// Words that state ownership or assignment ("Avery owns the kiosk", "take
@@ -450,6 +456,11 @@ impl Corpus {
         for b in boards {
             for o in &b.owner_assignments {
                 let target_text = sanitize_dashes(&crate::board::target_text(&o.target));
+                let from_text = o
+                    .moved_from
+                    .as_ref()
+                    .map(|t| sanitize_dashes(&crate::board::target_text(t)))
+                    .unwrap_or_default();
                 let words = OwnerKey {
                     name: tokens(&o.display_name),
                     owner: o.display_name.trim().to_string(),
@@ -457,6 +468,9 @@ impl Corpus {
                     target_text,
                     moved: o.moved_from.is_some(),
                     current: o.valid_to_s >= b.end_s() - 0.5,
+                    from: content_tokens(&from_text),
+                    from_text,
+                    since_s: o.valid_from_s,
                 };
                 assignments.push(words.clone());
                 // the owner events of this assignment (same person, same target
@@ -580,6 +594,35 @@ impl Corpus {
             .into_iter()
             .find(|k| !k.current)
             .map(|k| k.target_text.clone())
+    }
+
+    /// For a task of `owner` said only before (`said_until`, the end of its
+    /// last cited line) this person's owner tag moved away from a target the
+    /// task names: the move, as (from, to). A change in who does what
+    /// supersedes the earlier plan for the old target. A task with any word of
+    /// the new target, a task said after the move, and a person whose tag is
+    /// back on the old target at the end are kept.
+    fn moved_off(
+        &self,
+        owner: &str,
+        task: &str,
+        said_until: Option<f64>,
+    ) -> Option<(String, String)> {
+        let end = said_until?;
+        let words: BTreeSet<String> = content_tokens(task).into_iter().collect();
+        let name = tokens(owner);
+        let mine: Vec<&OwnerKey> = self.assignments.iter().filter(|k| k.name == name).collect();
+        mine.iter()
+            .filter(|k| k.moved && !k.from.is_empty() && end < k.since_s)
+            .find(|k| {
+                names_target(&words, &k.from)
+                    // any word of the new target, generic ones included,
+                    // ties the task to it ("map ledger entries to kit widgets"
+                    // after a move from the Ledger Service to the Design Kit)
+                    && !k.target.iter().any(|t| words.contains(t))
+                    && !mine.iter().any(|a| a.current && a.target == k.from)
+            })
+            .map(|k| (k.from_text.clone(), k.target_text.clone()))
     }
 
     /// The alias table.
@@ -1204,11 +1247,26 @@ pub fn check_with(
         }
     }
     if section == Section::ActionItems {
+        let said_until = evidence
+            .segment_ids
+            .iter()
+            .filter_map(|id| corpus.segment_span(id))
+            .map(|s| s.1)
+            .reduce(f64::max);
         for o in &owners {
             if let Some(target) = corpus.superseded_ownership(&o.name, &text) {
                 return Err(Failure {
                     reasons: vec![format!(
                         "{}'s owner tag on {target} was taken off the board: the task moved on",
+                        o.name
+                    )],
+                    fatal: true,
+                });
+            }
+            if let Some((from, to)) = corpus.moved_off(&o.name, &text, said_until) {
+                return Err(Failure {
+                    reasons: vec![format!(
+                        "{}'s owner tag moved from {from} to {to} after this was said: the task moved on",
                         o.name
                     )],
                     fatal: true,
@@ -2630,7 +2688,6 @@ mod tests {
         // ownership, and another person's ownership are kept
         for (owner, task) in [
             ("Mira", "Own the Kiosk App"),
-            ("Mira", "Migrate the ledger store records"),
             ("Rohan", "Work on the Ledger Store"),
             ("Rohan", "Own the Badge Printer"),
         ] {
@@ -2648,6 +2705,60 @@ mod tests {
             )
         );
         assert_eq!(ownership_words("Fix the kiosk app"), None);
+    }
+
+    #[test]
+    fn tasks_on_a_target_the_owner_later_moved_off_are_superseded() {
+        // Mira's tag moves from the Ledger Store to the Kiosk App at 60 s
+        let lines = vec![
+            said(
+                "s1",
+                25.0,
+                "avery-quinn",
+                "Mira, could you migrate the ledger store records?",
+            ),
+            said(
+                "s2",
+                80.0,
+                "avery-quinn",
+                "Mira, please send the ledger store notes to Rohan.",
+            ),
+        ];
+        let c = moved_board_corpus(&lines);
+        let act = |owner: &str, task: &str, seg: &str| DraftItem {
+            owner: owner.into(),
+            task: task.into(),
+            segment_ids: vec![seg.into()],
+            ..Default::default()
+        };
+        // said before the move, about the old target: superseded
+        let e = check_with(
+            Section::ActionItems,
+            &act("Mira", "Migrate the ledger store records", "s1"),
+            &c,
+            &ALL,
+        )
+        .unwrap_err();
+        assert!(
+            e.fatal && e.reasons[0].contains("moved from Ledger Store to Kiosk App"),
+            "{e:?}"
+        );
+        // said after the move, naming the new target too, or another person's
+        for (owner, task, seg) in [
+            ("Mira", "Send the ledger store notes to Rohan", "s2"),
+            (
+                "Mira",
+                "Migrate the ledger store records into the kiosk app",
+                "s1",
+            ),
+            ("Mira", "Map ledger store entries to app widgets", "s1"),
+            ("Rohan", "Migrate the ledger store records", "s1"),
+        ] {
+            assert!(
+                check_with(Section::ActionItems, &act(owner, task, seg), &c, &ALL).is_ok(),
+                "{owner}: {task}"
+            );
+        }
     }
 
     #[test]
