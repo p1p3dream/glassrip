@@ -1210,6 +1210,11 @@ mod tests {
             target: None,
             anchor: glassrip_meeting::consolidate::owners::AnchorKind::GeometryNode,
             tag: 0,
+            ocr_located: false,
+            name_read: Default::default(),
+            alternates: Vec::new(),
+            place: None,
+            physical: None,
         }
     }
 

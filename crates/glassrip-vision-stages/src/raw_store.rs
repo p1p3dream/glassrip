@@ -584,10 +584,22 @@ mod tests {
         let mut penalized = guarded.clone();
         penalized.sampling.repeat_penalty = Some(1.3);
         assert_ne!(with_guard, request_key("m", &penalized));
-        let mut windowed = plain;
+        let mut windowed = plain.clone();
         windowed.sampling.repeat_last_n = Some(512);
         assert_ne!(base, request_key("m", &windowed));
         assert_ne!(request_key("m", &penalized), request_key("m", &windowed));
+        // A sampled consensus read: the temperature and the seed each change the
+        // key, so the three reads of one keyframe are three records.
+        let mut sampled = plain.clone();
+        sampled.sampling.temperature = Some(0.3);
+        assert_ne!(base, request_key("m", &sampled));
+        let mut reseeded = sampled.clone();
+        reseeded.options.seed += 1;
+        assert_ne!(request_key("m", &sampled), request_key("m", &reseeded));
+        // Unset, the temperature leaves the key as it was.
+        let mut unset = plain;
+        unset.sampling.temperature = None;
+        assert_eq!(base, request_key("m", &unset));
     }
 
     /// Answers every request with a repetition stop.

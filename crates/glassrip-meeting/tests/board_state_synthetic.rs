@@ -1,15 +1,20 @@
 //! Board-state consolidation on synthetic reading sequences (fictional board and names).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
 use glassrip_meeting::artifacts::{CanvasDims, EdgeDirectionItem, EdgeEvidence};
 use glassrip_meeting::consolidate::events::EventKind;
 use glassrip_meeting::consolidate::events::SuppressReason;
 use glassrip_meeting::consolidate::owners::{
-    AnchorKind, Corroboration, Corroborator, MoveQuery, NoCorroboration, OwnerTarget,
+    AnchorKind, Corroboration, Corroborator, MoveQuery, NameRead, NoCorroboration, OpenReason,
+    OwnerTarget,
 };
 use glassrip_meeting::consolidate::{
     consolidate, consolidate_with_probe, split_boards, BoardFrame, BoardStateItem, CanvasSource,
-    ConsolidationParams, EdgeOrientation, FoldReason, Hooks, RegionProbe, StickyKind, TextAnchor,
+    ConsolidationParams, EdgeOrientation, FoldReason, Hooks, RegionProbe, SecondReader, StickyKind,
+    TextAnchor,
 };
 use glassrip_meeting::direction::{DirectionBasis, EdgeDirection, EndVerdict};
 use glassrip_meeting::pixel_direction::{EndEvidence, PixelEvidence, PixelStatus};
@@ -2801,4 +2806,1078 @@ fn an_emptied_corridor_without_a_joined_trace_keeps_the_connector() {
     let e = grpc(&run_with(&probe(joined, ink)));
     assert!(!e.in_final, "{e:?}");
     assert_eq!(e.lifetimes.last().unwrap().removed_at_s, Some(100.0));
+}
+
+/// OCR spans of the fictional nodes (and optional name tags) at their true places.
+fn true_ocr(names: &[(&str, (f64, f64))]) -> Vec<TextAnchor> {
+    NODES
+        .iter()
+        .map(|(_, text, c)| (*text, *c))
+        .chain(names.iter().copied())
+        .map(|(text, c)| TextAnchor {
+            text: text.to_string(),
+            bbox: BBox::new(c.0 - 60.0, c.1 - 12.0, c.0 + 60.0, c.1 + 12.0),
+        })
+        .collect()
+}
+
+/// A reading whose node boxes collapsed into one strip along the top, laid out left to
+/// right in list order, with the owner tag read in that strip too.
+fn collapse_nodes(f: &mut BoardFrame, tag_at: (f64, f64)) {
+    for (i, n) in f.board.nodes.iter_mut().enumerate() {
+        let x = 10.0 + 190.0 * i as f64;
+        n.bbox = BBox::new(x, 5.0, x + 180.0, 45.0);
+    }
+    for o in &mut f.board.owner_tags {
+        o.bbox = BBox::new(
+            tag_at.0 - 30.0,
+            tag_at.1 - 20.0,
+            tag_at.0 + 30.0,
+            tag_at.1 + 20.0,
+        );
+    }
+}
+
+fn avery(s: &BoardStateItem) -> Vec<&glassrip_meeting::consolidate::owners::OwnerAssignment> {
+    s.owner_assignments
+        .iter()
+        .filter(|a| a.person_id == "p-avery")
+        .collect()
+}
+
+/// Avery beside Ingest Gateway for four keyframes, then a keyframe with no tag at all
+/// (Ingest Gateway read and on OCR), then a long last keyframe whose reading collapsed
+/// every node box into one strip; OCR places the tag beside Ledger Store.
+fn end_move_frames(ocr_in_last: bool) -> Vec<BoardFrame> {
+    let mut specs: Vec<Spec> = (0..6).map(|_| base()).collect();
+    for s in specs.iter_mut().take(4) {
+        s.owners.push(("Avery", (200.0, 120.0), ""));
+    }
+    // The last view no longer shows Ingest Gateway.
+    specs[5].nodes.retain(|n| n.0 != "n1");
+    specs[5].owners.push(("Avery", (1200.0, 120.0), ""));
+    let mut fr = frames(&specs);
+    fr[4].ocr_anchors = true_ocr(&[]);
+    // Read in the strip right under the collapsed Queue box.
+    collapse_nodes(&mut fr[5], (100.0, 75.0));
+    if ocr_in_last {
+        fr[5].ocr_anchors = true_ocr(&[("Avery", (1200.0, 120.0))])
+            .into_iter()
+            .filter(|a| a.text != "Ingest Gateway")
+            .collect();
+    }
+    fr[5].t_end_s = fr[5].t_start_s + 50.0;
+    fr
+}
+
+#[test]
+fn a_collapsed_reading_places_the_tag_on_ocr_and_a_long_last_view_moves_it() {
+    let s = run(end_move_frames(true), &params());
+    let a = avery(&s);
+    assert_eq!(a.len(), 2, "{a:#?}");
+    assert_eq!(a[0].target.texts(), vec!["Ingest Gateway"]);
+    // Closed where Ingest Gateway was read with Avery nowhere.
+    assert_eq!(a[0].valid_to_s, 80.0);
+    assert_eq!(a[1].target.texts(), vec!["Ledger Store"]);
+    assert_eq!(a[1].opened_by, OpenReason::FinalHold);
+    assert_eq!(a[1].valid_from_s, 100.0);
+    assert!(a[1]
+        .moved_from
+        .as_ref()
+        .is_some_and(|m| m.texts() == vec!["Ingest Gateway"]));
+    assert!(a[1].sightings.iter().all(|x| x.ocr_located));
+    assert!(s
+        .events
+        .iter()
+        .any(|e| e.kind == EventKind::OwnerMoved && e.keyframe_id == "kf05"));
+    // Never tied to the strip box it was read next to.
+    assert!(s
+        .owner_assignments
+        .iter()
+        .all(|x| x.target.texts() != vec!["Queue"]));
+}
+
+#[test]
+fn without_ocr_a_collapsed_last_reading_moves_nothing() {
+    let s = run(end_move_frames(false), &params());
+    let a = avery(&s);
+    assert_eq!(a.len(), 1, "{a:#?}");
+    assert_eq!(a[0].target.texts(), vec!["Ingest Gateway"]);
+    assert!(s
+        .owner_assignments
+        .iter()
+        .all(|x| x.target.texts() != vec!["Queue"]));
+}
+
+#[test]
+fn one_strong_sighting_mid_meeting_opens_nothing() {
+    // The same OCR-placed sighting, followed by another keyframe: a later view can
+    // confirm, so one sighting is not enough.
+    let mut fr = end_move_frames(true);
+    let mut next = frames(&[base()]).remove(0);
+    next.keyframe_id = "kf06".into();
+    next.keyframe_index = 6;
+    next.t_start_s = fr[5].t_end_s;
+    next.t_end_s = next.t_start_s + 20.0;
+    next.t_rep_s = next.t_start_s + 10.0;
+    fr.push(next);
+    let s = run(fr, &params());
+    let a = avery(&s);
+    assert_eq!(a.len(), 1, "{a:#?}");
+    assert_eq!(a[0].target.texts(), vec!["Ingest Gateway"]);
+}
+
+#[test]
+fn a_pan_reveals_elements_without_add_events_but_drawn_ones_are_added() {
+    // Frames 0-2 zoomed in on the left part (Ledger Store and one sticky out of view),
+    // frames 3-5 zoomed out to the whole board. "Cache" is drawn during the zoom-out at
+    // a place the zoomed view showed empty; "Audit Log" is drawn later in a still view.
+    let zoomed = Similarity {
+        scale: 1.3,
+        angle: 0.0,
+        tx: 0.0,
+        ty: 0.0,
+    };
+    let specs: Vec<Spec> = (0..6)
+        .map(|i| {
+            let mut s = Spec {
+                t: if i < 3 { zoomed } else { Similarity::IDENTITY },
+                ink: Some(0.2),
+                ..base()
+            };
+            if i >= 3 {
+                s.nodes.push(("n7", "Cache".into(), (450.0, 420.0)));
+            }
+            if i >= 4 {
+                s.nodes.push(("n8", "Audit Log".into(), (1000.0, 420.0)));
+            }
+            s
+        })
+        .collect();
+    let s = run(frames(&specs), &params());
+    let added: Vec<(EventKind, String)> = s
+        .events
+        .iter()
+        .filter(|e| !e.baseline)
+        .filter(|e| {
+            matches!(
+                e.kind,
+                EventKind::NodeAdded | EventKind::StickyAdded | EventKind::EdgeAdded
+            )
+        })
+        .map(|e| (e.kind, e.detail.clone()))
+        .collect();
+    assert_eq!(
+        added,
+        vec![
+            (EventKind::NodeAdded, "Cache".to_string()),
+            (EventKind::NodeAdded, "Audit Log".to_string()),
+        ],
+        "{:#?}",
+        s.events
+    );
+    let revealed: Vec<(EventKind, &str)> = s
+        .suppressed_events
+        .iter()
+        .filter(|x| x.reason == SuppressReason::RevealedByView)
+        .map(|x| (x.event.kind, x.event.keyframe_id.as_str()))
+        .collect();
+    assert!(
+        revealed.contains(&(EventKind::NodeAdded, "kf03")),
+        "{revealed:?}"
+    );
+    assert!(
+        revealed.contains(&(EventKind::StickyAdded, "kf03")),
+        "{revealed:?}"
+    );
+    assert!(
+        revealed.contains(&(EventKind::EdgeAdded, "kf03")),
+        "{revealed:?}"
+    );
+    // Revealed elements are still on the board.
+    assert!(node_texts(&s).contains(&"Ledger Store".to_string()));
+    assert!(s
+        .stickies
+        .iter()
+        .any(|x| x.text == "Beta milestone in March" && x.in_final));
+}
+
+/// Ink marks on the fictional board, in reference coordinates, each drawn from a
+/// keyframe on; `views` maps reference to each keyframe's canvas.
+struct InkMarks {
+    views: Vec<Similarity>,
+    marks: Vec<(usize, BBox)>,
+}
+
+impl RegionProbe for InkMarks {
+    fn ink_share(&self, keyframe_id: &str, region: &BBox) -> Option<f64> {
+        let i: usize = keyframe_id.trim_start_matches("kf").parse().ok()?;
+        let t = self.views.get(i)?;
+        let c = ((region.x1 + region.x2) / 2.0, (region.y1 + region.y2) / 2.0);
+        let r = ((c.0 - t.tx) / t.scale, (c.1 - t.ty) / t.scale);
+        let inked = self.marks.iter().any(|(from, b)| {
+            *from <= i && r.0 >= b.x1 && r.0 <= b.x2 && r.1 >= b.y1 && r.1 <= b.y2
+        });
+        Some(if inked { 0.4 } else { 0.0 })
+    }
+    fn line_cover(&self, _: &str, _: (f64, f64), _: (f64, f64), _: f64) -> Option<f64> {
+        None
+    }
+}
+
+#[test]
+fn pixels_tell_a_missed_element_revealed_by_a_pan_from_one_drawn_during_it() {
+    // Zoomed in (frames 0-2), then the whole board (frames 3-5). "Cache" was on the
+    // board all along (ink at its place from frame 0) but only read after the zoom-out;
+    // "Spare" was drawn during the zoom-out (no ink at its place before frame 3).
+    let zoomed = Similarity {
+        scale: 1.3,
+        angle: 0.0,
+        tx: 0.0,
+        ty: 0.0,
+    };
+    let views: Vec<Similarity> = (0..6)
+        .map(|i| if i < 3 { zoomed } else { Similarity::IDENTITY })
+        .collect();
+    let specs: Vec<Spec> = views
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let mut s = Spec {
+                t: *t,
+                ink: Some(0.2),
+                ..base()
+            };
+            if i >= 3 {
+                s.nodes.push(("n7", "Cache".into(), (450.0, 420.0)));
+                s.nodes.push(("n8", "Spare".into(), (450.0, 540.0)));
+            }
+            s
+        })
+        .collect();
+    let px = InkMarks {
+        views,
+        marks: vec![
+            (0, BBox::new(360.0, 380.0, 540.0, 460.0)),
+            (3, BBox::new(360.0, 500.0, 540.0, 580.0)),
+        ],
+    };
+    let s = consolidate_with_probe(
+        frames(&specs),
+        "board-1",
+        &params(),
+        &hooks(&NoCorroboration),
+        Some(&px as &dyn RegionProbe),
+    );
+    let added: Vec<String> = s
+        .events
+        .iter()
+        .filter(|e| !e.baseline && e.kind == EventKind::NodeAdded)
+        .map(|e| e.detail.clone())
+        .collect();
+    assert_eq!(added, vec!["Spare".to_string()], "{:#?}", s.events);
+    assert!(s
+        .suppressed_events
+        .iter()
+        .any(|x| { x.reason == SuppressReason::RevealedByView && x.event.detail == "Cache" }));
+    // Without pixels, coverage alone cannot tell them apart.
+    let s = run(frames(&specs), &params());
+    let added: Vec<String> = s
+        .events
+        .iter()
+        .filter(|e| !e.baseline && e.kind == EventKind::NodeAdded)
+        .map(|e| e.detail.clone())
+        .collect();
+    assert!(added.contains(&"Cache".to_string()) && added.contains(&"Spare".to_string()));
+}
+
+/// Pixels whose traced strokes join every pair of boxes (`joined`), and whose
+/// straight corridors are all inked; nothing about boxes.
+struct Strokes {
+    joined: bool,
+}
+
+impl RegionProbe for Strokes {
+    fn ink_share(&self, _: &str, _: &BBox) -> Option<f64> {
+        None
+    }
+    fn line_cover(&self, _: &str, _: (f64, f64), _: (f64, f64), _: f64) -> Option<f64> {
+        Some(0.9)
+    }
+    fn stroke_between(
+        &self,
+        _: &str,
+        _: &BBox,
+        _: &BBox,
+        _: &BBox,
+        _: &[BBox],
+        _: f64,
+    ) -> Option<StrokeTrace> {
+        Some(StrokeTrace {
+            joined: self.joined,
+            ink: 0.1,
+        })
+    }
+    fn traces(&self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn a_connector_missed_before_a_zoom_out_is_not_added_when_a_traced_stroke_shows_it() {
+    // Both ends of the HTTP edge are in the zoomed view from the start, but the
+    // reader only lists the edge after the zoom-out.
+    let zoomed = Similarity {
+        scale: 1.3,
+        angle: 0.0,
+        tx: 0.0,
+        ty: 0.0,
+    };
+    let specs: Vec<Spec> = (0..6)
+        .map(|i| {
+            let mut s = Spec {
+                t: if i < 3 { zoomed } else { Similarity::IDENTITY },
+                ink: Some(0.2),
+                ..base()
+            };
+            if i < 3 {
+                s.edges.retain(|e| e.2 != "HTTP");
+            }
+            s
+        })
+        .collect();
+    let http_added = |s: &BoardStateItem| {
+        s.events.iter().any(|e| {
+            e.kind == EventKind::EdgeAdded && e.detail.contains("Ingest Gateway") && !e.baseline
+        })
+    };
+    let probed = |joined: bool| {
+        consolidate_with_probe(
+            frames(&specs),
+            "board-1",
+            &params(),
+            &hooks(&NoCorroboration),
+            Some(&Strokes { joined } as &dyn RegionProbe),
+        )
+    };
+    let s = probed(true);
+    assert!(!http_added(&s), "{:#?}", s.events);
+    assert!(s.suppressed_events.iter().any(|x| {
+        x.reason == SuppressReason::RevealedByView && x.event.kind == EventKind::EdgeAdded
+    }));
+    // No stroke joined the ends before (corridor ink alone proves nothing), or no
+    // pixels: both ends were in view, so a new connector.
+    assert!(http_added(&probed(false)));
+    assert!(http_added(&run(frames(&specs), &params())));
+}
+
+/// OCR spans of a spec's nodes and of the given names (reference places), mapped into
+/// the reading's coordinates; spans leaving the canvas are dropped.
+fn ocr_for(s: &Spec, names: &[(&str, (f64, f64))]) -> Vec<TextAnchor> {
+    s.nodes
+        .iter()
+        .map(|(_, text, c)| (text.as_str(), *c))
+        .chain(names.iter().copied())
+        .map(|(text, c)| TextAnchor {
+            text: text.to_string(),
+            bbox: bbox_at(&s.t, c, 60.0, 12.0),
+        })
+        .filter(|a| a.bbox.x1 >= 0.0 && a.bbox.y1 >= 0.0 && a.bbox.x2 <= W && a.bbox.y2 <= H)
+        .collect()
+}
+
+/// Frames of `specs` with OCR from `names_of(keyframe index)`.
+fn frames_with_ocr(
+    specs: &[Spec],
+    names_of: &dyn Fn(usize) -> Vec<(&'static str, (f64, f64))>,
+) -> Vec<BoardFrame> {
+    let mut fr = frames(specs);
+    for (i, f) in fr.iter_mut().enumerate() {
+        f.ocr_anchors = ocr_for(&specs[i], &names_of(i));
+    }
+    fr
+}
+
+/// Above Ingest Gateway, above Ledger Store, on the Ingest Gateway to Queue connector,
+/// and under Report Builder.
+const ABOVE_GATEWAY: (f64, f64) = (200.0, 120.0);
+const ABOVE_LEDGER: (f64, f64) = (1200.0, 120.0);
+const ON_HTTP_EDGE: (f64, f64) = (450.0, 205.0);
+const UNDER_REPORT: (f64, f64) = (700.0, 745.0);
+
+#[test]
+fn ocr_reads_a_tag_the_reader_missed() {
+    let specs: Vec<Spec> = (0..4).map(|_| base()).collect();
+    let s = run(
+        frames_with_ocr(&specs, &|_| vec![("Avery", ABOVE_GATEWAY)]),
+        &params(),
+    );
+    let a = avery(&s);
+    assert_eq!(a.len(), 1, "{a:#?}");
+    assert_eq!(a[0].target.texts(), vec!["Ingest Gateway"]);
+    assert_eq!((a[0].valid_from_s, a[0].valid_to_s), (0.0, 80.0));
+    assert!(a[0].sightings.iter().all(|x| x.name_read == NameRead::Ocr));
+}
+
+#[test]
+fn reader_tags_alone_open_nothing_where_ocr_reads_the_board() {
+    // The reader tags Avery in every keyframe; OCR reads the board but no name.
+    let specs: Vec<Spec> = (0..4)
+        .map(|_| {
+            let mut s = base();
+            s.owners.push(("Avery", ABOVE_GATEWAY, ""));
+            s
+        })
+        .collect();
+    let s = run(frames_with_ocr(&specs, &|_| vec![]), &params());
+    assert!(avery(&s).is_empty(), "{:#?}", s.owner_assignments);
+    // Without any OCR there is nothing to check against: the reader's tags count.
+    let s = run(frames(&specs), &params());
+    assert_eq!(avery(&s).len(), 1);
+}
+
+#[test]
+fn a_misplaced_reader_tag_follows_its_ocr_text() {
+    // The reader puts Avery's tag above Ledger Store; OCR reads it above Ingest Gateway.
+    let specs: Vec<Spec> = (0..4)
+        .map(|_| {
+            let mut s = base();
+            s.owners.push(("Avery", ABOVE_LEDGER, ""));
+            s
+        })
+        .collect();
+    let s = run(
+        frames_with_ocr(&specs, &|_| vec![("Avery", ABOVE_GATEWAY)]),
+        &params(),
+    );
+    let a = avery(&s);
+    assert_eq!(a.len(), 1, "{a:#?}");
+    assert_eq!(a[0].target.texts(), vec!["Ingest Gateway"]);
+}
+
+#[test]
+fn a_misspelled_ocr_name_resolves_to_its_participant() {
+    let specs: Vec<Spec> = (0..3).map(|_| base()).collect();
+    let s = run(
+        frames_with_ocr(&specs, &|_| vec![("Averry", ABOVE_GATEWAY)]),
+        &params(),
+    );
+    let a = avery(&s);
+    assert_eq!(a.len(), 1, "{a:#?}");
+    assert_eq!(a[0].name_raw, "Averry");
+    assert_eq!(a[0].target.texts(), vec!["Ingest Gateway"]);
+    // A name no participant is close to is not a tag.
+    let s = run(
+        frames_with_ocr(&specs, &|_| vec![("Morgan", ABOVE_GATEWAY)]),
+        &params(),
+    );
+    assert!(s.owner_assignments.is_empty());
+}
+
+#[test]
+fn an_edge_tag_does_not_jump_to_the_adjacent_node() {
+    // Avery's tag sits on the Ingest Gateway to Queue connector. In keyframes 2 and 3
+    // the reader draws Queue's box wider, reaching the tag: those views alone anchor
+    // it beside Queue. It is the same tag at the same place: the edge is kept.
+    let specs: Vec<Spec> = (0..6).map(|_| base()).collect();
+    let mut fr = frames_with_ocr(&specs, &|_| vec![("Avery", ON_HTTP_EDGE)]);
+    for f in &mut fr[2..4] {
+        for n in &mut f.board.nodes {
+            if n.local_id == "n2" {
+                n.bbox.x1 = 500.0;
+            }
+        }
+    }
+    let s = run(fr, &params());
+    let a = avery(&s);
+    assert_eq!(a.len(), 1, "{a:#?}");
+    assert_eq!(a[0].target.texts(), vec!["Ingest Gateway", "Queue"]);
+    assert!(a[0].moved_from.is_none());
+    assert_eq!((a[0].valid_from_s, a[0].valid_to_s), (0.0, 120.0));
+    assert!(a[0]
+        .sightings
+        .iter()
+        .any(|x| x.keyframe_id == "kf02" && x.anchor == AnchorKind::Registered));
+    assert!(s.events.iter().all(|e| e.kind != EventKind::OwnerMoved));
+}
+
+#[test]
+fn an_ocr_tag_moved_to_another_node_is_a_move() {
+    let specs: Vec<Spec> = (0..6).map(|_| base()).collect();
+    let s = run(
+        frames_with_ocr(&specs, &|i| {
+            vec![("Avery", if i < 3 { ABOVE_GATEWAY } else { ABOVE_LEDGER })]
+        }),
+        &params(),
+    );
+    let a = avery(&s);
+    assert_eq!(a.len(), 2, "{a:#?}");
+    assert_eq!(a[0].target.texts(), vec!["Ingest Gateway"]);
+    assert_eq!((a[0].valid_from_s, a[0].valid_to_s), (0.0, 60.0));
+    assert_eq!(a[1].target.texts(), vec!["Ledger Store"]);
+    assert_eq!(a[1].valid_from_s, 60.0);
+    assert!(a[1]
+        .moved_from
+        .as_ref()
+        .is_some_and(|m| m.texts() == vec!["Ingest Gateway"]));
+}
+
+#[test]
+fn a_tag_panned_out_of_view_is_not_absent() {
+    // Avery owns Ingest Gateway and Report Builder. Keyframes 2 and 3 pan the view so
+    // Report Builder sits at the bottom edge and its tag below it is cut off.
+    let panned = Similarity {
+        scale: 1.0,
+        angle: 0.0,
+        tx: 0.0,
+        ty: 200.0,
+    };
+    let specs: Vec<Spec> = (0..6)
+        .map(|i| Spec {
+            t: if (2..4).contains(&i) {
+                panned
+            } else {
+                Similarity::IDENTITY
+            },
+            ..base()
+        })
+        .collect();
+    let s = run(
+        frames_with_ocr(&specs, &|_| {
+            vec![("Avery", ABOVE_GATEWAY), ("Avery", UNDER_REPORT)]
+        }),
+        &params(),
+    );
+    assert!(s
+        .registration
+        .iter()
+        .all(|r| r.registration.mode != RegistrationMode::TextOnly));
+    let a = avery(&s);
+    let report: Vec<_> = a
+        .iter()
+        .filter(|x| x.target.texts() == vec!["Report Builder"])
+        .collect();
+    assert_eq!(report.len(), 1, "{a:#?}");
+    assert_eq!((report[0].valid_from_s, report[0].valid_to_s), (0.0, 120.0));
+    assert_eq!(a.len(), 2, "{a:#?}");
+}
+
+#[test]
+fn a_name_mentioned_in_a_sticky_is_no_tag() {
+    // A sticky under Ledger Store says "Ask Avery about retention"; OCR reads the
+    // name on its own line inside it.
+    let specs: Vec<Spec> = (0..4)
+        .map(|_| {
+            let mut s = base();
+            s.stickies = vec![("Ask Avery about retention", (1200.0, 300.0))];
+            s
+        })
+        .collect();
+    let s = run(
+        frames_with_ocr(&specs, &|_| {
+            vec![
+                ("Ask", (1200.0, 272.0)),
+                ("Avery", (1200.0, 300.0)),
+                ("about retention", (1200.0, 328.0)),
+            ]
+        }),
+        &params(),
+    );
+    assert!(avery(&s).is_empty(), "{:#?}", s.owner_assignments);
+    // The same sticky's reader box thrown over a real tag elsewhere: OCR reads no
+    // word of the sticky around the name, so the tag stands.
+    let specs: Vec<Spec> = (0..4)
+        .map(|_| {
+            let mut s = base();
+            s.stickies = vec![("Ask Avery about retention", ABOVE_GATEWAY)];
+            s
+        })
+        .collect();
+    let s = run(
+        frames_with_ocr(&specs, &|_| vec![("Avery", ABOVE_GATEWAY)]),
+        &params(),
+    );
+    let a = avery(&s);
+    assert_eq!(a.len(), 1, "{a:#?}");
+    assert_eq!(a[0].target.texts(), vec!["Ingest Gateway"]);
+}
+
+#[test]
+fn a_reader_tag_ocr_does_not_see_where_it_reads_the_name_is_dropped() {
+    // The reader sees two Avery tags throughout (above Ingest Gateway and above Ledger
+    // Store); OCR reads the one above Ingest Gateway, and the one above Ledger Store
+    // only from keyframe 4. The reader's extra tag is not evidence: Ledger Store opens
+    // when OCR reads it, not before.
+    let specs: Vec<Spec> = (0..6)
+        .map(|_| {
+            let mut s = base();
+            s.owners.push(("Avery", ABOVE_GATEWAY, ""));
+            s.owners.push(("Avery", ABOVE_LEDGER, ""));
+            s
+        })
+        .collect();
+    let s = run(
+        frames_with_ocr(&specs, &|i| {
+            let mut v = vec![("Avery", ABOVE_GATEWAY)];
+            if i >= 4 {
+                v.push(("Avery", ABOVE_LEDGER));
+            }
+            v
+        }),
+        &params(),
+    );
+    let a = avery(&s);
+    let ledger: Vec<_> = a
+        .iter()
+        .filter(|x| x.target.texts() == vec!["Ledger Store"])
+        .collect();
+    assert_eq!(ledger.len(), 1, "{a:#?}");
+    assert_eq!(ledger[0].valid_from_s, 80.0);
+    assert!(a
+        .iter()
+        .any(|x| x.target.texts() == vec!["Ingest Gateway"] && x.valid_from_s == 0.0));
+}
+
+#[test]
+fn a_tag_moved_next_to_the_adjacent_node_is_a_move() {
+    // Avery's tag sits mid-connector for three keyframes, then is moved along it to
+    // touch Queue: a new place, so a new physical tag, anchored beside Queue.
+    let specs: Vec<Spec> = (0..6).map(|_| base()).collect();
+    let s = run(
+        frames_with_ocr(&specs, &|i| {
+            vec![("Avery", if i < 3 { ON_HTTP_EDGE } else { (560.0, 205.0) })]
+        }),
+        &params(),
+    );
+    let a = avery(&s);
+    assert_eq!(a.len(), 2, "{a:#?}");
+    assert_eq!(a[0].target.texts(), vec!["Ingest Gateway", "Queue"]);
+    assert_eq!(a[0].valid_to_s, 60.0);
+    assert_eq!(a[1].target.texts(), vec!["Queue"]);
+    assert!(a[1].moved_from.is_some());
+}
+
+#[test]
+fn two_tags_on_one_node_are_two_physical_tags() {
+    // Two Avery tags above Ingest Gateway (left and right of it) in keyframe 0; only
+    // the right one is read afterwards. The right one is seen twice in a row and opens.
+    let left = (140.0, 120.0);
+    let right = (290.0, 120.0);
+    let specs: Vec<Spec> = (0..2).map(|_| base()).collect();
+    let s = run(
+        frames_with_ocr(&specs, &|i| {
+            if i == 0 {
+                vec![("Avery", left), ("Avery", right)]
+            } else {
+                vec![("Avery", right)]
+            }
+        }),
+        &params(),
+    );
+    let a = avery(&s);
+    assert_eq!(a.len(), 1, "{a:#?}");
+    assert_eq!(a[0].target.texts(), vec!["Ingest Gateway"]);
+    assert_eq!(a[0].valid_from_s, 0.0);
+}
+
+/// Where the misplaced or second Queue box sits (far from the real Queue).
+const FAR_QUEUE: (f64, f64) = (1400.0, 450.0);
+
+/// Six keyframes of the base board with OCR of the real board in every keyframe; in
+/// keyframes 4 and 5 the reader puts Queue's box at `FAR_QUEUE` (OCR still reads
+/// Queue at its real place). `avery_of(i)` places Avery's OCR name tag.
+fn misplaced_queue_frames(
+    avery_of: &dyn Fn(usize) -> Vec<(&'static str, (f64, f64))>,
+) -> Vec<BoardFrame> {
+    let specs: Vec<Spec> = (0..6).map(|_| base()).collect();
+    let mut fr = frames_with_ocr(&specs, avery_of);
+    for f in &mut fr[4..] {
+        for n in &mut f.board.nodes {
+            if n.local_id == "n2" {
+                n.bbox = bbox_at(&Similarity::IDENTITY, FAR_QUEUE, 90.0, 40.0);
+            }
+        }
+    }
+    fr
+}
+
+fn queue_nodes(s: &BoardStateItem) -> Vec<&glassrip_meeting::consolidate::NodeState> {
+    s.nodes
+        .iter()
+        .filter(|n| n.text == "Queue" && n.in_final)
+        .collect()
+}
+
+#[test]
+fn a_misplaced_same_text_track_merges_into_the_established_node() {
+    // Two keyframes read Queue far from its place while OCR reads it where it has
+    // been: one Queue, with its edges, and the second track reported as a duplicate.
+    let s = run(misplaced_queue_frames(&|_| vec![]), &params());
+    let q = queue_nodes(&s);
+    assert_eq!(q.len(), 1, "{:#?}", s.nodes);
+    assert_eq!(q[0].lifetimes.last().unwrap().keyframes, 6);
+    assert_eq!(
+        node_texts(&s),
+        vec!["Ingest Gateway", "Ledger Store", "Queue", "Report Builder"]
+    );
+    assert!(s
+        .folded
+        .iter()
+        .any(|f| f.text == "Queue" && f.into == "Queue" && f.reason == FoldReason::Duplicate));
+    // The edges read to the misplaced box in keyframes 4 and 5 are Queue's edges:
+    // every Queue edge is seen in all six keyframes.
+    let queue_edges: Vec<_> = s
+        .edges
+        .iter()
+        .filter(|e| e.a_text == "Queue" || e.b_text == "Queue")
+        .collect();
+    assert_eq!(queue_edges.len(), 3, "{:#?}", s.edges);
+    for e in queue_edges {
+        assert!(e.in_final);
+        assert_eq!(e.lifetimes.last().unwrap().keyframes, 6, "{e:#?}");
+    }
+}
+
+#[test]
+fn a_same_text_box_on_a_collapsed_reading_merges() {
+    // No OCR at all, but the last two readings collapse every node box into one
+    // place: the far Queue box there is no evidence of a second Queue.
+    let specs: Vec<Spec> = (0..6).map(|_| base()).collect();
+    let mut fr = frames(&specs);
+    for f in &mut fr[4..] {
+        for n in &mut f.board.nodes {
+            n.bbox = bbox_at(&Similarity::IDENTITY, FAR_QUEUE, 90.0, 40.0);
+        }
+    }
+    let s = run(fr, &params());
+    let q = queue_nodes(&s);
+    assert_eq!(q.len(), 1, "{:#?}", s.nodes);
+    assert_eq!(q[0].lifetimes.last().unwrap().keyframes, 6);
+    assert!(s
+        .folded
+        .iter()
+        .any(|f| f.text == "Queue" && f.reason == FoldReason::Duplicate));
+}
+
+#[test]
+fn a_distant_second_box_that_ocr_confirms_stays_a_second_node() {
+    // A real second Queue box from keyframe 2 on, read by the reader and by OCR at
+    // its own place on a reliable registration: two Queues.
+    let mut specs: Vec<Spec> = (0..6).map(|_| base()).collect();
+    for s in specs.iter_mut().skip(2) {
+        s.nodes.push(("n9", "Queue".into(), FAR_QUEUE));
+    }
+    let s = run(frames_with_ocr(&specs, &|_| vec![]), &params());
+    assert_eq!(queue_nodes(&s).len(), 2, "{:#?}", s.nodes);
+    assert!(s.folded.iter().all(|f| f.reason != FoldReason::Duplicate));
+    // Without OCR nothing says the second place is wrong: still two.
+    let s = run(frames(&specs), &params());
+    assert_eq!(queue_nodes(&s).len(), 2, "{:#?}", s.nodes);
+}
+
+#[test]
+fn an_adjacent_second_box_that_ocr_confirms_stays_a_second_node() {
+    // A second Queue box 150 px right of the first (the two boxes nearly touch):
+    // OCR reads Queue inside each box. The margin around the first box does not claim
+    // the second box's text: two Queues.
+    let mut specs: Vec<Spec> = (0..6).map(|_| base()).collect();
+    for s in specs.iter_mut().skip(2) {
+        s.nodes.push(("n9", "Queue".into(), (850.0, 220.0)));
+    }
+    let s = run(frames_with_ocr(&specs, &|_| vec![]), &params());
+    assert_eq!(queue_nodes(&s).len(), 2, "{:#?}", s.nodes);
+    assert!(s.folded.iter().all(|f| f.reason != FoldReason::Duplicate));
+}
+
+#[test]
+fn an_owner_tag_on_a_merged_duplicate_targets_the_established_node() {
+    // Avery sits above Ledger Store, then moves above Queue in the two keyframes that
+    // misplace Queue's box: the move targets the one Queue node.
+    let s = run(
+        misplaced_queue_frames(&|i| {
+            vec![("Avery", if i < 4 { ABOVE_LEDGER } else { (700.0, 140.0) })]
+        }),
+        &params(),
+    );
+    let q = queue_nodes(&s);
+    assert_eq!(q.len(), 1, "{:#?}", s.nodes);
+    let a = avery(&s);
+    let last = a.last().expect("an assignment");
+    assert_eq!(last.target.texts(), vec!["Queue"], "{a:#?}");
+    match &last.target {
+        OwnerTarget::Node { node_id, .. } => assert_eq!(node_id, &q[0].id),
+        other => panic!("{other:?}"),
+    }
+    assert!(last
+        .moved_from
+        .as_ref()
+        .is_some_and(|m| m.texts() == vec!["Ledger Store"]));
+}
+
+#[test]
+fn a_node_read_as_a_sticky_as_often_or_marked_as_one_is_a_sticky() {
+    // "Cache warmup plan" is read as a node in keyframes 0-1 and as a sticky in 2-3 at
+    // one place; "Pilot milestone in May" is always read as a node; neither has a
+    // connector. "Is the ledger durable?" is read as a node joined to Ledger Store.
+    let mut specs: Vec<Spec> = (0..4).map(|_| base()).collect();
+    for (i, s) in specs.iter_mut().enumerate() {
+        if i < 2 {
+            s.nodes
+                .push(("n7", "Cache warmup plan".into(), (1400.0, 450.0)));
+        } else {
+            s.stickies.push(("Cache warmup plan", (1400.0, 450.0)));
+        }
+        s.nodes
+            .push(("n8", "Pilot milestone in May".into(), (200.0, 450.0)));
+        s.nodes
+            .push(("n9", "Is the ledger durable?".into(), (1200.0, 450.0)));
+        s.edges.push(("n3", "n9", ""));
+    }
+    let s = run(frames(&specs), &params());
+    let texts = node_texts(&s);
+    assert!(
+        !texts.contains(&"Cache warmup plan".to_string()),
+        "{texts:?}"
+    );
+    assert!(!texts.contains(&"Pilot milestone in May".to_string()));
+    assert!(texts.contains(&"Is the ledger durable?".to_string()));
+    let sticky = |t: &str| s.stickies.iter().find(|x| x.text == t && x.in_final);
+    assert_eq!(
+        sticky("Pilot milestone in May").map(|x| x.kind),
+        Some(StickyKind::Milestone)
+    );
+    assert!(sticky("Cache warmup plan").is_some(), "{:#?}", s.stickies);
+}
+
+#[test]
+fn a_same_text_box_where_the_registration_is_off_merges() {
+    // No OCR. In keyframes 4 and 5 the reader throws Queue far from every other
+    // element, and Ledger Store to another far place (a different one in each
+    // keyframe): nothing read near the Queue box confirms the registration there, and
+    // the keyframe misplaces another known element. The Queue box is no second Queue.
+    let specs: Vec<Spec> = (0..6).map(|_| base()).collect();
+    let mut fr = frames(&specs);
+    let id = Similarity::IDENTITY;
+    for (k, ledger_at) in [(4, (-1200.0, 300.0)), (5, (-1200.0, 1400.0))] {
+        for n in &mut fr[k].board.nodes {
+            match n.local_id.as_str() {
+                "n2" => n.bbox = bbox_at(&id, (-700.0, -600.0), 90.0, 40.0),
+                "n3" => n.bbox = bbox_at(&id, ledger_at, 90.0, 40.0),
+                _ => {}
+            }
+        }
+    }
+    let s = run(fr, &params());
+    let q = queue_nodes(&s);
+    assert_eq!(q.len(), 1, "{:#?}", s.nodes);
+    assert_eq!(q[0].lifetimes.last().unwrap().keyframes, 6);
+    assert!(s
+        .folded
+        .iter()
+        .any(|f| f.text == "Queue" && f.reason == FoldReason::Duplicate));
+    // With the Ledger Store boxes where they belong, nothing in those keyframes says
+    // the registration is off: the far Queue box stays unexplained.
+    let mut fr = frames(&specs);
+    for f in &mut fr[4..] {
+        for n in &mut f.board.nodes {
+            if n.local_id == "n2" {
+                n.bbox = bbox_at(&id, (-700.0, -600.0), 90.0, 40.0);
+            }
+        }
+    }
+    let s = run(fr, &params());
+    assert!(s.folded.iter().all(|f| f.reason != FoldReason::Duplicate));
+}
+
+/// Codex r5 integration, MAJOR 2: connector ends were taken before fragments
+/// were redirected, so a connector read at a fragment did not keep the element
+/// it folds into a node; the element became a sticky and the edge was dropped.
+#[test]
+fn a_supported_connector_at_a_fragment_keeps_its_element_a_node_with_the_edge() {
+    // "Pilot milestone in May" is read whole in keyframes 0, 1, 4 and 5; keyframes 2
+    // and 3 read only its fragment "Pilot milestone" over the element's place
+    // (offset, so a separate reading rather than a label change), with a connector
+    // from Queue in both (an edge needs support). The fragment folds into the
+    // element, its connector with it: the element is a node (only nodes carry
+    // edges) and the connector survives.
+    let mut specs: Vec<Spec> = (0..6).map(|_| base()).collect();
+    for (i, s) in specs.iter_mut().enumerate() {
+        if !(2..4).contains(&i) {
+            s.nodes
+                .push(("n8", "Pilot milestone in May".into(), (200.0, 450.0)));
+        } else {
+            s.nodes
+                .push(("n8", "Pilot milestone".into(), (280.0, 450.0)));
+            s.edges.push(("n2", "n8", ""));
+        }
+    }
+    let s = run(frames(&specs), &params());
+    assert!(s
+        .folded
+        .iter()
+        .any(|f| f.text == "Pilot milestone" && f.into == "Pilot milestone in May"));
+    let texts = node_texts(&s);
+    assert!(
+        texts.contains(&"Pilot milestone in May".to_string()),
+        "{texts:?}"
+    );
+    assert!(!s
+        .stickies
+        .iter()
+        .any(|x| x.text.starts_with("Pilot milestone")));
+    let milestone_edge = |s: &BoardStateItem| {
+        s.edges.iter().any(|e| {
+            let ends = [e.a_text.as_str(), e.b_text.as_str()];
+            ends.contains(&"Queue") && ends.contains(&"Pilot milestone in May")
+        })
+    };
+    assert!(milestone_edge(&s), "{:#?}", s.edges);
+}
+
+#[test]
+fn a_connector_read_once_at_a_fragment_does_not_keep_a_marked_element_a_node() {
+    // As above, but only keyframe 4 reads the fragment with its connector: the
+    // edge has no support and is dropped whatever the element's kind, so it does
+    // not override the milestone marker; the element is a sticky.
+    let mut specs: Vec<Spec> = (0..5).map(|_| base()).collect();
+    for (i, s) in specs.iter_mut().enumerate() {
+        if i < 4 {
+            s.nodes
+                .push(("n8", "Pilot milestone in May".into(), (200.0, 450.0)));
+        } else {
+            s.nodes
+                .push(("n8", "Pilot milestone".into(), (280.0, 450.0)));
+            s.edges.push(("n2", "n8", ""));
+        }
+    }
+    let s = run(frames(&specs), &params());
+    let texts = node_texts(&s);
+    assert!(
+        !texts.iter().any(|t| t.starts_with("Pilot milestone")),
+        "{texts:?}"
+    );
+    assert!(s
+        .stickies
+        .iter()
+        .any(|x| x.text == "Pilot milestone in May" && x.kind == StickyKind::Milestone));
+}
+
+/// Two fragment-connector sightings meet the keyframe count but fail the
+/// edge's density rule when they are far apart.
+fn far_apart_fragment_specs() -> Vec<Spec> {
+    // 25 keyframes: "Pilot milestone in May" whole everywhere but keyframes 2 and
+    // 24, which read its fragment with a connector from Queue; two sightings over
+    // 23 keyframes are below the support density, so the edge is not drawn.
+    let mut specs: Vec<Spec> = (0..25).map(|_| base()).collect();
+    for (i, s) in specs.iter_mut().enumerate() {
+        if i != 2 && i != 24 {
+            s.nodes
+                .push(("n8", "Pilot milestone in May".into(), (200.0, 450.0)));
+        } else {
+            s.nodes
+                .push(("n8", "Pilot milestone".into(), (280.0, 450.0)));
+            s.edges.push(("n2", "n8", ""));
+        }
+    }
+    specs
+}
+
+#[test]
+fn far_apart_fragment_connectors_that_draw_no_edge_leave_a_marked_element_a_sticky() {
+    let specs = far_apart_fragment_specs();
+    let s = run(frames(&specs), &params());
+    assert!(
+        !s.edges
+            .iter()
+            .any(|e| e.a_text.starts_with("Pilot milestone")
+                || e.b_text.starts_with("Pilot milestone")),
+        "{:#?}",
+        s.edges
+    );
+    assert!(
+        !s.nodes
+            .iter()
+            .any(|n| n.text.starts_with("Pilot milestone")),
+        "{:?}",
+        node_texts(&s)
+    );
+    assert!(s
+        .stickies
+        .iter()
+        .any(|x| x.text == "Pilot milestone in May" && x.kind == StickyKind::Milestone));
+    assert!(s
+        .edges
+        .iter()
+        .any(|e| e.a_text == "Ingest Gateway" && e.b_text == "Queue"));
+}
+
+#[derive(Default)]
+struct OnceReader(Mutex<BTreeMap<(String, String), usize>>);
+
+impl SecondReader for OnceReader {
+    fn confirms(&self, keyframe_id: &str, text: &str) -> bool {
+        let mut calls = self.0.lock().unwrap();
+        let count = calls
+            .entry((keyframe_id.to_string(), text.to_string()))
+            .or_default();
+        *count += 1;
+        *count == 1
+    }
+}
+
+#[derive(Default)]
+struct CountingCorroborator(Mutex<Vec<f64>>);
+
+impl Corroborator for CountingCorroborator {
+    fn corroborate(&self, q: &MoveQuery<'_>) -> Option<Corroboration> {
+        self.0.lock().unwrap().push(q.t_start_s);
+        q.from.is_some().then(|| Corroboration {
+            source: "transcript".into(),
+            t_s: q.t_start_s,
+            detail: "synthetic cue".into(),
+        })
+    }
+}
+
+#[test]
+fn fragment_fallback_calls_each_external_hook_only_once() {
+    let mut specs = far_apart_fragment_specs();
+    for (i, s) in specs.iter_mut().enumerate() {
+        s.owners.push((
+            "Avery",
+            if i < 24 {
+                (200.0, 120.0)
+            } else {
+                (840.0, 650.0)
+            },
+            "",
+        ));
+    }
+    let reader = OnceReader::default();
+    let corroborator = CountingCorroborator::default();
+    let s = consolidate(
+        frames(&specs),
+        "board-1",
+        &params(),
+        &Hooks {
+            corroborator: &corroborator,
+            second_reader: Some(&reader),
+        },
+    );
+    assert!(s
+        .stickies
+        .iter()
+        .any(|x| x.text == "Pilot milestone in May"));
+    let calls = reader.0.lock().unwrap();
+    assert!(!calls.is_empty());
+    assert!(calls.values().all(|&n| n == 1), "{calls:?}");
+    let corroborations = corroborator.0.lock().unwrap();
+    assert!(corroborations.contains(&480.0), "{corroborations:?}");
+    assert!(
+        corroborations
+            .iter()
+            .enumerate()
+            .all(|(i, t)| !corroborations[..i].contains(t)),
+        "{corroborations:?}"
+    );
 }

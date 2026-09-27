@@ -5,7 +5,7 @@ use resvg::{tiny_skia, usvg};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::scene::{overlaps, Scene};
+use crate::scene::{overlaps, Estimate, Measure, Scene};
 use crate::RenderError;
 
 /// Formats a number for SVG attributes (integers without a decimal point).
@@ -32,6 +32,88 @@ fn comment_safe(s: String) -> String {
     out.trim_end_matches('-').to_string()
 }
 
+/// The board template (its `<style>` block also drives [`TextMeasure`]).
+const BOARD_TEMPLATE: &str = include_str!("../templates/board.svg.j2");
+
+/// Measures text the way the validation render lays it out: the template's
+/// own classes and the same fonts, so the layout can keep every glyph inside
+/// its box and the canvas.
+pub struct TextMeasure {
+    opt: usvg::Options<'static>,
+    css: String,
+    cache: std::cell::RefCell<std::collections::HashMap<(String, String), f64>>,
+}
+
+impl TextMeasure {
+    /// A measurer with the fonts of `fonts`.
+    pub fn new(fonts: &FontConfig) -> Self {
+        let mut opt = usvg::Options::default();
+        if let Some(f) = configure_fonts(opt.fontdb_mut(), fonts) {
+            opt.font_family = f;
+        }
+        let css = BOARD_TEMPLATE
+            .split_once("<style>")
+            .and_then(|(_, rest)| rest.split_once("</style>"))
+            .map(|(css, _)| css.to_string())
+            .unwrap_or_default();
+        Self {
+            opt,
+            css,
+            cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Width of the glyphs of `text` in `class`, as the validation measures
+    /// them; `None` when nothing renders (no font).
+    fn measure(&self, text: &str, class: &str) -> Option<f64> {
+        let esc: String = text
+            .chars()
+            .map(|c| match c {
+                '&' => "&amp;".to_string(),
+                '<' => "&lt;".to_string(),
+                '>' => "&gt;".to_string(),
+                '"' => "&quot;".to_string(),
+                '\'' => "&apos;".to_string(),
+                c => c.to_string(),
+            })
+            .collect();
+        let class: String = class
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        let svg = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100000\" height=\"200\"><style>{}</style><text class=\"{class}\" x=\"1000\" y=\"100\">{esc}</text></svg>",
+            self.css
+        );
+        let tree = usvg::Tree::from_str(&svg, &self.opt).ok()?;
+        fn first_text(g: &usvg::Group) -> Option<f64> {
+            g.children().iter().find_map(|n| match n {
+                usvg::Node::Group(g) => first_text(g),
+                usvg::Node::Text(t) => Some(f64::from(t.abs_bounding_box().width())),
+                _ => None,
+            })
+        }
+        first_text(tree.root()).filter(|w| *w > 0.0)
+    }
+}
+
+impl Measure for TextMeasure {
+    fn width(&self, text: &str, class: &str) -> f64 {
+        if text.trim().is_empty() {
+            return 0.0;
+        }
+        let key = (class.to_string(), text.to_string());
+        if let Some(w) = self.cache.borrow().get(&key) {
+            return *w;
+        }
+        let w = self
+            .measure(text, class)
+            .map_or_else(|| Estimate.width(text, class), |w| w.ceil());
+        self.cache.borrow_mut().insert(key, w);
+        w
+    }
+}
+
 /// Template environment shared by the SVG and markdown renderers.
 pub fn environment() -> Environment<'static> {
     let mut env = Environment::new();
@@ -49,7 +131,7 @@ pub fn environment() -> Environment<'static> {
     env.add_filter("cell", crate::markdown::cell);
     // the templates are compiled into the binary, so a failure here is a bug
     // caught by the tests; it surfaces as a render error, not a panic
-    let _ = env.add_template("board.svg", include_str!("../templates/board.svg.j2"));
+    let _ = env.add_template("board.svg", BOARD_TEMPLATE);
     let _ = env.add_template("notes.md", include_str!("../templates/notes.md.j2"));
     env
 }
@@ -92,6 +174,11 @@ pub struct SvgChecks {
     pub style_violations: Vec<String>,
     /// Layout method.
     pub layout_method: String,
+    /// Annotations with no room on the board, listed below it instead, and
+    /// edges drawn straight for want of a route (warnings: they do not fail
+    /// validation). Text past the canvas is a failure (in `overlaps`).
+    #[serde(default)]
+    pub warnings: Vec<String>,
     /// All checks passed.
     pub ok: bool,
 }
@@ -148,6 +235,37 @@ fn count_text(g: &usvg::Group, total: &mut usize, rendered: &mut usize) {
                 let b = t.flattened().bounding_box();
                 if b.width() > 0.0 && b.height() > 0.0 {
                     *rendered += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Text whose rendered glyphs reach outside the `w` x `h` canvas (measured
+/// with the fonts actually loaded, not estimated): a defect, since the layout
+/// sizes and fits text by the same measure.
+fn text_outside(g: &usvg::Group, w: f32, h: f32, out: &mut Vec<String>) {
+    for n in g.children() {
+        match n {
+            usvg::Node::Group(g) => text_outside(g, w, h, out),
+            usvg::Node::Text(t) => {
+                let b = t.abs_bounding_box();
+                if b.width() > 0.0
+                    && (b.left() < -0.5
+                        || b.top() < -0.5
+                        || b.right() > w + 0.5
+                        || b.bottom() > h + 0.5)
+                {
+                    let text: String = t
+                        .chunks()
+                        .iter()
+                        .map(|c| c.text())
+                        .collect::<String>()
+                        .chars()
+                        .take(40)
+                        .collect();
+                    out.push(format!("text \"{text}\" is outside the canvas"));
                 }
             }
             _ => {}
@@ -306,6 +424,7 @@ pub fn validate_svg(svg: &str, scene: &Scene, fonts: &FontConfig) -> (SvgChecks,
         overlaps: overlaps(scene),
         style_violations: style_violations(svg),
         layout_method: scene.layout_method.to_string(),
+        warnings: scene.degraded.clone(),
         ok: false,
     };
     let tree = match usvg::Tree::from_str(svg, &opt) {
@@ -323,6 +442,13 @@ pub fn validate_svg(svg: &str, scene: &Scene, fonts: &FontConfig) -> (SvgChecks,
         tree.root(),
         &mut checks.text_nodes,
         &mut checks.text_rendered,
+    );
+    let size_f = tree.size();
+    text_outside(
+        tree.root(),
+        size_f.width(),
+        size_f.height(),
+        &mut checks.overlaps,
     );
     let Some(mut pixmap) = tiny_skia::Pixmap::new(size.width(), size.height()) else {
         checks.parse_error = Some("zero-sized canvas".into());
@@ -374,6 +500,7 @@ mod tests {
             overlaps: vec!["card a overlaps card b".into()],
             style_violations: vec!["uses <marker> (arrowheads must be polygons)".into()],
             layout_method: "grid".into(),
+            warnings: vec!["no room on the board, listed below it as note 1: x".into()],
             ok: false,
         };
         assert_eq!(

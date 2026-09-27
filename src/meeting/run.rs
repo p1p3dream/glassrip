@@ -79,7 +79,8 @@ use glassrip_vision_stages::placement::{MonitorConfig, PlacementMonitor};
 use glassrip_vision_stages::stages::canvas_crop::CanvasCropParams;
 use glassrip_vision_stages::{
     BoardReadParams, BoardReadStage, BoardValidateParams, BoardValidateStage, CanvasCropStage,
-    ClassifyParams, ClassifyStage, OcrHarvestStage, VocabularyParams, VocabularyStage,
+    ClassifyParams, ClassifyStage, ConsensusParams, OcrHarvestStage, VocabularyParams,
+    VocabularyStage,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -466,6 +467,11 @@ fn vision_stages(v: VisionBackends, cfg: &Config) -> Result<VisionStages, Meetin
                 strong_repeats: br.degenerate_strong_repeats as usize,
                 ..DegenerateParams::default()
             },
+            consensus: ConsensusParams {
+                reads: br.reads,
+                min_agree: br.min_agree,
+                temperature: br.consensus_temperature as f32,
+            },
             ..BoardReadParams::default()
         },
         Arc::clone(&monitor),
@@ -720,6 +726,10 @@ pub async fn run_meeting(
         let validate = BoardValidateStage::new({
             let mut p = BoardValidateParams::default();
             p.validation.participant_names = participants.clone();
+            p.consensus_quorum = cfg
+                .board_read
+                .min_agree
+                .clamp(1, cfg.board_read.reads.max(1));
             p
         });
         let edges = EdgeDirectionStage::new(
@@ -926,6 +936,9 @@ pub async fn run_meeting(
         .into_iter()
         .find_map(|r| r.outcome.result);
         if let Some(r) = result {
+            for w in r.warnings() {
+                tracing::warn!(warning = %w, "render moved an annotation below the board");
+            }
             outcome.outputs = r.files.iter().map(|f| out_dir.join(&f.name)).collect();
         }
     }

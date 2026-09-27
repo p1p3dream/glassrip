@@ -31,8 +31,8 @@ use glassrip_vision_stages::raw_store::{RawStore, RecordingBackend, ReplayBacken
 use glassrip_vision_stages::stages::canvas_crop::CanvasCropParams;
 use glassrip_vision_stages::{
     adapter, BoardReadParams, BoardReadStage, BoardValidateParams, BoardValidateStage,
-    CanvasCropStage, ClassifyParams, ClassifyStage, OcrHarvestStage, VocabularyParams,
-    VocabularyStage,
+    CanvasCropStage, ClassifyParams, ClassifyStage, ConsensusParams, OcrHarvestStage,
+    VocabularyParams, VocabularyStage,
 };
 use image::{Rgb, RgbImage};
 use serde::de::DeserializeOwned;
@@ -223,11 +223,37 @@ fn read<T: DeserializeOwned>(run: &Path, schema: &str) -> Vec<(String, T)> {
         .collect()
 }
 
+/// The branch with one greedy board read per keyframe (the per-read paths).
 async fn run_branch(
     root: &Path,
     run: &Path,
     backend: Arc<dyn VisionBackend>,
 ) -> (Arc<PlacementMonitor>, Runner) {
+    let (monitor, runner, reports) = run_branch_with(
+        root,
+        run,
+        backend,
+        BoardReadParams {
+            consensus: ConsensusParams::single(),
+            ..BoardReadParams::default()
+        },
+    )
+    .await;
+    let reports = reports.unwrap();
+    assert!(reports.iter().all(|r| r.items_error == 0), "{reports:?}");
+    (monitor, runner)
+}
+
+async fn run_branch_with(
+    root: &Path,
+    run: &Path,
+    backend: Arc<dyn VisionBackend>,
+    board_read: BoardReadParams,
+) -> (
+    Arc<PlacementMonitor>,
+    Runner,
+    Result<Vec<glassrip_core::runner::StageReport>, pipeline::PipelineError>,
+) {
     adapter::build_inputs(run, &root.join("index.json"), None, "test-run").unwrap();
     let rd = RunDir::open(run, "test-run", Producer::glassrip("0.1.0", None)).unwrap();
     let mut runner = Runner::new(
@@ -267,19 +293,23 @@ async fn run_branch(
             None,
         ),
         canvas: CanvasCropStage::new(CanvasCropParams::default()),
+        board_validate: BoardValidateStage::new(BoardValidateParams {
+            consensus_quorum: board_read.consensus.quorum(),
+            ..BoardValidateParams::default()
+        }),
         board_read: BoardReadStage::new(
-            BoardReadParams::default(),
+            board_read,
             Arc::clone(&monitor),
             "scripted-vl",
             None,
             None,
         ),
-        board_validate: BoardValidateStage::new(BoardValidateParams::default()),
     };
-    let reports = branch.run(&mut runner, None).await.unwrap();
-    assert_eq!(reports.len(), 6);
-    assert!(reports.iter().all(|r| r.items_error == 0), "{reports:?}");
-    (monitor, runner)
+    let reports = branch.run(&mut runner, None).await;
+    if let Ok(r) = &reports {
+        assert_eq!(r.len(), 6);
+    }
+    (monitor, runner, reports)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -706,9 +736,11 @@ async fn a_regular_row_cut_at_the_limit_takes_the_budget_retry() {
 
 /// Scripted model whose board reads come back complete and valid but list the
 /// one real box six times under fresh ids (stepped boxes), with an edge to each
-/// copy. The repeat-penalty retry answers as `retry` says.
+/// copy (or the answer `board` builds). The repeat-penalty retry answers as
+/// `retry` says.
 struct DegenerateModel {
     retry: RetryReply,
+    board: fn(f64, f64) -> serde_json::Value,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -740,6 +772,24 @@ fn degenerate_board(w: f64, h: f64) -> serde_json::Value {
            "other_visible_text": [], "confidence": 0.7})
 }
 
+/// Eight separate boxes, each with an "Avery" owner tag under it: one person
+/// owning eight things, a name OCR does not read.
+fn one_owner_board(w: f64, h: f64) -> serde_json::Value {
+    let mut nodes = Vec::new();
+    let mut owner_tags = Vec::new();
+    for k in 0..8 {
+        let x = 0.02 * w + f64::from(k) * 0.12 * w;
+        nodes.push(
+            json!({"local_id": format!("n{}", k + 1), "text": format!("Step {k}"),
+            "bbox_2d": [x, 0.3 * h, x + 0.1 * w, 0.4 * h], "conf": 0.9}),
+        );
+        owner_tags.push(json!({"name_raw": "Avery", "near": format!("n{}", k + 1),
+            "bbox_2d": [x, 0.42 * h, x + 0.05 * w, 0.46 * h]}));
+    }
+    json!({"nodes": nodes, "edges": [], "stickies": [], "owner_tags": owner_tags,
+           "other_visible_text": [], "confidence": 0.7})
+}
+
 #[async_trait]
 impl VisionBackend for DegenerateModel {
     fn id(&self) -> BackendId {
@@ -763,7 +813,7 @@ impl VisionBackend for DegenerateModel {
             });
         }
         if board && (!retry || self.retry == RetryReply::Degenerate) {
-            let value = degenerate_board(
+            let value = (self.board)(
                 f64::from(request.image.width()),
                 f64::from(request.image.height()),
             );
@@ -793,7 +843,10 @@ async fn degenerate_reads_retry_then_collapse_and_replay(retry: RetryReply) {
         root,
         &live,
         Arc::new(RecordingBackend::new(
-            Arc::new(DegenerateModel { retry }),
+            Arc::new(DegenerateModel {
+                retry,
+                board: degenerate_board,
+            }),
             store.clone(),
         )),
     )
@@ -874,4 +927,546 @@ async fn still_degenerate_reads_are_collapsed_and_replay() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_degenerate_retry_keeps_the_first_reply_and_replays() {
     degenerate_reads_retry_then_collapse_and_replay(RetryReply::Truncated).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn separate_owner_tags_the_retry_repeats_are_kept_and_replay() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_inputs(root);
+    let store = RawStore::new(root.join("raw"));
+    let live = root.join("live");
+    let (monitor, _) = run_branch(
+        root,
+        &live,
+        Arc::new(RecordingBackend::new(
+            Arc::new(DegenerateModel {
+                retry: RetryReply::Degenerate,
+                board: one_owner_board,
+            }),
+            store.clone(),
+        )),
+    )
+    .await;
+    // 3 classify + 2 flagged board reads + 2 penalized retries.
+    assert_eq!(monitor.completed(), 7);
+    let readings: Vec<(String, BoardReadingItem)> = read(&live, artifacts::BOARD_READING);
+    assert_eq!(readings.len(), 2);
+    for (_, r) in &readings {
+        let d = r.requests[0]
+            .degenerate
+            .as_ref()
+            .expect("the repeated owner is flagged for the retry");
+        let rep = &d.finding.repeated[0];
+        assert_eq!((rep.text.as_str(), rep.count), ("avery", 8));
+        assert!(d.retried && d.retry_error.is_none(), "{d:?}");
+        // The retry repeats the tags side by side: every assignment stays.
+        assert!(d.collapsed.is_empty(), "{d:?}");
+        assert_eq!(r.result.owner_tags.len(), 8);
+        let near: Vec<&str> = r
+            .result
+            .owner_tags
+            .iter()
+            .map(|o| o.near.as_str())
+            .collect();
+        assert_eq!(near, ["n1", "n2", "n3", "n4", "n5", "n6", "n7", "n8"]);
+    }
+
+    let replay = root.join("replay");
+    run_branch(
+        root,
+        &replay,
+        Arc::new(ReplayBackend::new("scripted-vl", store)),
+    )
+    .await;
+    let again: Vec<(String, BoardReadingItem)> = read(&replay, artifacts::BOARD_READING);
+    assert_eq!(again.len(), 2);
+    for ((_, a), (_, b)) in again.iter().zip(&readings) {
+        assert_eq!(a.result, b.result);
+        assert_eq!(a.requests[0].request_key, b.requests[0].request_key);
+        assert_eq!(a.requests[0].degenerate, b.requests[0].degenerate);
+    }
+}
+
+/// Scripted model whose three consensus reads differ the way sampled replies
+/// do: every read has the service box (at slightly different places), the
+/// greedy read and one sampled read have the ledger, and one sampled read adds
+/// a box no other read has. Reads in `fail` answer with a protocol error.
+struct SampledModel {
+    fail: &'static [u64],
+    /// Fail only the first request of this read (whichever keyframe asks first).
+    fail_first_of: Option<u64>,
+    failed: std::sync::atomic::AtomicBool,
+    /// The retry of a failing read (seed above 2^32) answers.
+    retries_answer: bool,
+}
+
+impl SampledModel {
+    fn failing(fail: &'static [u64]) -> Self {
+        Self {
+            fail,
+            fail_first_of: None,
+            failed: std::sync::atomic::AtomicBool::new(false),
+            retries_answer: false,
+        }
+    }
+}
+
+impl SampledModel {
+    fn board(seed: u64, w: f64, h: f64) -> serde_json::Value {
+        let dx = seed as f64 * 0.004 * w;
+        let mut nodes = vec![
+            json!({"local_id": format!("s{seed}"), "text": "Order Service",
+                   "bbox_2d": [0.3 * w + dx, 0.3 * h, 0.5 * w + dx, 0.45 * h], "conf": 0.9}),
+        ];
+        let mut edges = Vec::new();
+        if seed != 1 {
+            nodes.push(json!({"local_id": format!("l{seed}"), "text": "Ledger",
+                   "bbox_2d": [0.6 * w, 0.6 * h, 0.8 * w, 0.72 * h], "conf": 0.8}));
+            edges.push(json!({"src": format!("s{seed}"), "dst": format!("l{seed}"),
+                   "label": "posts", "label_bbox_2d": [0.52 * w, 0.5 * h, 0.58 * w, 0.54 * h],
+                   "style": "solid", "conf": 0.7}));
+        }
+        if seed == 1 {
+            nodes.push(json!({"local_id": "g1", "text": "Ghost Queue",
+                   "bbox_2d": [0.05 * w, 0.7 * h, 0.2 * w, 0.8 * h], "conf": 0.6}));
+        }
+        json!({"nodes": nodes, "edges": edges, "stickies": [], "owner_tags": [],
+               "other_visible_text": [], "confidence": 0.7})
+    }
+}
+
+#[async_trait]
+impl VisionBackend for SampledModel {
+    fn id(&self) -> BackendId {
+        ScriptedModel.id()
+    }
+    async fn preflight(&self) -> glassrip_vision::Result<Placement> {
+        Err(VisionError::Config("unused".into()))
+    }
+    async fn infer(
+        &self,
+        request: VisionRequest,
+        cancel: CancellationToken,
+    ) -> glassrip_vision::Result<RawResponse> {
+        let board = request.schema.json()["properties"]["nodes"].is_object();
+        if !board {
+            return ScriptedModel.infer(request, cancel).await;
+        }
+        // The run seed is 0 and keyframe salts are multiples of 16; a retry
+        // adds 2^62 to its read's seed.
+        let retry = request.options.seed >= 1 << 62;
+        let seed = request.options.seed % 16;
+        // Read 0 is greedy; the sampled reads (and every retry) carry the
+        // temperature.
+        assert_eq!(
+            request.sampling.temperature.is_some(),
+            seed > 0 || retry,
+            "{seed}"
+        );
+        let first_of = self.fail_first_of.is_some_and(|k| {
+            k == seed && !self.failed.swap(true, std::sync::atomic::Ordering::SeqCst)
+        });
+        if (self.fail.contains(&seed) && !(retry && self.retries_answer)) || first_of {
+            return Err(VisionError::Protocol(format!(
+                "scripted failure of read {seed}"
+            )));
+        }
+        let value = Self::board(
+            seed,
+            f64::from(request.image.width()),
+            f64::from(request.image.height()),
+        );
+        request.schema.validate(&value).unwrap();
+        Ok(RawResponse {
+            raw_text: value.to_string(),
+            json: value,
+            prompt_eval_count: Some(request.image.tokens() + 900),
+            eval_count: Some(120),
+            durations: Durations::default(),
+            attempts: 1,
+            repaired: false,
+            done_reason: Some("stop".into()),
+        })
+    }
+}
+
+fn consensus_params() -> BoardReadParams {
+    BoardReadParams {
+        consensus: ConsensusParams {
+            reads: 3,
+            min_agree: 2,
+            temperature: 0.3,
+        },
+        ..BoardReadParams::default()
+    }
+}
+
+/// A consensus run recorded with the sampled model and its replay.
+struct ConsensusRuns {
+    live: Vec<(String, BoardReadingItem)>,
+    replay: Vec<(String, BoardReadingItem)>,
+    /// Model requests the live run completed.
+    completed: usize,
+    /// Items that failed (the same in both runs).
+    errors: u64,
+}
+
+/// [`read`], or nothing when the stage failed before writing its artifact.
+fn read_if_any<T: DeserializeOwned>(run: &Path, schema: &str) -> Vec<(String, T)> {
+    if run
+        .join("artifacts")
+        .join(format!("{schema}.jsonl"))
+        .exists()
+    {
+        read(run, schema)
+    } else {
+        Vec::new()
+    }
+}
+
+/// Failed items of a branch run: the reports' count, or the failed board_read
+/// items when they exceeded the runner's error rate.
+fn failed_items(
+    reports: &Result<Vec<glassrip_core::runner::StageReport>, pipeline::PipelineError>,
+) -> u64 {
+    match reports {
+        Ok(r) => r.iter().map(|r| r.items_error).sum(),
+        Err(pipeline::PipelineError::Runner(
+            glassrip_core::runner::RunnerError::ErrorRateExceeded { stage, errors, .. },
+        )) if stage == "board_read" => *errors,
+        Err(e) => panic!("{e}"),
+    }
+}
+
+/// Record with the sampled model, then replay in a fresh directory.
+async fn consensus_record_and_replay(fail: &'static [u64]) -> ConsensusRuns {
+    consensus_record_and_replay_with(SampledModel::failing(fail)).await
+}
+
+async fn consensus_record_and_replay_with(model: SampledModel) -> ConsensusRuns {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_inputs(root);
+    let store = RawStore::new(root.join("raw"));
+    let live = root.join("live");
+    let (monitor, _, reports) = run_branch_with(
+        root,
+        &live,
+        Arc::new(RecordingBackend::new(Arc::new(model), store.clone())),
+        consensus_params(),
+    )
+    .await;
+    let errors = failed_items(&reports);
+    let completed = monitor.completed();
+    let readings: Vec<(String, BoardReadingItem)> = read_if_any(&live, artifacts::BOARD_READING);
+    for (_, r) in &readings {
+        for log in &r.requests {
+            assert!(store.get(&log.request_key).unwrap().is_some(), "{log:?}");
+        }
+    }
+    let replay = root.join("replay");
+    let (_, _, again_reports) = run_branch_with(
+        root,
+        &replay,
+        Arc::new(ReplayBackend::new("scripted-vl", store)),
+        consensus_params(),
+    )
+    .await;
+    let again_errors = failed_items(&again_reports);
+    assert_eq!(again_errors, errors, "replay fails the same items");
+    let again: Vec<(String, BoardReadingItem)> = read_if_any(&replay, artifacts::BOARD_READING);
+    ConsensusRuns {
+        live: readings,
+        replay: again,
+        completed,
+        errors,
+    }
+}
+
+fn same_reading(a: &BoardReadingItem, b: &BoardReadingItem) {
+    assert_eq!(a.result, b.result);
+    // A failed read's error text is the live failure in one run and the
+    // missing record in the replay (no failed reply is recorded, as for a
+    // failed item); which reads failed, and the vote, are the same.
+    let votes = |r: &BoardReadingItem| {
+        r.consensus.clone().map(|mut c| {
+            let failed: Vec<u32> = c.failed.iter().map(|f| f.read).collect();
+            c.failed.clear();
+            (c, failed)
+        })
+    };
+    assert_eq!(votes(a), votes(b));
+    let keys = |r: &BoardReadingItem| {
+        r.requests
+            .iter()
+            .map(|l| (l.read, l.request_key.clone(), l.sampling))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(keys(a), keys(b));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consensus_reads_vote_record_three_replies_and_replay() {
+    let ConsensusRuns {
+        live,
+        replay,
+        completed,
+        errors,
+    } = consensus_record_and_replay(&[]).await;
+    // 3 classify + 2 keyframes x 3 reads.
+    assert_eq!((completed, errors), (9, 0));
+    assert_eq!(live.len(), 2);
+    for (_, r) in &live {
+        let reads: Vec<u32> = r.requests.iter().map(|l| l.read).collect();
+        assert_eq!(reads, [0, 1, 2]);
+        let keys: std::collections::BTreeSet<&str> =
+            r.requests.iter().map(|l| l.request_key.as_str()).collect();
+        assert_eq!(keys.len(), 3, "three distinct recorded replies");
+        assert_eq!(r.requests[0].sampling.temperature, None);
+        assert_eq!(r.requests[1].sampling.temperature, Some(0.3));
+        assert_eq!(r.requests[2].sampling.temperature, Some(0.3));
+        // The ghost box one sampled read made up is gone; the ledger two reads
+        // saw stays, with its edge.
+        let texts: Vec<&str> = r.result.nodes.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(texts, ["Order Service", "Ledger"]);
+        assert_eq!(r.result.edges.len(), 1);
+        assert_eq!(r.result.edges[0].label, "posts");
+        let c = r.consensus.as_ref().expect("a consensus reading");
+        assert_eq!((c.reads, c.min_agree, c.low_confidence), (3, 2, false));
+        assert_eq!(c.answered, [0, 1, 2]);
+        let votes: Vec<u32> = c.nodes.iter().map(|v| v.votes).collect();
+        assert_eq!(votes, [3, 2]);
+        assert_eq!(c.edges[0].votes, 2);
+        assert_eq!(c.dropped.nodes, 1);
+    }
+    // The two keyframes' canvases are identical (the marker block lies outside
+    // the canvas), yet no request of one is a request of the other.
+    let keys = |r: &BoardReadingItem| {
+        r.requests
+            .iter()
+            .map(|l| l.request_key.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    assert_eq!(live[0].1.crop_box, live[1].1.crop_box);
+    assert!(keys(&live[0].1).is_disjoint(&keys(&live[1].1)));
+    assert_eq!(replay.len(), live.len());
+    for ((_, a), (_, b)) in replay.iter().zip(&live) {
+        same_reading(a, b);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_failed_read_leaves_two_that_must_agree_and_replays() {
+    // Read 1 (the one with the ghost and without the ledger) fails: the ledger
+    // both others have stays, the service box too.
+    let ConsensusRuns {
+        live,
+        replay,
+        completed,
+        errors,
+    } = consensus_record_and_replay(&[1]).await;
+    assert_eq!((completed, errors), (9, 0));
+    for (_, r) in &live {
+        let c = r.consensus.as_ref().unwrap();
+        assert_eq!(c.answered, [0, 2]);
+        assert_eq!(c.failed.len(), 1);
+        assert_eq!(c.failed[0].read, 1);
+        assert_eq!((c.min_agree, c.low_confidence), (2, false));
+        // The quorum held: nothing is retried.
+        assert!(c.retried.is_empty());
+        let texts: Vec<&str> = r.result.nodes.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(texts, ["Order Service", "Ledger"]);
+        assert!(r.requests.iter().all(|l| l.read != 1 && l.read < 3));
+    }
+    for ((_, a), (_, b)) in replay.iter().zip(&live) {
+        same_reading(a, b);
+    }
+}
+
+/// Codex r5 integration, MAJOR 1: with reads 0 and 2 failing, read 1 was kept
+/// as it came (its ghost included) and only marked low confidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_short_of_the_quorum_is_retried_once_then_fails_the_item() {
+    // The retries fail too: both keyframes fail, in the replay as well.
+    let runs = consensus_record_and_replay(&[0, 2]).await;
+    assert!(
+        runs.live.is_empty() && runs.replay.is_empty(),
+        "{:?}",
+        runs.live
+    );
+    assert_eq!(runs.errors, 2, "both keyframes failed");
+
+    // The retries answer: reads 1, 3 (read 0 again) and 5 (read 2 again)
+    // vote, and the ghost only read 1 saw goes.
+    let ConsensusRuns {
+        live,
+        replay,
+        errors,
+        ..
+    } = consensus_record_and_replay_with(SampledModel {
+        retries_answer: true,
+        ..SampledModel::failing(&[0, 2])
+    })
+    .await;
+    assert_eq!(errors, 0);
+    assert_eq!(live.len(), 2);
+    for (_, r) in &live {
+        let c = r.consensus.as_ref().unwrap();
+        assert_eq!(c.answered, [1, 3, 5]);
+        assert_eq!(c.retried, [0, 2]);
+        assert_eq!((c.min_agree, c.low_confidence), (2, false));
+        let failed: Vec<u32> = c.failed.iter().map(|f| f.read).collect();
+        assert_eq!(failed, [0, 2]);
+        let texts: Vec<&str> = r.result.nodes.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(texts, ["Order Service", "Ledger"]);
+        let reads: Vec<u32> = r.requests.iter().map(|l| l.read).collect();
+        assert_eq!(reads, [1, 3, 5]);
+        assert!(r
+            .requests
+            .iter()
+            .all(|l| l.sampling.temperature == Some(0.3)));
+    }
+    assert_eq!(replay.len(), live.len());
+    for ((_, a), (_, b)) in replay.iter().zip(&live) {
+        same_reading(a, b);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_read_failing_fails_the_item() {
+    let runs = consensus_record_and_replay(&[0, 1, 2]).await;
+    assert!(runs.live.is_empty() && runs.replay.is_empty());
+    assert_eq!(runs.errors, 2, "both keyframes failed");
+}
+
+/// Codex round 4, MAJOR 1: the full-budget board read stops at the output
+/// limit, and the compact retry (sticky list of 30) lists thirty separate
+/// "TODO" notes spread over the canvas, which OCR does not read. The reply is
+/// flagged as degenerate but, already a retry, gets no second one. A list run
+/// to its limit is no evidence of fabrication: all thirty notes stay (the
+/// list-cap rule reduced them to one).
+struct TodoGridModel;
+
+#[async_trait]
+impl VisionBackend for TodoGridModel {
+    fn id(&self) -> BackendId {
+        ScriptedModel.id()
+    }
+    async fn preflight(&self) -> glassrip_vision::Result<Placement> {
+        Err(VisionError::Config("unused".into()))
+    }
+    async fn infer(
+        &self,
+        request: VisionRequest,
+        cancel: CancellationToken,
+    ) -> glassrip_vision::Result<RawResponse> {
+        let props = &request.schema.json()["properties"];
+        if !props["nodes"].is_object() {
+            return ScriptedModel.infer(request, cancel).await;
+        }
+        if props["stickies"]["maxItems"].as_u64() == Some(60) {
+            return Err(VisionError::Truncated {
+                num_predict: request.options.num_predict,
+                eval_count: Some(request.options.num_predict),
+                raw_text: "{\"nodes\": [], \"edges\": [], \"stickies\": [".into(),
+            });
+        }
+        assert_eq!(props["stickies"]["maxItems"].as_u64(), Some(30));
+        let (w, h) = (
+            f64::from(request.image.width()),
+            f64::from(request.image.height()),
+        );
+        let stickies: Vec<serde_json::Value> = (0..30u32)
+            .map(|i| {
+                let x = 0.05 * w + f64::from(i % 6) * 0.15 * w;
+                let y = 0.05 * h + f64::from(i / 6) * 0.18 * h;
+                json!({"text": "TODO", "color": "yellow",
+                       "bbox_2d": [x, y, x + 0.1 * w, y + 0.1 * h]})
+            })
+            .collect();
+        let value = json!({"nodes": [], "edges": [], "stickies": stickies, "owner_tags": [],
+                           "other_visible_text": [], "confidence": 0.7});
+        request.schema.validate(&value).unwrap();
+        Ok(RawResponse {
+            raw_text: value.to_string(),
+            json: value,
+            prompt_eval_count: Some(request.image.tokens() + 900),
+            eval_count: Some(900),
+            durations: Durations::default(),
+            attempts: 1,
+            repaired: false,
+            done_reason: Some("stop".into()),
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_compact_list_of_separate_notes_is_kept_and_replays() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_inputs(root);
+    let store = RawStore::new(root.join("raw"));
+    let live = root.join("live");
+    run_branch(
+        root,
+        &live,
+        Arc::new(RecordingBackend::new(
+            Arc::new(TodoGridModel),
+            store.clone(),
+        )),
+    )
+    .await;
+    let readings: Vec<(String, BoardReadingItem)> = read(&live, artifacts::BOARD_READING);
+    assert_eq!(readings.len(), 2);
+    for (_, r) in &readings {
+        let log = &r.requests[0];
+        assert!(log.compact_retry, "{log:?}");
+        let d = log.degenerate.as_ref().expect("thirty copies are flagged");
+        assert!(!d.retried, "a compact retry gets no second retry");
+        assert!(d.collapsed.is_empty(), "{d:?}");
+        assert_eq!(r.result.stickies.len(), 30);
+    }
+    let replay = root.join("replay");
+    run_branch(
+        root,
+        &replay,
+        Arc::new(ReplayBackend::new("scripted-vl", store)),
+    )
+    .await;
+    let again: Vec<(String, BoardReadingItem)> = read(&replay, artifacts::BOARD_READING);
+    for ((_, a), (_, b)) in again.iter().zip(&readings) {
+        assert_eq!(a.result, b.result);
+        assert_eq!(a.requests[0].degenerate, b.requests[0].degenerate);
+    }
+}
+
+/// Codex consensus round 1: two keyframes with identical canvases; the first
+/// sampled read to reach the model fails, the other keyframe's same read
+/// answers. Replay must fail that keyframe's read again, not borrow the other
+/// keyframe's recorded reply (identical requests once shared one key).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_read_is_not_answered_by_another_keyframes_record() {
+    let runs = consensus_record_and_replay_with(SampledModel {
+        fail: &[],
+        fail_first_of: Some(1),
+        failed: std::sync::atomic::AtomicBool::new(false),
+        retries_answer: false,
+    })
+    .await;
+    assert_eq!(runs.errors, 0);
+    let failed: Vec<Vec<u32>> = runs
+        .live
+        .iter()
+        .map(|(_, r)| {
+            let c = r.consensus.as_ref().unwrap();
+            c.failed.iter().map(|f| f.read).collect()
+        })
+        .collect();
+    let mut sorted = failed.clone();
+    sorted.sort();
+    assert_eq!(sorted, [vec![], vec![1]], "one keyframe lost read 1");
+    for ((_, a), (_, b)) in runs.replay.iter().zip(&runs.live) {
+        same_reading(a, b);
+    }
 }

@@ -134,7 +134,10 @@ pub fn role_of(label: &str) -> Role {
 /// Approximate rendered width of `s` at `size` px (Inter-like proportions).
 pub fn text_width(s: &str, size: f64, bold: bool) -> f64 {
     let per = if bold { 0.6 } else { 0.55 };
-    s.chars().count() as f64 * size * per
+    // full-width scripts take about a full em
+    s.chars()
+        .map(|c| if c.is_ascii() { size * per } else { size })
+        .sum()
 }
 
 /// Greedy word wrap to at most `max_chars` per line.
@@ -157,8 +160,19 @@ pub fn wrap(text: &str, max_chars: usize) -> Vec<String> {
 }
 
 /// Wraps and truncates to `max_lines`, ending the last line with `...` when cut.
+/// A word longer than a line (a URL, an identifier) is split across lines.
 pub fn wrap_lines(text: &str, max_chars: usize, max_lines: usize) -> Vec<String> {
-    let mut lines = wrap(text, max_chars);
+    let max = max_chars.max(1);
+    let mut lines: Vec<String> = wrap(text, max)
+        .into_iter()
+        .flat_map(|l| {
+            let chars: Vec<char> = l.chars().collect();
+            chars
+                .chunks(max)
+                .map(|c| c.iter().collect::<String>())
+                .collect::<Vec<_>>()
+        })
+        .collect();
     if lines.len() > max_lines {
         lines.truncate(max_lines);
         if let Some(last) = lines.last_mut() {
@@ -193,5 +207,12 @@ mod tests {
             wrap_lines("aaa bbb ccc ddd eee", 7, 2),
             vec!["aaa bbb", "ccc..."]
         );
+        // an overlong token is split, not left to run past its box
+        assert_eq!(
+            wrap_lines("see https://example.com/a/b", 8, 5),
+            vec!["see", "https://", "example.", "com/a/b"]
+        );
+        assert_eq!(text_width("ab", 10.0, false), 11.0);
+        assert_eq!(text_width("\u{4e2d}\u{6587}", 10.0, false), 20.0);
     }
 }

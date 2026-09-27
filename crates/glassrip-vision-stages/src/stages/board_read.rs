@@ -17,15 +17,34 @@
 //! - A complete reply that lists one text at many places (see
 //!   [`glassrip_vision::degenerate`], judged against the keyframe's OCR spans)
 //!   is retried once with the repeat-penalty retry. When no retry is left, the
-//!   retry fails, or its reply is degenerate too, the reply is kept with each
-//!   repeated text reduced to its best-supported copies, and the request log
-//!   records it as a warning.
+//!   retry fails, or its reply is degenerate too, the copies the reply
+//!   fabricated go (piled copies down to one per pile, and copies outside the
+//!   requested image), and the request log records it as a warning; copies
+//!   side by side on the canvas stay as read, a full list or not (the
+//!   consensus vote below drops those only one read lists).
+//! - Consensus: with `consensus.reads > 1` the keyframe is read that many times,
+//!   concurrently. Read 0 is the greedy request (temperature 0); read `k` is
+//!   sampled at `consensus.temperature`, so its reply is an independent sample.
+//!   Each request's seed encodes the keyframe's place in the plan, the
+//!   request's place among the keyframe's images (overview, tiles), and `k`
+//!   ([`ConsensusParams::seed`]), so every first request of the run has its own
+//!   request key: keyframes or tiles with identical pixels never share a
+//!   recorded reply (or a failure), and replay reaches every request's own
+//!   answer. Every read goes through
+//!   the whole path above (tiles, retries, the degenerate rule) on its own, then
+//!   [`crate::consensus::vote`] keeps what `consensus.min_agree` reads agree on.
+//!   The quorum holds: a failed read leaves the vote to the others while at
+//!   least `min_agree` (capped at `reads`) answered. With fewer, every failed
+//!   read is retried once, sampled, as read `reads + k` with its own seed (so a
+//!   replay reaches the retry's recorded reply); still short of the quorum, the
+//!   item fails. No reading is ever kept on fewer answering reads than the
+//!   quorum: an element one read alone saw never reaches the board.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use glassrip_core::envelope::ErrorInfo;
+use glassrip_core::envelope::{ErrorCode, ErrorInfo};
 use glassrip_core::runner::{
     ArtifactSpec, InputDecl, ItemContext, KeyExtras, Stage, StageError, StageInputs, WorkItem,
 };
@@ -34,7 +53,7 @@ use glassrip_vision::board::{
     BoardReading, OwnerTag, Sticky, TextItem, BOARD_READ_PROMPT, COMPACT_RETRY_NOTE,
     COMPACT_RETRY_SCALE,
 };
-use glassrip_vision::degenerate::{self, DegenerateParams};
+use glassrip_vision::degenerate::{self, DegenerateParams, ReplyFrame};
 use glassrip_vision::image_prep::{
     prepare_board_image_with, prepare_long_edge, BoardSizing, BOARD_LONG_EDGE, LOW_RES_THRESHOLD,
     LOW_RES_UPSCALE,
@@ -46,9 +65,10 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use crate::artifacts::{
-    self, BoardReadingItem, CanvasCropItem, DegenerateLog, ModelRef, OcrKeyframe, OcrSpan,
-    RequestLog, RequestRole, TextRegion,
+    self, BoardReadingItem, CanvasCropItem, ConsensusLog, DegenerateLog, DroppedCounts, EdgeVote,
+    ElementVote, FailedRead, ModelRef, OcrKeyframe, OcrSpan, RequestLog, RequestRole, TextRegion,
 };
+use crate::consensus::{vote, VoteParams};
 use crate::pixels;
 use crate::placement::{vision_error_info, InferFailure, PlacementMonitor};
 use crate::raw_store::request_key;
@@ -94,6 +114,88 @@ pub struct BoardReadParams {
     /// A complete reply repeating one text at many places in a list takes the
     /// repeat-penalty retry; a reply still degenerate is collapsed.
     pub degenerate: DegenerateParams,
+    /// Several reads per keyframe and a vote over them.
+    pub consensus: ConsensusParams,
+}
+
+/// Offset of a retry's seed from its read's seed (see [`ConsensusParams::seed`]).
+pub const RETRY_SEED: u64 = 1 << 62;
+
+/// Consensus reading (see [`crate::consensus`]).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, JsonSchema)]
+pub struct ConsensusParams {
+    /// Reads per keyframe (1: one greedy read, no vote).
+    pub reads: u32,
+    /// Reads an element needs to be kept (capped at `reads`).
+    pub min_agree: u32,
+    /// Sampling temperature of every read after the first (the first is greedy).
+    pub temperature: f32,
+}
+
+impl Default for ConsensusParams {
+    fn default() -> Self {
+        Self {
+            reads: 3,
+            min_agree: 2,
+            temperature: 0.3,
+        }
+    }
+}
+
+/// The consensus settings as one cache-key string.
+fn consensus_descriptor(c: &ConsensusParams) -> String {
+    format!(
+        "reads={};min_agree={};temperature={}",
+        c.reads, c.min_agree, c.temperature
+    )
+}
+
+impl ConsensusParams {
+    /// One greedy read, no vote.
+    pub fn single() -> Self {
+        Self {
+            reads: 1,
+            ..Self::default()
+        }
+    }
+
+    /// Seed of read `read` of the `job`th image (0: the overview, then the
+    /// tiles; at most 256) of the `index`th planned keyframe: the run seed plus
+    /// `(index + 1) * 4096 + job * 16 + read` (reads stay below 16), so no two
+    /// requests of a run share a seed. Read `reads + k` is the retry of read
+    /// `k` (see [`BoardReadStage`]): read `k`'s seed plus [`RETRY_SEED`]
+    /// (`2^62`). A first read's offset from the run seed is under `2^62` for
+    /// every index below `2^49` (a plan that long cannot be held in memory),
+    /// so no retry shares a seed with any first read, and seeds from the
+    /// default run seed stay below `i64::MAX` (the server's seed type). A
+    /// single read keeps the run seed (the request it always was).
+    pub fn seed(&self, base: u64, index: u64, job: u64, read: u32) -> u64 {
+        if self.reads <= 1 {
+            return base;
+        }
+        debug_assert!(index < 1 << 49 && job < 256 && read < 2 * self.reads);
+        let (read, retry) = if read >= self.reads {
+            (read - self.reads, RETRY_SEED)
+        } else {
+            (read, 0)
+        };
+        base.wrapping_add((index + 1) << 12)
+            .wrapping_add(job << 4)
+            .wrapping_add(u64::from(read))
+            .wrapping_add(retry)
+    }
+
+    /// Reads that must answer for a vote: `min_agree`, capped at `reads`.
+    pub fn quorum(&self) -> u32 {
+        self.min_agree.clamp(1, self.reads.max(1))
+    }
+
+    /// Temperature override of read `k`: none (0, greedy) for read 0; a retry
+    /// (read `reads + k`) is always sampled (a greedy retry would repeat the
+    /// greedy failure).
+    pub fn temperature(&self, read: u32) -> Option<f32> {
+        (read > 0).then_some(self.temperature)
+    }
 }
 
 impl Default for BoardReadParams {
@@ -122,17 +224,20 @@ impl Default for BoardReadParams {
             repetition_retry_last_n: 512,
             repetition_retry_predict_share: 0.75,
             degenerate: DegenerateParams::default(),
+            consensus: ConsensusParams::default(),
         }
     }
 }
 
-/// The retry of a looping board read: the same request with a repeat penalty over
-/// a long window and a smaller output budget (never under `min_num_predict`).
+/// The retry of a looping board read: the same request (a sampled consensus
+/// read keeps its temperature) with a repeat penalty over a long window and a
+/// smaller output budget (never under `min_num_predict`).
 pub fn repetition_retry(p: &BoardReadParams, request: &VisionRequest) -> VisionRequest {
     let mut retry = request.clone();
     retry.sampling = SamplingOverrides {
         repeat_penalty: Some(p.repetition_retry_penalty),
         repeat_last_n: Some(p.repetition_retry_last_n),
+        temperature: request.sampling.temperature,
     };
     let scaled =
         (f64::from(request.options.num_predict) * p.repetition_retry_predict_share).floor() as u32;
@@ -384,11 +489,13 @@ fn shift_output(mut o: BoardReading, dx: f64, dy: f64) -> BoardReading {
     o
 }
 
-/// Work: the canvas crop and its OCR spans in canvas pixels.
+/// Work: the canvas crop, its OCR spans in canvas pixels, and the keyframe's
+/// place in the plan (consensus seeds).
 #[derive(Debug, Clone)]
 pub struct ReadWork {
     pub crop: CanvasCropItem,
     pub anchors: Vec<(String, BBox)>,
+    pub index: u64,
 }
 
 /// The stage.
@@ -417,22 +524,30 @@ impl BoardReadStage {
         }
     }
 
+    /// One request of read `read` of image `job` of keyframe `index` (and its
+    /// retries).
+    #[allow(clippy::too_many_arguments)]
     async fn one(
         &self,
+        index: u64,
+        job: u64,
+        read: u32,
         role: RequestRole,
         region: BBox,
-        prepared: PreparedImage,
+        prepared: &PreparedImage,
         anchors: &[(String, BBox)],
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<(BoardReading, RequestLog), ErrorInfo> {
+        let consensus = &self.params.consensus;
         let mut request = board_read_request(
-            &prepared,
+            prepared,
             GenerationOptions {
-                seed: self.params.seed,
+                seed: consensus.seed(self.params.seed, index, job, read),
                 num_predict: self.params.min_num_predict,
             },
         )
         .map_err(|e| vision_error_info(&e))?;
+        request.sampling.temperature = consensus.temperature(read);
         request.options.num_predict = output_budget(&self.params, &request);
         request.repetition_guard = Some(self.params.repetition);
         let mut key = request_key(&self.model, &request);
@@ -493,11 +608,12 @@ impl BoardReadStage {
                     "board reading hit the output limit; retrying once with a compact budget"
                 );
                 let mut retry = board_read_request_compact(
-                    &prepared,
+                    prepared,
                     request.options,
                     self.params.compact_retry_scale,
                 )
                 .map_err(|e| vision_error_info(&e))?;
+                retry.sampling = request.sampling;
                 retry.repetition_guard = Some(self.params.repetition);
                 key = request_key(&self.model, &retry);
                 sent = retry.clone();
@@ -513,7 +629,7 @@ impl BoardReadStage {
             }
         };
         let to_canvas =
-            |o: BoardReadOutput| shift_output(o.to_canvas_coords(&prepared), region.x1, region.y1);
+            |o: BoardReadOutput| shift_output(o.to_canvas_coords(prepared), region.x1, region.y1);
         let mut out = to_canvas(out);
         let p = &self.params.degenerate;
         let mut degenerate = None;
@@ -572,16 +688,29 @@ impl BoardReadStage {
                 }
             }
             if !log.retried || degenerate::detect(&out, anchors, p).is_some() {
-                let (kept, collapsed) = degenerate::collapse(out, anchors, p);
+                // The evidence of fabrication is the reply's own: the image of
+                // the request that produced it.
+                let frame = ReplyFrame { extent: region };
+                let (kept, collapsed) = degenerate::collapse(out, anchors, &frame, p);
                 out = kept;
-                tracing::warn!(
-                    role = ?role,
-                    finding = %log.finding,
-                    retried = log.retried,
-                    retry_error = log.retry_error.as_deref().unwrap_or(""),
-                    collapsed = collapsed.len(),
-                    "degenerate board reading kept with repeated texts collapsed"
-                );
+                if collapsed.is_empty() {
+                    tracing::info!(
+                        role = ?role,
+                        finding = %log.finding,
+                        retried = log.retried,
+                        retry_error = log.retry_error.as_deref().unwrap_or(""),
+                        "repeated texts of a board reading kept as read: no sign the reply made them up"
+                    );
+                } else {
+                    tracing::warn!(
+                        role = ?role,
+                        finding = %log.finding,
+                        retried = log.retried,
+                        retry_error = log.retry_error.as_deref().unwrap_or(""),
+                        collapsed = collapsed.len(),
+                        "degenerate board reading kept with fabricated repeated texts collapsed"
+                    );
+                }
                 log.collapsed = collapsed;
             }
             degenerate = Some(log);
@@ -605,9 +734,144 @@ impl BoardReadStage {
                 sampling: sent.sampling,
                 num_predict: Some(sent.options.num_predict),
                 degenerate,
+                read,
             },
         ))
     }
+
+    /// Read `read` of a keyframe: the overview and any tiles, merged.
+    async fn read_board(
+        &self,
+        index: u64,
+        read: u32,
+        jobs: &[(RequestRole, BBox, PreparedImage)],
+        tiled: bool,
+        anchors: &[(String, BBox)],
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(BoardReading, Vec<RequestLog>), ErrorInfo> {
+        let results = futures_util::future::join_all(jobs.iter().zip(0u64..).map(
+            |((role, region, p), job)| {
+                self.one(index, job, read, *role, *region, p, anchors, cancel.clone())
+            },
+        ))
+        .await;
+        let mut outputs = Vec::new();
+        let mut logs = Vec::new();
+        for r in results {
+            let (o, l) = r?;
+            outputs.push(o);
+            logs.push(l);
+        }
+        let mut it = outputs.into_iter();
+        let overview_out = it.next().ok_or_else(|| internal("no overview reading"))?;
+        let result = if tiled {
+            merge_tiles(
+                overview_out,
+                it.collect(),
+                self.params.merge_iou,
+                self.params.merge_text_ratio,
+            )
+        } else {
+            overview_out
+        };
+        Ok((result, logs))
+    }
+}
+
+/// One read's vote on each of `n` elements.
+fn single_votes(n: usize) -> Vec<ElementVote> {
+    vec![
+        ElementVote {
+            votes: 1,
+            text_votes: 1,
+            uncertain: false,
+        };
+        n
+    ]
+}
+
+/// The consensus of `answered` reads (read index, reading), in read order;
+/// `reads` were requested and the reads in `retried` were retried once. Fewer
+/// answering reads than the quorum ([`ConsensusParams::quorum`]) fail the item:
+/// the vote never lowers its bar to the reads that happened to answer.
+pub fn consensus_of(
+    p: &BoardReadParams,
+    reads: u32,
+    answered: Vec<(u32, BoardReading)>,
+    failed: Vec<FailedRead>,
+    retried: Vec<u32>,
+    anchors: &[(String, BBox)],
+) -> Result<(BoardReading, ConsensusLog), ErrorInfo> {
+    let quorum = p.consensus.min_agree.clamp(1, reads.max(1)) as usize;
+    if answered.len() < quorum {
+        let Some(first) = failed.first() else {
+            return Err(internal("too few consensus reads and none failed"));
+        };
+        let mut e = first.error.clone();
+        e.message = format!(
+            "{} of {reads} consensus reads answered, {quorum} needed (each failed read \
+             retried once); read {}: {}",
+            answered.len(),
+            first.read,
+            e.message
+        );
+        return Err(e);
+    }
+    let indices: Vec<u32> = answered.iter().map(|(k, _)| *k).collect();
+    let readings: Vec<BoardReading> = answered.into_iter().map(|(_, r)| r).collect();
+    if let [single] = readings.as_slice() {
+        // A quorum of one: the read as it came.
+        let log = ConsensusLog {
+            reads,
+            answered: indices,
+            failed,
+            retried,
+            min_agree: 1,
+            low_confidence: false,
+            nodes: single_votes(single.nodes.len()),
+            edges: vec![
+                EdgeVote {
+                    votes: 1,
+                    direction_votes: 1,
+                    style_votes: 1,
+                    label_votes: 1,
+                    direction_uncertain: false,
+                    style_uncertain: false,
+                    label_uncertain: false,
+                };
+                single.edges.len()
+            ],
+            stickies: single_votes(single.stickies.len()),
+            owner_tags: single_votes(single.owner_tags.len()),
+            other_visible_text: single_votes(single.other_visible_text.len()),
+            dropped: DroppedCounts::default(),
+        };
+        return Ok((single.clone(), log));
+    }
+    let v = vote(
+        &readings,
+        anchors,
+        &VoteParams {
+            min_agree: quorum,
+            merge_iou: p.merge_iou,
+            text_ratio: p.merge_text_ratio,
+        },
+    );
+    let log = ConsensusLog {
+        reads,
+        answered: indices,
+        failed,
+        retried,
+        min_agree: quorum as u32,
+        low_confidence: false,
+        nodes: v.nodes,
+        edges: v.edges,
+        stickies: v.stickies,
+        owner_tags: v.owner_tags,
+        other_visible_text: v.other_visible_text,
+        dropped: v.dropped,
+    };
+    Ok((v.result, log))
 }
 
 impl Stage for BoardReadStage {
@@ -626,7 +890,41 @@ impl Stage for BoardReadStage {
         // may cache a dense board as truncated.
         // 5: degenerate complete replies (one text at many places) retried
         // with a repeat penalty, then collapsed; outputs of 4 may hold them.
-        5
+        // 6: only texts at the repeat bound count towards the duplicate share,
+        // the share needs piled copies (a row of identical cards OCR misses is
+        // no copy), an OCR text read twice backs one copy, and an invalid retry
+        // reply fails the item; outputs of 5 may hold collapsed legitimate
+        // cards.
+        // 7: copies side by side need the strong bound and the share, and an
+        // OCR text read twice only counts once within one box; outputs of 6
+        // may hold collapsed separate notes or wrongly supported copies.
+        // 8: only copies the reply fabricated are removed (each pile of copies
+        // keeps one; at least `min_repeats` copies wholly outside the requested
+        // image go; a list run to its `maxItems` with a repeated text last
+        // reduces that text, never for owner tags); copies side by side that
+        // the retry repeats are kept. Each OCR span backs its nearest matching
+        // item unless that item is backed or a span of its text at the same
+        // place backed one. Collapse records name their evidence. Outputs of 7
+        // may hold collapsed owner tags or cards.
+        // 9: consensus reading (several reads per keyframe, voted; reads after
+        // the first sampled at a temperature with their own seeds); request
+        // logs name their read. Outputs of 8 are single greedy reads.
+        // 10: a list run to its `maxItems` is no evidence of fabrication;
+        // separate on-canvas copies stay (outputs of 9 may hold collapsed
+        // genuine notes of a full compact list). Nodes, stickies, and owner
+        // tags vote together; elements match only with similar texts; the
+        // fold needs a read listing one text twice; consensus seeds encode the
+        // keyframe and image (outputs of 9 may share replies between them).
+        // 11: the quorum holds: with fewer than `min_agree` reads answering,
+        // each failed read is retried once (sampled, its own seed), and a
+        // keyframe still short of the quorum fails instead of keeping one
+        // unvoted read; an edge label is kept only when `min_agree` reads carry
+        // it (outputs of 10 may hold a single unconfirmed read, or a label one
+        // read gave to an edge the others labeled otherwise).
+        // 12: a retry's seed sits 2^62 above its read's (11 used 2^32, which a
+        // later keyframe's first read could reach); outputs of 11 may hold a
+        // retry answered with another request's reply.
+        12
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
@@ -654,15 +952,24 @@ impl Stage for BoardReadStage {
                 .server_version
                 .iter()
                 .map(|v| ("ollama".to_string(), v.clone()))
+                .chain(std::iter::once((
+                    "glassrip.board_read.consensus".to_string(),
+                    consensus_descriptor(&self.params.consensus),
+                )))
                 .collect::<BTreeMap<_, _>>(),
             ..KeyExtras::default()
         }
     }
     fn concurrency(&self) -> usize {
-        self.monitor.client().max_in_flight()
+        // Every keyframe issues its reads at once: fewer keyframes in flight
+        // keep the model's slots about as full without a long queue per item.
+        let reads = self.params.consensus.reads.max(1) as usize;
+        self.monitor.client().max_in_flight().div_ceil(reads).max(1)
     }
     fn item_timeout(&self) -> Option<Duration> {
-        Some(Duration::from_secs(900))
+        Some(Duration::from_secs(
+            900 * u64::from(self.params.consensus.reads.max(1)),
+        ))
     }
 
     fn plan(&self, inputs: &StageInputs) -> Result<Vec<WorkItem<ReadWork>>, StageError> {
@@ -676,14 +983,19 @@ impl Stage for BoardReadStage {
         Ok(inputs
             .read_ok::<CanvasCropItem>(artifacts::CANVAS_CROP)?
             .into_iter()
-            .map(|(id, crop)| {
+            .zip(0u64..)
+            .map(|((id, crop), index)| {
                 let anchors = spans_of
                     .get(&crop.keyframe_id)
                     .map(|spans| canvas_anchors(spans, &crop))
                     .unwrap_or_default();
                 WorkItem {
                     id,
-                    work: ReadWork { crop, anchors },
+                    work: ReadWork {
+                        crop,
+                        anchors,
+                        index,
+                    },
                 }
             })
             .collect())
@@ -694,7 +1006,11 @@ impl Stage for BoardReadStage {
         ctx: &ItemContext,
         work: ReadWork,
     ) -> Result<BoardReadingItem, ErrorInfo> {
-        let ReadWork { crop, anchors } = work;
+        let ReadWork {
+            crop,
+            anchors,
+            index,
+        } = work;
         self.monitor.ensure_preflight().await?;
         let started = Instant::now();
         let img = load_rgb(crop.source_image_path.clone().into()).await?;
@@ -730,29 +1046,74 @@ impl Stage for BoardReadStage {
             }
         }
         let cancel = ctx.cancel_token().clone();
-        let results = futures_util::future::join_all(
-            jobs.into_iter()
-                .map(|(role, region, p)| self.one(role, region, p, &anchors, cancel.clone())),
+        let reads = self.params.consensus.reads.max(1);
+        let outcomes = futures_util::future::join_all(
+            (0..reads).map(|k| self.read_board(index, k, &jobs, tiled, &anchors, cancel.clone())),
         )
         .await;
-        let mut outputs = Vec::new();
-        let mut logs = Vec::new();
-        for r in results {
-            let (o, l) = r?;
-            outputs.push(o);
-            logs.push(l);
+        // The run stopped (placement abort, cancellation): no vote.
+        if let Some(e) = self.monitor.abort_error() {
+            return Err(e);
         }
-        let mut it = outputs.into_iter();
-        let overview_out = it.next().ok_or_else(|| internal("no overview reading"))?;
-        let result = if tiled {
-            merge_tiles(
-                overview_out,
-                it.collect(),
-                self.params.merge_iou,
-                self.params.merge_text_ratio,
-            )
+        let mut answered = Vec::new();
+        let mut logs = Vec::new();
+        let mut failed = Vec::new();
+        let mut collect = |k: u32,
+                           r: Result<(BoardReading, Vec<RequestLog>), ErrorInfo>,
+                           failed: &mut Vec<FailedRead>|
+         -> Result<(), ErrorInfo> {
+            match r {
+                Ok((reading, l)) => {
+                    answered.push((k, reading));
+                    logs.extend(l);
+                }
+                Err(e) if e.code == ErrorCode::Cancelled || cancel.is_cancelled() => return Err(e),
+                Err(e) => failed.push(FailedRead { read: k, error: e }),
+            }
+            Ok(())
+        };
+        for (k, r) in (0..reads).zip(outcomes) {
+            collect(k, r, &mut failed)?;
+        }
+        // Short of the quorum: each failed read is retried once, sampled, as
+        // read `reads + k` with its own seed.
+        let quorum = self.params.consensus.quorum() as usize;
+        let mut retried = Vec::new();
+        if reads > 1 && reads as usize - failed.len() < quorum {
+            retried = failed.iter().map(|f| f.read).collect::<Vec<u32>>();
+            let again = futures_util::future::join_all(retried.iter().map(|&k| {
+                self.read_board(index, reads + k, &jobs, tiled, &anchors, cancel.clone())
+            }))
+            .await;
+            if let Some(e) = self.monitor.abort_error() {
+                return Err(e);
+            }
+            for (&k, r) in retried.iter().zip(again) {
+                collect(reads + k, r, &mut failed)?;
+            }
+        }
+        for f in &failed {
+            tracing::warn!(
+                keyframe = %crop.keyframe_id,
+                read = f.read,
+                error = %f.error.message,
+                "a consensus board read failed"
+            );
+        }
+        let (result, consensus) = if reads == 1 {
+            match answered.pop() {
+                Some((_, reading)) => (reading, None),
+                None => {
+                    return Err(failed
+                        .into_iter()
+                        .next()
+                        .map(|f| f.error)
+                        .unwrap_or_else(|| internal("no board read ran")))
+                }
+            }
         } else {
-            overview_out
+            let (r, log) = consensus_of(&self.params, reads, answered, failed, retried, &anchors)?;
+            (r, Some(log))
         };
         Ok(BoardReadingItem {
             keyframe_id: crop.keyframe_id,
@@ -773,6 +1134,7 @@ impl Stage for BoardReadStage {
             requests: logs,
             participants: crop.participants,
             result,
+            consensus,
         })
     }
 }
@@ -1076,6 +1438,198 @@ mod tests {
             c.degenerate_strong_repeats as usize,
             p.degenerate.strong_repeats
         );
+    }
+
+    #[test]
+    fn consensus_defaults_match_the_run_config() {
+        let p = BoardReadParams::default().consensus;
+        let c = glassrip_core::config::Config::default().board_read;
+        assert_eq!((p.reads, p.min_agree), (c.reads, c.min_agree));
+        assert_eq!(
+            f64::from(p.temperature) as f32,
+            c.consensus_temperature as f32
+        );
+        // A single read is the request it always was.
+        let single = ConsensusParams::single();
+        assert_eq!(single.seed(7, 3, 2, 0), 7);
+        assert_eq!(single.temperature(0), None);
+        // Read 0 is greedy; the others are sampled; every read of every image
+        // of every keyframe has its own seed.
+        assert_eq!(p.temperature(0), None);
+        assert_eq!(p.temperature(2), Some(p.temperature));
+        let mut seeds = std::collections::BTreeSet::new();
+        // Reads `reads..2 * reads` are the retries: sampled, with seeds of
+        // their own.
+        assert_eq!(p.temperature(p.reads), Some(p.temperature));
+        for index in 0..300u64 {
+            for job in 0..65u64 {
+                for read in 0..2 * p.reads {
+                    assert!(seeds.insert(p.seed(7, index, job, read)));
+                }
+            }
+        }
+        assert!(
+            seeds.iter().all(|&s| s != 7),
+            "no consensus seed is the run seed"
+        );
+        // Codex r5 fix round 1: a retry offset of 2^32 made read 0's retry of
+        // keyframe 0 the first read of keyframe 2^20. No retry seed is a first
+        // read's seed at any index a plan can hold, and every seed fits the
+        // server's signed seed.
+        let far = [0u64, 1, 299, 1 << 20, (1 << 20) - 1, 1 << 40, (1 << 49) - 1];
+        let first: std::collections::BTreeSet<u64> = far
+            .iter()
+            .flat_map(|&i| (0..65u64).flat_map(move |j| (0..3).map(move |r| (i, j, r))))
+            .map(|(i, j, r)| p.seed(0, i, j, r))
+            .collect();
+        for &i in &far {
+            for j in 0..65u64 {
+                for r in p.reads..2 * p.reads {
+                    let s = p.seed(0, i, j, r);
+                    assert!(!first.contains(&s), "retry {i} {j} {r}");
+                    assert!(s >= RETRY_SEED && s <= i64::MAX as u64);
+                }
+            }
+        }
+        assert!(first.iter().all(|&s| s < RETRY_SEED));
+        assert_eq!(p.seed(0, 0, 0, p.reads), p.seed(0, 0, 0, 0) + RETRY_SEED);
+    }
+
+    #[test]
+    fn retries_keep_a_sampled_read_sampled() {
+        let p = BoardReadParams::default();
+        let mut r = full_hd_board_request();
+        r.sampling.temperature = Some(0.3);
+        r.options.seed = 5;
+        let retry = repetition_retry(&p, &r);
+        assert_eq!(retry.sampling.temperature, Some(0.3));
+        assert_eq!(retry.options.seed, 5);
+        assert!(retry.sampling.repeat_penalty.is_some());
+    }
+
+    /// Codex r5 integration, MAJOR 1: one read answering of three (min_agree
+    /// 2) was kept in full as an unconfirmed reading.
+    #[test]
+    fn fewer_answering_reads_than_the_quorum_fail_the_item() {
+        let mut r = empty();
+        r.nodes = vec![
+            node("a", "Order Service", BBox::new(100.0, 100.0, 300.0, 160.0)),
+            node("b", "Ghost Queue", BBox::new(500.0, 400.0, 600.0, 450.0)),
+        ];
+        let failed = |k| FailedRead {
+            read: k,
+            error: ErrorInfo::new(ErrorCode::SchemaParse, "x"),
+        };
+        let p = BoardReadParams::default();
+        // Reads 0 and 2 failed, and so did their retries (reads 3 and 5).
+        let e = consensus_of(
+            &p,
+            3,
+            vec![(1, r.clone())],
+            vec![failed(0), failed(2), failed(3), failed(5)],
+            vec![0, 2],
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(e.code, ErrorCode::SchemaParse);
+        assert!(
+            e.message
+                .contains("1 of 3 consensus reads answered, 2 needed"),
+            "{}",
+            e.message
+        );
+        // min_agree 3: two answering reads are not lowered to a quorum of two.
+        let mut three = p.clone();
+        three.consensus.min_agree = 3;
+        assert!(consensus_of(
+            &three,
+            3,
+            vec![(0, r.clone()), (2, r.clone())],
+            vec![failed(1), failed(4)],
+            vec![1],
+            &[],
+        )
+        .is_err());
+        // A retry that answers restores the quorum: read 1 and the retry of
+        // read 0 vote; the ghost only read 1 lists goes.
+        let mut other = r.clone();
+        other.nodes.pop();
+        let (out, log) = consensus_of(
+            &p,
+            3,
+            vec![(1, r), (3, other)],
+            vec![failed(0), failed(2), failed(5)],
+            vec![0, 2],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(out.nodes.len(), 1);
+        assert_eq!((log.min_agree, log.low_confidence), (2, false));
+        assert_eq!(log.answered, [1, 3]);
+        assert_eq!(log.retried, [0, 2]);
+        // The configured quorum of one keeps one read.
+        let mut one = p.clone();
+        one.consensus.min_agree = 1;
+        let (_, log) =
+            consensus_of(&one, 3, vec![(1, empty())], vec![failed(0)], vec![], &[]).unwrap();
+        assert_eq!(log.min_agree, 1);
+    }
+
+    #[test]
+    fn two_answering_reads_must_both_agree() {
+        let with = |extra: &str| {
+            let mut r = empty();
+            r.nodes = vec![
+                node("a", "Order Service", BBox::new(100.0, 100.0, 300.0, 160.0)),
+                node("b", extra, BBox::new(500.0, 400.0, 600.0, 450.0)),
+            ];
+            r
+        };
+        let p = BoardReadParams::default();
+        let failed = vec![FailedRead {
+            read: 1,
+            error: ErrorInfo::new(ErrorCode::Timeout, "x"),
+        }];
+        let (out, log) = consensus_of(
+            &p,
+            3,
+            vec![(0, with("Ledger")), (2, with("Ledger"))],
+            failed.clone(),
+            vec![],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(out.nodes.len(), 2);
+        assert_eq!((log.min_agree, log.low_confidence), (2, false));
+        assert_eq!(log.answered, [0, 2]);
+        // A node only one of the two lists goes.
+        let mut other = with("Ledger");
+        other.nodes.pop();
+        let (out, log) = consensus_of(
+            &p,
+            3,
+            vec![(0, with("Ledger")), (2, other)],
+            failed,
+            vec![],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(out.nodes.len(), 1);
+        assert_eq!(log.dropped.nodes, 1);
+        // With three answering, two agreeing are enough.
+        let mut third = with("Ledger");
+        third.nodes.pop();
+        let (out, log) = consensus_of(
+            &p,
+            3,
+            vec![(0, with("Ledger")), (1, with("Ledger")), (2, third)],
+            vec![],
+            vec![],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(out.nodes.len(), 2);
+        assert_eq!(log.min_agree, 2);
     }
 
     #[test]

@@ -10,7 +10,11 @@
 //!    text at the same node place is a label variant). Nodes,
 //!    stickies, other text and edge labels share one pool, so an element read in
 //!    different lists in different keyframes is one track whose kind is the majority
-//!    list. Illegible or elided texts are not tracked.
+//!    list. Illegible or elided texts are not tracked. A newer node track with the
+//!    text of an established node is merged into it when its boxes are no evidence
+//!    of a second place ([`duplicates`]). A node-majority track that no connector
+//!    ends at is a sticky when it was read as a sticky at least as often, or when its
+//!    text carries a sticky marker (question, milestone).
 //! 3. Lifetimes and support ([`tracks::intervals`]). The final state is what was
 //!    observed and not later removed: an element is final when its last supported
 //!    interval was never ended by a removal. Removal needs evidence: consecutive
@@ -37,16 +41,20 @@
 //!    there keeps the edge whatever else changed on the board, a line gone removes
 //!    it. Otherwise (no pixels, or a routed connector the corridor does not follow)
 //!    the board's aligned ink must have changed since the edge was last read.
-//! 5. Owner tags become timed assignments ([`owners`]).
+//! 5. Owner tags become timed assignments ([`owners`]), anchored on the OCR positions of
+//!    tags and nodes where OCR read them ([`owner_geometry`]).
 //! 6. Events are computed from the state changes and gated on ink ([`events`]).
 
 pub mod anchor;
 mod cleanup;
+pub mod duplicates;
 pub mod events;
+pub mod owner_geometry;
 pub mod owners;
 pub mod tracks;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Mutex;
 
 use glassrip_vision::board::{EdgeStyle, ElementList, RejectReason, StickyColor, ValidatedBoard};
 use glassrip_vision::BBox;
@@ -62,12 +70,14 @@ use crate::register::{
 use crate::similarity::Similarity;
 use crate::text::{clean_label, is_unreliable, normalize, AliasTable};
 
-use anchor::{anchor_tag, box_distance, AnchorParams, Anchored, EdgeGeom};
+use anchor::{anchor_tag, box_distance, edge_end_ambiguities, AnchorParams, Anchored, EdgeGeom};
 use cleanup::{derive_groups, fold_fragments, Titles};
-use events::{BoardEvent, EventGate, EventKind, SuppressedEvent};
+use duplicates::{apply_merges, duplicate_merges, Sighting};
+use events::{BoardEvent, EventGate, EventKind, SuppressReason, SuppressedEvent};
+use owner_geometry::{FrameGeometry, OwnerGeometryParams, TagIn};
 use owners::{
-    apply_alternation, assign, collapse_edge_pairs, AnchorKind, Corroborator, OwnerAssignment,
-    OwnerParams, OwnerSighting, OwnerTarget,
+    apply_alternation, assign_with, collapse_edge_pairs, consolidate_tags, AnchorKind,
+    Corroborator, NameRead, OwnerAssignment, OwnerParams, OwnerSighting, OwnerTarget, TagPlace,
 };
 use tracks::{
     assign_frame, intervals, Interval, MatchParams, Obs, ObsList, SupportParams, Track, Visibility,
@@ -283,6 +293,34 @@ pub struct Hooks<'a> {
     pub second_reader: Option<&'a dyn SecondReader>,
 }
 
+// The fallback pass must see the same reader answers without calling the reader
+// twice for the same keyframe and text.
+struct MemoSecondReader<'a> {
+    inner: &'a dyn SecondReader,
+    answers: Mutex<BTreeMap<(String, String), bool>>,
+}
+
+impl SecondReader for MemoSecondReader<'_> {
+    fn confirms(&self, keyframe_id: &str, text: &str) -> bool {
+        let key = (keyframe_id.to_string(), text.to_string());
+        let cached = self
+            .answers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .copied();
+        if let Some(answer) = cached {
+            return answer;
+        }
+        let answer = self.inner.confirms(keyframe_id, text);
+        self.answers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, answer);
+        answer
+    }
+}
+
 /// Consolidation parameters.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -351,6 +389,17 @@ pub struct ConsolidationParams {
     /// Owner tag geometry thresholds.
     #[serde(default)]
     pub owner_anchor: AnchorParams,
+    /// Owner tags and nodes placed on their OCR text for owner geometry.
+    #[serde(default)]
+    pub owner_geometry: OwnerGeometryParams,
+    /// Shortest last board keyframe, in seconds, whose single OCR-placed geometric
+    /// sighting of an owner tag opens an assignment (no later keyframe can confirm it).
+    #[serde(default = "default_owner_final_hold_s")]
+    pub owner_final_hold_s: f64,
+    /// Reach, in tag sizes, within which a person's OCR-read tags at one registered
+    /// place are the same physical tag (one target set for all its keyframes).
+    #[serde(default = "default_owner_tag_reach_share")]
+    pub owner_tag_reach_share: f64,
     /// Alternations (A, B, A, B has 3) a strictly interleaving stretch between an
     /// edge's ends needs before its sightings are re-anchored to the edge.
     pub alternation_min_alternations: usize,
@@ -383,10 +432,21 @@ impl Default for ConsolidationParams {
             vote_min_share: 0.6,
             owner_confirm_keyframes: 2,
             owner_anchor: AnchorParams::default(),
+            owner_geometry: OwnerGeometryParams::default(),
+            owner_final_hold_s: default_owner_final_hold_s(),
+            owner_tag_reach_share: default_owner_tag_reach_share(),
             alternation_min_alternations: 3,
             backfill_untargeted_owners: false,
         }
     }
+}
+
+fn default_owner_final_hold_s() -> f64 {
+    30.0
+}
+
+fn default_owner_tag_reach_share() -> f64 {
+    0.5
 }
 
 fn default_coverage_radius_share() -> f64 {
@@ -578,6 +638,9 @@ pub enum FoldReason {
     GroupHeading,
     /// An edge's label also read as a box on that edge.
     EdgeLabel,
+    /// A second reading of an established node at a misplaced or duplicated box
+    /// (since board_state 1.4.0).
+    Duplicate,
 }
 
 /// An element taken out of the node and sticky lists, with where it went.
@@ -790,6 +853,64 @@ fn geometry_ok(board: &ValidatedBoard) -> bool {
     true
 }
 
+/// The owner tags of one reading: (name as read, the reader's `near`, box). A
+/// participant name read as a node, or rejected from the node list as one, is a tag
+/// read in the wrong list.
+fn reading_tags(f: &BoardFrame, participants: &AliasTable) -> Vec<(String, String, BBox)> {
+    let mut tags: Vec<(String, String, BBox)> = f
+        .board
+        .owner_tags
+        .iter()
+        .map(|o| (o.name_raw.clone(), o.near.clone(), o.bbox))
+        .collect();
+    for r in &f.board.chrome_rejected {
+        if r.list == ElementList::Nodes && r.reason == RejectReason::ParticipantName {
+            if let Some(b) = r.bbox {
+                tags.push((r.text.clone(), String::new(), b));
+            }
+        }
+    }
+    for nd in &f.board.nodes {
+        if participants.resolve(&nd.text).is_some() {
+            tags.push((nd.text.clone(), String::new(), nd.bbox));
+        }
+    }
+    tags
+}
+
+/// Owner geometry of one keyframe for its reading's `tags`
+/// ([`owner_geometry::place`]).
+fn frame_geometry(
+    f: &BoardFrame,
+    tags: &[(String, String, BBox)],
+    params: &ConsolidationParams,
+    diagonal: f64,
+) -> FrameGeometry {
+    let person_of = |text: &str| {
+        params
+            .participants
+            .resolve(text)
+            .map(|p| p.person_id.clone())
+    };
+    let people: Vec<Option<String>> = tags.iter().map(|t| person_of(&t.0)).collect();
+    let tag_in: Vec<TagIn<'_>> = tags
+        .iter()
+        .zip(&people)
+        .map(|(t, p)| TagIn {
+            bbox: t.2,
+            person: p.as_deref(),
+        })
+        .collect();
+    owner_geometry::place(
+        &f.board,
+        &tag_in,
+        &f.ocr_anchors,
+        &person_of,
+        diagonal,
+        &params.owner_geometry,
+    )
+}
+
 fn median(mut v: Vec<f64>) -> f64 {
     v.retain(|x| x.is_finite());
     if v.is_empty() {
@@ -815,13 +936,57 @@ pub fn consolidate(
 }
 
 /// [`consolidate`] with pixel evidence about the keyframes' canvases.
+///
+/// A connector read only at fragments of an element keeps that element a node
+/// only when the edge builder draws one of its edges. Whether it does depends on
+/// evidence gathered after the kind decision (coverage, corridor probes, removal
+/// intervals), so the builder's own result decides: when an element kept a node
+/// only by fragment connectors ends with no edge, the board is consolidated
+/// again with that protection withdrawn. Withdrawing it only removes edges that
+/// were not drawn, so a second pass is the last.
 pub fn consolidate_with_probe(
-    mut frames: Vec<BoardFrame>,
+    frames: Vec<BoardFrame>,
     board_id: &str,
     params: &ConsolidationParams,
     hooks: &Hooks<'_>,
     probe: Option<&dyn RegionProbe>,
 ) -> BoardStateItem {
+    let second_reader = hooks.second_reader.map(|inner| MemoSecondReader {
+        inner,
+        answers: Mutex::new(BTreeMap::new()),
+    });
+    let memo_hooks = Hooks {
+        corroborator: hooks.corroborator,
+        second_reader: second_reader.as_ref().map(|r| r as &dyn SecondReader),
+    };
+    let orphaned = match consolidate_pass(
+        frames.clone(),
+        board_id,
+        params,
+        &memo_hooks,
+        probe,
+        &BTreeSet::new(),
+    ) {
+        Ok(state) => return state,
+        Err(orphaned) => orphaned,
+    };
+    match consolidate_pass(frames, board_id, params, &memo_hooks, probe, &orphaned) {
+        Ok(state) => state,
+        Err(_) => unreachable!("a pass with fragment protection withdrawn cannot retry"),
+    }
+}
+
+/// One consolidation. Tracks in `withdrawn` are not kept nodes by connectors read
+/// at their fragments. Before owner callbacks, returns the tracks that need the
+/// fallback pass instead of an incomplete state.
+fn consolidate_pass(
+    mut frames: Vec<BoardFrame>,
+    board_id: &str,
+    params: &ConsolidationParams,
+    hooks: &Hooks<'_>,
+    probe: Option<&dyn RegionProbe>,
+    withdrawn: &BTreeSet<usize>,
+) -> Result<BoardStateItem, BTreeSet<usize>> {
     let corroborator = hooks.corroborator;
     frames.sort_by(|a, b| a.t_rep_s.total_cmp(&b.t_rep_s));
     let n = frames.len();
@@ -881,6 +1046,35 @@ pub fn consolidate_with_probe(
         let d = if ref_diag.is_finite() { ref_diag } else { 0.0 };
         (ta.scale / tb.scale - 1.0).abs() > 0.05
             || ((ta.tx - tb.tx).powi(2) + (ta.ty - tb.ty).powi(2)).sqrt() > 0.02 * d
+    };
+
+    // OCR anchors of every positioned keyframe in its cluster's reference frame, with
+    // their normalized text.
+    let ocr_ref: Vec<Vec<(String, BBox)>> = (0..n)
+        .map(|f| {
+            if !positioned(f) {
+                return Vec::new();
+            }
+            frames[f]
+                .ocr_anchors
+                .iter()
+                .map(|a| (normalize(&a.text), map_bbox(&regs[f].to_reference, &a.bbox)))
+                .filter(|(t, _)| t.chars().filter(|c| c.is_alphanumeric()).count() >= 3)
+                .collect()
+        })
+        .collect();
+    // OCR of keyframe `f` read `text` at (or around) reference box `b`.
+    let ocr_reads = |f: usize, text: &str, b: &BBox| -> bool {
+        let (bw, bh) = (b.width() * 0.5, b.height() * 0.5);
+        let near_box = BBox::new(b.x1 - bw, b.y1 - bh, b.x2 + bw, b.y2 + bh);
+        ocr_ref[f].iter().any(|(a, ab)| {
+            let c = ((ab.x1 + ab.x2) / 2.0, (ab.y1 + ab.y2) / 2.0);
+            c.0 >= near_box.x1
+                && c.0 <= near_box.x2
+                && c.1 >= near_box.y1
+                && c.1 <= near_box.y2
+                && (text.contains(a.as_str()) || a.contains(text))
+        })
     };
 
     // 2. Element tracks.
@@ -1002,24 +1196,286 @@ pub fn consolidate_with_probe(
         }
     }
 
+    // Duplicate node tracks ([`duplicates`]). A registration is trusted as for pixel
+    // evidence; a reading is unreliable when its boxes coincide or the OCR geometry
+    // check found most of them displaced.
+    let trusted_registration = |f: usize| {
+        let r = &regs[f];
+        r.mode == RegistrationMode::Reference
+            || (r.mode == RegistrationMode::Registered
+                && r.inliers >= params.region_probe.min_registration_inliers)
+    };
+    let geometries: Vec<FrameGeometry> = frames
+        .iter()
+        .enumerate()
+        .map(|(fi, f)| {
+            frame_geometry(
+                f,
+                &reading_tags(f, &params.participants),
+                params,
+                diagonals[fi],
+            )
+        })
+        .collect();
+    let reading_bad: Vec<bool> = frames
+        .iter()
+        .zip(&geometries)
+        .map(|(f, g)| !geometry_ok(&f.board) || g.unreliable)
+        .collect();
+    // OCR spans of keyframe `f` reading `text` with their center inside `b` grown by
+    // `grow` of its size on each side.
+    let ocr_hits = |f: usize, text: &str, b: &BBox, grow: f64| -> Vec<usize> {
+        let (gx, gy) = (b.width() * grow, b.height() * grow);
+        ocr_ref[f]
+            .iter()
+            .enumerate()
+            .filter(|(_, (a, ab))| {
+                let c = ((ab.x1 + ab.x2) / 2.0, (ab.y1 + ab.y2) / 2.0);
+                c.0 >= b.x1 - gx
+                    && c.0 <= b.x2 + gx
+                    && c.1 >= b.y1 - gy
+                    && c.1 <= b.y2 + gy
+                    && (text.contains(a.as_str()) || a.contains(text))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let same_place = |a: &BBox, b: &BBox| {
+        let (ca, cb) = (
+            ((a.x1 + a.x2) / 2.0, (a.y1 + a.y2) / 2.0),
+            ((b.x1 + b.x2) / 2.0, (b.y1 + b.y2) / 2.0),
+        );
+        (ca.0 - cb.0).hypot(ca.1 - cb.1) <= match_params.position_tolerance_px || a.iou(b) >= 0.3
+    };
+    // Tracks placed in at least two keyframes, and where each track's element is: its
+    // own place when it is placed so, else the place of any such track with its text.
+    let placed_twice: Vec<bool> = tracks
+        .iter()
+        .map(|u| u.obs.iter().filter(|o| o.bbox.is_some()).count() >= 2)
+        .collect();
+    let texts: Vec<String> = tracks.iter().map(Track::text).collect();
+    let homes: Vec<Vec<usize>> = (0..tracks.len())
+        .map(|u| {
+            if placed_twice[u] {
+                return vec![u];
+            }
+            if tracks[u].obs.iter().all(|o| o.bbox.is_none()) {
+                return Vec::new();
+            }
+            (0..tracks.len())
+                .filter(|&v| {
+                    v != u && placed_twice[v] && duplicates::same_text(&texts[u], &texts[v], fz)
+                })
+                .collect()
+        })
+        .collect();
+    // Each track's box per registered cluster, and per keyframe the readings of tracks
+    // whose element has a known place: (track, box, whether the box agrees with where
+    // the element is).
+    let track_box: Vec<BTreeMap<usize, BBox>> = tracks
+        .iter()
+        .map(|t| {
+            let clusters: BTreeSet<usize> = t
+                .obs
+                .iter()
+                .filter(|o| o.bbox.is_some())
+                .map(|o| o.cluster)
+                .collect();
+            clusters
+                .into_iter()
+                .filter_map(|c| t.bbox_in(c).map(|b| (c, b)))
+                .collect()
+        })
+        .collect();
+    let box_in = |u: usize, c: usize| track_box[u].get(&c).copied();
+    let mut frame_placed: Vec<Vec<(usize, BBox, bool)>> = vec![Vec::new(); n];
+    for (u, t) in tracks.iter().enumerate() {
+        for o in &t.obs {
+            let Some(b) = o.bbox else { continue };
+            let at: Vec<BBox> = homes[u]
+                .iter()
+                .filter_map(|&v| box_in(v, o.cluster))
+                .collect();
+            if !at.is_empty() {
+                frame_placed[o.frame].push((u, b, at.iter().any(|h| same_place(&b, h))));
+            }
+        }
+    }
+    let radius = params.coverage_radius_share * ref_diag;
+    // The registration of keyframe `f` is unconfirmed around `b` (no reading of a
+    // track placed in two keyframes lies within the coverage radius where its track
+    // is) and wrong elsewhere in the keyframe (some reading lies away from where its
+    // element is): the sighting's registered place says nothing. The readings of
+    // tracks `skip` and of every track with the candidate's text are left out of
+    // both: same-label readings never vouch for each other.
+    let registration_off = |f: usize, b: &BBox, skip: [usize; 2]| -> bool {
+        let c = ((b.x1 + b.x2) / 2.0, (b.y1 + b.y2) / 2.0);
+        let others = || {
+            frame_placed[f].iter().filter(|x| {
+                !skip.contains(&x.0) && !duplicates::same_text(&texts[x.0], &texts[skip[0]], fz)
+            })
+        };
+        let confirmed = radius.is_finite()
+            && others().any(|&(u, ub, agrees)| {
+                let uc = ((ub.x1 + ub.x2) / 2.0, (ub.y1 + ub.y2) / 2.0);
+                placed_twice[u] && agrees && (uc.0 - c.0).hypot(uc.1 - c.1) <= radius
+            });
+        !confirmed && others().any(|x| !x.2)
+    };
+    // OCR reading the text at the sighting's own place (and not at the established
+    // track's) is never explained away: a second element there on a trusted
+    // registration and a reliable reading, else unknown.
+    let judge = |ti: usize, i: usize, ei: usize| -> Sighting {
+        let o = &tracks[ti].obs[i];
+        let bad = reading_bad[o.frame];
+        let Some((b, eb)) = o.bbox.and_then(|b| box_in(ei, o.cluster).map(|eb| (b, eb))) else {
+            return if bad {
+                Sighting::Explained
+            } else {
+                Sighting::Unknown
+            };
+        };
+        if same_place(&b, &eb) {
+            return Sighting::Near;
+        }
+        // A span inside the sighting's own box is its own unless it also lies inside
+        // the established box itself (a neighbor's margin does not claim it); the
+        // established place, grown by half its size, explains a sighting only when
+        // OCR reads nothing at the sighting's own place.
+        let text = normalize(&o.text);
+        let inside_established = ocr_hits(o.frame, &text, &eb, 0.0);
+        let own = ocr_hits(o.frame, &text, &b, 0.0)
+            .into_iter()
+            .any(|x| !inside_established.contains(&x));
+        let at_established = ocr_hits(o.frame, &text, &eb, 0.5);
+        let off = registration_off(o.frame, &b, [ti, ei]);
+        if own {
+            if trusted_registration(o.frame) && !bad && !off {
+                Sighting::Apart
+            } else {
+                Sighting::Unknown
+            }
+        } else if bad || off || !at_established.is_empty() {
+            Sighting::Explained
+        } else {
+            Sighting::Unknown
+        }
+    };
+    let merges = duplicate_merges(&tracks, params.min_support_keyframes, fz, &judge);
+    let near: HashSet<(usize, usize)> = merges
+        .iter()
+        .flat_map(|(&t, &e)| (0..tracks[t].obs.len()).map(move |i| (t, i, e)))
+        .filter(|&(t, i, e)| judge(t, i, e) == Sighting::Near)
+        .map(|(t, i, _)| (t, i))
+        .collect();
+    let duplicate_folds: Vec<FoldedElement> = merges
+        .iter()
+        .map(|(&t, &e)| FoldedElement {
+            text: tracks[t].text(),
+            into: tracks[e].text(),
+            reason: FoldReason::Duplicate,
+        })
+        .collect();
+    apply_merges(&mut tracks, &merges, &|t, i| near.contains(&(t, i)));
+    for ti in node_track.values_mut() {
+        if let Some(&e) = merges.get(ti) {
+            *ti = e;
+        }
+    }
+    for m in &mut label_merges {
+        if let Some(&e) = merges.get(&m.0) {
+            m.0 = e;
+        }
+    }
+
     // Fragments: a shorter reading of a longer element at the same place is folded
     // into it. The fragment's sightings do not count as support; references to it
     // (edge endpoints, owner targets) are redirected.
     let fold_to = fold_fragments(&tracks);
+    let n_tracks = tracks.len();
     let resolve = |mut t: usize| {
         let mut guard = 0;
         while let Some(&u) = fold_to.get(&t) {
             t = u;
             guard += 1;
-            if guard > tracks.len() {
+            if guard > n_tracks {
                 break;
             }
         }
         t
     };
+    // Connector ends. A connector read at an element's own readings keeps it a
+    // node. One read at a fragment reaches the element through the redirect the
+    // edges take (section 4): it keeps the element a node when that edge, between
+    // the resolved ends, was read in at least `min_support_keyframes` keyframes
+    // (necessary for an edge to be kept) and the edge builder draws an edge at the
+    // element (checked at the end, see `consolidate_with_probe`). A connector the
+    // state draws is then never lost to its end's kind, and one it drops cannot
+    // turn a marked sticky into a node.
+    let mut edge_ends: HashSet<usize> = HashSet::new();
+    let mut via_fragment: BTreeMap<(usize, usize), (BTreeSet<usize>, BTreeSet<usize>)> =
+        BTreeMap::new();
+    for (fi, f) in frames.iter().enumerate() {
+        for e in &f.board.edges {
+            let raw = [&e.src, &e.dst].map(|end| node_track.get(&(fi, end.clone())).copied());
+            let ends = raw.map(|t| t.map(resolve));
+            for (r, t) in raw.iter().zip(&ends) {
+                if let (Some(r), Some(t)) = (r, t) {
+                    if r == t {
+                        edge_ends.insert(*t);
+                    }
+                }
+            }
+            if let [Some(s), Some(d)] = ends {
+                if s != d {
+                    let entry = via_fragment.entry((s.min(d), s.max(d))).or_default();
+                    entry.0.insert(fi);
+                    for (r, t) in raw.iter().zip(&ends) {
+                        if let (Some(r), Some(t)) = (r, t) {
+                            if r != t {
+                                entry.1.insert(*t);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut fragment_ends: BTreeSet<usize> = BTreeSet::new();
+    for (read_in, ends) in via_fragment.values() {
+        if read_in.len() >= params.min_support_keyframes {
+            fragment_ends.extend(
+                ends.iter()
+                    .copied()
+                    .filter(|t| !edge_ends.contains(t) && !withdrawn.contains(t)),
+            );
+        }
+    }
+    edge_ends.extend(fragment_ends.iter().copied());
     for ti in node_track.values_mut() {
         *ti = resolve(*ti);
     }
+
+    // Kind beyond the list votes, decided after fragments are folded on the vote
+    // kinds. A connector end (above) is a node: only nodes carry edges;
+    // otherwise a node-majority track is a sticky when it was read as a sticky (a
+    // colored card) at least as often as a node, or when its text carries a
+    // sticky marker (a question or a milestone, spec 6.11): node labels name
+    // components.
+    for (ti, t) in tracks.iter_mut().enumerate() {
+        let v = t.votes();
+        if v.kind() != ObsList::Node || edge_ends.contains(&ti) {
+            continue;
+        }
+        let marked = matches!(
+            sticky_kind(&t.text()),
+            StickyKind::Question | StickyKind::Milestone
+        );
+        if marked || (v.sticky > 0 && v.sticky >= v.node) {
+            t.kind_override = Some(ObsList::Sticky);
+        }
+    }
+
     let folded: Vec<FoldedElement> = fold_to
         .iter()
         .map(|(&t, &u)| FoldedElement {
@@ -1027,6 +1483,7 @@ pub fn consolidate_with_probe(
             into: tracks[resolve(u)].text(),
             reason: FoldReason::Fragment,
         })
+        .chain(duplicate_folds)
         .collect();
 
     // Views and visibility.
@@ -1073,33 +1530,7 @@ pub fn consolidate_with_probe(
             }
         }
     }
-    let ocr_ref: Vec<Vec<(String, BBox)>> = (0..n)
-        .map(|f| {
-            if !positioned(f) {
-                return Vec::new();
-            }
-            frames[f]
-                .ocr_anchors
-                .iter()
-                .map(|a| (normalize(&a.text), map_bbox(&regs[f].to_reference, &a.bbox)))
-                .filter(|(t, _)| t.chars().filter(|c| c.is_alphanumeric()).count() >= 3)
-                .collect()
-        })
-        .collect();
     let coverage_radius = params.coverage_radius_share * ref_diag;
-    // OCR of keyframe `f` read `text` at (or around) reference box `b`.
-    let ocr_reads = |f: usize, text: &str, b: &BBox| -> bool {
-        let (bw, bh) = (b.width() * 0.5, b.height() * 0.5);
-        let near_box = BBox::new(b.x1 - bw, b.y1 - bh, b.x2 + bw, b.y2 + bh);
-        ocr_ref[f].iter().any(|(a, ab)| {
-            let c = ((ab.x1 + ab.x2) / 2.0, (ab.y1 + ab.y2) / 2.0);
-            c.0 >= near_box.x1
-                && c.0 <= near_box.x2
-                && c.1 >= near_box.y1
-                && c.1 <= near_box.y2
-                && (text.contains(a.as_str()) || a.contains(text))
-        })
-    };
     // Region-local disappearance: a well-supported registration maps the track's
     // reference box `b` into keyframe `f`, and those canvas pixels lost the ink the
     // box held in the keyframe that last read the track.
@@ -1336,7 +1767,7 @@ pub fn consolidate_with_probe(
     // element.
     let mut established: HashMap<String, Vec<(usize, Vec<usize>)>> = HashMap::new();
     for (ti, t) in tracks.iter().enumerate() {
-        if !track_intervals[ti].is_empty() && t.votes().kind() == ObsList::Node {
+        if !track_intervals[ti].is_empty() && t.kind() == ObsList::Node {
             established
                 .entry(normalize(&t.text()))
                 .or_default()
@@ -1381,7 +1812,7 @@ pub fn consolidate_with_probe(
         }
         let votes = t.votes();
         let lifetimes: Vec<Lifetime> = ivs.iter().map(lifetime).collect();
-        match votes.kind() {
+        match t.kind() {
             ObsList::Node => {
                 let id = format!("node-{}", nodes.len() + 1);
                 node_id.insert(ti, id.clone());
@@ -1843,6 +2274,24 @@ pub fn consolidate_with_probe(
         });
     }
 
+    // Stop before owner corroboration when a fallback is needed. Owner callbacks
+    // may have side effects, and node IDs can change when an orphan becomes a
+    // sticky, so replaying their first-pass answers would not be safe.
+    if withdrawn.is_empty() {
+        let orphaned: BTreeSet<usize> = fragment_ends
+            .iter()
+            .copied()
+            .filter(|t| {
+                node_id
+                    .get(t)
+                    .is_some_and(|id| !edges.iter().any(|e| &e.a == id || &e.b == id))
+            })
+            .collect();
+        if !orphaned.is_empty() {
+            return Err(orphaned);
+        }
+    }
+
     // 5. Owners.
     let node_target = |ti: usize| -> Option<OwnerTarget> {
         node_id.get(&ti).map(|id| OwnerTarget::Node {
@@ -1861,43 +2310,88 @@ pub fn consolidate_with_probe(
             b_text: text_of(key.1),
         })
     };
+    // A node read once with the text of an established node, at an imprecise place,
+    // is that node (see `echo_of_established`): owner targets follow it there.
+    let owner_track = |ti: usize| -> usize {
+        if tracks[ti].kind() != ObsList::Node || !echo_of_established(ti, &tracks[ti]) {
+            return ti;
+        }
+        let seen = tracks[ti].frames();
+        established
+            .get(&normalize(&tracks[ti].text()))
+            .and_then(|v| {
+                v.iter()
+                    .filter(|(u, fr)| {
+                        *u != ti
+                            && node_id.contains_key(u)
+                            && fr.len() >= params.min_support_keyframes
+                            && !fr.contains(&seen[0])
+                    })
+                    .max_by_key(|(u, fr)| (fr.len(), std::cmp::Reverse(*u)))
+                    .map(|(u, _)| *u)
+            })
+            .unwrap_or(ti)
+    };
+    let owner_node = |ti: usize| node_target(owner_track(ti));
+    let person_of = |text: &str| {
+        params
+            .participants
+            .resolve(text)
+            .map(|p| p.person_id.clone())
+    };
     let mut rejected_owner_tags: Vec<RejectedOwnerTag> = Vec::new();
     let mut by_person: BTreeMap<String, (String, Vec<OwnerSighting>)> = BTreeMap::new();
+    // Per keyframe: people named anywhere in it (reading or OCR), and node tracks
+    // whose text OCR placed.
+    let mut named: Vec<HashSet<String>> = vec![HashSet::new(); n];
+    let mut ocr_placed: Vec<HashSet<usize>> = vec![HashSet::new(); n];
     for (fi, f) in frames.iter().enumerate() {
         let geo = geometry_ok(&f.board);
-        let mut tags: Vec<(String, String, BBox)> = f
-            .board
-            .owner_tags
-            .iter()
-            .map(|o| (o.name_raw.clone(), o.near.clone(), o.bbox))
-            .collect();
-        // A participant name read as a node is an owner tag in the wrong list.
-        for r in &f.board.chrome_rejected {
-            if r.list == ElementList::Nodes && r.reason == RejectReason::ParticipantName {
-                if let Some(b) = r.bbox {
-                    tags.push((r.text.clone(), String::new(), b));
-                }
-            }
-        }
-        for nd in &f.board.nodes {
-            if params.participants.resolve(&nd.text).is_some() {
-                tags.push((nd.text.clone(), String::new(), nd.bbox));
-            }
-        }
-        // Boxes of the tracked nodes in this keyframe, and of the supported edges seen
-        // here (for tag geometry).
-        let node_boxes: Vec<(AnchorKey, BBox)> = f
-            .board
+        let tags = reading_tags(f, &params.participants);
+        let b = &f.board;
+        for text in b
             .nodes
             .iter()
-            .filter(|x| params.participants.resolve(&x.text).is_none())
-            .filter_map(|x| {
-                node_track
-                    .get(&(fi, x.local_id.clone()))
-                    .filter(|ti| node_id.contains_key(ti))
-                    .map(|&ti| (AnchorKey::Node(ti), x.bbox))
-            })
-            .collect();
+            .map(|x| x.text.as_str())
+            .chain(b.stickies.iter().map(|x| x.text.as_str()))
+            .chain(b.other_visible_text.iter().map(|x| x.text.as_str()))
+            .chain(b.owner_tags.iter().map(|x| x.name_raw.as_str()))
+            .chain(b.chrome_rejected.iter().map(|x| x.text.as_str()))
+            .chain(f.ocr_anchors.iter().map(|x| x.text.as_str()))
+        {
+            if let Some(pid) = person_of(text) {
+                named[fi].insert(pid);
+            }
+        }
+        // Tags and nodes checked against OCR (displaced ones moved onto their text);
+        // an unreliable reading keeps only what OCR placed.
+        let people: Vec<Option<String>> = tags.iter().map(|t| person_of(&t.0)).collect();
+        let placed = &geometries[fi];
+        // Boxes of the tracked nodes in this keyframe, and of the supported edges seen
+        // here (for tag geometry).
+        let mut node_boxes: Vec<(AnchorKey, BBox)> = Vec::new();
+        for (x, pl) in f.board.nodes.iter().zip(&placed.nodes) {
+            if params.participants.resolve(&x.text).is_some() {
+                continue;
+            }
+            let (Some(pl), Some(&raw)) = (pl, node_track.get(&(fi, x.local_id.clone()))) else {
+                continue;
+            };
+            // A single misplaced reading of an established node stands for it.
+            let ti = if node_id.contains_key(&raw) {
+                raw
+            } else {
+                owner_track(raw)
+            };
+            if !node_id.contains_key(&ti) {
+                continue;
+            }
+            if pl.ocr {
+                ocr_placed[fi].insert(ti);
+                ocr_placed[fi].insert(owner_track(ti));
+            }
+            node_boxes.push((AnchorKey::Node(ti), pl.bbox));
+        }
         let box_of = |ti: usize| {
             node_boxes
                 .iter()
@@ -1909,15 +2403,101 @@ pub fn consolidate_with_probe(
             .filter(|(k, _)| edge_id_of.contains_key(k))
             .filter_map(|(k, l)| {
                 let o = l.iter().find(|o| o.frame == fi)?;
+                let (a, b) = (box_of(k.0)?, box_of(k.1)?);
+                // Traced termini where the reading is geometry; otherwise the facing
+                // border points of the placed boxes.
+                let traced = o
+                    .evidence
+                    .as_ref()
+                    .is_some_and(|ev| ev.pixel.src_end.is_some() && ev.pixel.dst_end.is_some());
+                let segment = if traced && !placed.unreliable {
+                    o.segment
+                } else {
+                    let (ac, bc) = (
+                        ((a.x1 + a.x2) / 2.0, (a.y1 + a.y2) / 2.0),
+                        ((b.x1 + b.x2) / 2.0, (b.y1 + b.y2) / 2.0),
+                    );
+                    (exit_point(&a, bc), exit_point(&b, ac))
+                };
                 Some(EdgeGeom {
                     key: AnchorKey::Edge(*k),
-                    a: (AnchorKey::Node(k.0), box_of(k.0)?),
-                    b: (AnchorKey::Node(k.1), box_of(k.1)?),
-                    segment: o.segment,
+                    a: (AnchorKey::Node(k.0), a),
+                    b: (AnchorKey::Node(k.1), b),
+                    segment,
                 })
             })
             .collect();
-        for (tag_index, (name, near, tb)) in tags.into_iter().enumerate() {
+        // Reader boxes that all coincide are no geometry, unless OCR placed what is
+        // used (an unreliable reading keeps nothing else).
+        let use_geometry = geo || placed.unreliable;
+        // OCR can vouch for names only where the OCR check runs.
+        let has_ocr = params.owner_geometry.enabled && !f.ocr_anchors.is_empty();
+        let pad =
+            |g: &BBox| owner_geometry::tag_box(g, placed.line, params.owner_geometry.tag_pad_lines);
+        // OCR-first tags. A reader tag OCR read sits on its OCR text; in a keyframe
+        // where OCR read a person's name, that person's other reader tags are
+        // misplaced or duplicated and dropped; every other OCR name span is a tag the
+        // reader missed. A span inside an element that mentions the name is no tag.
+        let ocr_people: HashSet<&str> = placed
+            .name_spans
+            .iter()
+            .filter(|s| !s.mention)
+            .map(|s| s.person.as_str())
+            .collect();
+        let span_of = |si: &usize| Some(*si).filter(|si| !placed.name_spans[*si].mention);
+        // (name, reader's near, geometry box, box on OCR text, who read the name)
+        let mut all: Vec<(String, String, Option<BBox>, bool, NameRead)> = Vec::new();
+        for (i, ((name, near, _), pl)) in tags.into_iter().zip(&placed.tags).enumerate() {
+            match placed.tag_spans[i].as_ref().and_then(span_of) {
+                Some(si) => all.push((
+                    name,
+                    near,
+                    Some(pad(&placed.name_spans[si].glyph)),
+                    true,
+                    NameRead::Ocr,
+                )),
+                None if people[i].as_deref().is_some_and(|p| ocr_people.contains(p)) => {}
+                None => all.push((
+                    name,
+                    near,
+                    pl.map(|p| p.bbox),
+                    pl.is_some_and(|p| p.ocr),
+                    if has_ocr {
+                        NameRead::Reader
+                    } else {
+                        NameRead::Unchecked
+                    },
+                )),
+            }
+        }
+        let claimed: HashSet<usize> = placed.tag_spans.iter().flatten().copied().collect();
+        for (si, ns) in placed.name_spans.iter().enumerate() {
+            if !ns.mention && !claimed.contains(&si) {
+                all.push((
+                    ns.text.clone(),
+                    String::new(),
+                    Some(pad(&ns.glyph)),
+                    true,
+                    NameRead::Ocr,
+                ));
+            }
+        }
+        let place_of = |b: &BBox| {
+            positioned(fi).then(|| {
+                let c = regs[fi]
+                    .to_reference
+                    .apply(((b.x1 + b.x2) / 2.0, (b.y1 + b.y2) / 2.0));
+                let k = regs[fi].to_reference.scale.abs();
+                TagPlace {
+                    cluster: regs[fi].cluster,
+                    x: c.0,
+                    y: c.1,
+                    w: b.width() * k,
+                    h: b.height() * k,
+                }
+            })
+        };
+        for (tag_index, (name, near, bx, box_ocr, name_read)) in all.into_iter().enumerate() {
             let Some(person) = params.participants.resolve(&name) else {
                 rejected_owner_tags.push(RejectedOwnerTag {
                     keyframe_id: f.keyframe_id.clone(),
@@ -1925,53 +2505,75 @@ pub fn consolidate_with_probe(
                 });
                 continue;
             };
-            let mut targets: Vec<(OwnerTarget, AnchorKind)> = Vec::new();
-            if geo {
-                let node_of = |k: &AnchorKey| match k {
-                    AnchorKey::Node(t) => node_target(*t),
-                    AnchorKey::Edge(_) => None,
-                };
-                match anchor_tag(&tb, &node_boxes, &frame_edges, &params.owner_anchor) {
-                    Some(Anchored::Node(k)) => {
-                        targets.extend(node_of(&k).map(|t| (t, AnchorKind::GeometryNode)));
+            // (target, anchor, the tag and every target node placed on OCR text,
+            // other targets the geometry fits)
+            type Found = (OwnerTarget, AnchorKind, bool, Vec<OwnerTarget>);
+            let mut targets: Vec<Found> = Vec::new();
+            if let (true, Some(bx)) = (use_geometry, bx) {
+                let on_ocr =
+                    |ks: &[usize]| box_ocr && ks.iter().all(|t| ocr_placed[fi].contains(t));
+                let amb = edge_end_ambiguities(&bx, &frame_edges, &params.owner_anchor);
+                match anchor_tag(&bx, &node_boxes, &frame_edges, &params.owner_anchor) {
+                    Some(Anchored::Node(AnchorKey::Node(x))) => {
+                        let alts: Vec<OwnerTarget> = amb
+                            .iter()
+                            .filter(|(_, end)| *end == AnchorKey::Node(x))
+                            .filter_map(|(e, _)| match e {
+                                AnchorKey::Edge(k) => edge_target(*k),
+                                AnchorKey::Node(_) => None,
+                            })
+                            .collect();
+                        targets.extend(
+                            owner_node(x)
+                                .map(|t| (t, AnchorKind::GeometryNode, on_ocr(&[x]), alts)),
+                        );
                     }
-                    Some(Anchored::Bridge(x, y)) => {
-                        targets.extend(node_of(&x).map(|t| (t, AnchorKind::GeometryBridge)));
-                        targets.extend(node_of(&y).map(|t| (t, AnchorKind::GeometryBridge)));
+                    Some(Anchored::Bridge(AnchorKey::Node(x), AnchorKey::Node(y))) => {
+                        for z in [x, y] {
+                            targets.extend(owner_node(z).map(|t| {
+                                (t, AnchorKind::GeometryBridge, on_ocr(&[z]), Vec::new())
+                            }));
+                        }
                     }
                     Some(Anchored::Edge(AnchorKey::Edge(k))) => {
-                        targets.extend(edge_target(k).map(|t| (t, AnchorKind::GeometryEdge)));
+                        let alts: Vec<OwnerTarget> = amb
+                            .iter()
+                            .filter(|(e, _)| *e == AnchorKey::Edge(k))
+                            .filter_map(|(_, end)| match end {
+                                AnchorKey::Node(x) => owner_node(*x),
+                                AnchorKey::Edge(_) => None,
+                            })
+                            .collect();
+                        targets.extend(
+                            edge_target(k)
+                                .map(|t| (t, AnchorKind::GeometryEdge, on_ocr(&[k.0, k.1]), alts)),
+                        );
                     }
-                    Some(Anchored::Edge(AnchorKey::Node(_))) | None => {}
+                    _ => {}
                 }
             }
             if targets.is_empty() && !near.is_empty() {
                 targets.extend(
                     node_track
                         .get(&(fi, near.clone()))
-                        .and_then(|&ti| node_target(ti))
-                        .map(|t| (t, AnchorKind::Near)),
+                        .and_then(|&ti| owner_node(ti))
+                        .map(|t| (t, AnchorKind::Near, false, Vec::new())),
                 );
             }
             let entry = by_person
                 .entry(person.person_id.clone())
                 .or_insert_with(|| (person.display_name.clone(), Vec::new()));
-            let targets: Vec<(Option<OwnerTarget>, AnchorKind)> = if targets.is_empty() {
-                vec![(None, AnchorKind::Untargeted)]
-            } else {
-                targets.into_iter().map(|(t, a)| (Some(t), a)).collect()
-            };
-            for (t, anchor) in targets {
-                // Several tags of one person in a keyframe are kept when their targets
-                // differ (multi-target owners).
-                if entry
-                    .1
-                    .iter()
-                    .any(|s| s.keyframe_id == f.keyframe_id && s.target == t)
-                {
-                    continue;
-                }
-                entry.1.push(OwnerSighting {
+            let targets: Vec<(Option<OwnerTarget>, AnchorKind, bool, Vec<OwnerTarget>)> =
+                if targets.is_empty() {
+                    vec![(None, AnchorKind::Untargeted, false, Vec::new())]
+                } else {
+                    targets
+                        .into_iter()
+                        .map(|(t, a, l, alts)| (Some(t), a, l, alts))
+                        .collect()
+                };
+            for (t, anchor, located, alternates) in targets {
+                let sighting = OwnerSighting {
                     keyframe_id: f.keyframe_id.clone(),
                     t_start_s: f.t_start_s,
                     t_end_s: f.t_end_s,
@@ -1979,7 +2581,25 @@ pub fn consolidate_with_probe(
                     target: t,
                     anchor,
                     tag: tag_index as u32,
-                });
+                    ocr_located: located,
+                    name_read,
+                    alternates,
+                    place: bx.as_ref().and_then(&place_of),
+                    physical: None,
+                };
+                // Several tags of one person in a keyframe are kept when their targets
+                // differ (multi-target owners); for one target the stronger evidence,
+                // unless both are placed: two placed tags are two physical tags.
+                let strength = |s: &OwnerSighting| (s.ocr_located, s.name_read != NameRead::Reader);
+                match entry.1.iter().position(|s| {
+                    s.keyframe_id == f.keyframe_id
+                        && s.target == sighting.target
+                        && !(s.place.is_some() && sighting.place.is_some() && s.tag != sighting.tag)
+                }) {
+                    None => entry.1.push(sighting),
+                    Some(j) if strength(&sighting) > strength(&entry.1[j]) => entry.1[j] = sighting,
+                    Some(_) => {}
+                }
             }
         }
     }
@@ -1991,6 +2611,7 @@ pub fn consolidate_with_probe(
     let owner_params = OwnerParams {
         confirm_keyframes: params.owner_confirm_keyframes,
         backfill_untargeted: params.backfill_untargeted_owners,
+        final_hold_min_s: params.owner_final_hold_s,
     };
     // A target is visible in a keyframe where its node (or both edge ends) was read.
     let track_of_id: HashMap<&str, usize> =
@@ -2002,18 +2623,59 @@ pub fn consolidate_with_probe(
         .enumerate()
         .map(|(i, f)| (f.keyframe_id.as_str(), i))
         .collect();
+    // Tracks that stand for another one (single imprecise readings of it).
+    let mut echoes: HashMap<usize, Vec<usize>> = HashMap::new();
+    for ti in 0..tracks.len() {
+        let u = owner_track(ti);
+        if u != ti {
+            echoes.entry(u).or_default().push(ti);
+        }
+    }
     let seen = |ti: usize, kf: &str| {
-        frame_of_kf
-            .get(kf)
-            .is_some_and(|fi| tracks[ti].obs.iter().any(|o| o.frame == *fi))
+        frame_of_kf.get(kf).is_some_and(|fi| {
+            std::iter::once(&ti)
+                .chain(echoes.get(&ti).into_iter().flatten())
+                .any(|&t| tracks[t].obs.iter().any(|o| o.frame == *fi))
+        })
     };
-    let target_visible = |kf: &str, t: &OwnerTarget| match t {
-        OwnerTarget::Node { node_id, .. } => track_of_id
-            .get(node_id.as_str())
-            .is_some_and(|&ti| seen(ti, kf)),
-        OwnerTarget::Edge { edge_id, .. } => edge_of_id
-            .get(edge_id.as_str())
-            .is_some_and(|&(a, b)| seen(a, kf) && seen(b, kf)),
+    // The tag's registered position lies inside the keyframe's canvas. Without a
+    // known tag position the target alone decides; with one, a keyframe that cannot
+    // map it (not registered, another registration cluster, no canvas) is not
+    // evidence either way.
+    let in_view = |fi: usize, place: Option<&TagPlace>| -> bool {
+        let Some(p) = place else { return true };
+        if !positioned(fi) || regs[fi].cluster != p.cluster {
+            return false;
+        }
+        let (Some(c), Some(inv)) = (canvases[fi], regs[fi].to_reference.inverse()) else {
+            return false;
+        };
+        let q = inv.apply((p.x, p.y));
+        q.0 >= 0.0 && q.1 >= 0.0 && q.0 <= c.width && q.1 <= c.height
+    };
+    let target_visible = |kf: &str, t: &OwnerTarget, place: Option<&TagPlace>| {
+        let read = match t {
+            OwnerTarget::Node { node_id, .. } => track_of_id
+                .get(node_id.as_str())
+                .is_some_and(|&ti| seen(ti, kf)),
+            OwnerTarget::Edge { edge_id, .. } => edge_of_id
+                .get(edge_id.as_str())
+                .is_some_and(|&(a, b)| seen(a, kf) && seen(b, kf)),
+        };
+        read && frame_of_kf.get(kf).is_some_and(|&fi| in_view(fi, place))
+    };
+    let target_tracks = |t: &OwnerTarget| -> Vec<usize> {
+        match t {
+            OwnerTarget::Node { node_id, .. } => track_of_id
+                .get(node_id.as_str())
+                .copied()
+                .into_iter()
+                .collect(),
+            OwnerTarget::Edge { edge_id, .. } => edge_of_id
+                .get(edge_id.as_str())
+                .map(|&(a, b)| vec![a, b])
+                .unwrap_or_default(),
+        }
     };
     let mut owner_assignments: Vec<OwnerAssignment> = Vec::new();
     for (pid, (name, mut sightings)) in by_person {
@@ -2023,7 +2685,30 @@ pub fn consolidate_with_probe(
             &alternation_edges,
             params.alternation_min_alternations,
         );
-        owner_assignments.extend(assign(
+        consolidate_tags(&mut sightings, params.owner_tag_reach_share);
+        // The first keyframe in [after, before) that read the target, OCR placed it,
+        // has the tag's last position in view, and names the person nowhere.
+        let absent =
+            |t: &OwnerTarget, place: Option<&TagPlace>, after: f64, before: f64| -> Option<f64> {
+                let ts = target_tracks(t);
+                if ts.is_empty() {
+                    return None;
+                }
+                frames
+                    .iter()
+                    .enumerate()
+                    .find(|(fi, f)| {
+                        f.t_start_s >= after - 1e-9
+                            && f.t_start_s < before - 1e-9
+                            && !named[*fi].contains(&pid)
+                            && in_view(*fi, place)
+                            && ts.iter().all(|&ti| {
+                                seen(ti, &f.keyframe_id) && ocr_placed[*fi].contains(&ti)
+                            })
+                    })
+                    .map(|(_, f)| f.t_start_s)
+            };
+        owner_assignments.extend(assign_with(
             &pid,
             &name,
             &sightings,
@@ -2031,6 +2716,7 @@ pub fn consolidate_with_probe(
             &owner_params,
             corroborator,
             &target_visible,
+            &absent,
         ));
     }
 
@@ -2147,6 +2833,94 @@ pub fn consolidate_with_probe(
 
     // 6. Events.
     let mut gate = EventGate::new(params.ink_event_threshold);
+    // Came into view rather than drawn: first seen right after a registered pan or
+    // zoom (two positioned keyframes of one cluster whose transforms differ), at a
+    // place the previous view did not show empty.
+    let view_changed_into = |f: usize| {
+        f > 0
+            && positioned(f - 1)
+            && positioned(f)
+            && regs[f - 1].cluster == regs[f].cluster
+            && view_moved(f - 1, f)
+    };
+    // The previous keyframe showed the place empty. With pixels: the place, mapped into
+    // the previous keyframe through a trusted registration, held almost no ink while
+    // the element's own reading holds ink. Without them: coverage evidence.
+    let shown_empty_before = |t: &Track, f: usize| -> bool {
+        let p = f - 1;
+        let pixels = || -> Option<bool> {
+            let probe = probe?;
+            let rp = &params.region_probe;
+            let r = &regs[p];
+            let trusted = r.mode == RegistrationMode::Reference
+                || (r.mode == RegistrationMode::Registered
+                    && r.inliers >= rp.min_registration_inliers);
+            if !trusted || track_visible(t, p) != Visibility::Visible {
+                return Some(false);
+            }
+            let b = t.bbox_in(r.cluster)?;
+            let inv = r.to_reference.inverse()?;
+            let own = t
+                .obs
+                .iter()
+                .find(|o| o.frame == f)
+                .and_then(|o| o.raw_bbox)?;
+            let now = probe.ink_share(&frames[f].keyframe_id, &own)?;
+            let before = probe.ink_share(&frames[p].keyframe_id, &map_bbox(&inv, &b))?;
+            Some(now >= rp.min_ink_share && before <= rp.gone_ratio * now)
+        };
+        pixels().unwrap_or_else(|| track_covered(t, p) == Visibility::Visible)
+    };
+    let revealed =
+        |ti: usize, f: usize| view_changed_into(f) && !shown_empty_before(&tracks[ti], f);
+    // An edge first read after a view change came into view when an end was not in
+    // the previous view, or when, both ends read there, a traced stroke already
+    // joined them there (straight-corridor ink proves no connection, and a probe
+    // that does not trace leaves the edge added).
+    let revealed_edge = |key: (usize, usize), f: usize| {
+        if !view_changed_into(f) {
+            return false;
+        }
+        let before = |ti: usize| {
+            tracks[ti]
+                .obs
+                .iter()
+                .find(|o| o.frame == f - 1)
+                .and_then(|o| o.raw_bbox)
+        };
+        if ![key.0, key.1]
+            .iter()
+            .all(|&ti| before(ti).is_some() || shown_empty_before(&tracks[ti], f))
+        {
+            return true;
+        }
+        let rp = &params.region_probe;
+        match (probe, before(key.0), before(key.1)) {
+            (Some(probe), Some(ba), Some(bb)) if probe.traces() => {
+                let p = f - 1;
+                let ring = (rp.corridor_half_width_share * ba.height().min(bb.height())).max(3.0);
+                let margin = rp.stroke_margin_share * ba.height().max(bb.height());
+                let region = BBox::new(
+                    ba.x1.min(bb.x1) - margin,
+                    ba.y1.min(bb.y1) - margin,
+                    ba.x2.max(bb.x2) + margin,
+                    ba.y2.max(bb.y2) + margin,
+                );
+                let masks: Vec<BBox> = others(key.0, key.1).filter_map(|x| raw_at(x, p)).collect();
+                probe
+                    .stroke_between(&frames[p].keyframe_id, &ba, &bb, &region, &masks, ring)
+                    .is_some_and(|t| t.joined)
+            }
+            _ => false,
+        }
+    };
+    let offer_added = |gate: &mut EventGate, e: BoardEvent, is_revealed: bool| {
+        if !e.baseline && is_revealed {
+            gate.suppress(e, SuppressReason::RevealedByView);
+        } else {
+            gate.offer(e);
+        }
+    };
     let event = |kind: EventKind, f: usize, subject: &str, detail: String| BoardEvent {
         event_id: String::new(),
         kind,
@@ -2167,7 +2941,11 @@ pub fn consolidate_with_probe(
         if let Some(id) = node_id.get(&ti) {
             let text = text_of(ti);
             for iv in ivs {
-                gate.offer(event(EventKind::NodeAdded, iv.first, id, text.clone()));
+                offer_added(
+                    &mut gate,
+                    event(EventKind::NodeAdded, iv.first, id, text.clone()),
+                    revealed(ti, iv.first),
+                );
                 if let Some(r) = iv.removed_at {
                     gate.offer(event(EventKind::NodeRemoved, r, id, text.clone()));
                 }
@@ -2187,7 +2965,11 @@ pub fn consolidate_with_probe(
         } else if let Some(id) = sticky_id.get(&ti) {
             let text = tracks[ti].current_text(fz);
             for iv in ivs {
-                gate.offer(event(EventKind::StickyAdded, iv.first, id, text.clone()));
+                offer_added(
+                    &mut gate,
+                    event(EventKind::StickyAdded, iv.first, id, text.clone()),
+                    revealed(ti, iv.first),
+                );
             }
         }
     }
@@ -2201,7 +2983,11 @@ pub fn consolidate_with_probe(
         };
         let detail = format!("{} - {}", e.a_text, e.b_text);
         for iv in edge_intervals.get(&key).map(Vec::as_slice).unwrap_or(&[]) {
-            gate.offer(event(EventKind::EdgeAdded, iv.first, &e.id, detail.clone()));
+            offer_added(
+                &mut gate,
+                event(EventKind::EdgeAdded, iv.first, &e.id, detail.clone()),
+                revealed_edge(key, iv.first),
+            );
             if let Some(r) = iv.removed_at {
                 gate.offer(event(EventKind::EdgeRemoved, r, &e.id, detail.clone()));
             }
@@ -2243,8 +3029,7 @@ pub fn consolidate_with_probe(
         .collect();
     nodes.retain(|n| !heading_ids.contains(&n.id));
     stickies.retain(|s| !heading_ids.contains(&s.id));
-
-    BoardStateItem {
+    let state = BoardStateItem {
         board_id: board_id.to_string(),
         board_title: titles.board_title(),
         groups,
@@ -2271,7 +3056,8 @@ pub fn consolidate_with_probe(
         rejected_owner_tags,
         events,
         suppressed_events,
-    }
+    };
+    Ok(state)
 }
 
 /// Keyframes where an edge's direction flips: per-keyframe decisions (pixel first,

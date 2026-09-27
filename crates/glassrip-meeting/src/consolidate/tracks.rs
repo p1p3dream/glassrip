@@ -88,9 +88,16 @@ impl ListVotes {
 pub struct Track {
     /// Sightings in time order (at most one per keyframe).
     pub obs: Vec<Obs>,
+    /// Kind decided from more than the list votes (see [`Track::kind`]).
+    pub kind_override: Option<ObsList>,
 }
 
 impl Track {
+    /// The element's kind: the override when one was decided, else the majority list.
+    pub fn kind(&self) -> ObsList {
+        self.kind_override.unwrap_or_else(|| self.votes().kind())
+    }
+
     /// Normalized variant to (display text, count), in first-seen order of keys.
     pub fn variants(&self) -> BTreeMap<String, (String, u32)> {
         let mut m: BTreeMap<String, (String, u32)> = BTreeMap::new();

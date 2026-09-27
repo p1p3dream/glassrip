@@ -108,7 +108,19 @@ impl Stage for RenderStage {
         // cache, see `cacheable`).
         // 4: edge owners slide along their edge; validation errors list the
         // failed checks.
-        4
+        // 5: an annotation with no room on the board (owner, note, badge, edge
+        // label) is listed below it with a numbered marker and a warning
+        // instead of failing validation; more spots and leader lines first.
+        // 6: edges are routed orthogonally around the cards; labels sit beside
+        // a straight segment of their edge; history notes sit next to their
+        // owner pill; validation fails an edge through a card or a label an
+        // edge runs through. Text is sized and fitted by its measured glyph
+        // widths, and any glyph past the canvas fails validation.
+        // 7: an edge the grid cannot route takes a cheap detour (L, Z, or around
+        // the architecture) clear of the cards before falling back to a straight
+        // line, and validation fails a fallback edge through another card
+        // (outputs of 6 may report ok with a straight edge over a card).
+        7
     }
     /// The markdown, SVG and PNG files are the stage's output and live outside
     /// the run directory: a cache hit would restore the artifact without

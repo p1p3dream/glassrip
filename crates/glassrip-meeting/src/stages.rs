@@ -1196,12 +1196,39 @@ impl Stage for BoardStateStage {
         // 6: an emptied corridor removes a connector only with evidence from its
         // own traced stroke (a stroke that never joined its ends, or that a
         // tracing probe could not trace, keeps it).
-        6
+        // 7: owner geometry on OCR positions (unreliable readings keep only what
+        // OCR placed), a strong last-keyframe sighting opens, absence evidence dates
+        // moves, and additions revealed by a registered pan or zoom are suppressed.
+        // 8: owner sightings start from OCR name spans (reader tags corroborate only),
+        // ambiguous edge or end-node geometry keeps the incumbent, and a tag panned out
+        // of view is not absent.
+        // 9: a same-text node track whose boxes are no evidence of a second place
+        // (near the established node, read on an unreliable reading or a registration
+        // that is off around it, or where OCR puts the text at the established node
+        // and not at its own place) is merged into it, with its edges and owner tags;
+        // node-majority tracks read as stickies as often, or carrying a sticky marker,
+        // with no connector are stickies; one physical owner tag holds at most one
+        // tag per keyframe.
+        // 10: a connector read at a fragment counts for the element the fragment
+        // folds into when that edge has keyframe support, so the element stays a
+        // node and keeps the edge (outputs of 9 may have turned it into a sticky
+        // and dropped the connector).
+        // 11: that fragment connector needs keyframe support (`min_support_keyframes`
+        // keyframes) to keep its element a node; outputs of 10 may hold a marked
+        // sticky made a node by a connector read once at a fragment.
+        // 12: a fragment connector keeps its element a node only when the edge
+        // builder draws an edge at it (the board is consolidated again without that
+        // protection otherwise); outputs of 11 may hold a marked sticky made a node
+        // by fragment connectors whose edge failed the support density.
+        // 13: the fallback reuses second-reader answers and waits to call owner
+        // corroboration until the final pass; outputs of 12 can vary with hook
+        // side effects.
+        13
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
             schema: BOARD_STATE,
-            version: Version::new(1, 1, 0),
+            version: Version::new(1, 4, 0),
         }
     }
     fn inputs(&self) -> Vec<InputDecl> {

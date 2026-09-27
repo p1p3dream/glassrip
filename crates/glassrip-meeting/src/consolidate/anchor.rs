@@ -17,6 +17,10 @@
 //!    both nodes. Without a connector between them geometry gives no answer.
 //! 5. **Nearest node.** Otherwise the unique nearest box within `node_range_share`
 //!    sizes.
+//!
+//! [`edge_end_ambiguities`] reports where the answer is ambiguous between an edge and
+//! one of its end nodes: the tag touches the connector (or the link's gap) and sits
+//! within `beside_share` sizes of that end.
 
 use glassrip_vision::BBox;
 use schemars::JsonSchema;
@@ -137,6 +141,42 @@ pub fn gap_region(a: &BBox, b: &BBox) -> Option<(BBox, bool)> {
     None
 }
 
+/// The gap of a link widened by `m` across the link: sideways for stacked boxes (a
+/// vertical link), above and below for boxes side by side (a horizontal link).
+fn widened_gap<K>(e: &EdgeGeom<K>, m: f64) -> Option<BBox> {
+    gap_region(&e.a.1, &e.b.1).map(|(g, stacked)| {
+        if stacked {
+            BBox::new(g.x1 - m, g.y1, g.x2 + m, g.y2)
+        } else {
+            BBox::new(g.x1, g.y1 - m, g.x2, g.y2 + m)
+        }
+    })
+}
+
+/// Edges a tag touches (its connector passes through the tag, or the tag meets the
+/// link's widened gap) while it sits within `beside_share` tag sizes of one end:
+/// `(edge key, that end's key)`. Anchoring picks one of the two; both fit.
+pub fn edge_end_ambiguities<K: Clone>(
+    tag: &BBox,
+    edges: &[EdgeGeom<K>],
+    p: &AnchorParams,
+) -> Vec<(K, K)> {
+    let size = tag.width().max(tag.height()).max(1.0);
+    edges
+        .iter()
+        .filter(|e| {
+            segment_hits_box(e.segment, tag)
+                || widened_gap(e, p.gap_margin_share * size)
+                    .is_some_and(|g| inter_area(tag, &g) > 0.0)
+        })
+        .filter_map(|e| {
+            let (da, db) = (box_distance(tag, &e.a.1), box_distance(tag, &e.b.1));
+            let (near, dn) = if da <= db { (&e.a.0, da) } else { (&e.b.0, db) };
+            (dn <= p.beside_share * size).then(|| (e.key.clone(), near.clone()))
+        })
+        .collect()
+}
+
 fn center(b: &BBox) -> (f64, f64) {
     ((b.x1 + b.x2) / 2.0, (b.y1 + b.y2) / 2.0)
 }
@@ -196,17 +236,7 @@ pub fn anchor_tag<K: Clone + PartialEq>(
     // 3. In the gap of a link.
     // Several gaps may touch the tag; the one whose center is nearest the tag's wins.
     let gap_dist = |e: &EdgeGeom<K>| -> Option<f64> {
-        let m = p.gap_margin_share * size;
-        // Widen across the link: sideways for stacked boxes (a vertical link), above
-        // and below for boxes side by side (a horizontal link).
-        let g = gap_region(&e.a.1, &e.b.1).map(|(g, stacked)| {
-            if stacked {
-                BBox::new(g.x1 - m, g.y1, g.x2 + m, g.y2)
-            } else {
-                BBox::new(g.x1, g.y1 - m, g.x2, g.y2 + m)
-            }
-        });
-        let g = g.filter(|g| inter_area(tag, g) > 0.0)?;
+        let g = widened_gap(e, p.gap_margin_share * size).filter(|g| inter_area(tag, g) > 0.0)?;
         let (c, gc) = (center(tag), center(&g));
         Some(((c.0 - gc.0).powi(2) + (c.1 - gc.1).powi(2)).sqrt())
     };

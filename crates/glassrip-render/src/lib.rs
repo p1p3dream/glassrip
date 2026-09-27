@@ -11,6 +11,7 @@
 
 pub mod facts;
 pub mod markdown;
+pub mod route;
 pub mod scene;
 pub mod stage;
 pub mod style;
@@ -93,6 +94,15 @@ impl RenderResult {
         }
         out
     }
+
+    /// Every warning (annotations moved below a board for want of room),
+    /// prefixed with the board (`svg <board id>`). Warnings never fail a render.
+    pub fn warnings(&self) -> Vec<String> {
+        self.svg
+            .iter()
+            .flat_map(|(board, c)| c.warnings.iter().map(move |w| format!("svg {board}: {w}")))
+            .collect()
+    }
 }
 
 fn write(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), RenderError> {
@@ -141,8 +151,10 @@ pub fn render_all(
     let mut svg_checks = Vec::new();
     let mut svg_text = Vec::new();
     let multi = boards.len() > 1;
+    // text is fitted by its real glyph widths, with the validation's fonts
+    let measure = svg::TextMeasure::new(&params.fonts);
     for b in boards {
-        let scene = scene::build_scene(b, notes);
+        let scene = scene::build_scene_with(b, notes, &measure);
         let text = svg::render_svg(&env, &scene)?;
         let (checks, png) = svg::validate_svg(&text, &scene, &params.fonts);
         let base = if multi {

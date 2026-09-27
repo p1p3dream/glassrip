@@ -417,7 +417,8 @@ impl MeetingGolden {
     }
 
     /// Notes items whose phrasings carry no key term. They are matched strictly
-    /// (every claim word, [`crate::text::allowed_missing`]); listed in the report so
+    /// (every claim word but dropped low-content words, [`crate::text::allowed_missing`],
+    /// [`crate::text::light_allowance`]); listed in the report so
     /// an author can see which items rely on wording alone.
     pub fn unkeyed_notes_items(&self) -> Vec<String> {
         let v = self.vocabulary();

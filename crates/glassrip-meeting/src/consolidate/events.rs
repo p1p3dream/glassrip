@@ -70,6 +70,9 @@ pub enum SuppressReason {
     /// The ink change of this keyframe pair is unknown (non-adjacent keyframes or no
     /// alignment), so the change cannot be told from pan or zoom.
     InkUnknown,
+    /// First seen right after a registered pan or zoom, at a place the previous view
+    /// did not show empty: the element came into view, it was not drawn.
+    RevealedByView,
 }
 
 /// A computed state change that did not pass the gate.
@@ -115,6 +118,11 @@ impl EventGate {
             None => self.events.push(e),
             Some(reason) => self.suppressed.push(SuppressedEvent { event: e, reason }),
         }
+    }
+
+    /// Record a candidate as suppressed for `reason`, whatever its ink.
+    pub fn suppress(&mut self, e: BoardEvent, reason: SuppressReason) {
+        self.suppressed.push(SuppressedEvent { event: e, reason });
     }
 
     /// Sort both lists by time, then kind, then subject, and number the events.
