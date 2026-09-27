@@ -1331,30 +1331,57 @@ pub fn consolidate_with_probe(
         }
         t
     };
-    for ti in node_track.values_mut() {
-        *ti = resolve(*ti);
-    }
-    // Connector ends through the same redirect the edges take (section 4): a
-    // fragment folds into its element because both are one card, so a connector
-    // read at the fragment ends at the element, and the element's kind must let
-    // that edge exist.
+    // Connector ends. A connector read at an element's own readings keeps it a
+    // node. One read at a fragment reaches the element through the redirect the
+    // edges take (section 4): it keeps the element a node when that edge, between
+    // the resolved ends, was read in at least `min_support_keyframes` keyframes
+    // (what an edge needs to be kept). A connector the state would draw is then
+    // never lost to its end's kind, and one it would drop anyway cannot turn a
+    // marked sticky into a node.
     let mut edge_ends: HashSet<usize> = HashSet::new();
+    let mut via_fragment: BTreeMap<(usize, usize), (BTreeSet<usize>, BTreeSet<usize>)> =
+        BTreeMap::new();
     for (fi, f) in frames.iter().enumerate() {
         for e in &f.board.edges {
-            for end in [&e.src, &e.dst] {
-                if let Some(&ti) = node_track.get(&(fi, end.clone())) {
-                    edge_ends.insert(ti);
+            let raw = [&e.src, &e.dst].map(|end| node_track.get(&(fi, end.clone())).copied());
+            let ends = raw.map(|t| t.map(resolve));
+            for (r, t) in raw.iter().zip(&ends) {
+                if let (Some(r), Some(t)) = (r, t) {
+                    if r == t {
+                        edge_ends.insert(*t);
+                    }
+                }
+            }
+            if let [Some(s), Some(d)] = ends {
+                if s != d {
+                    let entry = via_fragment.entry((s.min(d), s.max(d))).or_default();
+                    entry.0.insert(fi);
+                    for (r, t) in raw.iter().zip(&ends) {
+                        if let (Some(r), Some(t)) = (r, t) {
+                            if r != t {
+                                entry.1.insert(*t);
+                            }
+                        }
+                    }
                 }
             }
         }
     }
+    for (read_in, ends) in via_fragment.values() {
+        if read_in.len() >= params.min_support_keyframes {
+            edge_ends.extend(ends.iter().copied());
+        }
+    }
+    for ti in node_track.values_mut() {
+        *ti = resolve(*ti);
+    }
 
     // Kind beyond the list votes, decided after fragments are folded on the vote
-    // kinds. A connector end is a node (only nodes carry edges, so demoting it
-    // would drop a connector the board shows); otherwise a node-majority track is
-    // a sticky when it was read as a sticky (a colored card) at least as often as
-    // a node, or when its text carries a sticky marker (a question or a
-    // milestone, spec 6.11): node labels name components.
+    // kinds. A connector end (above) is a node: only nodes carry edges;
+    // otherwise a node-majority track is a sticky when it was read as a sticky (a
+    // colored card) at least as often as a node, or when its text carries a
+    // sticky marker (a question or a milestone, spec 6.11): node labels name
+    // components.
     for (ti, t) in tracks.iter_mut().enumerate() {
         let v = t.votes();
         if v.kind() != ObsList::Node || edge_ends.contains(&ti) {

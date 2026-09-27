@@ -3689,13 +3689,13 @@ fn a_same_text_box_where_the_registration_is_off_merges() {
 /// were redirected, so a connector read at a fragment did not keep the element
 /// it folds into a node; the element became a sticky and the edge was dropped.
 #[test]
-fn a_connector_at_a_fragment_keeps_its_element_a_node_with_the_edge() {
+fn a_supported_connector_at_a_fragment_keeps_its_element_a_node_with_the_edge() {
     // "Pilot milestone in May" is read whole in keyframes 0, 1, 4 and 5; keyframes 2
-    // and 3 read only its fragment "Pilot milestone" over the element's place (offset, so a
-    // separate reading rather than a label change), with a connector from Queue (two
-    // keyframes: an edge needs support). The fragment folds into the element, its
-    // connector with it: the element is a node (only nodes carry edges) and the
-    // connector survives.
+    // and 3 read only its fragment "Pilot milestone" over the element's place
+    // (offset, so a separate reading rather than a label change), with a connector
+    // from Queue in both (an edge needs support). The fragment folds into the
+    // element, its connector with it: the element is a node (only nodes carry
+    // edges) and the connector survives.
     let mut specs: Vec<Spec> = (0..6).map(|_| base()).collect();
     for (i, s) in specs.iter_mut().enumerate() {
         if !(2..4).contains(&i) {
@@ -3721,9 +3721,39 @@ fn a_connector_at_a_fragment_keeps_its_element_a_node_with_the_edge() {
         .stickies
         .iter()
         .any(|x| x.text.starts_with("Pilot milestone")));
-    let edge = s.edges.iter().find(|e| {
-        let ends = [e.a_text.as_str(), e.b_text.as_str()];
-        ends.contains(&"Queue") && ends.contains(&"Pilot milestone in May")
-    });
-    assert!(edge.is_some(), "{:#?}", s.edges);
+    let milestone_edge = |s: &BoardStateItem| {
+        s.edges.iter().any(|e| {
+            let ends = [e.a_text.as_str(), e.b_text.as_str()];
+            ends.contains(&"Queue") && ends.contains(&"Pilot milestone in May")
+        })
+    };
+    assert!(milestone_edge(&s), "{:#?}", s.edges);
+}
+
+#[test]
+fn a_connector_read_once_at_a_fragment_does_not_keep_a_marked_element_a_node() {
+    // As above, but only keyframe 4 reads the fragment with its connector: the
+    // edge has no support and is dropped whatever the element's kind, so it does
+    // not override the milestone marker; the element is a sticky.
+    let mut specs: Vec<Spec> = (0..5).map(|_| base()).collect();
+    for (i, s) in specs.iter_mut().enumerate() {
+        if i < 4 {
+            s.nodes
+                .push(("n8", "Pilot milestone in May".into(), (200.0, 450.0)));
+        } else {
+            s.nodes
+                .push(("n8", "Pilot milestone".into(), (280.0, 450.0)));
+            s.edges.push(("n2", "n8", ""));
+        }
+    }
+    let s = run(frames(&specs), &params());
+    let texts = node_texts(&s);
+    assert!(
+        !texts.iter().any(|t| t.starts_with("Pilot milestone")),
+        "{texts:?}"
+    );
+    assert!(s
+        .stickies
+        .iter()
+        .any(|x| x.text == "Pilot milestone in May" && x.kind == StickyKind::Milestone));
 }

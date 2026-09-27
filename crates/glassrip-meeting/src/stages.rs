@@ -1210,9 +1210,13 @@ impl Stage for BoardStateStage {
         // with no connector are stickies; one physical owner tag holds at most one
         // tag per keyframe.
         // 10: a connector read at a fragment counts for the element the fragment
-        // folds into, so that element stays a node and keeps the edge (outputs of
-        // 9 may have turned it into a sticky and dropped the connector).
-        10
+        // folds into when that edge has keyframe support, so the element stays a
+        // node and keeps the edge (outputs of 9 may have turned it into a sticky
+        // and dropped the connector).
+        // 11: that fragment connector needs keyframe support (`min_support_keyframes`
+        // keyframes) to keep its element a node; outputs of 10 may hold a marked
+        // sticky made a node by a connector read once at a fragment.
+        11
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
