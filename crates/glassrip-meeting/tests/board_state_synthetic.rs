@@ -3475,3 +3475,241 @@ fn two_tags_on_one_node_are_two_physical_tags() {
     assert_eq!(a[0].target.texts(), vec!["Ingest Gateway"]);
     assert_eq!(a[0].valid_from_s, 0.0);
 }
+
+/// Where the misplaced or second Queue box sits (far from the real Queue).
+const FAR_QUEUE: (f64, f64) = (1400.0, 450.0);
+
+/// Six keyframes of the base board with OCR of the real board in every keyframe; in
+/// keyframes 4 and 5 the reader puts Queue's box at `FAR_QUEUE` (OCR still reads
+/// Queue at its real place). `avery_of(i)` places Avery's OCR name tag.
+fn misplaced_queue_frames(
+    avery_of: &dyn Fn(usize) -> Vec<(&'static str, (f64, f64))>,
+) -> Vec<BoardFrame> {
+    let specs: Vec<Spec> = (0..6).map(|_| base()).collect();
+    let mut fr = frames_with_ocr(&specs, avery_of);
+    for f in &mut fr[4..] {
+        for n in &mut f.board.nodes {
+            if n.local_id == "n2" {
+                n.bbox = bbox_at(&Similarity::IDENTITY, FAR_QUEUE, 90.0, 40.0);
+            }
+        }
+    }
+    fr
+}
+
+fn queue_nodes(s: &BoardStateItem) -> Vec<&glassrip_meeting::consolidate::NodeState> {
+    s.nodes
+        .iter()
+        .filter(|n| n.text == "Queue" && n.in_final)
+        .collect()
+}
+
+#[test]
+fn a_misplaced_same_text_track_merges_into_the_established_node() {
+    // Two keyframes read Queue far from its place while OCR reads it where it has
+    // been: one Queue, with its edges, and the second track reported as a duplicate.
+    let s = run(misplaced_queue_frames(&|_| vec![]), &params());
+    let q = queue_nodes(&s);
+    assert_eq!(q.len(), 1, "{:#?}", s.nodes);
+    assert_eq!(q[0].lifetimes.last().unwrap().keyframes, 6);
+    assert_eq!(
+        node_texts(&s),
+        vec!["Ingest Gateway", "Ledger Store", "Queue", "Report Builder"]
+    );
+    assert!(s
+        .folded
+        .iter()
+        .any(|f| f.text == "Queue" && f.into == "Queue" && f.reason == FoldReason::Duplicate));
+    // The edges read to the misplaced box in keyframes 4 and 5 are Queue's edges:
+    // every Queue edge is seen in all six keyframes.
+    let queue_edges: Vec<_> = s
+        .edges
+        .iter()
+        .filter(|e| e.a_text == "Queue" || e.b_text == "Queue")
+        .collect();
+    assert_eq!(queue_edges.len(), 3, "{:#?}", s.edges);
+    for e in queue_edges {
+        assert!(e.in_final);
+        assert_eq!(e.lifetimes.last().unwrap().keyframes, 6, "{e:#?}");
+    }
+}
+
+#[test]
+fn a_same_text_box_on_a_collapsed_reading_merges() {
+    // No OCR at all, but the last two readings collapse every node box into one
+    // place: the far Queue box there is no evidence of a second Queue.
+    let specs: Vec<Spec> = (0..6).map(|_| base()).collect();
+    let mut fr = frames(&specs);
+    for f in &mut fr[4..] {
+        for n in &mut f.board.nodes {
+            n.bbox = bbox_at(&Similarity::IDENTITY, FAR_QUEUE, 90.0, 40.0);
+        }
+    }
+    let s = run(fr, &params());
+    let q = queue_nodes(&s);
+    assert_eq!(q.len(), 1, "{:#?}", s.nodes);
+    assert_eq!(q[0].lifetimes.last().unwrap().keyframes, 6);
+    assert!(s
+        .folded
+        .iter()
+        .any(|f| f.text == "Queue" && f.reason == FoldReason::Duplicate));
+}
+
+#[test]
+fn a_distant_second_box_that_ocr_confirms_stays_a_second_node() {
+    // A real second Queue box from keyframe 2 on, read by the reader and by OCR at
+    // its own place on a reliable registration: two Queues.
+    let mut specs: Vec<Spec> = (0..6).map(|_| base()).collect();
+    for s in specs.iter_mut().skip(2) {
+        s.nodes.push(("n9", "Queue".into(), FAR_QUEUE));
+    }
+    let s = run(frames_with_ocr(&specs, &|_| vec![]), &params());
+    assert_eq!(queue_nodes(&s).len(), 2, "{:#?}", s.nodes);
+    assert!(s.folded.iter().all(|f| f.reason != FoldReason::Duplicate));
+    // Without OCR nothing says the second place is wrong: still two.
+    let s = run(frames(&specs), &params());
+    assert_eq!(queue_nodes(&s).len(), 2, "{:#?}", s.nodes);
+}
+
+#[test]
+fn an_adjacent_second_box_that_ocr_confirms_stays_a_second_node() {
+    // A second Queue box 150 px right of the first (the two boxes nearly touch):
+    // OCR reads Queue inside each box. The margin around the first box does not claim
+    // the second box's text: two Queues.
+    let mut specs: Vec<Spec> = (0..6).map(|_| base()).collect();
+    for s in specs.iter_mut().skip(2) {
+        s.nodes.push(("n9", "Queue".into(), (850.0, 220.0)));
+    }
+    let s = run(frames_with_ocr(&specs, &|_| vec![]), &params());
+    assert_eq!(queue_nodes(&s).len(), 2, "{:#?}", s.nodes);
+    assert!(s.folded.iter().all(|f| f.reason != FoldReason::Duplicate));
+}
+
+#[test]
+fn an_owner_tag_on_a_merged_duplicate_targets_the_established_node() {
+    // Avery sits above Ledger Store, then moves above Queue in the two keyframes that
+    // misplace Queue's box: the move targets the one Queue node.
+    let s = run(
+        misplaced_queue_frames(&|i| {
+            vec![("Avery", if i < 4 { ABOVE_LEDGER } else { (700.0, 140.0) })]
+        }),
+        &params(),
+    );
+    let q = queue_nodes(&s);
+    assert_eq!(q.len(), 1, "{:#?}", s.nodes);
+    let a = avery(&s);
+    let last = a.last().expect("an assignment");
+    assert_eq!(last.target.texts(), vec!["Queue"], "{a:#?}");
+    match &last.target {
+        OwnerTarget::Node { node_id, .. } => assert_eq!(node_id, &q[0].id),
+        other => panic!("{other:?}"),
+    }
+    assert!(last
+        .moved_from
+        .as_ref()
+        .is_some_and(|m| m.texts() == vec!["Ledger Store"]));
+}
+
+#[test]
+fn a_node_read_as_a_sticky_as_often_or_marked_as_one_is_a_sticky() {
+    // "Cache warmup plan" is read as a node in keyframes 0-1 and as a sticky in 2-3 at
+    // one place; "Pilot milestone in May" is always read as a node; neither has a
+    // connector. "Is the ledger durable?" is read as a node joined to Ledger Store.
+    let mut specs: Vec<Spec> = (0..4).map(|_| base()).collect();
+    for (i, s) in specs.iter_mut().enumerate() {
+        if i < 2 {
+            s.nodes
+                .push(("n7", "Cache warmup plan".into(), (1400.0, 450.0)));
+        } else {
+            s.stickies.push(("Cache warmup plan", (1400.0, 450.0)));
+        }
+        s.nodes
+            .push(("n8", "Pilot milestone in May".into(), (200.0, 450.0)));
+        s.nodes
+            .push(("n9", "Is the ledger durable?".into(), (1200.0, 450.0)));
+        s.edges.push(("n3", "n9", ""));
+    }
+    let s = run(frames(&specs), &params());
+    let texts = node_texts(&s);
+    assert!(
+        !texts.contains(&"Cache warmup plan".to_string()),
+        "{texts:?}"
+    );
+    assert!(!texts.contains(&"Pilot milestone in May".to_string()));
+    assert!(texts.contains(&"Is the ledger durable?".to_string()));
+    let sticky = |t: &str| s.stickies.iter().find(|x| x.text == t && x.in_final);
+    assert_eq!(
+        sticky("Pilot milestone in May").map(|x| x.kind),
+        Some(StickyKind::Milestone)
+    );
+    assert!(sticky("Cache warmup plan").is_some(), "{:#?}", s.stickies);
+}
+
+#[test]
+fn a_same_text_box_where_the_registration_is_off_merges() {
+    // No OCR. In keyframes 4 and 5 the reader throws Queue far from every other
+    // element, and Ledger Store to another far place (a different one in each
+    // keyframe): nothing read near the Queue box confirms the registration there, and
+    // the keyframe misplaces another known element. The Queue box is no second Queue.
+    let specs: Vec<Spec> = (0..6).map(|_| base()).collect();
+    let mut fr = frames(&specs);
+    let id = Similarity::IDENTITY;
+    for (k, ledger_at) in [(4, (-1200.0, 300.0)), (5, (-1200.0, 1400.0))] {
+        for n in &mut fr[k].board.nodes {
+            match n.local_id.as_str() {
+                "n2" => n.bbox = bbox_at(&id, (-700.0, -600.0), 90.0, 40.0),
+                "n3" => n.bbox = bbox_at(&id, ledger_at, 90.0, 40.0),
+                _ => {}
+            }
+        }
+    }
+    let s = run(fr, &params());
+    let q = queue_nodes(&s);
+    assert_eq!(q.len(), 1, "{:#?}", s.nodes);
+    assert_eq!(q[0].lifetimes.last().unwrap().keyframes, 6);
+    assert!(s
+        .folded
+        .iter()
+        .any(|f| f.text == "Queue" && f.reason == FoldReason::Duplicate));
+    // With the Ledger Store boxes where they belong, nothing in those keyframes says
+    // the registration is off: the far Queue box stays unexplained.
+    let mut fr = frames(&specs);
+    for f in &mut fr[4..] {
+        for n in &mut f.board.nodes {
+            if n.local_id == "n2" {
+                n.bbox = bbox_at(&id, (-700.0, -600.0), 90.0, 40.0);
+            }
+        }
+    }
+    let s = run(fr, &params());
+    assert!(s.folded.iter().all(|f| f.reason != FoldReason::Duplicate));
+}
+
+#[test]
+fn a_connector_at_a_fragment_does_not_keep_a_marked_element_a_node() {
+    // "Pilot milestone in May" is read whole in keyframes 0-3; keyframe 4 reads only
+    // its fragment "Pilot milestone" over the element's place (offset, so a separate
+    // reading rather than a label change), with a connector from Queue. The fragment
+    // folds into the element; the element is a sticky.
+    let mut specs: Vec<Spec> = (0..5).map(|_| base()).collect();
+    for (i, s) in specs.iter_mut().enumerate() {
+        if i < 4 {
+            s.nodes
+                .push(("n8", "Pilot milestone in May".into(), (200.0, 450.0)));
+        } else {
+            s.nodes
+                .push(("n8", "Pilot milestone".into(), (280.0, 450.0)));
+            s.edges.push(("n2", "n8", ""));
+        }
+    }
+    let s = run(frames(&specs), &params());
+    let texts = node_texts(&s);
+    assert!(
+        !texts.iter().any(|t| t.starts_with("Pilot milestone")),
+        "{texts:?}"
+    );
+    assert!(s
+        .stickies
+        .iter()
+        .any(|x| x.text == "Pilot milestone in May" && x.kind == StickyKind::Milestone));
+}

@@ -153,7 +153,7 @@ impl Titles {
 /// folded. The longer element must be seen at least as often. Returns fragment track
 /// to target track.
 pub(crate) fn fold_fragments(tracks: &[Track]) -> HashMap<usize, usize> {
-    let kind = |t: &Track| t.votes().kind();
+    let kind = |t: &Track| t.kind();
     let mut out = HashMap::new();
     for (ti, t) in tracks.iter().enumerate() {
         let k = kind(t);
@@ -370,7 +370,7 @@ pub(crate) fn derive_groups(
             .iter()
             .enumerate()
             .filter(|(ti, t)| {
-                !member_set.contains(ti) && !excluded(*ti) && t.votes().kind() != ObsList::EdgeLabel
+                !member_set.contains(ti) && !excluded(*ti) && t.kind() != ObsList::EdgeLabel
             })
             .filter_map(|(ti, t)| {
                 let b = t.obs.iter().find(|o| o.frame == c.frame)?.raw_bbox?;
