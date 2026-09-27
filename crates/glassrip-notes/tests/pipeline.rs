@@ -83,7 +83,7 @@ fn transcript() -> Vec<TranscriptSegment> {
         segment("seg_00008", "L0", 47.0, "Rohan, can you also pair with Mira on the relay tests?", D),
         segment("seg_00009", "L1", 52.0, "Yes, I will pair with Mira on the relay tests.", D),
         segment("seg_00010", "L0", 58.0, "Which widgets do we need for the kiosk? We still have not settled that.", D),
-        segment("seg_00011", "L0", 66.0, "and everyone should push work to a branch early even if it is rough", G),
+        segment("seg_00011", "L0", 66.0, "and everyone should publish each build to the tracker even if it is rough", G),
         segment("seg_00012", "L2", 80.0, "Sounds good, I'll see you all later.", D),
     ]
 }

@@ -17,9 +17,9 @@ pub const SYSTEM: &str = "You write meeting notes from a speaker-attributed tran
 Use only what was said or shown; never add facts. \
 Every item must cite the ids of the transcript lines that support it (segment_ids, for example seg_00012), and may also cite board event ids and keyframe ids from the board summary; an action item or decision backed only by an owner tag on the board may cite just that board id. Cite only ids that appear in the input. \
 The quote field must be copied exactly from one cited transcript line (3 to 20 consecutive words, keep the original wording and spelling) or be an empty string. \
-Decisions: choices the group settled on (what to do, what not to do, a change in who does what), not ideas that were only floated; giving someone a task or ownership is an action item for that person, not a decision. \
-Action items: one person (or everyone) who will do one concrete task; owner is a participant name or everyone; the task starts with a verb and names what is done. Never list greetings, farewells, thanks or small talk. \
-Open questions: questions raised and left unanswered. \
+Decisions: choices the group settled on (what to do, what not to do, a change in who does what), not ideas that were only floated; a proposal is settled once another participant agrees to it (\"that makes sense\", \"sounds good\") and nobody objects or takes it back; giving someone a task or ownership is an action item for that person, not a decision. \
+Action items: one person (or everyone) who will do one concrete task; owner is a participant name or everyone; the task starts with a verb and names what is done. List the small ones too: someone offering to do something (\"I'll send the draft\"), a request to a person (\"can you\", \"it would be great if you could\"; the owner is the person asked) and an instruction to the whole group (\"make sure to\", \"please\", \"I'd encourage everyone to\"; the owner is everyone). Never list greetings, farewells, thanks or small talk. \
+Open questions: questions raised and left unanswered; leave out questions answered later in the meeting, rhetorical questions and quick checks on the participants (whether someone knows, has or heard something). \
 Timeline: the main phases of the meeting in order, one short entry per phase. \
 Summary: the three to six most important points. \
 Write short plain sentences. Do not use em dashes.";
@@ -331,7 +331,8 @@ pub fn reduce_request(
             merged.section_mut(s).extend(d.section(s).iter().cloned());
         }
     }
-    let candidates = serde_json::to_string_pretty(&merged).unwrap_or_default();
+    // compact: the drafts are the largest part of the prompt
+    let candidates = serde_json::to_string(&merged).unwrap_or_default();
     let user = format!(
         "Participants: {}\n\nWhiteboard:\n{digest}\nThe notes below were drafted separately for consecutive parts of one meeting, so the same point can appear more than once. Merge them into one set of notes: combine duplicates into one item and keep the union of their citations, keep the clearest wording, drop items that do not meet the rules, order the timeline by time and merge it into at most 12 phases, and give three to six summary points. Copy segment_ids, event_ids, keyframe_ids and quotes only from the drafts.{}{} Return JSON only.\n\nDrafts:\n{candidates}",
         participants_line(people),
@@ -539,6 +540,11 @@ mod tests {
         );
         assert!(SYSTEM.contains("a change in who does what"));
         assert!(SYSTEM.contains("ownership is an action item for that person, not a decision"));
+        // agreed proposals, requests and group instructions
+        assert!(SYSTEM.contains("a proposal is settled once another participant agrees to it"));
+        assert!(SYSTEM.contains("the owner is the person asked"));
+        assert!(SYSTEM.contains("the owner is everyone"));
+        assert!(SYSTEM.contains("leave out questions answered later in the meeting"));
         // no facts: no block
         let bare = map_request(
             (0, 1),

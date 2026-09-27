@@ -24,7 +24,7 @@
       { "owner": "Rohan", "task": "Design the relay storage schema this week", "segment_ids": ["seg_00007"], "event_ids": [], "keyframe_ids": [], "quote": "design the relay storage schema" },
       { "owner": "Mira", "task": "Map ledger entries to kit widgets", "segment_ids": ["seg_00006"], "event_ids": ["EV_OWNERS"], "keyframe_ids": [], "quote": "map entries to kit widgets" },
       { "owner": "Rohan", "task": "Pair with Mira on the relay tests", "segment_ids": ["seg_00009"], "event_ids": [], "keyframe_ids": [], "quote": "" },
-      { "owner": "everyone", "task": "Push work to a branch early, even if it is rough", "segment_ids": ["seg_00011"], "event_ids": [], "keyframe_ids": [], "quote": "push work to a branch early" },
+      { "owner": "everyone", "task": "Publish each build to the tracker, even if it is rough", "segment_ids": ["seg_00011"], "event_ids": [], "keyframe_ids": [], "quote": "publish each build to the tracker" },
       { "owner": "Mira", "task": "See you all later", "segment_ids": ["seg_00012"], "event_ids": [], "keyframe_ids": [], "quote": "" },
       { "owner": "Avery", "task": "Backend: relay side", "segment_ids": ["seg_00005"], "event_ids": [], "keyframe_ids": [], "quote": "" }
     ],
