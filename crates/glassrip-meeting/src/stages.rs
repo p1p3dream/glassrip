@@ -1220,7 +1220,10 @@ impl Stage for BoardStateStage {
         // builder draws an edge at it (the board is consolidated again without that
         // protection otherwise); outputs of 11 may hold a marked sticky made a node
         // by fragment connectors whose edge failed the support density.
-        12
+        // 13: the fallback reuses second-reader answers and waits to call owner
+        // corroboration until the final pass; outputs of 12 can vary with hook
+        // side effects.
+        13
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {

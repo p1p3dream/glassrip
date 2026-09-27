@@ -1,6 +1,9 @@
 //! Board-state consolidation on synthetic reading sequences (fictional board and names).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
 use glassrip_meeting::artifacts::{CanvasDims, EdgeDirectionItem, EdgeEvidence};
 use glassrip_meeting::consolidate::events::EventKind;
 use glassrip_meeting::consolidate::events::SuppressReason;
@@ -10,7 +13,8 @@ use glassrip_meeting::consolidate::owners::{
 };
 use glassrip_meeting::consolidate::{
     consolidate, consolidate_with_probe, split_boards, BoardFrame, BoardStateItem, CanvasSource,
-    ConsolidationParams, EdgeOrientation, FoldReason, Hooks, RegionProbe, StickyKind, TextAnchor,
+    ConsolidationParams, EdgeOrientation, FoldReason, Hooks, RegionProbe, SecondReader, StickyKind,
+    TextAnchor,
 };
 use glassrip_meeting::direction::{DirectionBasis, EdgeDirection, EndVerdict};
 use glassrip_meeting::pixel_direction::{EndEvidence, PixelEvidence, PixelStatus};
@@ -3758,11 +3762,9 @@ fn a_connector_read_once_at_a_fragment_does_not_keep_a_marked_element_a_node() {
         .any(|x| x.text == "Pilot milestone in May" && x.kind == StickyKind::Milestone));
 }
 
-/// Codex r5 fix round 3: two fragment-connector sightings met the keyframe
-/// count, but lying far apart they fail the edge's density rule, so no edge was
-/// drawn while the milestone was still kept a node.
-#[test]
-fn far_apart_fragment_connectors_that_draw_no_edge_leave_a_marked_element_a_sticky() {
+/// Two fragment-connector sightings meet the keyframe count but fail the
+/// edge's density rule when they are far apart.
+fn far_apart_fragment_specs() -> Vec<Spec> {
     // 25 keyframes: "Pilot milestone in May" whole everywhere but keyframes 2 and
     // 24, which read its fragment with a connector from Queue; two sightings over
     // 23 keyframes are below the support density, so the edge is not drawn.
@@ -3777,6 +3779,12 @@ fn far_apart_fragment_connectors_that_draw_no_edge_leave_a_marked_element_a_stic
             s.edges.push(("n2", "n8", ""));
         }
     }
+    specs
+}
+
+#[test]
+fn far_apart_fragment_connectors_that_draw_no_edge_leave_a_marked_element_a_sticky() {
+    let specs = far_apart_fragment_specs();
     let s = run(frames(&specs), &params());
     assert!(
         !s.edges
@@ -3797,4 +3805,79 @@ fn far_apart_fragment_connectors_that_draw_no_edge_leave_a_marked_element_a_stic
         .stickies
         .iter()
         .any(|x| x.text == "Pilot milestone in May" && x.kind == StickyKind::Milestone));
+    assert!(s
+        .edges
+        .iter()
+        .any(|e| e.a_text == "Ingest Gateway" && e.b_text == "Queue"));
+}
+
+#[derive(Default)]
+struct OnceReader(Mutex<BTreeMap<(String, String), usize>>);
+
+impl SecondReader for OnceReader {
+    fn confirms(&self, keyframe_id: &str, text: &str) -> bool {
+        let mut calls = self.0.lock().unwrap();
+        let count = calls
+            .entry((keyframe_id.to_string(), text.to_string()))
+            .or_default();
+        *count += 1;
+        *count == 1
+    }
+}
+
+#[derive(Default)]
+struct CountingCorroborator(Mutex<Vec<f64>>);
+
+impl Corroborator for CountingCorroborator {
+    fn corroborate(&self, q: &MoveQuery<'_>) -> Option<Corroboration> {
+        self.0.lock().unwrap().push(q.t_start_s);
+        q.from.is_some().then(|| Corroboration {
+            source: "transcript".into(),
+            t_s: q.t_start_s,
+            detail: "synthetic cue".into(),
+        })
+    }
+}
+
+#[test]
+fn fragment_fallback_calls_each_external_hook_only_once() {
+    let mut specs = far_apart_fragment_specs();
+    for (i, s) in specs.iter_mut().enumerate() {
+        s.owners.push((
+            "Avery",
+            if i < 24 {
+                (200.0, 120.0)
+            } else {
+                (840.0, 650.0)
+            },
+            "",
+        ));
+    }
+    let reader = OnceReader::default();
+    let corroborator = CountingCorroborator::default();
+    let s = consolidate(
+        frames(&specs),
+        "board-1",
+        &params(),
+        &Hooks {
+            corroborator: &corroborator,
+            second_reader: Some(&reader),
+        },
+    );
+    assert!(s
+        .stickies
+        .iter()
+        .any(|x| x.text == "Pilot milestone in May"));
+    let calls = reader.0.lock().unwrap();
+    assert!(!calls.is_empty());
+    assert!(calls.values().all(|&n| n == 1), "{calls:?}");
+    let corroborations = corroborator.0.lock().unwrap();
+    assert!(corroborations.contains(&480.0), "{corroborations:?}");
+    assert!(
+        corroborations
+            .iter()
+            .enumerate()
+            .all(|(i, t)| !corroborations[..i].contains(t)),
+        "{corroborations:?}"
+    );
 }

@@ -54,6 +54,7 @@ pub mod owners;
 pub mod tracks;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Mutex;
 
 use glassrip_vision::board::{EdgeStyle, ElementList, RejectReason, StickyColor, ValidatedBoard};
 use glassrip_vision::BBox;
@@ -290,6 +291,34 @@ pub struct Hooks<'a> {
     pub corroborator: &'a dyn Corroborator,
     /// Second reader pass for single sightings.
     pub second_reader: Option<&'a dyn SecondReader>,
+}
+
+// The fallback pass must see the same reader answers without calling the reader
+// twice for the same keyframe and text.
+struct MemoSecondReader<'a> {
+    inner: &'a dyn SecondReader,
+    answers: Mutex<BTreeMap<(String, String), bool>>,
+}
+
+impl SecondReader for MemoSecondReader<'_> {
+    fn confirms(&self, keyframe_id: &str, text: &str) -> bool {
+        let key = (keyframe_id.to_string(), text.to_string());
+        let cached = self
+            .answers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .copied();
+        if let Some(answer) = cached {
+            return answer;
+        }
+        let answer = self.inner.confirms(keyframe_id, text);
+        self.answers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, answer);
+        answer
+    }
 }
 
 /// Consolidation parameters.
@@ -922,23 +951,34 @@ pub fn consolidate_with_probe(
     hooks: &Hooks<'_>,
     probe: Option<&dyn RegionProbe>,
 ) -> BoardStateItem {
-    let (state, orphaned) = consolidate_pass(
+    let second_reader = hooks.second_reader.map(|inner| MemoSecondReader {
+        inner,
+        answers: Mutex::new(BTreeMap::new()),
+    });
+    let memo_hooks = Hooks {
+        corroborator: hooks.corroborator,
+        second_reader: second_reader.as_ref().map(|r| r as &dyn SecondReader),
+    };
+    let orphaned = match consolidate_pass(
         frames.clone(),
         board_id,
         params,
-        hooks,
+        &memo_hooks,
         probe,
         &BTreeSet::new(),
-    );
-    if orphaned.is_empty() {
-        return state;
+    ) {
+        Ok(state) => return state,
+        Err(orphaned) => orphaned,
+    };
+    match consolidate_pass(frames, board_id, params, &memo_hooks, probe, &orphaned) {
+        Ok(state) => state,
+        Err(_) => unreachable!("a pass with fragment protection withdrawn cannot retry"),
     }
-    consolidate_pass(frames, board_id, params, hooks, probe, &orphaned).0
 }
 
 /// One consolidation. Tracks in `withdrawn` are not kept nodes by connectors read
-/// at their fragments. Returns the state and the tracks a fragment connector kept
-/// a node that carry no drawn edge.
+/// at their fragments. Before owner callbacks, returns the tracks that need the
+/// fallback pass instead of an incomplete state.
 fn consolidate_pass(
     mut frames: Vec<BoardFrame>,
     board_id: &str,
@@ -946,7 +986,7 @@ fn consolidate_pass(
     hooks: &Hooks<'_>,
     probe: Option<&dyn RegionProbe>,
     withdrawn: &BTreeSet<usize>,
-) -> (BoardStateItem, BTreeSet<usize>) {
+) -> Result<BoardStateItem, BTreeSet<usize>> {
     let corroborator = hooks.corroborator;
     frames.sort_by(|a, b| a.t_rep_s.total_cmp(&b.t_rep_s));
     let n = frames.len();
@@ -2234,6 +2274,24 @@ fn consolidate_pass(
         });
     }
 
+    // Stop before owner corroboration when a fallback is needed. Owner callbacks
+    // may have side effects, and node IDs can change when an orphan becomes a
+    // sticky, so replaying their first-pass answers would not be safe.
+    if withdrawn.is_empty() {
+        let orphaned: BTreeSet<usize> = fragment_ends
+            .iter()
+            .copied()
+            .filter(|t| {
+                node_id
+                    .get(t)
+                    .is_some_and(|id| !edges.iter().any(|e| &e.a == id || &e.b == id))
+            })
+            .collect();
+        if !orphaned.is_empty() {
+            return Err(orphaned);
+        }
+    }
+
     // 5. Owners.
     let node_target = |ti: usize| -> Option<OwnerTarget> {
         node_id.get(&ti).map(|id| OwnerTarget::Node {
@@ -2971,17 +3029,6 @@ fn consolidate_pass(
         .collect();
     nodes.retain(|n| !heading_ids.contains(&n.id));
     stickies.retain(|s| !heading_ids.contains(&s.id));
-    // Nodes kept only by fragment connectors whose edges were not drawn.
-    let orphaned: BTreeSet<usize> = fragment_ends
-        .iter()
-        .copied()
-        .filter(|t| {
-            node_id.get(t).is_some_and(|id| {
-                nodes.iter().any(|n| &n.id == id) && !edges.iter().any(|e| &e.a == id || &e.b == id)
-            })
-        })
-        .collect();
-
     let state = BoardStateItem {
         board_id: board_id.to_string(),
         board_title: titles.board_title(),
@@ -3010,7 +3057,7 @@ fn consolidate_pass(
         events,
         suppressed_events,
     };
-    (state, orphaned)
+    Ok(state)
 }
 
 /// Keyframes where an edge's direction flips: per-keyframe decisions (pixel first,
