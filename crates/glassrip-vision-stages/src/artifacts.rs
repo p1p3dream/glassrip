@@ -462,8 +462,10 @@ pub struct ElementVote {
     pub votes: u32,
     /// Reads whose text is the kept text.
     pub text_votes: u32,
-    /// An attribute (sticky color, owner tag's node) was tied between reads:
-    /// the kept value is the first read's (color) or none (owner tag's node).
+    /// The reads split evenly on the element's list (the earliest read's is
+    /// kept) or on an attribute (sticky color: the earliest read's; owner tag's
+    /// node: none), or an owner tag keeps no node though a read named one
+    /// (the node it named did not survive, or the other reads named none).
     #[serde(default, skip_serializing_if = "is_false")]
     pub uncertain: bool,
 }

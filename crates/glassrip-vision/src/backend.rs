@@ -61,9 +61,10 @@ impl Default for GenerationOptions {
     }
 }
 
-/// Sampling settings a retry may change. Unset fields leave the server's
-/// defaults, and are left out of request keys, so requests without overrides keep
-/// the keys (and recorded responses) they always had.
+/// Sampling settings a retry or a sampled consensus read may change. Unset
+/// fields leave the server's defaults (temperature 0), and are left out of
+/// request keys, so requests without overrides keep the keys (and recorded
+/// responses) they always had.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SamplingOverrides {

@@ -18,14 +18,17 @@
 //!   [`glassrip_vision::degenerate`], judged against the keyframe's OCR spans)
 //!   is retried once with the repeat-penalty retry. When no retry is left, the
 //!   retry fails, or its reply is degenerate too, the copies the reply
-//!   fabricated go (piled copies down to one per pile, copies outside the
-//!   requested image, or a text that ran its list to `maxItems` down to its
-//!   best-supported copies), and the request log records it as a warning;
-//!   copies side by side on the canvas stay as read.
+//!   fabricated go (piled copies down to one per pile, and copies outside the
+//!   requested image), and the request log records it as a warning; copies
+//!   side by side on the canvas stay as read, a full list or not (the
+//!   consensus vote below drops those only one read lists).
 //! - Consensus: with `consensus.reads > 1` the keyframe is read that many times,
-//!   concurrently. Read 0 is the greedy request (temperature 0, the run seed);
-//!   read `k` uses seed + `k` at `consensus.temperature`, so its reply is an
-//!   independent sample and has its own request key. Every read goes through
+//!   concurrently. Read 0 is the greedy request (temperature 0); read `k` is
+//!   sampled at `consensus.temperature`, so its reply is an independent sample.
+//!   Each read's seed is the run seed plus a salt of the keyframe id plus `k`,
+//!   so every request of the run has its own request key: two keyframes with
+//!   identical canvases never share a recorded reply (or a failure), and
+//!   replay reaches every read's own answer. Every read goes through
 //!   the whole path above (tiles, retries, the degenerate rule) on its own, then
 //!   [`crate::consensus::vote`] keeps what `consensus.min_agree` reads agree on.
 //!   A failed read leaves the vote to the others, all of which must then agree
@@ -45,7 +48,7 @@ use glassrip_vision::board::{
     BoardReading, OwnerTag, Sticky, TextItem, BOARD_READ_PROMPT, COMPACT_RETRY_NOTE,
     COMPACT_RETRY_SCALE,
 };
-use glassrip_vision::degenerate::{self, DegenerateParams, ListCaps, ReplyFrame};
+use glassrip_vision::degenerate::{self, DegenerateParams, ReplyFrame};
 use glassrip_vision::image_prep::{
     prepare_board_image_with, prepare_long_edge, BoardSizing, BOARD_LONG_EDGE, LOW_RES_THRESHOLD,
     LOW_RES_UPSCALE,
@@ -131,6 +134,16 @@ impl Default for ConsensusParams {
     }
 }
 
+/// A per-keyframe seed offset: 27 bits of the id's blake3, times 16 (reads
+/// stay below 16, so seeds of different keyframes and reads never meet), under
+/// 2^31 so a server parsing the seed as a 32-bit integer takes it.
+pub fn keyframe_salt(keyframe_id: &str) -> u64 {
+    let h = blake3::hash(keyframe_id.as_bytes());
+    let b = h.as_bytes();
+    let v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) & 0x07FF_FFFF;
+    u64::from(v) << 4
+}
+
 /// The consensus settings as one cache-key string.
 fn consensus_descriptor(c: &ConsensusParams) -> String {
     format!(
@@ -148,9 +161,19 @@ impl ConsensusParams {
         }
     }
 
-    /// Seed of read `k`: the run seed plus `k`.
-    pub fn seed(&self, base: u64, read: u32) -> u64 {
-        base.wrapping_add(u64::from(read))
+    /// Seed of read `read` of the keyframe with `salt` (see [`Self::salt`]).
+    pub fn seed(&self, base: u64, salt: u64, read: u32) -> u64 {
+        base.wrapping_add(salt).wrapping_add(u64::from(read))
+    }
+
+    /// The seed salt of a keyframe: 0 for a single read (the request it always
+    /// was), else [`keyframe_salt`].
+    pub fn salt(&self, keyframe_id: &str) -> u64 {
+        if self.reads > 1 {
+            keyframe_salt(keyframe_id)
+        } else {
+            0
+        }
     }
 
     /// Temperature override of read `k`: none (0, greedy) for read 0.
@@ -205,24 +228,6 @@ pub fn repetition_retry(p: &BoardReadParams, request: &VisionRequest) -> VisionR
     retry.options.num_predict = scaled.max(p.min_num_predict.min(request.options.num_predict));
     retry.repetition_guard = Some(p.repetition);
     retry
-}
-
-/// The `maxItems` of each list in a board request's schema (`0` when absent):
-/// a compact retry's lists are shorter than the first request's.
-pub fn list_caps(request: &VisionRequest) -> ListCaps {
-    let props = &request.schema.json()["properties"];
-    let cap = |list: &str| {
-        props[list]["maxItems"]
-            .as_u64()
-            .map_or(0, |v| usize::try_from(v).unwrap_or(usize::MAX))
-    };
-    ListCaps {
-        nodes: cap("nodes"),
-        edges: cap("edges"),
-        stickies: cap("stickies"),
-        owner_tags: cap("owner_tags"),
-        other_visible_text: cap("other_visible_text"),
-    }
 }
 
 /// A failed retry that the raw store records as the model's answer (stopped at
@@ -501,9 +506,12 @@ impl BoardReadStage {
         }
     }
 
-    /// One request of read `read` (and its retries).
+    /// One request of read `read` (and its retries); `salt` is the keyframe's
+    /// seed salt.
+    #[allow(clippy::too_many_arguments)]
     async fn one(
         &self,
+        salt: u64,
         read: u32,
         role: RequestRole,
         region: BBox,
@@ -515,7 +523,7 @@ impl BoardReadStage {
         let mut request = board_read_request(
             prepared,
             GenerationOptions {
-                seed: consensus.seed(self.params.seed, read),
+                seed: consensus.seed(self.params.seed, salt, read),
                 num_predict: self.params.min_num_predict,
             },
         )
@@ -661,12 +669,9 @@ impl BoardReadStage {
                 }
             }
             if !log.retried || degenerate::detect(&out, anchors, p).is_some() {
-                // The evidence of fabrication is the reply's own: the image and
-                // the list limits of the request that produced it.
-                let frame = ReplyFrame {
-                    extent: region,
-                    caps: list_caps(&sent),
-                };
+                // The evidence of fabrication is the reply's own: the image of
+                // the request that produced it.
+                let frame = ReplyFrame { extent: region };
                 let (kept, collapsed) = degenerate::collapse(out, anchors, &frame, p);
                 out = kept;
                 if collapsed.is_empty() {
@@ -718,17 +723,17 @@ impl BoardReadStage {
     /// Read `read` of a keyframe: the overview and any tiles, merged.
     async fn read_board(
         &self,
+        salt: u64,
         read: u32,
         jobs: &[(RequestRole, BBox, PreparedImage)],
         tiled: bool,
         anchors: &[(String, BBox)],
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<(BoardReading, Vec<RequestLog>), ErrorInfo> {
-        let results =
-            futures_util::future::join_all(jobs.iter().map(|(role, region, p)| {
-                self.one(read, *role, *region, p, anchors, cancel.clone())
-            }))
-            .await;
+        let results = futures_util::future::join_all(jobs.iter().map(|(role, region, p)| {
+            self.one(salt, read, *role, *region, p, anchors, cancel.clone())
+        }))
+        .await;
         let mut outputs = Vec::new();
         let mut logs = Vec::new();
         for r in results {
@@ -863,7 +868,12 @@ impl Stage for BoardReadStage {
         // 9: consensus reading (several reads per keyframe, voted; reads after
         // the first sampled at a temperature with their own seeds); request
         // logs name their read. Outputs of 8 are single greedy reads.
-        9
+        // 10: a list run to its `maxItems` is no evidence of fabrication;
+        // separate on-canvas copies stay (outputs of 9 may hold collapsed
+        // genuine notes of a full compact list). Nodes, stickies, and owner
+        // tags vote together; the fold needs one text; consensus seeds carry a
+        // keyframe salt (outputs of 9 may share replies between keyframes).
+        10
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
@@ -977,8 +987,9 @@ impl Stage for BoardReadStage {
         }
         let cancel = ctx.cancel_token().clone();
         let reads = self.params.consensus.reads.max(1);
+        let salt = self.params.consensus.salt(&crop.keyframe_id);
         let outcomes = futures_util::future::join_all(
-            (0..reads).map(|k| self.read_board(k, &jobs, tiled, &anchors, cancel.clone())),
+            (0..reads).map(|k| self.read_board(salt, k, &jobs, tiled, &anchors, cancel.clone())),
         )
         .await;
         // The run stopped (placement abort, cancellation): no vote.
@@ -1342,30 +1353,6 @@ mod tests {
     }
 
     #[test]
-    fn list_caps_follow_the_request_that_produced_the_reply() {
-        let normal = full_hd_board_request();
-        let caps = list_caps(&normal);
-        assert_eq!(
-            (
-                caps.nodes,
-                caps.edges,
-                caps.stickies,
-                caps.owner_tags,
-                caps.other_visible_text
-            ),
-            (60, 80, 60, 20, 20)
-        );
-        // The penalized retry keeps the schema; the compact retry halves it.
-        let p = BoardReadParams::default();
-        assert_eq!(list_caps(&repetition_retry(&p, &normal)), caps);
-        let img = prepare_board_image(&DynamicImage::ImageRgb8(RgbImage::new(1920, 1176))).unwrap();
-        let compact =
-            board_read_request_compact(&img, normal.options, p.compact_retry_scale).unwrap();
-        let half = list_caps(&compact);
-        assert_eq!((half.nodes, half.owner_tags), (30, 10));
-    }
-
-    #[test]
     fn degenerate_rule_is_on_by_default() {
         let p = BoardReadParams::default();
         assert!(p.degenerate.enabled());
@@ -1390,10 +1377,22 @@ mod tests {
             f64::from(p.temperature) as f32,
             c.consensus_temperature as f32
         );
-        // Read 0 is the greedy request the single read always was; the others
-        // are sampled with their own seeds.
-        assert_eq!((p.seed(7, 0), p.temperature(0)), (7, None));
-        assert_eq!((p.seed(7, 2), p.temperature(2)), (9, Some(p.temperature)));
+        // A single read is the request it always was.
+        let single = ConsensusParams::single();
+        assert_eq!(single.salt("kf-1"), 0);
+        assert_eq!((single.seed(7, 0, 0), single.temperature(0)), (7, None));
+        // Read 0 is greedy; the others are sampled; every read of every
+        // keyframe has its own seed, within 32-bit range.
+        let (a, b) = (p.salt("kf-1"), p.salt("kf-2"));
+        assert_ne!(a, b);
+        assert_eq!(p.temperature(0), None);
+        assert_eq!(p.temperature(2), Some(p.temperature));
+        let seeds: std::collections::BTreeSet<u64> = [a, b]
+            .iter()
+            .flat_map(|&s| (0..p.reads).map(move |k| p.seed(7, s, k)))
+            .collect();
+        assert_eq!(seeds.len(), 2 * p.reads as usize);
+        assert!(seeds.iter().all(|&s| s < 1 << 31));
     }
 
     #[test]

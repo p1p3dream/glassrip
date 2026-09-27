@@ -5,20 +5,21 @@
 //! reading is one sample. `board_read` can read a keyframe several times and
 //! keep what enough reads agree on:
 //!
-//! - Elements of one list (nodes, stickies, owner tags, other text) are matched
-//!   across reads one to one: two elements are one when their boxes overlap at
-//!   least `merge_iou`, or their normalized texts are at least `text_ratio`
-//!   similar and their centers lie within the larger box's long side. Each read
-//!   contributes at most one element to a match, so a text one read repeats
-//!   many times finds at most one partner per other read.
-//! - A match is kept when at least `min_agree` reads have it. Its box is the
-//!   per-coordinate median of the reads' boxes, its text the most common
-//!   normalized form (a tie goes to the form the OCR spans at the box back,
-//!   then to the earliest read).
-//! - Kept matches of one list whose boxes overlap at least `merge_iou` are one
-//!   element (the rule the tile merge uses) unless `min_agree` reads list both
-//!   separately: a pile of copies in one read cannot pair with two reads'
-//!   element twice.
+//! - Elements are matched across reads one to one: two elements are one when
+//!   their boxes overlap at least `merge_iou`, or their normalized texts are at
+//!   least `text_ratio` similar and their centers lie within the larger box's
+//!   long side. Each read contributes at most one element to a match, so a text
+//!   one read repeats many times finds at most one partner per other read.
+//!   Nodes, stickies, and owner tags are matched together (reads disagree on
+//!   which of these lists an element is in); other text on its own.
+//! - A match is kept when at least `min_agree` reads have it, in the list most
+//!   of them chose. Its box is the per-coordinate median of the reads' boxes,
+//!   its text the most common normalized form (a tie goes to the form the OCR
+//!   spans at the box back, then to the earliest read).
+//! - Kept matches of the same text whose boxes overlap at least `merge_iou`
+//!   are one element (the rule the tile merge uses) unless `min_agree` reads
+//!   list both separately: a pile of copies in one read cannot pair with two
+//!   reads' element twice.
 //! - Edges are matched by their endpoints mapped through the node matching
 //!   (then by label when a read has several edges between the same two nodes)
 //!   and kept with `min_agree` reads whose endpoints both survived. Direction
@@ -249,29 +250,31 @@ fn majority<T: PartialEq + Copy>(values: &[T]) -> (Option<T>, u32) {
     }
 }
 
-/// Kept clusters of one list after the overlap merge, with the map from every
-/// cluster to its kept index (`None`: dropped).
+/// Kept clusters after the overlap fold, with the map from every cluster to its
+/// kept index (`None`: dropped) and the first member of every dropped cluster.
 struct Kept {
     clusters: Vec<Vec<Member>>,
     of_cluster: Vec<Option<usize>>,
-    dropped: u32,
+    dropped: Vec<Member>,
 }
 
 /// Keep clusters with `min_agree` reads, then fold a kept cluster into an
-/// earlier one when their median boxes overlap at least `merge_iou` and fewer
-/// than `min_agree` reads list both (one read's pile of copies paired with
-/// another read's element); the fold keeps one member per read, the larger
-/// cluster's first (ties to the earlier). Overlapping elements that
-/// `min_agree` reads list separately stay separate.
+/// earlier one of the same text (normalized similarity at least `text_ratio`)
+/// when their median boxes overlap at least `merge_iou` and fewer than
+/// `min_agree` reads list both (one read's pile of copies paired with another
+/// read's element); the fold keeps one member per read, the larger cluster's
+/// first (ties to the earlier). Overlapping elements of different texts, or
+/// that `min_agree` reads list separately, stay separate.
 fn keep(clusters: Vec<Vec<Member>>, lists: &[Vec<El<'_>>], p: &VoteParams) -> Kept {
-    let boxes = |ms: &[Member]| median_box(ms.iter().map(|m| lists[m.read][m.idx].bbox));
+    let el = |m: &Member| lists[m.read][m.idx];
+    let boxes = |ms: &[Member]| median_box(ms.iter().map(|m| el(m).bbox));
     let mut kept: Vec<Vec<Member>> = Vec::new();
     let mut of_cluster = Vec::with_capacity(clusters.len());
-    let mut dropped = 0;
+    let mut dropped = Vec::new();
     for c in clusters {
         if c.len() < p.min_agree {
             of_cluster.push(None);
-            dropped += 1;
+            dropped.push(c[0]);
             continue;
         }
         let b = boxes(&c);
@@ -281,9 +284,15 @@ fn keep(clusters: Vec<Vec<Member>>, lists: &[Vec<El<'_>>], p: &VoteParams) -> Ke
                 .filter(|m| k.iter().any(|x| x.read == m.read))
                 .count()
         };
+        let same_text = |k: &[Member]| {
+            c.iter().any(|m| {
+                k.iter()
+                    .any(|x| text_sim(el(m).text, el(x).text) >= p.text_ratio)
+            })
+        };
         match kept
             .iter()
-            .position(|k| boxes(k).iou(&b) >= p.merge_iou && both(k) < p.min_agree)
+            .position(|k| boxes(k).iou(&b) >= p.merge_iou && both(k) < p.min_agree && same_text(k))
         {
             Some(k) => {
                 let (first, second) = if c.len() > kept[k].len() {
@@ -314,62 +323,143 @@ fn keep(clusters: Vec<Vec<Member>>, lists: &[Vec<El<'_>>], p: &VoteParams) -> Ke
     }
 }
 
+/// The lists that vote together (see [`vote`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Node,
+    Sticky,
+    Owner,
+}
+
+fn pooled_el(r: &BoardReading, (kind, i): (Kind, usize)) -> El<'_> {
+    match kind {
+        Kind::Node => El {
+            text: &r.nodes[i].text,
+            bbox: &r.nodes[i].bbox,
+        },
+        Kind::Sticky => El {
+            text: &r.stickies[i].text,
+            bbox: &r.stickies[i].bbox,
+        },
+        Kind::Owner => El {
+            text: &r.owner_tags[i].name_raw,
+            bbox: &r.owner_tags[i].bbox,
+        },
+    }
+}
+
 /// Vote over `reads` (in read order, at least one). `anchors` are the
 /// keyframe's OCR spans in canvas pixels (text tie-breaks).
+///
+/// Nodes, stickies, and owner tags vote together: reads disagree on which of
+/// these lists an element belongs to (`board_validate` moves elements between
+/// them by their pixels), and an element exists when enough reads list it in
+/// any of them. It goes to the list most of its reads put it in (a tie: the
+/// earliest read's, flagged uncertain).
 pub fn vote(reads: &[BoardReading], anchors: &[(String, BBox)], p: &VoteParams) -> Vote {
     let p = VoteParams {
         min_agree: p.min_agree.clamp(1, reads.len().max(1)),
         ..*p
     };
-    let els = |f: &dyn Fn(&BoardReading) -> Vec<El<'_>>| reads.iter().map(f).collect::<Vec<_>>();
     let mut dropped = DroppedCounts::default();
 
-    // Nodes.
-    let node_lists = els(&|r| {
-        r.nodes
-            .iter()
-            .map(|n| El {
-                text: &n.text,
-                bbox: &n.bbox,
-            })
-            .collect()
-    });
-    let node_clusters = cluster(&node_lists, &p);
-    let node_member_cluster: Vec<(Member, usize)> = node_clusters
+    // Nodes, stickies, owner tags.
+    let pooled: Vec<Vec<(Kind, usize)>> = reads
+        .iter()
+        .map(|r| {
+            (0..r.nodes.len())
+                .map(|i| (Kind::Node, i))
+                .chain((0..r.stickies.len()).map(|i| (Kind::Sticky, i)))
+                .chain((0..r.owner_tags.len()).map(|i| (Kind::Owner, i)))
+                .collect()
+        })
+        .collect();
+    let pool_lists: Vec<Vec<El<'_>>> = reads
+        .iter()
+        .zip(&pooled)
+        .map(|(r, ks)| ks.iter().map(|&k| pooled_el(r, k)).collect())
+        .collect();
+    let kind = |m: &Member| pooled[m.read][m.idx].0;
+    let index = |m: &Member| pooled[m.read][m.idx].1;
+    let clusters = cluster(&pool_lists, &p);
+    let member_cluster: Vec<(Member, usize)> = clusters
         .iter()
         .enumerate()
         .flat_map(|(c, ms)| ms.iter().map(move |m| (*m, c)))
         .collect();
-    let kept_nodes = keep(node_clusters, &node_lists, &p);
-    dropped.nodes = kept_nodes.dropped;
+    let kept = keep(clusters, &pool_lists, &p);
+    for m in &kept.dropped {
+        match kind(m) {
+            Kind::Node => dropped.nodes += 1,
+            Kind::Sticky => dropped.stickies += 1,
+            Kind::Owner => dropped.owner_tags += 1,
+        }
+    }
     let mut nodes = Vec::new();
     let mut node_votes = Vec::new();
-    for (k, ms) in kept_nodes.clusters.iter().enumerate() {
-        let bbox = median_box(ms.iter().map(|m| &reads[m.read].nodes[m.idx].bbox));
-        let texts: Vec<&str> = ms
-            .iter()
-            .map(|m| reads[m.read].nodes[m.idx].text.as_str())
-            .collect();
+    let mut stickies = Vec::new();
+    let mut sticky_votes = Vec::new();
+    // Owner tags wait for the node numbering: (cluster, text, box, text votes, list tied).
+    let mut owners: Vec<(usize, String, BBox, u32, bool)> = Vec::new();
+    let mut node_index: Vec<Option<usize>> = vec![None; kept.clusters.len()];
+    for (c, ms) in kept.clusters.iter().enumerate() {
+        let (voted, _) = majority(&ms.iter().map(kind).collect::<Vec<_>>());
+        let k = voted.unwrap_or(kind(&ms[0]));
+        let list_tied = voted.is_none();
+        let bbox = median_box(ms.iter().map(|m| pool_lists[m.read][m.idx].bbox));
+        let texts: Vec<&str> = ms.iter().map(|m| pool_lists[m.read][m.idx].text).collect();
         let (text, text_votes) = vote_text(&texts, &bbox, anchors);
-        nodes.push(BoardNode {
-            local_id: format!("n{}", k + 1),
-            text,
-            bbox,
-            conf: median(ms.iter().map(|m| reads[m.read].nodes[m.idx].conf).collect()),
-        });
-        node_votes.push(ElementVote {
-            votes: ms.len() as u32,
-            text_votes,
-            uncertain: false,
-        });
+        let votes = ms.len() as u32;
+        // Attributes of the list come from the reads that put it there.
+        let own: Vec<&Member> = ms.iter().filter(|m| kind(m) == k).collect();
+        match k {
+            Kind::Node => {
+                node_index[c] = Some(nodes.len());
+                nodes.push(BoardNode {
+                    local_id: format!("n{}", nodes.len() + 1),
+                    text,
+                    bbox,
+                    conf: median(
+                        own.iter()
+                            .map(|m| reads[m.read].nodes[index(m)].conf)
+                            .collect(),
+                    ),
+                });
+                node_votes.push(ElementVote {
+                    votes,
+                    text_votes,
+                    uncertain: list_tied,
+                });
+            }
+            Kind::Sticky => {
+                let colors: Vec<_> = own
+                    .iter()
+                    .map(|m| reads[m.read].stickies[index(m)].color)
+                    .collect();
+                let (color, _) = majority(&colors);
+                stickies.push(Sticky {
+                    text,
+                    color: color.unwrap_or(colors[0]),
+                    bbox,
+                });
+                sticky_votes.push(ElementVote {
+                    votes,
+                    text_votes,
+                    uncertain: list_tied || color.is_none(),
+                });
+            }
+            Kind::Owner => owners.push((c, text, bbox, text_votes, list_tied)),
+        }
     }
     // (read, local id) -> kept node index; the first node of a read with an id wins.
-    let mut node_of: Vec<HashMap<&str, usize>> = vec![HashMap::new(); reads.len()];
     let mut by_member: Vec<Vec<Option<usize>>> =
         reads.iter().map(|r| vec![None; r.nodes.len()]).collect();
-    for (m, c) in &node_member_cluster {
-        by_member[m.read][m.idx] = kept_nodes.of_cluster[*c];
+    for (m, c) in &member_cluster {
+        if kind(m) == Kind::Node {
+            by_member[m.read][index(m)] = kept.of_cluster[*c].and_then(|k| node_index[k]);
+        }
     }
+    let mut node_of: Vec<HashMap<&str, usize>> = vec![HashMap::new(); reads.len()];
     for (r, read) in reads.iter().enumerate() {
         for (i, n) in read.nodes.iter().enumerate() {
             if let Some(k) = by_member[r][i] {
@@ -378,6 +468,40 @@ pub fn vote(reads: &[BoardReading], anchors: &[(String, BBox)], p: &VoteParams) 
         }
     }
     let node_id = |r: usize, id: &str| node_of[r].get(id).copied();
+
+    // Owner tags: the node each read put the tag at, mapped through the nodes.
+    let mut owner_tags = Vec::new();
+    let mut owner_votes = Vec::new();
+    for (c, name_raw, bbox, text_votes, list_tied) in owners {
+        let ms = &kept.clusters[c];
+        let nears: Vec<Option<usize>> = ms
+            .iter()
+            .filter(|m| kind(m) == Kind::Owner)
+            .map(|m| {
+                let near = &reads[m.read].owner_tags[index(m)].near;
+                (!near.is_empty()).then(|| node_id(m.read, near)).flatten()
+            })
+            .collect();
+        let (near, _) = majority(&nears);
+        // No node won, yet a read named one (a node that did not survive the
+        // vote, or outvoted by reads naming none): not a clear "no node".
+        let named = ms
+            .iter()
+            .any(|m| kind(m) == Kind::Owner && !reads[m.read].owner_tags[index(m)].near.is_empty());
+        owner_tags.push(OwnerTag {
+            name_raw,
+            near: near
+                .flatten()
+                .map(|k| format!("n{}", k + 1))
+                .unwrap_or_default(),
+            bbox,
+        });
+        owner_votes.push(ElementVote {
+            votes: ms.len() as u32,
+            text_votes,
+            uncertain: list_tied || near.is_none() || (near == Some(None) && named),
+        });
+    }
 
     // Edges: by kept endpoints (unordered), then by label within a read.
     struct EdgeMember {
@@ -491,92 +615,21 @@ pub fn vote(reads: &[BoardReading], anchors: &[(String, BBox)], p: &VoteParams) 
         });
     }
 
-    // Stickies.
-    let sticky_lists = els(&|r| {
-        r.stickies
-            .iter()
-            .map(|s| El {
-                text: &s.text,
-                bbox: &s.bbox,
-            })
-            .collect()
-    });
-    let kept = keep(cluster(&sticky_lists, &p), &sticky_lists, &p);
-    dropped.stickies = kept.dropped;
-    let mut stickies = Vec::new();
-    let mut sticky_votes = Vec::new();
-    for ms in &kept.clusters {
-        let s = |m: &Member| &reads[m.read].stickies[m.idx];
-        let bbox = median_box(ms.iter().map(|m| &s(m).bbox));
-        let texts: Vec<&str> = ms.iter().map(|m| s(m).text.as_str()).collect();
-        let (text, text_votes) = vote_text(&texts, &bbox, anchors);
-        let (color, _) = majority(&ms.iter().map(|m| s(m).color).collect::<Vec<_>>());
-        stickies.push(Sticky {
-            text,
-            color: color.unwrap_or(s(&ms[0]).color),
-            bbox,
-        });
-        sticky_votes.push(ElementVote {
-            votes: ms.len() as u32,
-            text_votes,
-            uncertain: color.is_none(),
-        });
-    }
-
-    // Owner tags: the node each read put the tag at, mapped through the nodes.
-    let owner_lists = els(&|r| {
-        r.owner_tags
-            .iter()
-            .map(|o| El {
-                text: &o.name_raw,
-                bbox: &o.bbox,
-            })
-            .collect()
-    });
-    let kept = keep(cluster(&owner_lists, &p), &owner_lists, &p);
-    dropped.owner_tags = kept.dropped;
-    let mut owner_tags = Vec::new();
-    let mut owner_votes = Vec::new();
-    for ms in &kept.clusters {
-        let o = |m: &Member| &reads[m.read].owner_tags[m.idx];
-        let bbox = median_box(ms.iter().map(|m| &o(m).bbox));
-        let texts: Vec<&str> = ms.iter().map(|m| o(m).name_raw.as_str()).collect();
-        let (name_raw, text_votes) = vote_text(&texts, &bbox, anchors);
-        let nears: Vec<Option<usize>> = ms
-            .iter()
-            .map(|m| {
-                let near = &o(m).near;
-                (!near.is_empty()).then(|| node_id(m.read, near)).flatten()
-            })
-            .collect();
-        let (near, _) = majority(&nears);
-        owner_tags.push(OwnerTag {
-            name_raw,
-            near: near
-                .flatten()
-                .map(|k| format!("n{}", k + 1))
-                .unwrap_or_default(),
-            bbox,
-        });
-        owner_votes.push(ElementVote {
-            votes: ms.len() as u32,
-            text_votes,
-            uncertain: near.is_none(),
-        });
-    }
-
     // Other text.
-    let other_lists = els(&|r| {
-        r.other_visible_text
-            .iter()
-            .map(|t| El {
-                text: &t.text,
-                bbox: &t.bbox,
-            })
-            .collect()
-    });
+    let other_lists: Vec<Vec<El<'_>>> = reads
+        .iter()
+        .map(|r| {
+            r.other_visible_text
+                .iter()
+                .map(|t| El {
+                    text: &t.text,
+                    bbox: &t.bbox,
+                })
+                .collect()
+        })
+        .collect();
     let kept = keep(cluster(&other_lists, &p), &other_lists, &p);
-    dropped.other_visible_text = kept.dropped;
+    dropped.other_visible_text = kept.dropped.len() as u32;
     let mut other_visible_text = Vec::new();
     let mut other_votes = Vec::new();
     for ms in &kept.clusters {
@@ -893,6 +946,61 @@ mod tests {
         };
         let v = vote(&[r(), r(), r()], &[], &p());
         assert_eq!(texts(&v.result), ["Payments", "Refunds"]);
+    }
+
+    #[test]
+    fn an_element_two_reads_put_in_different_lists_is_kept() {
+        // Codex consensus round 1: read 0 lists "Ship it" as a node, read 1 as a
+        // sticky at the same place, read 2 omits it. Two reads saw it.
+        let a = reading(vec![node("n1", "Ship it", 100.0, 100.0)], vec![]);
+        let mut b = reading(vec![], vec![]);
+        b.stickies = vec![Sticky {
+            text: "Ship it".into(),
+            color: StickyColor::Yellow,
+            bbox: BBox::new(101.0, 99.0, 201.0, 141.0),
+        }];
+        let c = reading(vec![], vec![]);
+        let v = vote(&[a.clone(), b.clone(), c], &[], &p());
+        assert_eq!(texts(&v.result), ["Ship it"], "the earliest read's list");
+        assert!(v.result.stickies.is_empty());
+        assert_eq!(v.nodes[0].votes, 2);
+        assert!(v.nodes[0].uncertain, "the list was tied");
+        // Two of three reads calling it a sticky make it a sticky.
+        let v = vote(&[a, b.clone(), b], &[], &p());
+        assert!(v.result.nodes.is_empty());
+        assert_eq!(v.result.stickies.len(), 1);
+        assert_eq!((v.stickies[0].votes, v.stickies[0].uncertain), (3, false));
+    }
+
+    #[test]
+    fn overlapping_elements_of_different_texts_are_not_folded() {
+        // Codex consensus round 1: "Payments" (reads 0 and 1) and "Refunds"
+        // (reads 1 and 2) overlap by 0.72; only read 1 lists both. Each has two
+        // reads: both stay.
+        let pay = || BoardNode {
+            local_id: "p".into(),
+            text: "Payments".into(),
+            bbox: BBox::new(100.0, 100.0, 300.0, 200.0),
+            conf: 0.9,
+        };
+        let refunds = || BoardNode {
+            local_id: "r".into(),
+            text: "Refunds".into(),
+            bbox: BBox::new(110.0, 110.0, 290.0, 190.0),
+            conf: 0.9,
+        };
+        let v = vote(
+            &[
+                reading(vec![pay()], vec![]),
+                reading(vec![pay(), refunds()], vec![]),
+                reading(vec![refunds()], vec![]),
+            ],
+            &[],
+            &p(),
+        );
+        let mut t = texts(&v.result);
+        t.sort_unstable();
+        assert_eq!(t, ["Payments", "Refunds"]);
     }
 
     #[test]

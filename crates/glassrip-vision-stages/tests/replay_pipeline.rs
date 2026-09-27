@@ -991,6 +991,19 @@ async fn separate_owner_tags_the_retry_repeats_are_kept_and_replay() {
 /// a box no other read has. Reads in `fail` answer with a protocol error.
 struct SampledModel {
     fail: &'static [u64],
+    /// Fail only the first request of this read (whichever keyframe asks first).
+    fail_first_of: Option<u64>,
+    failed: std::sync::atomic::AtomicBool,
+}
+
+impl SampledModel {
+    fn failing(fail: &'static [u64]) -> Self {
+        Self {
+            fail,
+            fail_first_of: None,
+            failed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
 }
 
 impl SampledModel {
@@ -1034,10 +1047,14 @@ impl VisionBackend for SampledModel {
         if !board {
             return ScriptedModel.infer(request, cancel).await;
         }
-        let seed = request.options.seed;
+        // The run seed is 0 and keyframe salts are multiples of 16.
+        let seed = request.options.seed % 16;
         // Read 0 is greedy; the sampled reads carry the temperature.
         assert_eq!(request.sampling.temperature.is_some(), seed > 0, "{seed}");
-        if self.fail.contains(&seed) {
+        let first_of = self.fail_first_of.is_some_and(|k| {
+            k == seed && !self.failed.swap(true, std::sync::atomic::Ordering::SeqCst)
+        });
+        if self.fail.contains(&seed) || first_of {
             return Err(VisionError::Protocol(format!(
                 "scripted failure of read {seed}"
             )));
@@ -1111,6 +1128,10 @@ fn failed_items(
 
 /// Record with the sampled model, then replay in a fresh directory.
 async fn consensus_record_and_replay(fail: &'static [u64]) -> ConsensusRuns {
+    consensus_record_and_replay_with(SampledModel::failing(fail)).await
+}
+
+async fn consensus_record_and_replay_with(model: SampledModel) -> ConsensusRuns {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     write_inputs(root);
@@ -1119,10 +1140,7 @@ async fn consensus_record_and_replay(fail: &'static [u64]) -> ConsensusRuns {
     let (monitor, _, reports) = run_branch_with(
         root,
         &live,
-        Arc::new(RecordingBackend::new(
-            Arc::new(SampledModel { fail }),
-            store.clone(),
-        )),
+        Arc::new(RecordingBackend::new(Arc::new(model), store.clone())),
         consensus_params(),
     )
     .await;
@@ -1209,6 +1227,16 @@ async fn consensus_reads_vote_record_three_replies_and_replay() {
         assert_eq!(c.edges[0].votes, 2);
         assert_eq!(c.dropped.nodes, 1);
     }
+    // The two keyframes' canvases are identical (the marker block lies outside
+    // the canvas), yet no request of one is a request of the other.
+    let keys = |r: &BoardReadingItem| {
+        r.requests
+            .iter()
+            .map(|l| l.request_key.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    assert_eq!(live[0].1.crop_box, live[1].1.crop_box);
+    assert!(keys(&live[0].1).is_disjoint(&keys(&live[1].1)));
     assert_eq!(replay.len(), live.len());
     for ((_, a), (_, b)) in replay.iter().zip(&live) {
         same_reading(a, b);
@@ -1267,4 +1295,134 @@ async fn every_read_failing_fails_the_item() {
     let runs = consensus_record_and_replay(&[0, 1, 2]).await;
     assert!(runs.live.is_empty() && runs.replay.is_empty());
     assert_eq!(runs.errors, 2, "both keyframes failed");
+}
+
+/// Codex round 4, MAJOR 1: the full-budget board read stops at the output
+/// limit, and the compact retry (sticky list of 30) lists thirty separate
+/// "TODO" notes spread over the canvas, which OCR does not read. The reply is
+/// flagged as degenerate but, already a retry, gets no second one. A list run
+/// to its limit is no evidence of fabrication: all thirty notes stay (the
+/// list-cap rule reduced them to one).
+struct TodoGridModel;
+
+#[async_trait]
+impl VisionBackend for TodoGridModel {
+    fn id(&self) -> BackendId {
+        ScriptedModel.id()
+    }
+    async fn preflight(&self) -> glassrip_vision::Result<Placement> {
+        Err(VisionError::Config("unused".into()))
+    }
+    async fn infer(
+        &self,
+        request: VisionRequest,
+        cancel: CancellationToken,
+    ) -> glassrip_vision::Result<RawResponse> {
+        let props = &request.schema.json()["properties"];
+        if !props["nodes"].is_object() {
+            return ScriptedModel.infer(request, cancel).await;
+        }
+        if props["stickies"]["maxItems"].as_u64() == Some(60) {
+            return Err(VisionError::Truncated {
+                num_predict: request.options.num_predict,
+                eval_count: Some(request.options.num_predict),
+                raw_text: "{\"nodes\": [], \"edges\": [], \"stickies\": [".into(),
+            });
+        }
+        assert_eq!(props["stickies"]["maxItems"].as_u64(), Some(30));
+        let (w, h) = (
+            f64::from(request.image.width()),
+            f64::from(request.image.height()),
+        );
+        let stickies: Vec<serde_json::Value> = (0..30u32)
+            .map(|i| {
+                let x = 0.05 * w + f64::from(i % 6) * 0.15 * w;
+                let y = 0.05 * h + f64::from(i / 6) * 0.18 * h;
+                json!({"text": "TODO", "color": "yellow",
+                       "bbox_2d": [x, y, x + 0.1 * w, y + 0.1 * h]})
+            })
+            .collect();
+        let value = json!({"nodes": [], "edges": [], "stickies": stickies, "owner_tags": [],
+                           "other_visible_text": [], "confidence": 0.7});
+        request.schema.validate(&value).unwrap();
+        Ok(RawResponse {
+            raw_text: value.to_string(),
+            json: value,
+            prompt_eval_count: Some(request.image.tokens() + 900),
+            eval_count: Some(900),
+            durations: Durations::default(),
+            attempts: 1,
+            repaired: false,
+            done_reason: Some("stop".into()),
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_compact_list_of_separate_notes_is_kept_and_replays() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_inputs(root);
+    let store = RawStore::new(root.join("raw"));
+    let live = root.join("live");
+    run_branch(
+        root,
+        &live,
+        Arc::new(RecordingBackend::new(
+            Arc::new(TodoGridModel),
+            store.clone(),
+        )),
+    )
+    .await;
+    let readings: Vec<(String, BoardReadingItem)> = read(&live, artifacts::BOARD_READING);
+    assert_eq!(readings.len(), 2);
+    for (_, r) in &readings {
+        let log = &r.requests[0];
+        assert!(log.compact_retry, "{log:?}");
+        let d = log.degenerate.as_ref().expect("thirty copies are flagged");
+        assert!(!d.retried, "a compact retry gets no second retry");
+        assert!(d.collapsed.is_empty(), "{d:?}");
+        assert_eq!(r.result.stickies.len(), 30);
+    }
+    let replay = root.join("replay");
+    run_branch(
+        root,
+        &replay,
+        Arc::new(ReplayBackend::new("scripted-vl", store)),
+    )
+    .await;
+    let again: Vec<(String, BoardReadingItem)> = read(&replay, artifacts::BOARD_READING);
+    for ((_, a), (_, b)) in again.iter().zip(&readings) {
+        assert_eq!(a.result, b.result);
+        assert_eq!(a.requests[0].degenerate, b.requests[0].degenerate);
+    }
+}
+
+/// Codex consensus round 1: two keyframes with identical canvases; the first
+/// sampled read to reach the model fails, the other keyframe's same read
+/// answers. Replay must fail that keyframe's read again, not borrow the other
+/// keyframe's recorded reply (identical requests once shared one key).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_read_is_not_answered_by_another_keyframes_record() {
+    let runs = consensus_record_and_replay_with(SampledModel {
+        fail: &[],
+        fail_first_of: Some(1),
+        failed: std::sync::atomic::AtomicBool::new(false),
+    })
+    .await;
+    assert_eq!(runs.errors, 0);
+    let failed: Vec<Vec<u32>> = runs
+        .live
+        .iter()
+        .map(|(_, r)| {
+            let c = r.consensus.as_ref().unwrap();
+            c.failed.iter().map(|f| f.read).collect()
+        })
+        .collect();
+    let mut sorted = failed.clone();
+    sorted.sort();
+    assert_eq!(sorted, [vec![], vec![1]], "one keyframe lost read 1");
+    for ((_, a), (_, b)) in runs.replay.iter().zip(&runs.live) {
+        same_reading(a, b);
+    }
 }

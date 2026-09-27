@@ -36,15 +36,16 @@
 //! - copies piled on each other: each pile keeps its best-supported copy;
 //! - at least `min_repeats` copies lying wholly outside the image the request
 //!   sent: those copies go, OCR-backed or not (nothing outside the image was
-//!   read from it; a tile's OCR anchors cover the whole canvas);
-//! - a list that ran to its `maxItems` while repeating (its last item is a copy
-//!   of a repeated text: the limit, not the board, stopped the run): the text
-//!   keeps its best-supported copies. Owner tags never collapse on the limit:
-//!   one person owns many things.
+//!   read from it; a tile's OCR anchors cover the whole canvas).
 //!
 //! Every other copy stays as read, however many there are: a row of identical
 //! cards, or eight "Avery" tags on eight nodes, that OCR misses is still a row,
-//! and real copies of a text keep their place beside fabricated ones.
+//! and real copies of a text keep their place beside fabricated ones. A list
+//! that ran to its `maxItems` is no evidence either: thirty separate "TODO"
+//! notes fill a compact list as surely as a runaway does. Separate copies a
+//! runaway spreads over the canvas are left to the consensus vote of
+//! `board_read`, where the other reads confirm at most one copy per real
+//! element.
 //!
 //! Best-supported items: every item backed by its own OCR span, or the first
 //! item when OCR backs none. Edges and owner tags pointing at a removed node
@@ -95,35 +96,11 @@ impl DegenerateParams {
     }
 }
 
-/// The `maxItems` of each list in the request that produced a reply; `0` when
-/// unknown (no list then counts as run to its limit).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ListCaps {
-    pub nodes: usize,
-    pub edges: usize,
-    pub stickies: usize,
-    pub owner_tags: usize,
-    pub other_visible_text: usize,
-}
-
-impl ListCaps {
-    pub fn of(&self, list: ElementList) -> usize {
-        match list {
-            ElementList::Nodes => self.nodes,
-            ElementList::Edges => self.edges,
-            ElementList::Stickies => self.stickies,
-            ElementList::OwnerTags => self.owner_tags,
-            ElementList::OtherVisibleText => self.other_visible_text,
-        }
-    }
-}
-
 /// What a reply was asked to read: the evidence [`collapse`] weighs.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ReplyFrame {
     /// The image the request sent, in the reading's (canvas) pixels.
     pub extent: BBox,
-    pub caps: ListCaps,
 }
 
 /// Why the copies of a repeated text were made up by the reply.
@@ -136,8 +113,8 @@ pub enum Fabrication {
     /// At least `min_repeats` copies lie wholly outside the image; they go,
     /// OCR-backed or not (a tile's OCR anchors cover the whole canvas).
     OffCanvas,
-    /// The list ran to its `maxItems` with a repeated text last (never counted
-    /// for owner tags); the text keeps its best-supported copies.
+    /// No longer produced (a full list is no evidence of fabrication); kept so
+    /// that readings recorded before `board_read` version 10 still parse.
     ListCap,
 }
 
@@ -450,13 +427,11 @@ fn best(r: &Repeat, members: &[usize]) -> Vec<usize> {
 }
 
 /// What shows the reply made up copies of one repeated text, and the items
-/// that stay; `None` when nothing does (every copy stays as read). `stopped`:
-/// the list ran to its limit with a repeated text last.
+/// that stay; `None` when nothing does (every copy stays as read).
 fn plan(
     r: &Repeat,
     items: &[Item<'_>],
     frame: &ReplyFrame,
-    stopped: bool,
     p: &DegenerateParams,
 ) -> Option<(Vec<Fabrication>, Vec<usize>)> {
     let off: Vec<usize> = r
@@ -470,11 +445,9 @@ fn plan(
         })
         .collect();
     let off_canvas = off.len() >= p.min_repeats;
-    let capped = stopped && r.text.list != ElementList::OwnerTags;
     let evidence: Vec<Fabrication> = [
         (r.piled, Fabrication::Piled),
         (off_canvas, Fabrication::OffCanvas),
-        (capped, Fabrication::ListCap),
     ]
     .into_iter()
     .filter_map(|(on, f)| on.then_some(f))
@@ -496,9 +469,6 @@ fn plan(
             best(r, &inside)
         }
     };
-    if capped {
-        return Some((evidence, prefer_inside(&r.idx)));
-    }
     // Copies outside the image go, OCR-backed or not.
     let mut gone: HashSet<usize> = if off_canvas {
         off.iter().copied().collect()
@@ -616,17 +586,10 @@ fn fabricated(
     frame: &ReplyFrame,
     p: &DegenerateParams,
 ) -> Vec<Fabricated> {
-    let repeats = list_repeats(list, items, anchors, p);
-    let cap = frame.caps.of(list);
-    let stopped = cap > 0
-        && items.len() >= cap
-        && items
-            .last()
-            .is_some_and(|last| repeats.iter().any(|r| r.text.text == last.key));
-    repeats
+    list_repeats(list, items, anchors, p)
         .into_iter()
         .filter_map(|r| {
-            let (ev, keep) = plan(&r, items, frame, stopped, p)?;
+            let (ev, keep) = plan(&r, items, frame, p)?;
             Some((r, ev, keep))
         })
         .collect()
@@ -844,22 +807,10 @@ mod tests {
         DegenerateParams::default()
     }
 
-    /// A large image and unknown list limits: only piled copies are evidence.
+    /// A large image: only piled copies are evidence.
     fn frame() -> ReplyFrame {
         ReplyFrame {
             extent: BBox::new(0.0, 0.0, 10_000.0, 10_000.0),
-            caps: ListCaps::default(),
-        }
-    }
-
-    /// The board schema's list limits.
-    fn board_caps() -> ListCaps {
-        ListCaps {
-            nodes: 60,
-            edges: 80,
-            stickies: 60,
-            owner_tags: 20,
-            other_visible_text: 20,
         }
     }
 
@@ -1114,18 +1065,9 @@ mod tests {
             .collect();
         let f = detect(&r, &anchors, &p()).expect("degenerate");
         assert_eq!(f.repeated.len(), 5, "{f}");
-        // The grid ran the sticky list to its limit of 60: made up.
-        let capped = ReplyFrame {
-            caps: board_caps(),
-            ..frame()
-        };
-        let (after, done) = collapse(r.clone(), &anchors, &capped, &p());
-        assert_eq!(after.stickies.len(), 5);
-        assert!(done
-            .iter()
-            .all(|c| c.before == 12 && c.after == 1 && c.evidence == [Fabrication::ListCap]));
-        // Side by side on the canvas in a list the limit did not stop, the same
-        // notes are retried but kept as read.
+        // Side by side on the canvas, the notes are retried but kept as read,
+        // though they fill the sticky list to its limit of 60: a full list is
+        // no evidence (the consensus vote judges a grid only one read has).
         let (after, done) = collapse(r.clone(), &anchors, &frame(), &p());
         assert_eq!(after, r);
         assert!(done.is_empty());
@@ -1364,19 +1306,13 @@ mod tests {
             (ElementList::OwnerTags, 8)
         );
         // ...but when the retry repeats them, every assignment stays.
-        let capped = ReplyFrame {
-            caps: board_caps(),
-            ..frame()
-        };
-        let (after, done) = collapse(r.clone(), &[], &capped, &p());
+        let (after, done) = collapse(r.clone(), &[], &frame(), &p());
         assert_eq!(after, r);
         assert!(done.is_empty());
-        // Owner tags never collapse on the list limit: twenty tags on twenty
-        // nodes fill the owner list and stay.
+        // Twenty tags on twenty nodes fill the owner list (20) and stay.
         let full = owner_on_every_node(20);
-        assert_eq!(full.owner_tags.len(), board_caps().owner_tags);
         assert!(detect(&full, &[], &p()).is_some());
-        let (after, done) = collapse(full.clone(), &[], &capped, &p());
+        let (after, done) = collapse(full.clone(), &[], &frame(), &p());
         assert_eq!(after, full);
         assert!(done.is_empty());
     }
@@ -1388,7 +1324,6 @@ mod tests {
         let mut r = owner_on_every_node(8);
         let small = ReplyFrame {
             extent: BBox::new(0.0, 0.0, 800.0, 400.0),
-            ..frame()
         };
         for (i, t) in r.owner_tags.iter_mut().enumerate().skip(3) {
             let x = 900.0 + i as f64 * 50.0;
@@ -1425,24 +1360,12 @@ mod tests {
         let anchors = vec![span("Queue", 100.0, 100.0), span("Queue", 750.0, 100.0)];
         let tile = ReplyFrame {
             extent: BBox::new(0.0, 0.0, 500.0, 400.0),
-            ..frame()
         };
         assert!(detect(&r, &anchors, &p()).is_some());
         let (after, done) = collapse(r.clone(), &anchors, &tile, &p());
         let ids: Vec<&str> = after.nodes.iter().map(|n| n.local_id.as_str()).collect();
         assert_eq!(ids, ["q0"]);
         assert_eq!(done[0].evidence, [Fabrication::OffCanvas]);
-        // Run to the list limit, the keepers still come from inside the tile.
-        let capped = ReplyFrame {
-            caps: ListCaps {
-                nodes: 9,
-                ..ListCaps::default()
-            },
-            ..tile
-        };
-        let (after, _) = collapse(r, &anchors, &capped, &p());
-        let ids: Vec<&str> = after.nodes.iter().map(|n| n.local_id.as_str()).collect();
-        assert_eq!(ids, ["q0"]);
     }
 
     #[test]
@@ -1582,7 +1505,6 @@ mod tests {
         assert!(detect(&r, &[], &p()).is_some());
         let image = ReplyFrame {
             extent: BBox::new(0.0, 0.0, 1920.0, 954.0),
-            caps: ListCaps::default(),
         };
         // The 17 copies wholly past the edge go; their edges join the nearest
         // kept copy's. The eleven inside stay (the retry repeated them).
@@ -1592,35 +1514,7 @@ mod tests {
         assert!(after.nodes.iter().all(|n| n.bbox.x1 < 1920.0));
         assert_eq!((done[0].before, done[0].after), (28, 11));
         assert_eq!(done[0].evidence, [Fabrication::OffCanvas]);
-        // At the compact list limit (30 nodes) the same row is also capped.
-        let compact = ReplyFrame {
-            caps: ListCaps {
-                nodes: 30,
-                ..ListCaps::default()
-            },
-            ..image
-        };
-        let (after, done) = collapse(r.clone(), &[], &compact, &p());
-        assert_eq!(
-            done[0].evidence,
-            [Fabrication::OffCanvas, Fabrication::ListCap]
-        );
-        assert_eq!((after.nodes.len(), after.edges.len()), (3, 1));
-        // A list at its limit whose last item is no copy was not stopped mid-run.
-        let mut last_real = r.clone();
-        last_real.nodes.rotate_left(2);
-        let (after, done) = collapse(
-            last_real.clone(),
-            &[],
-            &ReplyFrame {
-                extent: frame().extent,
-                ..compact
-            },
-            &p(),
-        );
-        assert_eq!(after, last_real);
-        assert!(done.is_empty());
-        // Inside a wide enough image, below the limit, the row is kept.
+        // Inside a wide enough image the row is kept.
         let (after, done) = collapse(r.clone(), &[], &frame(), &p());
         assert_eq!(after, r);
         assert!(done.is_empty());
