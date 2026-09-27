@@ -749,7 +749,8 @@ pub fn assign_with(
 /// Group one person's OCR-read sightings into physical tags and give each tag one
 /// target set. Two sightings are the same physical tag when they share a registration
 /// cluster and their centers lie within `reach_share` tag sizes of the tag's mean
-/// center. A tag that has not moved has not changed target: the target set its
+/// center; one physical tag holds at most one tag of a keyframe (the two sightings of
+/// a bridge are one tag). A tag that has not moved has not changed target: the target set its
 /// keyframes anchored to most often (a keyframe's set is all targets the tag took
 /// there, so a bridge counts as one pair) is given to every keyframe of the tag,
 /// including keyframes where geometry found nothing. Ties go to the set with more
@@ -774,16 +775,22 @@ pub fn consolidate_tags(sightings: &mut Vec<OwnerSighting>, reach_share: f64) {
         };
         // A bridge is two sightings of one physical tag in one keyframe.
         if let Some(t) = tags.iter_mut().find(|t| {
-            t.members.last().is_some_and(|&j| {
-                sightings[j].keyframe_id == s.keyframe_id && sightings[j].tag == s.tag
-            })
+            t.members
+                .iter()
+                .any(|&j| sightings[j].keyframe_id == s.keyframe_id && sightings[j].tag == s.tag)
         }) {
             t.members.push(i);
             continue;
         }
+        // Another tag of the same keyframe is another physical tag, however near.
         let near = tags
             .iter_mut()
             .filter(|t| t.cluster == p.cluster)
+            .filter(|t| {
+                !t.members
+                    .iter()
+                    .any(|&j| sightings[j].keyframe_id == s.keyframe_id)
+            })
             .map(|t| {
                 let d = (p.x - t.sx / t.n).hypot(p.y - t.sy / t.n);
                 (d, reach_share * t.size.max(p.size()), t)
@@ -1578,6 +1585,41 @@ mod tests {
         consolidate_tags(&mut r, 1.0);
         assert_eq!(r[0].target, Some(node("n2")));
         assert!(r[0].physical.is_none());
+    }
+
+    #[test]
+    fn two_tags_of_one_keyframe_are_two_physical_tags() {
+        // Keyframe 0 reads two nearby Avery tags, on n1 and on n2; keyframe 10 reads
+        // only the n1 tag. The n2 tag must not be copied into keyframe 10 and
+        // confirmed there.
+        let mut v = vec![
+            at(s(0.0, Some(node("n1"))), 500.0, 100.0),
+            OwnerSighting {
+                tag: 1,
+                ..at(s(0.0, Some(node("n2"))), 520.0, 100.0)
+            },
+            at(s(10.0, Some(node("n1"))), 505.0, 100.0),
+        ];
+        consolidate_tags(&mut v, 1.0);
+        assert_ne!(v[0].physical, v[1].physical);
+        assert_eq!(v[0].physical, v[2].physical);
+        let at10: Vec<&OwnerTarget> = v
+            .iter()
+            .filter(|x| x.t_start_s == 10.0)
+            .filter_map(|x| x.target.as_ref())
+            .collect();
+        assert_eq!(at10, vec![&node("n1")]);
+        let a = assign(
+            "p1",
+            "Avery",
+            &v,
+            100.0,
+            &params(),
+            &NoCorroboration,
+            &|_, _, _| true,
+        );
+        assert!(a.iter().all(|x| x.target != node("n2")), "{a:#?}");
+        assert!(a.iter().any(|x| x.target == node("n1")), "{a:#?}");
     }
 
     #[test]
