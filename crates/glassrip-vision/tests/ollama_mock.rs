@@ -827,7 +827,7 @@ async fn guarded_requests_stream_and_forward_sampling_overrides() {
         .and(path("/api/chat"))
         .and(body_partial_json(json!({
             "stream": true,
-            "options": {"repeat_penalty": 1.25, "repeat_last_n": 512}
+            "options": {"repeat_penalty": 1.25, "repeat_last_n": 512, "temperature": 0.25, "seed": 8}
         })))
         .respond_with(ResponseTemplate::new(200).set_body_string(stream_body(
             &[
@@ -843,6 +843,8 @@ async fn guarded_requests_stream_and_forward_sampling_overrides() {
     let mut r = guarded();
     r.sampling.repeat_penalty = Some(1.25);
     r.sampling.repeat_last_n = Some(512);
+    r.sampling.temperature = Some(0.25);
+    r.options.seed = 8;
     let raw = backend(&server)
         .infer(r, CancellationToken::new())
         .await

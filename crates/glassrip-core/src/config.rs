@@ -468,6 +468,18 @@ pub struct BoardReadConfig {
     /// ...or at any share from this many copies (0: no such bound).
     #[garde(range(max = 80))]
     pub degenerate_strong_repeats: u32,
+    /// Reads per whiteboard keyframe. With more than one, the reads run
+    /// concurrently and the reading keeps the elements `min_agree` of them
+    /// agree on (1: one greedy read, no vote).
+    #[garde(range(min = 1, max = 9))]
+    pub reads: u32,
+    /// Reads an element needs to be kept (capped at `reads`).
+    #[garde(range(min = 1, max = 9))]
+    pub min_agree: u32,
+    /// Sampling temperature of every read after the first (the first is
+    /// greedy), so the reads are independent samples.
+    #[garde(range(min = 0.0, max = 2.0))]
+    pub consensus_temperature: f64,
 }
 
 impl Default for BoardReadConfig {
@@ -483,6 +495,10 @@ impl Default for BoardReadConfig {
             degenerate_min_repeats: 4,
             degenerate_min_duplicate_share: 0.5,
             degenerate_strong_repeats: 8,
+            // glassrip_vision_stages::stages::board_read::ConsensusParams::default()
+            reads: 3,
+            min_agree: 2,
+            consensus_temperature: 0.3,
         }
     }
 }

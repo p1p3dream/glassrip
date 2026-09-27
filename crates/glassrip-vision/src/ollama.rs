@@ -758,6 +758,9 @@ impl OllamaBackend {
             if let Some(n) = request.sampling.repeat_last_n {
                 opts.insert("repeat_last_n".into(), json!(n));
             }
+            if let Some(t) = request.sampling.temperature {
+                opts.insert("temperature".into(), json!(t));
+            }
         }
         body
     }

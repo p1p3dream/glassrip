@@ -725,6 +725,7 @@ mod tests {
             requests: vec![],
             participants: vec![],
             result,
+            consensus: None,
         }
     }
 
