@@ -25,10 +25,12 @@
 //! - Consensus: with `consensus.reads > 1` the keyframe is read that many times,
 //!   concurrently. Read 0 is the greedy request (temperature 0); read `k` is
 //!   sampled at `consensus.temperature`, so its reply is an independent sample.
-//!   Each read's seed is the run seed plus a salt of the keyframe id plus `k`,
-//!   so every request of the run has its own request key: two keyframes with
-//!   identical canvases never share a recorded reply (or a failure), and
-//!   replay reaches every read's own answer. Every read goes through
+//!   Each request's seed encodes the keyframe's place in the plan, the
+//!   request's place among the keyframe's images (overview, tiles), and `k`
+//!   ([`ConsensusParams::seed`]), so every first request of the run has its own
+//!   request key: keyframes or tiles with identical pixels never share a
+//!   recorded reply (or a failure), and replay reaches every request's own
+//!   answer. Every read goes through
 //!   the whole path above (tiles, retries, the degenerate rule) on its own, then
 //!   [`crate::consensus::vote`] keeps what `consensus.min_agree` reads agree on.
 //!   A failed read leaves the vote to the others, all of which must then agree
@@ -134,16 +136,6 @@ impl Default for ConsensusParams {
     }
 }
 
-/// A per-keyframe seed offset: 27 bits of the id's blake3, times 16 (reads
-/// stay below 16, so seeds of different keyframes and reads never meet), under
-/// 2^31 so a server parsing the seed as a 32-bit integer takes it.
-pub fn keyframe_salt(keyframe_id: &str) -> u64 {
-    let h = blake3::hash(keyframe_id.as_bytes());
-    let b = h.as_bytes();
-    let v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) & 0x07FF_FFFF;
-    u64::from(v) << 4
-}
-
 /// The consensus settings as one cache-key string.
 fn consensus_descriptor(c: &ConsensusParams) -> String {
     format!(
@@ -161,19 +153,18 @@ impl ConsensusParams {
         }
     }
 
-    /// Seed of read `read` of the keyframe with `salt` (see [`Self::salt`]).
-    pub fn seed(&self, base: u64, salt: u64, read: u32) -> u64 {
-        base.wrapping_add(salt).wrapping_add(u64::from(read))
-    }
-
-    /// The seed salt of a keyframe: 0 for a single read (the request it always
-    /// was), else [`keyframe_salt`].
-    pub fn salt(&self, keyframe_id: &str) -> u64 {
-        if self.reads > 1 {
-            keyframe_salt(keyframe_id)
-        } else {
-            0
+    /// Seed of read `read` of the `job`th image (0: the overview, then the
+    /// tiles; at most 256) of the `index`th planned keyframe: the run seed plus
+    /// `(index + 1) * 4096 + job * 16 + read` (reads stay below 16), so no two
+    /// requests of a run share a seed. A single read keeps the run seed (the
+    /// request it always was).
+    pub fn seed(&self, base: u64, index: u64, job: u64, read: u32) -> u64 {
+        if self.reads <= 1 {
+            return base;
         }
+        base.wrapping_add((index + 1) << 12)
+            .wrapping_add(job << 4)
+            .wrapping_add(u64::from(read))
     }
 
     /// Temperature override of read `k`: none (0, greedy) for read 0.
@@ -473,11 +464,13 @@ fn shift_output(mut o: BoardReading, dx: f64, dy: f64) -> BoardReading {
     o
 }
 
-/// Work: the canvas crop and its OCR spans in canvas pixels.
+/// Work: the canvas crop, its OCR spans in canvas pixels, and the keyframe's
+/// place in the plan (consensus seeds).
 #[derive(Debug, Clone)]
 pub struct ReadWork {
     pub crop: CanvasCropItem,
     pub anchors: Vec<(String, BBox)>,
+    pub index: u64,
 }
 
 /// The stage.
@@ -506,12 +499,13 @@ impl BoardReadStage {
         }
     }
 
-    /// One request of read `read` (and its retries); `salt` is the keyframe's
-    /// seed salt.
+    /// One request of read `read` of image `job` of keyframe `index` (and its
+    /// retries).
     #[allow(clippy::too_many_arguments)]
     async fn one(
         &self,
-        salt: u64,
+        index: u64,
+        job: u64,
         read: u32,
         role: RequestRole,
         region: BBox,
@@ -523,7 +517,7 @@ impl BoardReadStage {
         let mut request = board_read_request(
             prepared,
             GenerationOptions {
-                seed: consensus.seed(self.params.seed, salt, read),
+                seed: consensus.seed(self.params.seed, index, job, read),
                 num_predict: self.params.min_num_predict,
             },
         )
@@ -723,16 +717,18 @@ impl BoardReadStage {
     /// Read `read` of a keyframe: the overview and any tiles, merged.
     async fn read_board(
         &self,
-        salt: u64,
+        index: u64,
         read: u32,
         jobs: &[(RequestRole, BBox, PreparedImage)],
         tiled: bool,
         anchors: &[(String, BBox)],
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<(BoardReading, Vec<RequestLog>), ErrorInfo> {
-        let results = futures_util::future::join_all(jobs.iter().map(|(role, region, p)| {
-            self.one(salt, read, *role, *region, p, anchors, cancel.clone())
-        }))
+        let results = futures_util::future::join_all(jobs.iter().zip(0u64..).map(
+            |((role, region, p), job)| {
+                self.one(index, job, read, *role, *region, p, anchors, cancel.clone())
+            },
+        ))
         .await;
         let mut outputs = Vec::new();
         let mut logs = Vec::new();
@@ -871,8 +867,9 @@ impl Stage for BoardReadStage {
         // 10: a list run to its `maxItems` is no evidence of fabrication;
         // separate on-canvas copies stay (outputs of 9 may hold collapsed
         // genuine notes of a full compact list). Nodes, stickies, and owner
-        // tags vote together; the fold needs one text; consensus seeds carry a
-        // keyframe salt (outputs of 9 may share replies between keyframes).
+        // tags vote together; elements match only with similar texts; the
+        // fold needs a read listing one text twice; consensus seeds encode the
+        // keyframe and image (outputs of 9 may share replies between them).
         10
     }
     fn output(&self) -> ArtifactSpec {
@@ -932,14 +929,19 @@ impl Stage for BoardReadStage {
         Ok(inputs
             .read_ok::<CanvasCropItem>(artifacts::CANVAS_CROP)?
             .into_iter()
-            .map(|(id, crop)| {
+            .zip(0u64..)
+            .map(|((id, crop), index)| {
                 let anchors = spans_of
                     .get(&crop.keyframe_id)
                     .map(|spans| canvas_anchors(spans, &crop))
                     .unwrap_or_default();
                 WorkItem {
                     id,
-                    work: ReadWork { crop, anchors },
+                    work: ReadWork {
+                        crop,
+                        anchors,
+                        index,
+                    },
                 }
             })
             .collect())
@@ -950,7 +952,11 @@ impl Stage for BoardReadStage {
         ctx: &ItemContext,
         work: ReadWork,
     ) -> Result<BoardReadingItem, ErrorInfo> {
-        let ReadWork { crop, anchors } = work;
+        let ReadWork {
+            crop,
+            anchors,
+            index,
+        } = work;
         self.monitor.ensure_preflight().await?;
         let started = Instant::now();
         let img = load_rgb(crop.source_image_path.clone().into()).await?;
@@ -987,9 +993,8 @@ impl Stage for BoardReadStage {
         }
         let cancel = ctx.cancel_token().clone();
         let reads = self.params.consensus.reads.max(1);
-        let salt = self.params.consensus.salt(&crop.keyframe_id);
         let outcomes = futures_util::future::join_all(
-            (0..reads).map(|k| self.read_board(salt, k, &jobs, tiled, &anchors, cancel.clone())),
+            (0..reads).map(|k| self.read_board(index, k, &jobs, tiled, &anchors, cancel.clone())),
         )
         .await;
         // The run stopped (placement abort, cancellation): no vote.
@@ -1379,20 +1384,24 @@ mod tests {
         );
         // A single read is the request it always was.
         let single = ConsensusParams::single();
-        assert_eq!(single.salt("kf-1"), 0);
-        assert_eq!((single.seed(7, 0, 0), single.temperature(0)), (7, None));
-        // Read 0 is greedy; the others are sampled; every read of every
-        // keyframe has its own seed, within 32-bit range.
-        let (a, b) = (p.salt("kf-1"), p.salt("kf-2"));
-        assert_ne!(a, b);
+        assert_eq!(single.seed(7, 3, 2, 0), 7);
+        assert_eq!(single.temperature(0), None);
+        // Read 0 is greedy; the others are sampled; every read of every image
+        // of every keyframe has its own seed.
         assert_eq!(p.temperature(0), None);
         assert_eq!(p.temperature(2), Some(p.temperature));
-        let seeds: std::collections::BTreeSet<u64> = [a, b]
-            .iter()
-            .flat_map(|&s| (0..p.reads).map(move |k| p.seed(7, s, k)))
-            .collect();
-        assert_eq!(seeds.len(), 2 * p.reads as usize);
-        assert!(seeds.iter().all(|&s| s < 1 << 31));
+        let mut seeds = std::collections::BTreeSet::new();
+        for index in 0..300u64 {
+            for job in 0..65u64 {
+                for read in 0..p.reads {
+                    assert!(seeds.insert(p.seed(7, index, job, read)));
+                }
+            }
+        }
+        assert!(
+            seeds.iter().all(|&s| s != 7),
+            "no consensus seed is the run seed"
+        );
     }
 
     #[test]

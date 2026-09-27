@@ -6,20 +6,21 @@
 //! keep what enough reads agree on:
 //!
 //! - Elements are matched across reads one to one: two elements are one when
-//!   their boxes overlap at least `merge_iou`, or their normalized texts are at
-//!   least `text_ratio` similar and their centers lie within the larger box's
-//!   long side. Each read contributes at most one element to a match, so a text
-//!   one read repeats many times finds at most one partner per other read.
+//!   their normalized texts are at least `text_ratio` similar and their
+//!   centers lie within the larger box's long side (reads that disagree on the
+//!   text do not confirm each other). Each read contributes at most one element
+//!   to a match, so a text one read repeats many times finds at most one
+//!   partner per other read.
 //!   Nodes, stickies, and owner tags are matched together (reads disagree on
 //!   which of these lists an element is in); other text on its own.
 //! - A match is kept when at least `min_agree` reads have it, in the list most
 //!   of them chose. Its box is the per-coordinate median of the reads' boxes,
 //!   its text the most common normalized form (a tie goes to the form the OCR
 //!   spans at the box back, then to the earliest read).
-//! - Kept matches of the same text whose boxes overlap at least `merge_iou`
-//!   are one element (the rule the tile merge uses) unless `min_agree` reads
-//!   list both separately: a pile of copies in one read cannot pair with two
-//!   reads' element twice.
+//! - Two kept matches whose boxes overlap at least `merge_iou` are one element
+//!   when a read listed the same normalized text in both (a pile of copies)
+//!   and fewer than `min_agree` reads list both: one read's pile cannot pair
+//!   with two reads' element twice.
 //! - Edges are matched by their endpoints mapped through the node matching
 //!   (then by label when a read has several edges between the same two nodes)
 //!   and kept with `min_agree` reads whose endpoints both survived. Direction
@@ -44,10 +45,11 @@ use crate::artifacts::{DroppedCounts, EdgeVote, ElementVote};
 pub struct VoteParams {
     /// Reads an element needs to be kept (at least 1).
     pub min_agree: usize,
-    /// Two elements are one when their boxes overlap at least this much...
+    /// Kept elements overlapping at least this much may be one pile (see
+    /// [`vote`]).
     pub merge_iou: f64,
-    /// ...or their normalized texts are at least this similar and their
-    /// centers are close.
+    /// Two elements of different reads are one when their normalized texts are
+    /// at least this similar and their centers are close.
     pub text_ratio: f64,
 }
 
@@ -96,7 +98,7 @@ fn match_score(a: El<'_>, b: El<'_>, p: &VoteParams) -> Option<f64> {
         .width()
         .max(a.bbox.height())
         .max(b.bbox.width().max(b.bbox.height()));
-    let same = iou >= p.merge_iou || (sim >= p.text_ratio && d <= reach);
+    let same = sim >= p.text_ratio && d <= reach;
     let close = if reach > 0.0 {
         1.0 - (d / reach).min(1.0)
     } else {
@@ -259,12 +261,13 @@ struct Kept {
 }
 
 /// Keep clusters with `min_agree` reads, then fold a kept cluster into an
-/// earlier one of the same text (normalized similarity at least `text_ratio`)
-/// when their median boxes overlap at least `merge_iou` and fewer than
-/// `min_agree` reads list both (one read's pile of copies paired with another
+/// earlier one when their median boxes overlap at least `merge_iou`, fewer
+/// than `min_agree` reads list both, and every read listing both wrote the
+/// same normalized text in both (one read's pile of copies paired with another
 /// read's element); the fold keeps one member per read, the larger cluster's
-/// first (ties to the earlier). Overlapping elements of different texts, or
-/// that `min_agree` reads list separately, stay separate.
+/// first (ties to the earlier). Overlapping elements that no read listed
+/// twice under one text, or that `min_agree` reads list separately, stay
+/// separate.
 fn keep(clusters: Vec<Vec<Member>>, lists: &[Vec<El<'_>>], p: &VoteParams) -> Kept {
     let el = |m: &Member| lists[m.read][m.idx];
     let boxes = |ms: &[Member]| median_box(ms.iter().map(|m| el(m).bbox));
@@ -284,15 +287,20 @@ fn keep(clusters: Vec<Vec<Member>>, lists: &[Vec<El<'_>>], p: &VoteParams) -> Ke
                 .filter(|m| k.iter().any(|x| x.read == m.read))
                 .count()
         };
-        let same_text = |k: &[Member]| {
-            c.iter().any(|m| {
-                k.iter()
-                    .any(|x| text_sim(el(m).text, el(x).text) >= p.text_ratio)
-            })
+        // Every read listing both wrote one text twice: a pile.
+        let pile = |k: &[Member]| {
+            let shared: Vec<(&Member, &Member)> = c
+                .iter()
+                .filter_map(|m| k.iter().find(|x| x.read == m.read).map(|x| (m, x)))
+                .collect();
+            !shared.is_empty()
+                && shared
+                    .iter()
+                    .all(|(m, x)| normalize(el(m).text) == normalize(el(x).text))
         };
         match kept
             .iter()
-            .position(|k| boxes(k).iou(&b) >= p.merge_iou && both(k) < p.min_agree && same_text(k))
+            .position(|k| boxes(k).iou(&b) >= p.merge_iou && both(k) < p.min_agree && pile(k))
         {
             Some(k) => {
                 let (first, second) = if c.len() > kept[k].len() {
@@ -1001,6 +1009,51 @@ mod tests {
         let mut t = texts(&v.result);
         t.sort_unstable();
         assert_eq!(t, ["Payments", "Refunds"]);
+    }
+
+    #[test]
+    fn similar_texts_one_read_lists_separately_are_not_folded() {
+        // Codex consensus round 2: "Payment" (reads 0 and 1) and "Payments"
+        // (reads 1 and 2) overlap by 0.72 and are 0.875 similar; read 1 lists
+        // both, under two texts: no pile, both stay.
+        let el = |t: &str, b: BBox| BoardNode {
+            local_id: t.into(),
+            text: t.into(),
+            bbox: b,
+            conf: 0.9,
+        };
+        let (a, b) = (
+            BBox::new(100.0, 100.0, 300.0, 200.0),
+            BBox::new(110.0, 110.0, 290.0, 190.0),
+        );
+        let v = vote(
+            &[
+                reading(vec![el("Payment", a)], vec![]),
+                reading(vec![el("Payment", a), el("Payments", b)], vec![]),
+                reading(vec![el("Payments", b)], vec![]),
+            ],
+            &[],
+            &p(),
+        );
+        let mut t = texts(&v.result);
+        t.sort_unstable();
+        assert_eq!(t, ["Payment", "Payments"]);
+    }
+
+    #[test]
+    fn reads_disagreeing_on_the_text_do_not_confirm_each_other() {
+        // Codex consensus round 2: read 0 lists a node "Ghost", read 1 a
+        // sticky "Real" at the same box, read 2 neither. No text has two reads.
+        let a = reading(vec![node("n1", "Ghost", 100.0, 100.0)], vec![]);
+        let mut b = reading(vec![], vec![]);
+        b.stickies = vec![Sticky {
+            text: "Real".into(),
+            color: StickyColor::Yellow,
+            bbox: BBox::new(100.0, 100.0, 200.0, 140.0),
+        }];
+        let v = vote(&[a, b, reading(vec![], vec![])], &[], &p());
+        assert!(v.result.nodes.is_empty() && v.result.stickies.is_empty());
+        assert_eq!((v.dropped.nodes, v.dropped.stickies), (1, 1));
     }
 
     #[test]
