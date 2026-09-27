@@ -14,7 +14,7 @@ expression: r.markdown_text
 ## Summary
 
 - The pilot focuses on the relay side; the badge flow stays as it is (00:26 to 00:32)
-- Rohan owns the relay storage schema and Mira maps ledger entries to kit widgets (00:33 to 00:43)
+- Rohan owns the relay storage schema and Mira connects ledger records to kit widgets (00:33 to 00:43)
 - Which kiosk widgets to build is still open (00:15 to 01:03)
 
 ## Architecture
@@ -35,9 +35,9 @@ Arrows point from caller to callee, as drawn on the board. Final board state at 
 
 ## Decisions
 
-1. **Leave the badge flow alone for the pilot and focus on the relay side, badge changes wait** (00:26 to 00:32). "leave the badge flow alone for the pilot"
+1. **Freeze the badge flow for the pilot and focus on the relay side, badge changes wait** (00:26 to 00:32). "freeze the badge flow for the pilot"
 2. **Rohan pairs with Mira on the relay tests** (00:47 to 00:56). "pair with Mira on the relay tests"
-3. **Park the Design Kit links for now and focus on the relay side** (00:26 to 00:32). "focus on the relay side"
+3. **Defer Design Kit links until June; focus on the relay side** (00:26 to 00:32). "focus on the relay side"
 
 ## Owners and next steps
 
@@ -52,23 +52,23 @@ Arrows point from caller to callee, as drawn on the board. Final board state at 
 
 **Mira Okafor**
 
-- Map ledger entries to kit widgets (00:33 to 00:40). "map entries to kit widgets"
+- Connect ledger records to kit widgets (00:33 to 00:40). "connect ledger records to the kit widgets"
 
 **Everyone**
 
-- Push work to a branch early, even if it is rough (01:06 to 01:11). "push work to a branch early"
+- Publish each build to the tracker, even if it is unfinished (01:06 to 01:11). "publish each build to the tracker"
 
 ## Open questions
 
-- **Which widgets does the kiosk need?** (board sticky; discussed at 00:15). "Which widgets do we need for the kiosk"
-- **Do we have to change anything in the badge flow?** (board sticky; discussed at 00:20). "change anything in the badge flow"
+- **Which widgets suit the kiosk?** (board sticky; discussed at 00:15). "Which widgets suit the kiosk"
+- **Does the badge flow need edits?** (board sticky; discussed at 00:20). "Does the badge flow need edits"
 
 ## Timeline
 
 | Time | What happened |
 |---|---|
 | 00:00 to 00:18 | Avery walks through the relay, ledger and kiosk architecture |
-| 00:26 to 00:43 | Owners are assigned and the badge flow is left alone |
+| 00:26 to 00:43 | Owners are assigned and the badge flow is frozen |
 | 00:47 to 01:11 | Pairing, open widget question and wrap-up |
 
 ## Caveats
@@ -91,13 +91,13 @@ Speaker labels from diarization and how they were matched:
 
 [00:09] Mira Okafor (speaker uncertain): Hey.
 
-[00:10] Avery Quinn: So the relay pulls entries from the ledger service over REST and the kiosk app talks GraphQL to the relay.
+[00:10] Avery Quinn: Ledger records move to the relay through REST; the kiosk requests them through GraphQL.
 
-[00:20] Rohan Dasgupta: Do we have to change anything in the badge flow, or can we leave it alone?
+[00:20] Rohan Dasgupta: Does the badge flow need edits, or is it fine as it is?
 
-[00:26] Avery Quinn: Let's leave the badge flow alone for the pilot and focus on the relay side.
+[00:26] Avery Quinn: Let's freeze the badge flow for the pilot and focus on the relay side.
 
-[00:33] Mira Okafor: I can take the ledger side and map entries to kit widgets.
+[00:33] Mira Okafor: I'll connect ledger records to the kit widgets.
 
 [00:40] Rohan Dasgupta: I'll design the relay storage schema this week.
 
@@ -105,8 +105,8 @@ Speaker labels from diarization and how they were matched:
 
 [00:52] Rohan Dasgupta: Yes, I will pair with Mira on the relay tests.
 
-[00:58] Avery Quinn: Which widgets do we need for the kiosk? We still have not settled that.
+[00:58] Avery Quinn: Which widgets suit the kiosk? We still have not settled that.
 
-[01:06] Avery Quinn: and everyone should push work to a branch early even if it is rough
+[01:06] Avery Quinn: and everyone should publish each build to the tracker even if it is unfinished
 
-[01:20] Mira Okafor: Sounds good, I'll see you all later.
+[01:20] Mira Okafor: Sounds good, see you on Monday.

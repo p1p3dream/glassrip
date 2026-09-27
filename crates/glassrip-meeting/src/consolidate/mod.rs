@@ -3633,6 +3633,6 @@ mod tests {
         assert_eq!(sticky_kind("Do we need a cache?"), StickyKind::Question);
         assert_eq!(sticky_kind("Beta milestone: March"), StickyKind::Milestone);
         assert_eq!(sticky_kind("Idea: batch the writes"), StickyKind::Idea);
-        assert_eq!(sticky_kind("Clone the landing page"), StickyKind::Note);
+        assert_eq!(sticky_kind("Print the landing maps"), StickyKind::Note);
     }
 }

@@ -421,7 +421,7 @@ mod tests {
             Some(ScreenType::Code)
         );
         // One studio word on a board is not enough.
-        let e = r.evaluate(&["Relationships between content", "Content Manager"]);
+        let e = r.evaluate(&["Rules for content", "Content Queue"]);
         assert!(e.best().is_none());
     }
 

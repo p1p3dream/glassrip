@@ -864,7 +864,7 @@ fn without_you_know(n: &str) -> String {
 
 /// Hedged or modal proposals of a course of action: "maybe we just cache
 /// the photos", "I think we should move the importer", "someone should own
-/// the kiosk", "we probably need someone on the relay importer". Any clause that
+/// the kiosk", "we definitely need somebody on the relay importer". Any clause that
 /// commits ([`clause_commits`], hedges allowed) proposes too. Questions,
 /// conditions and personal activities do not.
 pub fn is_proposal(text: &str) -> bool {
@@ -945,7 +945,7 @@ fn modal_proposal(w: &[&str]) -> bool {
             modal |= !matches!(w[j], "kind" | "of" | "sort" | "like" | "be");
             j += 1;
         }
-        // "someone should be focused on", "we could be using": the word after
+        // "somebody should be working on", "we could be caching": the word after
         // "be" is the verb
         let verb = w.get(j).copied();
         if let Some(v) = verb {
@@ -2488,7 +2488,7 @@ mod tests {
         let texts = [
             // requests to a person, some phrased as questions
             "Could you send the ledger schema to the vendor?",
-            "It would be great if you guys could kind of start on the kiosk importer.",
+            "It would be great if you all could sort of start on the kiosk importer.",
             "Honestly, you should check the badge flow first.",
             "I need you to test the relay config tonight.",
             // an instruction to the group, hedged and after an opener
@@ -2682,7 +2682,7 @@ mod tests {
             (
                 6.0,
                 "avery",
-                "And we probably need someone on the relay importer.",
+                "And we definitely need somebody on the relay importer.",
             ),
             (12.0, "avery", "Does that work for everyone?"),
             (16.0, "rohan", "Yes, sounds good."),
@@ -2761,7 +2761,7 @@ mod tests {
         );
         // "we need someone" proposes an assignment
         assert!(is_proposal(
-            "We probably need someone on the relay importer."
+            "We definitely need somebody on the relay importer."
         ));
         assert!(!is_proposal("Someone told me the build was red."));
     }

@@ -902,8 +902,8 @@ mod tests {
         assert!(!single_name_word("12 members"));
         assert!(name_shaped("Jane Smith").is_some());
         assert!(name_shaped("Jane van Smi...").is_some());
-        assert!(name_shaped("Unread chats").is_none());
-        assert!(name_shaped("Set of cool").is_none());
+        assert!(name_shaped("Pending tasks").is_none());
+        assert!(name_shaped("Pile of old").is_none());
         assert!(name_shaped("Jane").is_none());
         assert!(name_shaped("Order 66 Service").is_none());
         assert!(names_match("Jane van Smi...", "Jane van Smith"));

@@ -75,16 +75,16 @@ fn transcript() -> Vec<TranscriptSegment> {
         segment("seg_00000", "L0", 0.0, "Welcome everyone, this is the kiosk relay planning session for the pilot.", D),
         segment("seg_00001", "L1", 6.0, "Hey, Mira, glad you could join us.", D),
         segment("seg_00002", "L0", 9.2, "Hey.", D),
-        segment("seg_00003", "L0", 10.0, "So the relay pulls entries from the ledger service over REST and the kiosk app talks GraphQL to the relay.", D),
-        segment("seg_00004", "L1", 20.0, "Do we have to change anything in the badge flow, or can we leave it alone?", D),
-        segment("seg_00005", "L0", 26.0, "Let's leave the badge flow alone for the pilot and focus on the relay side.", D),
-        segment("seg_00006", "L2", 33.0, "I can take the ledger side and map entries to kit widgets.", D),
+        segment("seg_00003", "L0", 10.0, "Ledger records move to the relay through REST; the kiosk requests them through GraphQL.", D),
+        segment("seg_00004", "L1", 20.0, "Does the badge flow need edits, or is it fine as it is?", D),
+        segment("seg_00005", "L0", 26.0, "Let's freeze the badge flow for the pilot and focus on the relay side.", D),
+        segment("seg_00006", "L2", 33.0, "I'll connect ledger records to the kit widgets.", D),
         segment("seg_00007", "L1", 40.0, "I'll design the relay storage schema this week.", D),
         segment("seg_00008", "L0", 47.0, "Rohan, can you also pair with Mira on the relay tests?", D),
         segment("seg_00009", "L1", 52.0, "Yes, I will pair with Mira on the relay tests.", D),
-        segment("seg_00010", "L0", 58.0, "Which widgets do we need for the kiosk? We still have not settled that.", D),
-        segment("seg_00011", "L0", 66.0, "and everyone should publish each build to the tracker even if it is rough", G),
-        segment("seg_00012", "L2", 80.0, "Sounds good, I'll see you all later.", D),
+        segment("seg_00010", "L0", 58.0, "Which widgets suit the kiosk? We still have not settled that.", D),
+        segment("seg_00011", "L0", 66.0, "and everyone should publish each build to the tracker even if it is unfinished", G),
+        segment("seg_00012", "L2", 80.0, "Sounds good, see you on Monday.", D),
     ]
 }
 
@@ -399,7 +399,7 @@ async fn speakers_and_notes_end_to_end() {
     assert_eq!(n.report.items_repaired, 1);
     let dropped: Vec<&str> = n.report.dropped.iter().map(|d| d.text.as_str()).collect();
     assert_eq!(dropped.len(), 2, "{dropped:?}");
-    assert!(dropped.iter().any(|d| d.contains("See you all later")));
+    assert!(dropped.iter().any(|d| d.contains("See you on Monday")));
     assert!(dropped.iter().any(|d| d.contains("every lobby")));
     assert_eq!(n.open_questions.len(), 2);
     assert!(n
@@ -612,10 +612,7 @@ async fn quality_options_keep_the_pipeline_sound() {
         .map(|(_, u)| u.as_str())
         .unwrap();
     assert!(reduce.contains("already in the notes from the board's question stickies"));
-    assert!(
-        reduce.contains("Which widgets do we need for the kiosk?"),
-        "{reduce}"
-    );
+    assert!(reduce.contains("Which widgets suit the kiosk?"), "{reduce}");
 }
 
 // ---- empty inputs: no speech, no participant names, no board, no keyframes

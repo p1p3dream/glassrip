@@ -192,7 +192,7 @@ mod tests {
         assert_eq!(role_of("Ledger Service"), Role::Processing);
         assert_eq!(role_of("Relay API"), Role::Api);
         assert_eq!(role_of("Kiosk App"), Role::Client);
-        assert_eq!(role_of("/frontend design system"), Role::Client);
+        assert_eq!(role_of("/frontend widget kit"), Role::Client);
         assert_eq!(role_of("Orders DB"), Role::Storage);
         assert_eq!(role_of("Acme"), Role::External);
     }

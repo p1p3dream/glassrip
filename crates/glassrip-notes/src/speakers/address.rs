@@ -190,7 +190,7 @@ mod tests {
                 "s2",
                 "L1",
                 20.0,
-                &["Um,", "Avery,", "you", "want", "to", "chime", "in?"],
+                &["Um,", "Avery,", "any", "thoughts", "on", "this?"],
             ),
             seg("s3", "L0", 40.0, &["what", "about", "you", "Rowan?"]),
             seg("s4", "L0", 60.0, &["We", "told", "Avery", "already."]),

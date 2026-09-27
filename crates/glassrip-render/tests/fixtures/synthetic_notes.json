@@ -44,7 +44,7 @@
     },
     {
       "id": "s2",
-      "text": "Rohan owns the relay storage schema and Mira maps ledger entries to kit widgets",
+      "text": "Rohan owns the relay storage schema and Mira connects ledger records to kit widgets",
       "t_start_s": 33.0,
       "t_end_s": 43.2,
       "evidence": {
@@ -77,7 +77,7 @@
   "decisions": [
     {
       "id": "d1",
-      "text": "Leave the badge flow alone for the pilot and focus on the relay side, badge changes wait",
+      "text": "Freeze the badge flow for the pilot and focus on the relay side, badge changes wait",
       "t_start_s": 26.0,
       "t_end_s": 32.0,
       "evidence": {
@@ -88,7 +88,7 @@
         "keyframe_ids": []
       },
       "quote": {
-        "text": "leave the badge flow alone for the pilot",
+        "text": "freeze the badge flow for the pilot",
         "segment_id": "seg_00005",
         "matched": "raw"
       }
@@ -114,7 +114,7 @@
     },
     {
       "id": "d3",
-      "text": "Park the Design Kit links for now and focus on the relay side",
+      "text": "Defer Design Kit links until June; focus on the relay side",
       "t_start_s": 26.0,
       "t_end_s": 32.0,
       "evidence": {
@@ -156,7 +156,7 @@
       "id": "a2",
       "person_id": "mira-okafor",
       "owner": "Mira Okafor",
-      "task": "Map ledger entries to kit widgets",
+      "task": "Connect ledger records to kit widgets",
       "t_s": 33.0,
       "t_end_s": 40.0,
       "evidence": {
@@ -169,7 +169,7 @@
         "keyframe_ids": []
       },
       "quote": {
-        "text": "map entries to kit widgets",
+        "text": "connect ledger records to the kit widgets",
         "segment_id": "seg_00006",
         "matched": "raw"
       }
@@ -194,7 +194,7 @@
       "id": "a4",
       "person_id": null,
       "owner": "Everyone",
-      "task": "Push work to a branch early, even if it is rough",
+      "task": "Publish each build to the tracker, even if it is unfinished",
       "t_s": 66.0,
       "t_end_s": 71.6,
       "evidence": {
@@ -205,7 +205,7 @@
         "keyframe_ids": []
       },
       "quote": {
-        "text": "push work to a branch early",
+        "text": "publish each build to the tracker",
         "segment_id": "seg_00011",
         "matched": "raw"
       }
@@ -234,7 +234,7 @@
   "open_questions": [
     {
       "id": "q1",
-      "text": "Which widgets does the kiosk need?",
+      "text": "Which widgets suit the kiosk?",
       "source": "board_and_transcript",
       "t_s": 15.0,
       "evidence": {
@@ -249,14 +249,14 @@
         ]
       },
       "quote": {
-        "text": "Which widgets do we need for the kiosk",
+        "text": "Which widgets suit the kiosk",
         "segment_id": "seg_00010",
         "matched": "raw"
       }
     },
     {
       "id": "q2",
-      "text": "Do we have to change anything in the badge flow?",
+      "text": "Does the badge flow need edits?",
       "source": "board_and_transcript",
       "t_s": 20.0,
       "evidence": {
@@ -271,7 +271,7 @@
         ]
       },
       "quote": {
-        "text": "change anything in the badge flow",
+        "text": "Does the badge flow need edits",
         "segment_id": "seg_00004",
         "matched": "raw"
       }
@@ -298,7 +298,7 @@
       "id": "t2",
       "t_start_s": 26.0,
       "t_end_s": 43.2,
-      "text": "Owners are assigned and the badge flow is left alone",
+      "text": "Owners are assigned and the badge flow is frozen",
       "evidence": {
         "segment_ids": [
           "seg_00005",
@@ -395,7 +395,7 @@
       "end_s": 18.0,
       "speaker": "Avery Quinn",
       "person_id": "avery-quinn",
-      "text": "So the relay pulls entries from the ledger service over REST and the kiosk app talks GraphQL to the relay.",
+      "text": "Ledger records move to the relay through REST; the kiosk requests them through GraphQL.",
       "segment_ids": [
         "seg_00003"
       ],
@@ -406,7 +406,7 @@
       "end_s": 26.4,
       "speaker": "Rohan Dasgupta",
       "person_id": "rohan-dasgupta",
-      "text": "Do we have to change anything in the badge flow, or can we leave it alone?",
+      "text": "Does the badge flow need edits, or is it fine as it is?",
       "segment_ids": [
         "seg_00004"
       ],
@@ -417,7 +417,7 @@
       "end_s": 32.0,
       "speaker": "Avery Quinn",
       "person_id": "avery-quinn",
-      "text": "Let's leave the badge flow alone for the pilot and focus on the relay side.",
+      "text": "Let's freeze the badge flow for the pilot and focus on the relay side.",
       "segment_ids": [
         "seg_00005"
       ],
@@ -428,7 +428,7 @@
       "end_s": 37.8,
       "speaker": "Mira Okafor",
       "person_id": "mira-okafor",
-      "text": "I can take the ledger side and map entries to kit widgets.",
+      "text": "I'll connect ledger records to the kit widgets.",
       "segment_ids": [
         "seg_00006"
       ],
@@ -472,7 +472,7 @@
       "end_s": 63.6,
       "speaker": "Avery Quinn",
       "person_id": "avery-quinn",
-      "text": "Which widgets do we need for the kiosk? We still have not settled that.",
+      "text": "Which widgets suit the kiosk? We still have not settled that.",
       "segment_ids": [
         "seg_00010"
       ],
@@ -483,7 +483,7 @@
       "end_s": 71.6,
       "speaker": "Avery Quinn",
       "person_id": "avery-quinn",
-      "text": "and everyone should push work to a branch early even if it is rough",
+      "text": "and everyone should publish each build to the tracker even if it is unfinished",
       "segment_ids": [
         "seg_00011"
       ],
@@ -494,7 +494,7 @@
       "end_s": 82.8,
       "speaker": "Mira Okafor",
       "person_id": "mira-okafor",
-      "text": "Sounds good, I'll see you all later.",
+      "text": "Sounds good, see you on Monday.",
       "segment_ids": [
         "seg_00012"
       ],
@@ -555,7 +555,7 @@
     "dropped": [
       {
         "section": "action_items",
-        "text": "Mira: See you all later",
+        "text": "Mira: See you on Monday",
         "reasons": [
           "greeting or farewell"
         ]

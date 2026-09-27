@@ -495,7 +495,7 @@ mod tests {
 
     #[test]
     fn dictionary_scoring_and_decision() {
-        assert_eq!(dictionary_hits("The Mobile App, and a new PAGE: hello!"), 6);
+        assert_eq!(dictionary_hits("The Team Board, and a new PAGE: hello!"), 6);
         assert_eq!(dictionary_hits("ǝɥʇ dnoɹƃ sı"), 0);
         assert_eq!(decide_by_hits([40, 2, 5, 1], 5, 1.5).unwrap(), 0);
         let e = decide_by_hits([30, 0, 25, 0], 5, 1.5).unwrap_err();
