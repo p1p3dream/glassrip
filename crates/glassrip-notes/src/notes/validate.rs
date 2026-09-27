@@ -210,6 +210,12 @@ pub struct Corpus {
     /// keyframes that opened owner assignments), with the owner and target of
     /// each assignment they concern.
     owner_keys: BTreeMap<String, Vec<OwnerKey>>,
+    /// Every owner assignment on the boards.
+    assignments: Vec<OwnerKey>,
+    /// Transcript lines in time order (who replied to whom).
+    lines: Vec<NamedLine>,
+    /// Indices into `lines` of each segment's lines.
+    line_index: BTreeMap<String, Vec<usize>>,
 }
 
 /// The owner and target of an owner-tag change, as tokens.
@@ -217,8 +223,12 @@ pub struct Corpus {
 struct OwnerKey {
     /// Tokens of the owner's display name.
     name: Vec<String>,
+    /// The owner's display name.
+    owner: String,
     /// Content tokens of the target.
     target: Vec<String>,
+    /// The target as text.
+    target_text: String,
     /// The owner tag moved here from another target (a change the group made);
     /// a plain owner tag only says who is responsible.
     moved: bool,
@@ -273,6 +283,84 @@ impl OwnerKey {
         let hit = distinctive.iter().filter(|t| words.contains(*t)).count();
         hit >= 2 && hit * 2 > distinctive.len()
     }
+}
+
+/// Verbs of an ownership task ("Own the kiosk", "Work on the importer",
+/// "Take the ledger").
+const OWNERSHIP_VERBS: &[&str] = &["own", "work", "lead", "handle", "manage", "take", "drive"];
+/// Words that only say "ownership" in an ownership task.
+const OWNERSHIP_FILLERS: &[&str] = &["ownership", "over", "owner", "responsibility"];
+
+/// The content words an ownership task says the owner owns: the task opens
+/// (after "to", "will") with an ownership verb, and what follows is kept
+/// without stopwords and ownership fillers. `None` for other tasks.
+pub fn ownership_words(task: &str) -> Option<BTreeSet<String>> {
+    let toks = tokens(task);
+    let mut i = 0;
+    while toks
+        .get(i)
+        .is_some_and(|t| TASK_PREFIXES.contains(&t.as_str()))
+    {
+        i += 1;
+    }
+    if !OWNERSHIP_VERBS.contains(&toks.get(i)?.as_str()) {
+        return None;
+    }
+    let words: BTreeSet<String> = toks[i + 1..]
+        .iter()
+        .filter(|t| !is_stopword(t) && !OWNERSHIP_FILLERS.contains(&t.as_str()))
+        .cloned()
+        .collect();
+    (!words.is_empty()).then_some(words)
+}
+
+/// The ownership words name this target and add at most one word of their
+/// own ("Own the kiosk rollout" owns the Kiosk App; "Work on the kiosk crash
+/// report for the audit" is a task about it, not its ownership).
+fn owns_target(words: &BTreeSet<String>, target: &[String]) -> bool {
+    names_target(words, target) && words.iter().filter(|w| !target.contains(w)).count() <= 1
+}
+
+/// Decisions backed only by a plain owner tag (none moved) that is still on
+/// the board are refiled as "Own <target>" action items for the tag's owner,
+/// keeping their citations: an owner tag says who is responsible, which is a
+/// task, not a decision. Skipped when the draft already has an action of that
+/// owner naming the target. Returns how many were refiled.
+pub fn refile_owner_decisions(draft: &mut Draft, corpus: &Corpus) -> usize {
+    let mut kept = Vec::new();
+    let mut refiled = 0;
+    for d in std::mem::take(&mut draft.decisions) {
+        let words: BTreeSet<String> = tokens(&d.text).into_iter().collect();
+        let backing: Vec<&OwnerKey> = d
+            .event_ids
+            .iter()
+            .chain(&d.keyframe_ids)
+            .filter_map(|id| corpus.owner_keys.get(id.trim()))
+            .flatten()
+            .filter(|k| k.backs(&words))
+            .collect();
+        let plain = backing.iter().all(|k| !k.moved);
+        let Some(k) = backing.iter().find(|k| k.current).filter(|_| plain) else {
+            kept.push(d);
+            continue;
+        };
+        let has_action = draft.action_items.iter().any(|a| {
+            let owner = tokens(&a.owner);
+            let task: BTreeSet<String> = content_tokens(&a.task).into_iter().collect();
+            (owner == k.name || owner.first() == k.name.first()) && names_target(&task, &k.target)
+        });
+        if !has_action {
+            draft.action_items.push(DraftItem {
+                owner: k.owner.clone(),
+                task: format!("Own {}", k.target_text),
+                text: String::new(),
+                ..d
+            });
+        }
+        refiled += 1;
+    }
+    draft.decisions = kept;
+    refiled
 }
 
 /// Validation switches (see [`super::candidates`]).
@@ -337,14 +425,19 @@ impl Corpus {
             }
         }
         let mut owner_keys: BTreeMap<String, Vec<OwnerKey>> = BTreeMap::new();
+        let mut assignments = Vec::new();
         for b in boards {
             for o in &b.owner_assignments {
+                let target_text = sanitize_dashes(&crate::board::target_text(&o.target));
                 let words = OwnerKey {
                     name: tokens(&o.display_name),
-                    target: content_tokens(&crate::board::target_text(&o.target)),
+                    owner: o.display_name.trim().to_string(),
+                    target: content_tokens(&target_text),
+                    target_text,
                     moved: o.moved_from.is_some(),
                     current: o.valid_to_s >= b.end_s() - 0.5,
                 };
+                assignments.push(words.clone());
                 // the owner events of this assignment (same person, same target
                 // by id, same kind, near its start): an event backs a move only
                 // through the move assignment it was matched to
@@ -367,12 +460,78 @@ impl Corpus {
                 }
             }
         }
+        let mut ordered: Vec<NamedLine> = lines.to_vec();
+        ordered.sort_by(|a, b| a.start_s.total_cmp(&b.start_s));
+        let mut line_index: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (i, l) in ordered.iter().enumerate() {
+            line_index.entry(l.segment_id.clone()).or_default().push(i);
+        }
         Self {
             segs,
             times,
             table,
             owner_keys,
+            assignments,
+            lines: ordered,
+            line_index,
         }
+    }
+
+    /// A cited segment holds a commitment ([`super::candidates::has_standing_commitment`],
+    /// in its verbatim or corrected text) that no line in reply retracts.
+    fn commits(&self, id: &str) -> bool {
+        let Some(s) = self.segs.get(id) else {
+            return false;
+        };
+        let committed = super::candidates::has_standing_commitment(&s.text)
+            || super::candidates::has_standing_commitment(&s.text_raw);
+        committed
+            && !self
+                .line_index
+                .get(id)
+                .and_then(|v| v.last())
+                .is_some_and(|i| super::candidates::retracted_after(&self.lines, *i))
+    }
+
+    /// The segment proposes something another speaker then agreed to
+    /// ([`super::candidates::accepted_proposal`]), and the proposal line
+    /// shares a content word with `words` (the item's): an agreement vouches
+    /// only for what was proposed. Returns the agreeing segment.
+    fn agreement(&self, id: &str, words: &BTreeSet<String>) -> Option<String> {
+        self.line_index.get(id)?.iter().find_map(|i| {
+            let l = &self.lines[*i];
+            let on_topic = content_tokens(&l.text)
+                .iter()
+                .chain(&content_tokens(&l.text_raw))
+                .any(|t| words.contains(t));
+            if !on_topic {
+                return None;
+            }
+            super::candidates::accepted_proposal(&self.lines, *i)
+                .map(|j| self.lines[j].segment_id.clone())
+        })
+    }
+
+    /// For an ownership task ([`ownership_words`]) of `owner`: the target it
+    /// names when every owner tag of this person on that target was taken
+    /// off before the end (moved elsewhere or removed) and none is still on
+    /// it. "Work on the kiosk" after the owner's tag moved from the kiosk to
+    /// the ledger is no longer their task.
+    fn superseded_ownership(&self, owner: &str, task: &str) -> Option<String> {
+        let words = ownership_words(task)?;
+        let name = tokens(owner);
+        let mine: Vec<&OwnerKey> = self.assignments.iter().filter(|k| k.name == name).collect();
+        let named: Vec<&OwnerKey> = mine
+            .into_iter()
+            .filter(|k| owns_target(&words, &k.target))
+            .collect();
+        if named.iter().any(|k| k.current) {
+            return None;
+        }
+        named
+            .into_iter()
+            .find(|k| !k.current)
+            .map(|k| k.target_text.clone())
     }
 
     /// The alias table.
@@ -560,6 +719,7 @@ const TASK_VERBS: &[&str] = &[
     "document",
     "draft",
     "draw",
+    "drive",
     "enable",
     "estimate",
     "evaluate",
@@ -575,6 +735,7 @@ const TASK_VERBS: &[&str] = &[
     "follow",
     "gather",
     "get",
+    "handle",
     "hook",
     "identify",
     "implement",
@@ -584,10 +745,12 @@ const TASK_VERBS: &[&str] = &[
     "install",
     "integrate",
     "investigate",
+    "lead",
     "learn",
     "list",
     "look",
     "make",
+    "manage",
     "map",
     "measure",
     "meet",
@@ -758,11 +921,51 @@ const PERSONAL_PHRASES: &[&str] = &[
     "take a quick call",
     "get the door",
     "answer the door",
+    "drive home",
+    "head home",
+    "go home",
 ];
 
-/// True when a task is a personal activity rather than work.
+/// Words that open a time adjunct ("after lunch", "when I'm back from the
+/// dentist"): it says when, not what.
+const TIME_ADJUNCTS: &[&str] = &[
+    "after", "before", "during", "until", "till", "once", "while", "when",
+];
+
+/// The text without its time adjuncts: a trailing one ("review the logs
+/// after lunch") is cut at its first word, and a fronted one set off by a comma
+/// ("After lunch, review the logs") is left out. A fronted adjunct with nothing after
+/// it is kept, since it may be all there is.
+fn without_time_adjuncts(text: &str) -> String {
+    let pieces: Vec<Vec<String>> = text
+        .split([',', ';', ':'])
+        .map(tokens)
+        .filter(|p| !p.is_empty())
+        .collect();
+    let mut kept: Vec<String> = Vec::new();
+    for (i, p) in pieces.iter().enumerate() {
+        let fronted = TIME_ADJUNCTS.contains(&p[0].as_str());
+        if fronted {
+            if i + 1 < pieces.len() {
+                continue;
+            }
+            kept.push(p.join(" "));
+            continue;
+        }
+        let cut = p
+            .iter()
+            .position(|t| TIME_ADJUNCTS.contains(&t.as_str()))
+            .unwrap_or(p.len());
+        kept.push(p[..cut].join(" "));
+    }
+    kept.join(" , ")
+}
+
+/// True when a task is a personal activity rather than work. A time adjunct
+/// does not make work personal ("Review the kiosk logs after lunch" is
+/// work; "Grab lunch after the demo" is not).
 pub fn is_personal_activity(text: &str) -> bool {
-    let toks = tokens(text);
+    let toks = tokens(&without_time_adjuncts(text));
     // "walk through the design" is a work walkthrough, not a walk
     let n = format!(" {} ", toks.join(" ")).replace(" walk through ", " walkthrough ");
     toks.iter().any(|t| PERSONAL.contains(&t.as_str()))
@@ -930,18 +1133,36 @@ pub fn check_with(
     if needs_segment && evidence.segment_ids.is_empty() && !board_ok {
         reasons.push("must cite at least one transcript segment".into());
     }
+    // the line where another speaker agreed to a cited proposal, added to the
+    // evidence once the item passes
+    let mut agreed_segment = None;
     if opts.precision_guard && section == Section::Decisions && !board_backed {
-        let committed = evidence.segment_ids.iter().any(|id| {
-            corpus.segs.get(id).is_some_and(|s| {
-                super::candidates::has_commitment(&s.text)
-                    || super::candidates::has_commitment(&s.text_raw)
-            })
-        });
+        let content_words: BTreeSet<String> = content_tokens(&text).into_iter().collect();
+        let committed = evidence.segment_ids.iter().any(|id| corpus.commits(id));
         if !committed {
-            reasons.push(
-                "a decision must cite a line where someone commits to it (or an owner tag moved on the board)"
-                    .into(),
-            );
+            agreed_segment = evidence
+                .segment_ids
+                .iter()
+                .find_map(|id| corpus.agreement(id, &content_words));
+            if agreed_segment.is_none() {
+                reasons.push(
+                    "a decision must cite a line where someone commits to it and does not take it back, or a proposal another participant agreed to (or an owner tag moved on the board)"
+                        .into(),
+                );
+            }
+        }
+    }
+    if section == Section::ActionItems {
+        for o in &owners {
+            if let Some(target) = corpus.superseded_ownership(&o.name, &text) {
+                return Err(Failure {
+                    reasons: vec![format!(
+                        "{}'s owner tag on {target} was taken off the board: the task moved on",
+                        o.name
+                    )],
+                    fatal: true,
+                });
+            }
         }
     }
     for id in &evidence.segment_ids {
@@ -974,6 +1195,12 @@ pub fn check_with(
             reasons,
             fatal: false,
         });
+    }
+    let mut evidence = evidence;
+    if let Some(id) = agreed_segment {
+        if !evidence.segment_ids.contains(&id) {
+            evidence.segment_ids.push(id);
+        }
     }
     let mut times: Vec<(f64, f64)> = evidence
         .segment_ids
@@ -1030,6 +1257,49 @@ pub struct Sections {
 /// Near-duplicate threshold (content-token Jaccard) within a section.
 const DUP_JACCARD: f64 = 0.7;
 
+/// Two items restate one claim: they cite a common id, and the content
+/// words of one (at least two) are all in the other ("Skip the importer for
+/// now" and "Skip the importer for now to focus on the ledger", both citing
+/// the line that says it), or both are ownership tasks whose owned words are
+/// nested or share two words and differ by at most one on each side ("Own the
+/// Kiosk App", "Work on the Kiosk App"; "Own the kiosk app link", "Work on
+/// the kiosk app integration"). Items citing different evidence are kept
+/// apart however alike.
+fn restates(a: &Checked, b: &Checked) -> bool {
+    let ids = |e: &Evidence| -> BTreeSet<String> {
+        e.segment_ids
+            .iter()
+            .chain(&e.event_ids)
+            .chain(&e.keyframe_ids)
+            .cloned()
+            .collect()
+    };
+    if ids(&a.evidence).is_disjoint(&ids(&b.evidence)) {
+        return false;
+    }
+    let nested = |x: &BTreeSet<String>, y: &BTreeSet<String>| {
+        let (small, large) = if x.len() <= y.len() { (x, y) } else { (y, x) };
+        small.is_subset(large)
+    };
+    let ta: BTreeSet<String> = content_tokens(&a.text).into_iter().collect();
+    let tb: BTreeSet<String> = content_tokens(&b.text).into_iter().collect();
+    if ta.len().min(tb.len()) >= 2 && nested(&ta, &tb) {
+        return true;
+    }
+    a.section == Section::ActionItems
+        && match (ownership_words(&a.text), ownership_words(&b.text)) {
+            // "Own the kiosk app link" and "Work on the kiosk app
+            // integration": the same target with one word of framing each
+            (Some(x), Some(y)) => {
+                nested(&x, &y)
+                    || (x.intersection(&y).count() >= 2
+                        && x.difference(&y).count() <= 1
+                        && y.difference(&x).count() <= 1)
+            }
+            _ => false,
+        }
+}
+
 /// Assembles checked items into sections: duplicates merged, times ordered, ids assigned.
 pub fn assemble(checked: Vec<Checked>) -> Sections {
     let mut by_section: BTreeMap<Section, Vec<Checked>> = BTreeMap::new();
@@ -1037,10 +1307,10 @@ pub fn assemble(checked: Vec<Checked>) -> Sections {
         let list = by_section.entry(c.section).or_default();
         let toks = content_tokens(&c.text);
         let same_owner = |a: &Checked| a.owners == c.owners;
-        match list
-            .iter_mut()
-            .find(|x| same_owner(x) && jaccard(&content_tokens(&x.text), &toks) >= DUP_JACCARD)
-        {
+        match list.iter_mut().find(|x| {
+            same_owner(x)
+                && (jaccard(&content_tokens(&x.text), &toks) >= DUP_JACCARD || restates(x, &c))
+        }) {
             Some(x) => {
                 x.evidence.merge(&c.evidence);
                 x.t_start_s = x.t_start_s.min(c.t_start_s);
@@ -1884,7 +2154,7 @@ mod tests {
         a.segment_ids = vec!["s3".into()];
         assert!(check(Section::ActionItems, &a, &c).unwrap_err().fatal);
         a.owner = "Everyone and Avery".into();
-        a.task = "Push work to a branch early".into();
+        a.task = "Publish each kiosk release in the tracker".into();
         let ok = check(Section::ActionItems, &a, &c).unwrap();
         assert_eq!(ok.owners.len(), 2);
         a.owner = "Kristen".into();
@@ -1946,6 +2216,371 @@ mod tests {
         );
         assert_eq!(s.open_questions[1].source, QuestionSource::Board);
         assert_eq!(s.open_questions[1].id, "q2");
+    }
+
+    fn said(id: &str, t: f64, who: &str, text: &str) -> NamedLine {
+        let mut l = line(id, t, text, text);
+        l.person_id = Some(who.into());
+        l.speaker = who.into();
+        l
+    }
+
+    fn talk(lines: &[NamedLine]) -> Corpus {
+        Corpus::new(
+            lines,
+            &[],
+            &KeyframeTimes::default(),
+            AliasTable::from_names(&["Avery Quinn", "Rohan Dasgupta"]),
+        )
+    }
+
+    #[test]
+    fn an_agreed_proposal_is_a_decision_and_cites_the_agreement() {
+        let proposal = "Maybe we just cache the badge photos on the kiosk.";
+        let d = item("Cache the badge photos on the kiosk", &["s1"], "");
+        // agreed by another speaker: kept, and the agreement is cited
+        let c = talk(&[
+            said("s1", 0.0, "avery-quinn", proposal),
+            said("s2", 5.0, "rohan-dasgupta", "Yeah, that makes sense to me."),
+        ]);
+        let ok = check_with(Section::Decisions, &d, &c, &ALL).unwrap();
+        assert_eq!(ok.evidence.segment_ids, vec!["s1", "s2"]);
+        assert_eq!((ok.t_start_s, ok.t_end_s), (0.0, 8.0));
+        // only floated, agreed by the proposer alone, objected to, or agreed
+        // and then taken back: rejected
+        for replies in [
+            vec![],
+            vec![said("s2", 5.0, "avery-quinn", "Sounds good to me.")],
+            vec![said(
+                "s2",
+                5.0,
+                "rohan-dasgupta",
+                "I don't think so, the kiosk has no disk space.",
+            )],
+            vec![
+                said("s2", 5.0, "rohan-dasgupta", "Sounds good."),
+                said(
+                    "s3",
+                    9.0,
+                    "avery-quinn",
+                    "Actually, scratch that, we keep loading them live.",
+                ),
+            ],
+        ] {
+            let mut lines = vec![said("s1", 0.0, "avery-quinn", proposal)];
+            lines.extend(replies.clone());
+            let e = check_with(Section::Decisions, &d, &talk(&lines), &ALL).unwrap_err();
+            assert!(
+                e.reasons.iter().any(|r| r.contains("commits")),
+                "{replies:?}"
+            );
+        }
+        // an agreed proposal does not vouch for a decision about something else
+        let c = talk(&[
+            said("s1", 0.0, "avery-quinn", proposal),
+            said("s2", 5.0, "rohan-dasgupta", "Yeah, that makes sense to me."),
+        ]);
+        let other = item("Migrate the ledger service to the new cluster", &["s1"], "");
+        assert!(check_with(Section::Decisions, &other, &c, &ALL).is_err());
+        // an agreement elsewhere does not back a decision citing a line with no proposal
+        let c = talk(&[
+            said("s1", 0.0, "avery-quinn", "The kiosk demo runs on Friday."),
+            said("s2", 5.0, "rohan-dasgupta", "Sounds good."),
+        ]);
+        assert!(check_with(Section::Decisions, &d, &c, &ALL).is_err());
+    }
+
+    #[test]
+    fn a_retracted_commitment_is_not_a_decision() {
+        let d = item("Ship the importer on Friday", &["s1"], "");
+        let commit = "Let's ship the importer on Friday.";
+        // kept when it stands
+        let c = talk(&[
+            said("s1", 0.0, "avery-quinn", commit),
+            said("s2", 5.0, "rohan-dasgupta", "Great, I'll tell the vendor."),
+        ]);
+        assert!(check_with(Section::Decisions, &d, &c, &ALL).is_ok());
+        // taken back in the same line, or by anyone right after
+        for lines in [
+            vec![said(
+                "s1",
+                0.0,
+                "avery-quinn",
+                "Let's ship the importer on Friday. Actually, never mind.",
+            )],
+            vec![
+                said("s1", 0.0, "avery-quinn", commit),
+                said(
+                    "s2",
+                    5.0,
+                    "rohan-dasgupta",
+                    "Wait, no, legal has not signed off.",
+                ),
+            ],
+        ] {
+            assert!(check_with(Section::Decisions, &d, &talk(&lines), &ALL).is_err());
+        }
+    }
+
+    #[test]
+    fn a_time_adjunct_does_not_make_work_personal() {
+        let c = guard_corpus();
+        let task = |t: &str| DraftItem {
+            owner: "Avery".into(),
+            task: t.into(),
+            segment_ids: vec!["s1".into()],
+            ..Default::default()
+        };
+        for t in [
+            "Review the kiosk logs after lunch and the dentist",
+            "Sync with the vendor when back from the dentist",
+        ] {
+            assert!(
+                check_with(Section::ActionItems, &task(t), &c, &ALL).is_ok(),
+                "{t}"
+            );
+        }
+        assert!(!is_personal_activity("After lunch, review the kiosk logs"));
+        for t in [
+            "Grab lunch after the demo",
+            "Take a break after the standup",
+            "Pick up the kids before the review",
+            "After lunch, grab a coffee",
+            "After the dentist",
+        ] {
+            assert!(is_personal_activity(t), "{t}");
+        }
+        let e = check_with(
+            Section::ActionItems,
+            &task("Grab lunch after the demo"),
+            &c,
+            &ALL,
+        );
+        assert!(e.unwrap_err().fatal);
+    }
+
+    /// Mira's owner tag on the Ledger Store (plain, taken off at 60 s) moved to
+    /// the Kiosk App (current); Rohan's plain tag on the Badge Printer (current).
+    fn moved_board_corpus(lines: &[NamedLine]) -> Corpus {
+        use crate::board::build;
+        let mut b = build::board("b", 100.0);
+        b.nodes = vec![
+            build::node("n1", "Ledger Store", 0.0, 100.0, None),
+            build::node("n2", "Kiosk App", 0.0, 100.0, None),
+            build::node("n3", "Badge Printer", 0.0, 100.0, None),
+        ];
+        let (t1, t2, t3) = (
+            build::node_target(&b, "n1"),
+            build::node_target(&b, "n2"),
+            build::node_target(&b, "n3"),
+        );
+        let mut plain = build::owner("mira-okafor", "Mira Okafor", t1.clone(), 20.0, 60.0, None);
+        plain.opened_at_keyframe = "kf_000020".into();
+        let mut moved = build::owner("mira-okafor", "Mira Okafor", t2, 60.0, 100.0, Some(t1));
+        moved.opened_at_keyframe = "kf_000060".into();
+        let mut rohan = build::owner("rohan-dasgupta", "Rohan Dasgupta", t3, 30.0, 100.0, None);
+        rohan.opened_at_keyframe = "kf_000030".into();
+        b.owner_assignments = vec![plain, moved, rohan];
+        Corpus::new(
+            lines,
+            &[b],
+            &KeyframeTimes::default(),
+            AliasTable::from_names(&["Mira Okafor", "Rohan Dasgupta"]),
+        )
+    }
+
+    #[test]
+    fn plain_owner_tag_decisions_are_refiled_as_tasks() {
+        let lines = vec![said(
+            "s1",
+            25.0,
+            "mira-okafor",
+            "Let's put Rohan on this one.",
+        )];
+        let c = moved_board_corpus(&lines);
+        let dec = |text: &str, kf: &str| DraftItem {
+            text: text.into(),
+            segment_ids: vec!["s1".into()],
+            keyframe_ids: vec![kf.into()],
+            ..Default::default()
+        };
+        let mut d = Draft {
+            decisions: vec![
+                // a plain, current tag: a task for its owner
+                dec("Rohan Dasgupta owns the Badge Printer", "kf_000030"),
+                // a move: stays a decision
+                dec(
+                    "Mira Okafor moves from Ledger Store to Kiosk App",
+                    "kf_000060",
+                ),
+                // a plain tag taken off: not a current task, left for the guard
+                dec("Mira Okafor owns the Ledger Store", "kf_000020"),
+                // no owner tag behind it
+                dec("Keep the ledger API on REST", "kf_000030"),
+            ],
+            ..Draft::default()
+        };
+        assert_eq!(refile_owner_decisions(&mut d, &c), 1);
+        let texts: Vec<&str> = d.decisions.iter().map(|x| x.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "Mira Okafor moves from Ledger Store to Kiosk App",
+                "Mira Okafor owns the Ledger Store",
+                "Keep the ledger API on REST",
+            ]
+        );
+        assert_eq!(d.action_items.len(), 1);
+        let a = &d.action_items[0];
+        assert_eq!(
+            (a.owner.as_str(), a.task.as_str()),
+            ("Rohan Dasgupta", "Own Badge Printer")
+        );
+        assert_eq!(a.keyframe_ids, vec!["kf_000030"]);
+        let ok = check_with(Section::ActionItems, a, &c, &ALL).unwrap();
+        assert_eq!(ok.owners[0].person_id.as_deref(), Some("rohan-dasgupta"));
+        // the owner already has an action naming the target: no duplicate
+        let mut d = Draft {
+            decisions: vec![dec("Rohan Dasgupta owns the Badge Printer", "kf_000030")],
+            action_items: vec![DraftItem {
+                owner: "Rohan".into(),
+                task: "Fix the badge printer driver".into(),
+                segment_ids: vec!["s1".into()],
+                ..Default::default()
+            }],
+            ..Draft::default()
+        };
+        assert_eq!(refile_owner_decisions(&mut d, &c), 1);
+        assert!(d.decisions.is_empty());
+        assert_eq!(d.action_items.len(), 1);
+    }
+
+    #[test]
+    fn ownership_of_a_target_the_owner_moved_off_is_superseded() {
+        let lines = vec![said(
+            "s1",
+            25.0,
+            "mira-okafor",
+            "I'll work on the ledger store.",
+        )];
+        let c = moved_board_corpus(&lines);
+        let act = |owner: &str, task: &str| DraftItem {
+            owner: owner.into(),
+            task: task.into(),
+            segment_ids: vec!["s1".into()],
+            ..Default::default()
+        };
+        for task in ["Work on the Ledger Store", "Own Ledger Store integration"] {
+            let e = check_with(Section::ActionItems, &act("Mira", task), &c, &ALL).unwrap_err();
+            assert!(
+                e.fatal && e.reasons[0].contains("taken off"),
+                "{task}: {e:?}"
+            );
+        }
+        // her current target, a task about the old one that is not its
+        // ownership, and another person's ownership are kept
+        for (owner, task) in [
+            ("Mira", "Own the Kiosk App"),
+            ("Mira", "Migrate the ledger store records"),
+            ("Rohan", "Work on the Ledger Store"),
+            ("Rohan", "Own the Badge Printer"),
+        ] {
+            assert!(
+                check_with(Section::ActionItems, &act(owner, task), &c, &ALL).is_ok(),
+                "{owner}: {task}"
+            );
+        }
+        assert_eq!(
+            ownership_words("Take ownership of the kiosk app"),
+            Some(
+                ["kiosk".to_string(), "app".to_string()]
+                    .into_iter()
+                    .collect()
+            )
+        );
+        assert_eq!(ownership_words("Fix the kiosk app"), None);
+    }
+
+    #[test]
+    fn restated_items_merge_only_on_shared_evidence() {
+        let c = talk(&[
+            said(
+                "s1",
+                0.0,
+                "avery-quinn",
+                "Let's skip the ledger importer for now.",
+            ),
+            said(
+                "s2",
+                5.0,
+                "avery-quinn",
+                "Let's skip the ledger importer tests for the kiosk.",
+            ),
+            said("s3", 9.0, "avery-quinn", "I'll own the kiosk app."),
+        ]);
+        let get = |s: Section, text: &str, ids: &[&str]| {
+            let mut d = item(text, ids, "");
+            if s == Section::ActionItems {
+                d.owner = "Avery".into();
+                d.task = text.into();
+            }
+            check_with(s, &d, &c, &CheckOptions::default()).unwrap()
+        };
+        // one line, stated twice, once with an added reason
+        let s = assemble(vec![
+            get(
+                Section::Decisions,
+                "Skip the ledger importer for now",
+                &["s1"],
+            ),
+            get(
+                Section::Decisions,
+                "Skip the ledger importer for now to focus on the kiosk",
+                &["s1"],
+            ),
+        ]);
+        assert_eq!(s.decisions.len(), 1);
+        // alike, but from different lines: two decisions
+        let s = assemble(vec![
+            get(Section::Decisions, "Skip the ledger importer", &["s1"]),
+            get(
+                Section::Decisions,
+                "Skip the ledger importer tests for the kiosk",
+                &["s2"],
+            ),
+        ]);
+        assert_eq!(s.decisions.len(), 2);
+        // ownership in other words, same line
+        let s = assemble(vec![
+            get(Section::ActionItems, "Own the Kiosk App", &["s3"]),
+            get(Section::ActionItems, "Work on the Kiosk App", &["s3"]),
+        ]);
+        assert_eq!(s.action_items.len(), 1);
+        // one word of framing on each side, same line: merged; other lines
+        // or two different targets: kept apart
+        let s = assemble(vec![
+            get(Section::ActionItems, "Own the kiosk app link", &["s3"]),
+            get(
+                Section::ActionItems,
+                "Work on the kiosk app integration",
+                &["s3"],
+            ),
+        ]);
+        assert_eq!(s.action_items.len(), 1);
+        let s = assemble(vec![
+            get(Section::ActionItems, "Own the kiosk app link", &["s3"]),
+            get(
+                Section::ActionItems,
+                "Work on the kiosk app integration",
+                &["s1"],
+            ),
+        ]);
+        assert_eq!(s.action_items.len(), 2);
+        let s = assemble(vec![
+            get(Section::ActionItems, "Own the kiosk app", &["s3"]),
+            get(Section::ActionItems, "Own the ledger store", &["s3"]),
+        ]);
+        assert_eq!(s.action_items.len(), 2);
     }
 
     #[test]

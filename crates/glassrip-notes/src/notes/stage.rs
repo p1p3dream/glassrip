@@ -20,8 +20,8 @@ use super::prompt::{
     board_digest, map_request, reduce_request, repair_context, repair_request, windows, RepairCase,
 };
 use super::validate::{
-    assemble, check_with, dropped, merge_board_questions, CheckOptions, Checked, Corpus, Draft,
-    Section,
+    assemble, check_with, dropped, merge_board_questions, refile_owner_decisions, CheckOptions,
+    Checked, Corpus, Draft, Section,
 };
 use super::{
     CallRecord, Caveat, Evidence, MeetingNotes, NotesReport, NotesStatus, SpeakerLine,
@@ -97,7 +97,8 @@ pub struct NotesParams {
     /// Transcript lines this close to an owner tag's appearance can corroborate it, seconds.
     #[serde(default = "default_owner_corroboration_s")]
     pub owner_corroboration_s: f64,
-    /// Time windows of this length instead of token windows, seconds.
+    /// Time windows of this length instead of token windows, seconds (each
+    /// still capped at `window_tokens`). `None` cuts token windows only.
     #[serde(default)]
     pub window_s: Option<f64>,
     /// Overlap between time windows, seconds.
@@ -123,7 +124,9 @@ impl Default for NotesParams {
             text_model: "qwen3.6:27b".into(),
             vision_model: Some("qwen2.5vl:7b".into()),
             ollama: OllamaTextConfig::default(),
-            num_predict: 4096,
+            // the reduce call restates every kept item; 4096 tokens cut it
+            // off on a half-hour meeting's drafts
+            num_predict: 6144,
             window_tokens: 6000,
             window_overlap_lines: 4,
             allow_spill: false,
@@ -144,7 +147,11 @@ impl Default for NotesParams {
             precision_guard: true,
             owner_actions: true,
             owner_corroboration_s: default_owner_corroboration_s(),
-            window_s: None,
+            // a model given a long window lists only its most prominent
+            // items; eight-minute windows let it list the small ones too,
+            // while few enough drafts reach the reduce call that it merges
+            // them without losing items
+            window_s: Some(480.0),
             window_overlap_s: default_window_overlap_s(),
         }
     }
@@ -423,7 +430,10 @@ impl NotesStage {
                 p.num_predict,
                 &extras,
             );
-            if let Some(d) = self.call(req, &mut calls).await? {
+            if let Some(mut d) = self.call(req, &mut calls).await? {
+                // before the reduce sees it: a plain owner tag filed as a
+                // decision is a task
+                refile_owner_decisions(&mut d, &corpus);
                 drafts.push(d);
             }
         }
@@ -445,6 +455,8 @@ impl NotesStage {
         } else {
             drafts.into_iter().next().unwrap_or_default()
         };
+        let mut draft = draft;
+        refile_owner_decisions(&mut draft, &corpus);
 
         let mut checked: Vec<Checked> = Vec::new();
         let mut dropped_items = Vec::new();
@@ -987,7 +999,12 @@ impl Stage for NotesStage {
         // (the text model digest joined the key through `key_extras`, not the
         // version: the output is unchanged, and a keyed digest already misses
         // every entry written without one)
-        3
+        // 4: eight-minute time windows; request, instruction and agreed
+        // proposal cues; decisions from proposals another speaker agreed to;
+        // retracted commitments rejected; plain owner-tag decisions refiled as
+        // tasks; placement by pointing corroborates owner tags; superseded
+        // ownership tasks dropped; restated items merged
+        4
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {

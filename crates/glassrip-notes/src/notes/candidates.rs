@@ -235,6 +235,92 @@ const RECALL_CUES: &[&str] = &[
     "you'll",
     "you will",
     "take a stab",
+    // assignments to someone not yet named ("someone should own the
+    // importer", "we need someone on the kiosk")
+    "someone should",
+    "somebody should",
+    "someone needs",
+    "somebody needs",
+    "need someone",
+    "have someone",
+    "one person",
+    // instructions to the group ("make sure to push", "I'd encourage us to")
+    "make sure",
+    "don't forget",
+    "remember to",
+    "please",
+    "encourage",
+    "everyone should",
+    "everybody should",
+];
+/// Words between a second-person subject (and its modal) and the task verb
+/// ("you should, you know, check", "you all could kind of look").
+const REQUEST_FILLERS: &[&str] = &[
+    "still",
+    "just",
+    "maybe",
+    "probably",
+    "also",
+    "kind",
+    "sort",
+    "of",
+    "like",
+    "definitely",
+    "then",
+    "please",
+    "go",
+    "ahead",
+    "and",
+    "really",
+    "actually",
+    "first",
+];
+/// Modals after a second-person subject that make a request or suggestion
+/// ("you should", "you could", "you need to").
+/// ("you can see" describes, "can you send" asks: "can" counts only inverted.)
+const REQUEST_MODALS: &[&str] = &["should", "could", "would", "will", "might", "to"];
+/// Polite request frames ("it would be great if you", "I'd appreciate you").
+const REQUEST_PHRASES: &[&str] = &[
+    "appreciate you",
+    "appreciate it if you",
+    "would be great if you",
+    "would be amazing if you",
+    "would be awesome if you",
+    "would be helpful if you",
+    "would be nice if you",
+    "i'd love it if you",
+    "i'd love for you to",
+    "i'd like you to",
+    "i want you to",
+];
+/// Words that end a clause the next clause continues ("it would, you know,
+/// take you there"): the next clause is not an imperative.
+const CONTINUED: &[&str] = &[
+    "would", "could", "should", "will", "can", "might", "must", "to", "gonna", "going", "and",
+    "or", "but", "just", "then",
+];
+/// Openers skipped before an imperative verb ("so maybe just file it",
+/// "and then tag the release").
+const IMPERATIVE_LEAD: &[&str] = &[
+    "so",
+    "and",
+    "then",
+    "maybe",
+    "just",
+    "please",
+    "also",
+    "okay",
+    "ok",
+    "yeah",
+    "um",
+    "uh",
+    "like",
+    "now",
+    "first",
+    "definitely",
+    "you",
+    "but",
+    "or",
 ];
 /// First-person futures: cues only when the rest names a work task.
 const FIRST_PERSON_FUTURES: &[&str] = &[
@@ -617,21 +703,465 @@ pub fn has_commitment(text: &str) -> bool {
     })
 }
 
+/// Like [`has_commitment`], but a later sentence of the same text that
+/// retracts ("Actually, scratch that.") cancels the commitments before it.
+pub fn has_standing_commitment(text: &str) -> bool {
+    let mut standing = false;
+    for s in split_sentences(text) {
+        if has_commitment(&s) {
+            standing = true;
+        } else if is_retraction(&s) {
+            standing = false;
+        }
+    }
+    standing
+}
+
+/// A second-person request or suggestion that names a work task: "can you
+/// look at the kiosk", "you guys could start on the importer", "I think you
+/// should write the spec", "I need you to test it". The task verb follows the
+/// subject and its modal within a few filler words and has an object.
+fn second_person_request(w: &[&str]) -> bool {
+    let verb_after = |mut j: usize| -> bool {
+        let mut skipped = 0;
+        while w.get(j).is_some_and(|t| REQUEST_FILLERS.contains(t)) && skipped < 4 {
+            j += 1;
+            skipped += 1;
+        }
+        w.get(j)
+            .is_some_and(|v| is_task_verb(v) && verb_commits(v, &w[j + 1..]))
+    };
+    for i in 0..w.len() {
+        // inverted: "can you look at", "could you guys send"
+        if matches!(w[i], "can" | "could" | "would" | "will") && w.get(i + 1) == Some(&"you") {
+            let j = if w.get(i + 2) == Some(&"guys") {
+                i + 3
+            } else {
+                i + 2
+            };
+            if verb_after(j) {
+                return true;
+            }
+        }
+        let subject_end = match (w[i], w.get(i + 1)) {
+            ("you", Some(&"guys")) | ("you", Some(&"all")) => i + 2,
+            ("you", _) | ("y'all", _) => i + 1,
+            ("you'll", _) => {
+                if verb_after(i + 1) {
+                    return true;
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        let Some(m) = w.get(subject_end) else {
+            continue;
+        };
+        let after_modal = match *m {
+            m if REQUEST_MODALS.contains(&m) => subject_end + 1,
+            // "you need to", "you have to"
+            "need" | "have" if w.get(subject_end + 1) == Some(&"to") => subject_end + 2,
+            _ => continue,
+        };
+        if verb_after(after_modal) {
+            return true;
+        }
+    }
+    false
+}
+
+/// A clause that starts, after openers ("so maybe just"), with a task verb
+/// and an object: an instruction ("maybe just file the expense report",
+/// "tag each release in the tracker").
+fn imperative(w: &[&str]) -> bool {
+    let mut j = 0;
+    while w.get(j).is_some_and(|t| IMPERATIVE_LEAD.contains(t)) {
+        j += 1;
+    }
+    w.get(j)
+        .is_some_and(|v| is_task_verb(v) && verb_commits(v, &w[j + 1..]))
+}
+
+/// The sentence asks someone to do a work task, or instructs the group: a
+/// second-person request ([`second_person_request`]) or an imperative clause
+/// ([`imperative`]), not a personal activity.
+fn is_request(sentence: &str) -> bool {
+    let whole = without_you_know(&cue_text(sentence));
+    if has_any(&whole, REQUEST_PHRASES) && !is_personal_activity(sentence) {
+        return true;
+    }
+    let cs: Vec<String> = clauses(sentence)
+        .iter()
+        .map(|c| without_you_know(c))
+        .filter(|c| !c.trim().is_empty())
+        .collect();
+    cs.iter().enumerate().any(|(i, c)| {
+        let w: Vec<&str> = c.split_whitespace().collect();
+        // an imperative does not continue a clause cut after a modal
+        let continued = i > 0
+            && cs[i - 1]
+                .split_whitespace()
+                .last()
+                .is_some_and(|t| CONTINUED.contains(&t));
+        let request = second_person_request(&w) || (imperative(&w) && !continued);
+        request && !is_personal_activity(c)
+    })
+}
+
+/// Padded cue text without the filler "you know" (which is not a subject).
+fn without_you_know(n: &str) -> String {
+    let w: Vec<&str> = n.split_whitespace().collect();
+    let mut out: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < w.len() {
+        if w[i] == "you" && w.get(i + 1) == Some(&"know") {
+            i += 2;
+            continue;
+        }
+        out.push(w[i]);
+        i += 1;
+    }
+    format!(" {} ", out.join(" "))
+}
+
+/// Hedged or modal proposals of a course of action: "maybe we just cache
+/// the photos", "I think we should move the importer", "someone should own
+/// the kiosk", "we probably need someone on the relay importer". Any clause that
+/// commits ([`clause_commits`], hedges allowed) proposes too. Questions,
+/// conditions and personal activities do not.
+pub fn is_proposal(text: &str) -> bool {
+    split_sentences(text).iter().any(|s| {
+        if is_question(s, &cue_text(s)) {
+            return false;
+        }
+        let cs = clauses(s);
+        cs.iter().enumerate().any(|(i, c)| {
+            let w: Vec<&str> = c.split_whitespace().collect();
+            (clause_commits(&w) || modal_proposal(&w))
+                && !is_conditional(c)
+                && !(i > 0 && is_conditional(&cs[i - 1]))
+                && !is_personal_activity(c)
+        })
+    })
+}
+
+/// Modal words in a proposal between its subject and verb.
+const PROPOSAL_MODALS: &[&str] = &[
+    "should",
+    "could",
+    "can",
+    "might",
+    "just",
+    "maybe",
+    "probably",
+    "need",
+    "needs",
+    "to",
+    "will",
+    "would",
+    "definitely",
+    "also",
+    "kind",
+    "of",
+    "sort",
+    "like",
+    "be",
+];
+/// Verbs that steer the talk rather than propose ("we could say", "someone
+/// should see").
+const TALK_VERBS: &[&str] = &[
+    "see", "say", "think", "hear", "talk", "chat", "discuss", "wait", "hope", "assume", "imagine",
+    "suppose", "recap", "wonder", "know",
+];
+
+/// "we", "someone" or "somebody", then at least one modal ("should",
+/// "could", "just", "need"), then a verb with an object; or "we need
+/// someone ..." / "have someone ...".
+fn modal_proposal(w: &[&str]) -> bool {
+    for i in 0..w.len() {
+        if matches!(w[i], "need" | "needs" | "have" | "want")
+            && matches!(w.get(i + 1), Some(&"someone") | Some(&"somebody"))
+            && i > 0
+            && matches!(
+                w[i - 1],
+                "we" | "probably" | "definitely" | "just" | "really"
+            )
+        {
+            return w.len() > i + 2;
+        }
+        if !matches!(w[i], "we" | "someone" | "somebody") {
+            continue;
+        }
+        let mut j = i + 1;
+        let mut modal = false;
+        while w.get(j).is_some_and(|t| PROPOSAL_MODALS.contains(t)) {
+            modal |= !matches!(w[j], "kind" | "of" | "sort" | "like" | "be");
+            j += 1;
+        }
+        // "someone should be focused on", "we could be using": the word after
+        // "be" is the verb
+        let verb = w.get(j).copied();
+        if let Some(v) = verb {
+            if modal && !TALK_VERBS.contains(&v) && verb_commits(v, &w[j + 1..]) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Phrases that agree to a proposal.
+const ASSENTS: &[&str] = &[
+    "makes sense",
+    "make sense to me",
+    "sounds good",
+    "sounds great",
+    "sounds fine",
+    "sounds like a plan",
+    "good idea",
+    "great idea",
+    "i agree",
+    "agreed",
+    "works for me",
+    "that works",
+    "fine by me",
+    "let's do that",
+    "let's do it",
+    "i'm on board",
+    "count me in",
+    "i like that",
+    "i like it",
+    "love that",
+    "love it",
+    "perfect",
+    // taking on a request
+    "can do that",
+    "can definitely do that",
+    "can do it",
+    "will do",
+    "happy to",
+    "i'm on it",
+];
+/// Phrases that object to a proposal.
+const OBJECTIONS: &[&str] = &[
+    "i disagree",
+    "don't agree",
+    "i don't think so",
+    "not sure about",
+    "i'm not sure",
+    "bad idea",
+    "i'd rather not",
+    "won't work",
+    "doesn't work",
+    "wouldn't work",
+    "i don't like",
+    "i'm not a fan",
+    "no no",
+    "let's not",
+];
+/// Phrases that take back something just said.
+const RETRACTIONS: &[&str] = &[
+    "scratch that",
+    "never mind",
+    "nevermind",
+    "on second thought",
+    "forget that",
+    "forget it",
+    "take that back",
+    "actually no",
+    "no actually",
+    "wait no",
+    "no wait",
+    "let's not do that",
+    "let's not do it",
+    "changed my mind",
+    "change of plans",
+    "change of plan",
+];
+/// Negations that turn an assent phrase around ("not a good idea", "that
+/// doesn't sound good").
+const NEGATIONS: &[&str] = &[
+    "not", "no", "don't", "doesn't", "isn't", "wasn't", "won't", "never", "hardly",
+];
+
+/// The text agrees ("Yeah, that makes sense", "Sounds good to me"): an
+/// assent phrase with no negation in the three words before it, and no
+/// objection.
+pub fn is_assent(text: &str) -> bool {
+    let n = cue_text(text);
+    if is_objection(text) {
+        return false;
+    }
+    let w: Vec<&str> = n.split_whitespace().collect();
+    ASSENTS.iter().any(|a| {
+        let seq: Vec<&str> = a.split(' ').collect();
+        (0..w.len()).any(|i| {
+            starts_with_seq(&w, i, &seq)
+                && !w[i.saturating_sub(3)..i]
+                    .iter()
+                    .any(|t| NEGATIONS.contains(t))
+        })
+    })
+}
+
+/// The text objects: an objection phrase, or it opens with a plain "no".
+pub fn is_objection(text: &str) -> bool {
+    let n = cue_text(text);
+    has_any(&n, OBJECTIONS) || (n.starts_with(" no ") && !has_any(&n, RETRACTIONS))
+}
+
+/// The text takes back what was just said ("Actually, scratch that").
+pub fn is_retraction(text: &str) -> bool {
+    has_any(&cue_text(text), RETRACTIONS)
+}
+
+/// How long after a line an agreement, objection or retraction still refers
+/// to it, seconds.
+pub const REPLY_WINDOW_S: f64 = 60.0;
+/// Most lines after a line that can agree to, object to or retract it.
+pub const REPLY_MAX_LINES: usize = 8;
+
+/// Who spoke a line: the participant, else the diarization label.
+fn speaker_key(l: &NamedLine) -> &str {
+    l.person_id.as_deref().unwrap_or(&l.speaker)
+}
+
+/// How far a speaker's turn continues a line: their next lines, up to this
+/// long after the line's end, seconds.
+pub const TURN_MAX_S: f64 = 120.0;
+
+/// The last line of the speaker's turn that `lines[i]` opens: the same
+/// speaker's consecutive lines starting within [`TURN_MAX_S`] of its end.
+fn turn_end(lines: &[NamedLine], i: usize) -> usize {
+    let Some(l) = lines.get(i) else {
+        return i;
+    };
+    let who = speaker_key(l);
+    let limit = l.end_s + TURN_MAX_S;
+    let mut k = i;
+    while lines
+        .get(k + 1)
+        .is_some_and(|n| speaker_key(n) == who && n.start_s <= limit)
+    {
+        k += 1;
+    }
+    k
+}
+
+/// Indices of the lines that can reply to `lines[i]`: the rest of its
+/// speaker's turn ([`turn_end`]), then lines within [`REPLY_WINDOW_S`] of the
+/// turn's end and at most [`REPLY_MAX_LINES`] lines after it.
+fn replies(lines: &[NamedLine], i: usize) -> impl Iterator<Item = usize> + '_ {
+    let k = turn_end(lines, i);
+    let end = lines.get(k).map_or(f64::NEG_INFINITY, |l| l.end_s);
+    (i + 1..=k).filter(move |j| *j < lines.len()).chain(
+        (k + 1..lines.len())
+            .take(REPLY_MAX_LINES)
+            .take_while(move |j| lines[*j].start_s <= end + REPLY_WINDOW_S),
+    )
+}
+
+/// A line that can reply to `lines[i]` (see [`replies`]) retracts it.
+pub fn retracted_after(lines: &[NamedLine], i: usize) -> bool {
+    replies(lines, i).any(|j| is_retraction(&lines[j].text))
+}
+
+/// The proposal in `lines[i]` ([`is_proposal`], not taken back later in the
+/// line) was accepted: a different speaker agrees ([`is_assent`]) in a reply
+/// to it, before that nobody retracts it, no other speaker objects and no one
+/// makes a new proposal or request after the proposer's turn (the agreement
+/// would answer that one), and nobody retracts the agreement afterwards.
+/// Returns the agreeing line.
+pub fn accepted_proposal(lines: &[NamedLine], i: usize) -> Option<usize> {
+    agreed_to(lines, i, is_proposal)
+}
+
+/// A request in `lines[i]` ([`is_request`]) that another speaker took on,
+/// under the same rules as [`accepted_proposal`]. Returns the accepting line.
+pub fn accepted_request(lines: &[NamedLine], i: usize) -> Option<usize> {
+    agreed_to(lines, i, is_request)
+}
+
+/// See [`accepted_proposal`]: `offer` says what `lines[i]` must hold.
+fn agreed_to(lines: &[NamedLine], i: usize, offer: fn(&str) -> bool) -> Option<usize> {
+    let l = lines.get(i)?;
+    // an offer the speaker takes back later in the same line is not open to
+    // agree to
+    let mut standing = false;
+    for s in split_sentences(&l.text) {
+        if offer(&s) {
+            standing = true;
+        } else if is_retraction(&s) {
+            standing = false;
+        }
+    }
+    if !standing {
+        return None;
+    }
+    let who = speaker_key(l);
+    let turn = turn_end(lines, i);
+    // an agreement answers the latest offer: a new proposal or request after
+    // the offering turn (by anyone) ends the search
+    let new_offer = |t: &str| is_proposal(t) || is_request(t);
+    for j in replies(lines, i) {
+        let r = &lines[j];
+        if is_retraction(&r.text) {
+            return None;
+        }
+        if speaker_key(r) == who {
+            if j > turn && new_offer(&r.text) {
+                return None;
+            }
+            continue;
+        }
+        if is_objection(&r.text) {
+            return None;
+        }
+        if is_assent(&r.text) {
+            return (!retracted_after(lines, j)).then_some(j);
+        }
+        if new_offer(&r.text) {
+            return None;
+        }
+    }
+    None
+}
+
 /// Sentences of a window with cues, as
-/// `segment_id [mm:ss] speaker: sentence (kind)`.
+/// `segment_id [mm:ss] speaker: sentence (kind)`. Requests name who owns
+/// them; proposals another speaker agreed to name the agreement.
 pub fn cue_lines(win: &Window, lines: &[NamedLine], max: usize) -> Vec<String> {
     let mut out = Vec::new();
-    for l in win.lines.iter().filter_map(|i| lines.get(*i)) {
+    for &i in &win.lines {
+        let Some(l) = lines.get(i) else {
+            continue;
+        };
+        let agreed = accepted_proposal(lines, i);
+        let taken = accepted_request(lines, i);
         for sentence in split_sentences(&l.text) {
             let n = cue_text(&sentence);
             // very short fragments ("Okay?") carry no content
             if n.split_whitespace().count() < 4 {
                 continue;
             }
-            let kind = if is_question(&sentence, &n) {
-                "question cue"
+            let kind = if is_request(&sentence) {
+                // before the question test: "can you send the spec?" asks for work
+                match taken {
+                    Some(j) => format!(
+                        "request {} took on in {}: an action item for them",
+                        lines[j].speaker, lines[j].segment_id
+                    ),
+                    None => "request cue: an action item for the person asked, or everyone when the group is asked".to_string(),
+                }
+            } else if is_question(&sentence, &n) {
+                "question cue".to_string()
+            } else if let Some(j) = agreed.filter(|_| is_proposal(&sentence)) {
+                format!(
+                    "proposal {} agreed to in {}: a decision when it settles what to do",
+                    lines[j].speaker, lines[j].segment_id
+                )
             } else if has_any(&n, RECALL_CUES) || first_person_work(&n) {
-                "decision or action cue"
+                "decision or action cue".to_string()
             } else {
                 continue;
             };
@@ -720,6 +1250,42 @@ fn vocative(text: &str, first: &str) -> bool {
         .any(|piece| tokens(piece) == [first])
 }
 
+/// Verbs that place a person on a board element ("put Avery here", "have
+/// Avery take this one").
+const PLACEMENT_VERBS: &[&str] = &["put", "have", "assign", "place", "stick", "give"];
+/// Words that point at the board.
+const DEICTICS: &[&str] = &["here", "there", "this", "that"];
+/// A placement refers to the tag only this close to its appearance, seconds.
+pub const PLACEMENT_S: f64 = 60.0;
+/// A pointing word must follow the name within this many words.
+const PLACEMENT_REACH: usize = 5;
+
+/// Someone places the owner on the board by pointing: in one clause, a
+/// placement verb directly before the owner's name (first name, or the full
+/// name for a first name that is a common word) and a pointing word within
+/// [`PLACEMENT_REACH`] words after it ("let's put Avery on this box", "we'll
+/// have Avery own that one").
+fn placement(text: &str, first: &str, surname: Option<&String>) -> bool {
+    text.split([',', ';', '.', '?', '!']).map(tokens).any(|w| {
+        (1..w.len()).any(|i| {
+            if w[i] != first || !PLACEMENT_VERBS.contains(&w[i - 1].as_str()) {
+                return false;
+            }
+            let mut after = i + 1;
+            if WORD_NAMES.contains(&first) {
+                if surname.is_none_or(|s| w.get(i + 1) != Some(s)) {
+                    return false;
+                }
+                after += 1;
+            }
+            w[after.min(w.len())..]
+                .iter()
+                .take(PLACEMENT_REACH)
+                .any(|t| DEICTICS.contains(&t.as_str()))
+        })
+    })
+}
+
 /// Transcript lines within `near_s` of the tag's appearance that corroborate
 /// an owner tag:
 ///
@@ -729,7 +1295,10 @@ fn vocative(text: &str, first: &str) -> bool {
 ///   owner's own speech and self-introductions ("I'm Avery") are not
 ///   mentions, and a first name that is a common word ("mark", "bill")
 ///   counts only with the surname or when addressing the owner in a line
-///   that names the target.
+///   that names the target;
+/// - anyone, the owner included, placing the owner on the board by pointing
+///   ([`placement`]) within [`PLACEMENT_S`] of the tag's appearance: the
+///   pointing word stands in for the target.
 fn corroborating_lines(
     ctx: &OwnerActionContext<'_>,
     o: &OwnerAssignment,
@@ -760,7 +1329,11 @@ fn corroborating_lines(
         if !near(l) {
             continue;
         }
-        let ok = if l.person_id.as_deref() == owner_id {
+        let placed = (l.start_s - o.valid_from_s).abs() <= PLACEMENT_S.min(ctx.near_s)
+            && placement(&l.text, first, surname);
+        let ok = if placed {
+            true
+        } else if l.person_id.as_deref() == owner_id {
             names(l)
         } else {
             let words = tokens(&l.text);
@@ -1589,7 +2162,7 @@ mod tests {
             line(0, 0.0, "Let's skip the ledger import for now."),
             line(1, 5.0, "How do we pick the layout for small screens?"),
             line(2, 10.0, "The weather was nice. Okay?"),
-            line(3, 15.0, "I'll write up where I left things tonight."),
+            line(3, 15.0, "I'll document the relay settings tonight."),
             line(4, 20.0, "Should we skip the review this week?"),
             line(5, 25.0, "I'm going to grab a coffee before we start."),
             line(6, 30.0, "I'll be back in a minute or so."),
@@ -1776,6 +2349,286 @@ mod tests {
         let c = cue_lines(&w, &lines, 10);
         assert_eq!(c.len(), 1, "{c:#?}");
         assert!(c[0].starts_with("seg_00002"));
+    }
+
+    #[test]
+    fn requests_and_group_instructions_are_action_cues() {
+        let texts = [
+            // requests to a person, some phrased as questions
+            "Could you send the ledger schema to the vendor?",
+            "It would be great if you guys could kind of start on the kiosk importer.",
+            "Honestly, you should check the badge flow first.",
+            "I need you to test the relay config tonight.",
+            // an instruction to the group, hedged and after an opener
+            "So maybe just document the relay settings before you log off.",
+            "I'd encourage everyone to tag each release in the tracker.",
+            // an assignment to someone not yet named
+            "We need someone on the badge printer.",
+            // not requests: talk, personal, no task verb
+            "Can you hear me okay?",
+            "You can see the diagram here.",
+            "Maybe just take a break for a minute.",
+            "Could you grab a coffee for me?",
+            // "you know" is a filler, and "you can" describes
+            "And the button would, you know, send you to the kiosk page.",
+            "The panel lists settings that you can change in the ledger.",
+            // a polite request frame
+            "I'd really appreciate you reviewing the ledger migration.",
+        ];
+        let lines: Vec<NamedLine> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| line(i, i as f64 * 5.0, t))
+            .collect();
+        let w = Window {
+            lines: (0..lines.len()).collect(),
+        };
+        let c = cue_lines(&w, &lines, 50);
+        let kind = |seg: &str| -> Option<&str> {
+            c.iter()
+                .find(|x| x.starts_with(seg))
+                .map(|x| x.rsplit_once(" (").map_or("", |p| p.1))
+        };
+        for (i, t) in texts.iter().enumerate().take(5) {
+            let k = kind(&format!("seg_{i:05}")).unwrap_or("none");
+            assert!(k.starts_with("request cue"), "{t}: {k}");
+        }
+        for (i, t) in texts.iter().enumerate().skip(5).take(2) {
+            assert!(kind(&format!("seg_{i:05}")).is_some(), "{t}");
+        }
+        assert_eq!(kind("seg_00007"), Some("question cue)"));
+        assert_eq!(kind("seg_00008"), None);
+        assert_eq!(kind("seg_00009"), None);
+        assert_eq!(kind("seg_00010"), Some("question cue)"));
+        assert_eq!(kind("seg_00011"), None);
+        assert_eq!(kind("seg_00012"), None);
+        assert!(kind("seg_00013").is_some_and(|k| k.starts_with("request cue")));
+    }
+
+    #[test]
+    fn a_request_someone_takes_on_names_them() {
+        let lines = dialog(&[
+            (
+                0.0,
+                "avery",
+                "Rohan, could you send the ledger schema to the vendor?",
+            ),
+            (5.0, "rohan", "Yeah, we can definitely do that."),
+        ]);
+        let w = Window { lines: vec![0, 1] };
+        let c = cue_lines(&w, &lines, 10);
+        assert!(
+            c[0].ends_with("(request rohan took on in seg_00001: an action item for them)"),
+            "{c:#?}"
+        );
+        // no one takes it on: a plain request cue
+        let lines = dialog(&[
+            (
+                0.0,
+                "avery",
+                "Rohan, could you send the ledger schema to the vendor?",
+            ),
+            (5.0, "rohan", "I'm not sure I have it."),
+        ]);
+        let c = cue_lines(&Window { lines: vec![0, 1] }, &lines, 10);
+        assert!(c[0].contains("(request cue:"), "{c:#?}");
+    }
+
+    fn dialog(turns: &[(f64, &str, &str)]) -> Vec<NamedLine> {
+        turns
+            .iter()
+            .enumerate()
+            .map(|(i, (t, who, text))| {
+                let mut l = spoken(i, *t, who, text);
+                l.speaker = (*who).to_string();
+                l
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_proposal_is_accepted_only_by_another_speakers_agreement() {
+        let proposal = "Maybe we just cache the badge photos on the kiosk.";
+        let accepted = |turns: &[(f64, &str, &str)]| accepted_proposal(&dialog(turns), 0);
+        // agreement from someone else
+        assert_eq!(
+            accepted(&[
+                (0.0, "avery", proposal),
+                (6.0, "rohan", "Yeah, that makes sense to me."),
+            ]),
+            Some(1)
+        );
+        // the proposer's own "sounds good" is not agreement
+        assert_eq!(
+            accepted(&[(0.0, "avery", proposal), (6.0, "avery", "Sounds good.")]),
+            None
+        );
+        // an objection before any agreement
+        assert_eq!(
+            accepted(&[
+                (0.0, "avery", proposal),
+                (
+                    6.0,
+                    "rohan",
+                    "I don't think so, the kiosk has no disk space."
+                ),
+                (12.0, "mira", "Sounds good to me."),
+            ]),
+            None
+        );
+        // negated assent phrases
+        for reply in ["That's not a good idea.", "That doesn't sound good."] {
+            assert_eq!(
+                accepted(&[(0.0, "avery", proposal), (6.0, "rohan", reply)]),
+                None,
+                "{reply}"
+            );
+        }
+        // agreed, then taken back
+        assert_eq!(
+            accepted(&[
+                (0.0, "avery", proposal),
+                (6.0, "rohan", "Sounds good."),
+                (
+                    10.0,
+                    "avery",
+                    "Actually, scratch that, we keep loading them live."
+                ),
+            ]),
+            None
+        );
+        // too late to refer to it
+        assert_eq!(
+            accepted(&[(0.0, "avery", proposal), (90.0, "rohan", "Sounds good.")]),
+            None
+        );
+        // questions, conditions and talk are not proposals
+        for text in [
+            "Should we just cache the badge photos on the kiosk?",
+            "If the vendor agrees, we could cache the badge photos.",
+            "Maybe we could talk about the order later.",
+        ] {
+            assert_eq!(
+                accepted(&[(0.0, "avery", text), (6.0, "rohan", "Sounds good.")]),
+                None,
+                "{text}"
+            );
+        }
+        // a proposal at the start of a long turn is agreed to after the turn
+        let lines = dialog(&[
+            (
+                0.0,
+                "avery",
+                "I think someone should own the badge printer.",
+            ),
+            (40.0, "avery", "And the ledger side needs a person too."),
+            (70.0, "avery", "Is that a fair way to divide it?"),
+            (80.0, "rohan", "Sure, sounds good."),
+        ]);
+        assert_eq!(accepted_proposal(&lines, 0), Some(3));
+        // an agreement answers the latest offer, not an earlier one
+        assert_eq!(
+            accepted(&[
+                (0.0, "avery", proposal),
+                (
+                    6.0,
+                    "mira",
+                    "Also, could you send the badge specs to the vendor?"
+                ),
+                (12.0, "rohan", "Sure, I can do that."),
+            ]),
+            None
+        );
+        assert_eq!(
+            accepted(&[
+                (0.0, "avery", proposal),
+                (6.0, "avery", "Oh, and I'll write the kiosk release notes."),
+                (40.0, "mira", "Hmm."),
+                (
+                    44.0,
+                    "avery",
+                    "And we should also rename the ledger service."
+                ),
+                (50.0, "rohan", "Sounds good."),
+            ]),
+            None
+        );
+        // "we need someone" proposes an assignment
+        assert!(is_proposal(
+            "We probably need someone on the relay importer."
+        ));
+        assert!(!is_proposal("Someone told me the build was red."));
+    }
+
+    #[test]
+    fn a_later_retraction_takes_a_commitment_back() {
+        assert!(!has_standing_commitment(
+            "Let's ship the importer on Friday. Actually, never mind."
+        ));
+        // a retraction before the commitment does not
+        assert!(has_standing_commitment(
+            "Scratch that. Let's ship the importer on Monday."
+        ));
+        let lines = dialog(&[
+            (0.0, "avery", "Let's ship the importer on Friday."),
+            (5.0, "rohan", "Wait, no, legal has not signed off yet."),
+        ]);
+        assert!(retracted_after(&lines, 0));
+        let lines = dialog(&[
+            (0.0, "avery", "Let's ship the importer on Friday."),
+            (5.0, "rohan", "Great, I'll tell the vendor."),
+        ]);
+        assert!(!retracted_after(&lines, 0));
+    }
+
+    #[test]
+    fn pointing_at_the_board_places_an_owner() {
+        let owners = &[("rohan-dasgupta", "Rohan Dasgupta", "Kiosk App")];
+        let one = |t: f64, who: &str, text: &str| tag_actions(owners, &[spoken(0, t, who, text)]);
+        // someone else, or the owner, placing the owner by pointing near the
+        // tag's appearance (at 100 s)
+        assert_eq!(
+            one(110.0, "avery-quinn", "Let's put Rohan on this one.").len(),
+            1
+        );
+        assert_eq!(
+            one(
+                95.0,
+                "rohan-dasgupta",
+                "Okay, let's have Rohan own this box here, and the rest later."
+            )
+            .len(),
+            1
+        );
+        // no pointing word, no placement verb, too far from the tag
+        assert!(one(110.0, "avery-quinn", "We'll put Rohan on the call.").is_empty());
+        assert!(one(110.0, "rohan-dasgupta", "Rohan here, the build is green.").is_empty());
+        assert!(one(170.0, "avery-quinn", "Let's put Rohan on this one.").is_empty());
+        // a first name that is a common word needs the surname
+        let marks = &[("mark-ellery", "Mark Ellery", "Kiosk App")];
+        let mark = |text: &str| tag_actions(marks, &[spoken(0, 110.0, "avery-quinn", text)]);
+        assert!(mark("Let's put mark there and move on.").is_empty());
+        assert_eq!(mark("Let's put Mark Ellery on this one.").len(), 1);
+    }
+
+    #[test]
+    fn cues_name_the_agreement_to_a_proposal() {
+        let lines = dialog(&[
+            (
+                0.0,
+                "avery",
+                "Maybe we just cache the badge photos on the kiosk.",
+            ),
+            (6.0, "rohan", "Yeah, that makes sense to me."),
+        ]);
+        let w = Window { lines: vec![0, 1] };
+        let c = cue_lines(&w, &lines, 10);
+        assert!(
+            c[0].ends_with(
+                "(proposal rohan agreed to in seg_00001: a decision when it settles what to do)"
+            ),
+            "{c:#?}"
+        );
     }
 
     #[test]
