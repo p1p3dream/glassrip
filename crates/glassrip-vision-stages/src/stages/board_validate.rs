@@ -13,8 +13,10 @@
 //! 4. An edge label that repeats a sticky's text is cleared.
 //!
 //! A consensus reading kept on fewer answering reads than its quorum (one read
-//! kept unvoted and marked `low_confidence`, written by `board_read` before
-//! version 11 and still reachable through `--from-stage`) fails its item: an
+//! kept unvoted and marked `low_confidence`, or voted with `min_agree` lowered
+//! below the run's quorum to the reads that answered, both written by
+//! `board_read` before version 11 and still reachable through `--from-stage`)
+//! fails its item: an
 //! unconfirmed read never reaches the board state. An edge label its vote does
 //! not confirm (`label_uncertain`, or fewer than `min_agree` label votes, as
 //! `board_read` before 11 could keep) is cleared; a vote log that does not run
@@ -58,6 +60,10 @@ pub struct BoardValidateParams {
     pub participant_similarity: f64,
     /// Edge label at least this similar to a sticky text is cleared.
     pub label_sticky_similarity: f64,
+    /// The run's consensus quorum (`board_read.min_agree` capped at `reads`): a
+    /// consensus reading recorded with a lower `min_agree` (board_read before
+    /// version 11 lowered it to the reads that answered) is refused.
+    pub consensus_quorum: u32,
 }
 
 impl Default for BoardValidateParams {
@@ -71,6 +77,7 @@ impl Default for BoardValidateParams {
             participant_min_keyframes: 2,
             participant_similarity: 0.8,
             label_sticky_similarity: 0.85,
+            consensus_quorum: crate::stages::board_read::ConsensusParams::default().quorum(),
         }
     }
 }
@@ -387,7 +394,8 @@ pub fn validate_reading(
     p: &BoardValidateParams,
 ) -> Result<BoardValidateItem, ErrorInfo> {
     if let Some(c) = &reading.consensus {
-        if c.low_confidence || (c.answered.len() as u32) < c.min_agree {
+        let quorum = p.consensus_quorum.clamp(1, c.reads.max(1));
+        if c.low_confidence || c.min_agree < quorum || (c.answered.len() as u32) < c.min_agree {
             return Err(invalid(format!(
                 "keyframe {}: a consensus reading kept on {} of {} reads without a quorum is \
                  unconfirmed and not validated (rerun board_read)",
@@ -599,7 +607,10 @@ impl Stage for BoardValidateStage {
         // kept one unvoted read, `low_confidence`) fails its item, and an edge
         // label its vote does not confirm is cleared; outputs of 1 may hold
         // such a reading or label.
-        2
+        // 3: a reading voted below the run's quorum (`consensus_quorum`) fails
+        // too; outputs of 2 may hold one, or a label version 2 as first
+        // committed did not yet clear.
+        3
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {
@@ -817,6 +828,25 @@ mod tests {
         };
         let e = run(log.clone()).unwrap_err();
         assert_eq!(e.code, glassrip_core::envelope::ErrorCode::InvalidInput);
+        // Codex r5 fix round 2: with min_agree 3 configured, board_read before
+        // 11 voted two answering reads with min_agree lowered to 2.
+        let lowered = crate::artifacts::ConsensusLog {
+            answered: vec![0, 2],
+            min_agree: 2,
+            low_confidence: false,
+            ..log.clone()
+        };
+        let mut r = reading(out.clone());
+        r.consensus = Some(lowered.clone());
+        let three = BoardValidateParams {
+            consensus_quorum: 3,
+            ..BoardValidateParams::default()
+        };
+        assert!(validate_reading(&r, &board_image(), &[], &[], &three).is_err());
+        assert!(
+            run(lowered).is_ok(),
+            "quorum 2: two agreeing reads are voted"
+        );
         // A voted reading (two of three answered, quorum two) is validated.
         let voted = crate::artifacts::ConsensusLog {
             answered: vec![0, 2],

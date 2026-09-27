@@ -921,7 +921,10 @@ impl Stage for BoardReadStage {
         // unvoted read; an edge label is kept only when `min_agree` reads carry
         // it (outputs of 10 may hold a single unconfirmed read, or a label one
         // read gave to an edge the others labeled otherwise).
-        11
+        // 12: a retry's seed sits 2^62 above its read's (11 used 2^32, which a
+        // later keyframe's first read could reach); outputs of 11 may hold a
+        // retry answered with another request's reply.
+        12
     }
     fn output(&self) -> ArtifactSpec {
         ArtifactSpec {

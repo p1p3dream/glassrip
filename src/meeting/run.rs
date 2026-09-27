@@ -726,6 +726,10 @@ pub async fn run_meeting(
         let validate = BoardValidateStage::new({
             let mut p = BoardValidateParams::default();
             p.validation.participant_names = participants.clone();
+            p.consensus_quorum = cfg
+                .board_read
+                .min_agree
+                .clamp(1, cfg.board_read.reads.max(1));
             p
         });
         let edges = EdgeDirectionStage::new(
