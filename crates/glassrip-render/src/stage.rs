@@ -111,7 +111,12 @@ impl Stage for RenderStage {
         // 5: an annotation with no room on the board (owner, note, badge, edge
         // label) is listed below it with a numbered marker and a warning
         // instead of failing validation; more spots and leader lines first.
-        5
+        // 6: edges are routed orthogonally around the cards; labels sit beside
+        // a straight segment of their edge; history notes sit next to their
+        // owner pill; validation fails an edge through a card or a label an
+        // edge runs through. Text is sized and fitted by its measured glyph
+        // widths, and any glyph past the canvas fails validation.
+        6
     }
     /// The markdown, SVG and PNG files are the stage's output and live outside
     /// the run directory: a cache hit would restore the artifact without
