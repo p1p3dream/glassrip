@@ -53,7 +53,7 @@ pub mod owner_geometry;
 pub mod owners;
 pub mod tracks;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use glassrip_vision::board::{EdgeStyle, ElementList, RejectReason, StickyColor, ValidatedBoard};
 use glassrip_vision::BBox;
@@ -1132,19 +1132,22 @@ pub fn consolidate_with_probe(
             || (r.mode == RegistrationMode::Registered
                 && r.inliers >= params.region_probe.min_registration_inliers)
     };
-    let reading_bad: Vec<bool> = frames
+    let geometries: Vec<FrameGeometry> = frames
         .iter()
         .enumerate()
         .map(|(fi, f)| {
-            !geometry_ok(&f.board)
-                || frame_geometry(
-                    f,
-                    &reading_tags(f, &params.participants),
-                    params,
-                    diagonals[fi],
-                )
-                .unreliable
+            frame_geometry(
+                f,
+                &reading_tags(f, &params.participants),
+                params,
+                diagonals[fi],
+            )
         })
+        .collect();
+    let reading_bad: Vec<bool> = frames
+        .iter()
+        .zip(&geometries)
+        .map(|(f, g)| !geometry_ok(&f.board) || g.unreliable)
         .collect();
     // OCR spans of keyframe `f` reading `text` with their center inside `b` grown by
     // `grow` of its size on each side.
@@ -1193,44 +1196,66 @@ pub fn consolidate_with_probe(
                 .collect()
         })
         .collect();
-    // Where keyframe `f` placed its reading of track `u`, and whether that agrees
-    // with where the element is.
-    let placed_in = |u: usize, f: usize| -> Option<(BBox, bool)> {
-        let o = tracks[u].obs.iter().find(|o| o.frame == f)?;
-        let b = o.bbox?;
-        let at: Vec<BBox> = homes[u]
-            .iter()
-            .filter_map(|&v| tracks[v].bbox_in(o.cluster))
-            .collect();
-        (!at.is_empty()).then(|| (b, at.iter().any(|h| same_place(&b, h))))
-    };
+    // Each track's box per registered cluster, and per keyframe the readings of tracks
+    // whose element has a known place: (track, box, whether the box agrees with where
+    // the element is).
+    let track_box: Vec<BTreeMap<usize, BBox>> = tracks
+        .iter()
+        .map(|t| {
+            let clusters: BTreeSet<usize> = t
+                .obs
+                .iter()
+                .filter(|o| o.bbox.is_some())
+                .map(|o| o.cluster)
+                .collect();
+            clusters
+                .into_iter()
+                .filter_map(|c| t.bbox_in(c).map(|b| (c, b)))
+                .collect()
+        })
+        .collect();
+    let box_in = |u: usize, c: usize| track_box[u].get(&c).copied();
+    let mut frame_placed: Vec<Vec<(usize, BBox, bool)>> = vec![Vec::new(); n];
+    for (u, t) in tracks.iter().enumerate() {
+        for o in &t.obs {
+            let Some(b) = o.bbox else { continue };
+            let at: Vec<BBox> = homes[u]
+                .iter()
+                .filter_map(|&v| box_in(v, o.cluster))
+                .collect();
+            if !at.is_empty() {
+                frame_placed[o.frame].push((u, b, at.iter().any(|h| same_place(&b, h))));
+            }
+        }
+    }
     let radius = params.coverage_radius_share * ref_diag;
     // The registration of keyframe `f` is unconfirmed around `b` (no reading of a
     // track placed in two keyframes lies within the coverage radius where its track
     // is) and wrong elsewhere in the keyframe (some reading lies away from where its
     // element is): the sighting's registered place says nothing. The readings of
-    // tracks `skip` are left out of both.
+    // tracks `skip` and of every track with the candidate's text are left out of
+    // both: same-label readings never vouch for each other.
     let registration_off = |f: usize, b: &BBox, skip: [usize; 2]| -> bool {
         let c = ((b.x1 + b.x2) / 2.0, (b.y1 + b.y2) / 2.0);
         let others = || {
-            (0..tracks.len())
-                .filter(move |u| !skip.contains(u))
-                .filter_map(move |u| placed_in(u, f).map(|x| (u, x)))
+            frame_placed[f].iter().filter(|x| {
+                !skip.contains(&x.0) && !duplicates::same_text(&texts[x.0], &texts[skip[0]], fz)
+            })
         };
         let confirmed = radius.is_finite()
-            && others().any(|(u, (ub, agrees))| {
+            && others().any(|&(u, ub, agrees)| {
                 let uc = ((ub.x1 + ub.x2) / 2.0, (ub.y1 + ub.y2) / 2.0);
                 placed_twice[u] && agrees && (uc.0 - c.0).hypot(uc.1 - c.1) <= radius
             });
-        !confirmed && others().any(|(_, (_, agrees))| !agrees)
+        !confirmed && others().any(|x| !x.2)
     };
+    // OCR reading the text at the sighting's own place (and not at the established
+    // track's) is never explained away: a second element there on a trusted
+    // registration and a reliable reading, else unknown.
     let judge = |ti: usize, i: usize, ei: usize| -> Sighting {
         let o = &tracks[ti].obs[i];
         let bad = reading_bad[o.frame];
-        let Some((b, eb)) = o
-            .bbox
-            .and_then(|b| tracks[ei].bbox_in(o.cluster).map(|eb| (b, eb)))
-        else {
+        let Some((b, eb)) = o.bbox.and_then(|b| box_in(ei, o.cluster).map(|eb| (b, eb))) else {
             return if bad {
                 Sighting::Explained
             } else {
@@ -1240,19 +1265,22 @@ pub fn consolidate_with_probe(
         if same_place(&b, &eb) {
             return Sighting::Near;
         }
-        if bad || registration_off(o.frame, &b, [ti, ei]) {
-            return Sighting::Explained;
-        }
         let text = normalize(&o.text);
         let at_established = ocr_hits(o.frame, &text, &eb, 0.5);
         let own = ocr_hits(o.frame, &text, &b, 0.0)
             .into_iter()
             .any(|x| !at_established.contains(&x));
-        match (own, at_established.is_empty()) {
-            (true, _) if trusted_registration(o.frame) => Sighting::Apart,
-            (true, _) => Sighting::Unknown,
-            (false, false) => Sighting::Explained,
-            (false, true) => Sighting::Unknown,
+        let off = registration_off(o.frame, &b, [ti, ei]);
+        if own {
+            if trusted_registration(o.frame) && !bad && !off {
+                Sighting::Apart
+            } else {
+                Sighting::Unknown
+            }
+        } else if bad || off || !at_established.is_empty() {
+            Sighting::Explained
+        } else {
+            Sighting::Unknown
         }
     };
     let merges = duplicate_merges(&tracks, params.min_support_keyframes, fz, &judge);
@@ -1282,7 +1310,29 @@ pub fn consolidate_with_probe(
         }
     }
 
-    // Kind beyond the list votes. A connector end is a node; otherwise a
+    // Fragments: a shorter reading of a longer element at the same place is folded
+    // into it. The fragment's sightings do not count as support; references to it
+    // (edge endpoints, owner targets) are redirected.
+    let fold_to = fold_fragments(&tracks);
+    let n_tracks = tracks.len();
+    let resolve = |mut t: usize| {
+        let mut guard = 0;
+        while let Some(&u) = fold_to.get(&t) {
+            t = u;
+            guard += 1;
+            if guard > n_tracks {
+                break;
+            }
+        }
+        t
+    };
+    for ti in node_track.values_mut() {
+        *ti = resolve(*ti);
+    }
+
+    // Kind beyond the list votes (after fragments are folded on the vote kinds, so a
+    // connector read at a fragment protects the element it folds into). A connector
+    // end is a node; otherwise a
     // node-majority track is a sticky when it was read as a sticky (a colored card)
     // at least as often as a node, or when its text carries a sticky marker (a
     // question or a milestone, spec 6.11): node labels name components.
@@ -1310,24 +1360,6 @@ pub fn consolidate_with_probe(
         }
     }
 
-    // Fragments: a shorter reading of a longer element at the same place is folded
-    // into it. The fragment's sightings do not count as support; references to it
-    // (edge endpoints, owner targets) are redirected.
-    let fold_to = fold_fragments(&tracks);
-    let resolve = |mut t: usize| {
-        let mut guard = 0;
-        while let Some(&u) = fold_to.get(&t) {
-            t = u;
-            guard += 1;
-            if guard > tracks.len() {
-                break;
-            }
-        }
-        t
-    };
-    for ti in node_track.values_mut() {
-        *ti = resolve(*ti);
-    }
     let folded: Vec<FoldedElement> = fold_to
         .iter()
         .map(|(&t, &u)| FoldedElement {
@@ -2200,7 +2232,7 @@ pub fn consolidate_with_probe(
         // Tags and nodes checked against OCR (displaced ones moved onto their text);
         // an unreliable reading keeps only what OCR placed.
         let people: Vec<Option<String>> = tags.iter().map(|t| person_of(&t.0)).collect();
-        let placed = frame_geometry(f, &tags, params, diagonals[fi]);
+        let placed = &geometries[fi];
         // Boxes of the tracked nodes in this keyframe, and of the supported edges seen
         // here (for tag geometry).
         let mut node_boxes: Vec<(AnchorKey, BBox)> = Vec::new();

@@ -9,22 +9,25 @@
 //!
 //! - **Near**: its registered box is within the same-place tolerance of the
 //!   established track's box.
-//! - **Explained**: its box is no evidence of a second place: the keyframe's reading
-//!   is unreliable (the OCR geometry check found most boxes displaced, or the boxes
-//!   coincide), the keyframe's registration is off around it (no other placed
-//!   element read near it where its track is, while the keyframe places some other
-//!   element away from its track), or OCR reads the text at the established track's
-//!   place and not at the sighting's own.
-//! - **Apart**: a second element: a trusted registration and a reliable reading put
-//!   it away from the established track, and OCR reads the text at its own place.
+//! - **Apart**: OCR reads the text at its own place (and not at the established
+//!   track's), on a trusted registration that is not off around it and a reliable
+//!   reading: a second element.
+//! - **Explained**: OCR does not read the text at its own place, and its box is no
+//!   evidence of a second place: the keyframe's reading is unreliable (the OCR
+//!   geometry check found most boxes displaced, or the boxes coincide), the
+//!   keyframe's registration is off around it (no other placed element read near it
+//!   where its track is, while the keyframe places some other element away from
+//!   where it is), or OCR reads the text at the established track's place.
 //! - **Unknown**: none of these (no OCR of the text anywhere, text-only
-//!   registration).
+//!   registration, or OCR at its own place where the reading or registration cannot
+//!   be trusted).
 //!
 //! The newer track is merged into the established one when no sighting is apart
-//! and at least half of its sightings are near or explained. Two real boxes with
-//! one label stay two elements when OCR confirms the second place on a reliable
-//! reading; a second box OCR never confirms and the reader places consistently
-//! stays too (its sightings are unknown).
+//! and at least half of its sightings are near or explained. A target that is
+//! itself merged passes the duplicate on only to a final target that accepts it.
+//! Two real boxes with one label stay two elements when OCR confirms the second
+//! place on a reliable reading; a second box OCR never confirms and the reader
+//! places consistently stays too (its sightings are unknown).
 
 use std::collections::BTreeMap;
 
@@ -65,53 +68,56 @@ pub(crate) fn duplicate_merges(
     let frames: Vec<usize> = tracks.iter().map(|t| t.frames().len()).collect();
     let is_node = |t: &Track| !t.obs.is_empty() && t.kind() == ObsList::Node;
     let texts: Vec<String> = tracks.iter().map(Track::text).collect();
-    let mut out = BTreeMap::new();
+    // Track `ti` may merge into track `ei`.
+    let accepts = |ti: usize, ei: usize| -> bool {
+        if ei == ti
+            || !is_node(&tracks[ei])
+            || frames[ei] < min_support.max(1)
+            || frames[ei] <= frames[ti]
+            || !same_text(&texts[ti], &texts[ei], fuzzy)
+        {
+            return false;
+        }
+        let verdicts: Vec<Sighting> = (0..tracks[ti].obs.len())
+            .map(|i| judge(ti, i, ei))
+            .collect();
+        let supporting = verdicts
+            .iter()
+            .filter(|v| matches!(v, Sighting::Near | Sighting::Explained))
+            .count();
+        !verdicts.contains(&Sighting::Apart) && supporting > 0 && 2 * supporting >= verdicts.len()
+    };
+    let mut out: BTreeMap<usize, usize> = BTreeMap::new();
     for (ti, t) in tracks.iter().enumerate() {
         if !is_node(t) {
             continue;
         }
-        let mut best: Option<usize> = None;
-        for (ei, e) in tracks.iter().enumerate() {
-            if ei == ti
-                || !is_node(e)
-                || frames[ei] < min_support.max(1)
-                || frames[ei] <= frames[ti]
-                || !same_text(&texts[ti], &texts[ei], fuzzy)
-            {
-                continue;
-            }
-            let verdicts: Vec<Sighting> = (0..t.obs.len()).map(|i| judge(ti, i, ei)).collect();
-            if verdicts.contains(&Sighting::Apart) {
-                continue;
-            }
-            let supporting = verdicts
-                .iter()
-                .filter(|v| matches!(v, Sighting::Near | Sighting::Explained))
-                .count();
-            if supporting == 0 || 2 * supporting < verdicts.len() {
-                continue;
-            }
-            if best.is_none_or(|b| frames[ei] > frames[b]) {
-                best = Some(ei);
-            }
-        }
+        let best = (0..tracks.len())
+            .filter(|&ei| accepts(ti, ei))
+            .max_by_key(|&ei| (frames[ei], std::cmp::Reverse(ei)));
         if let Some(ei) = best {
             out.insert(ti, ei);
         }
     }
-    // A target that is itself merged passes its duplicates on; a chain never loops
-    // because every step goes to a track seen in strictly more keyframes.
-    let resolved: BTreeMap<usize, usize> = out
+    // A target that is itself merged passes its duplicates on, but only to a final
+    // target the duplicate is itself accepted by; otherwise the duplicate stays apart
+    // (and its own duplicates stop at it). Chains never loop: every step goes to a
+    // track seen in strictly more keyframes.
+    let resolve = |out: &BTreeMap<usize, usize>, t: usize| {
+        let mut u = out[&t];
+        while let Some(&v) = out.get(&u) {
+            u = v;
+        }
+        u
+    };
+    while let Some(t) = out
         .keys()
-        .map(|&t| {
-            let mut u = out[&t];
-            while let Some(&v) = out.get(&u) {
-                u = v;
-            }
-            (t, u)
-        })
-        .collect();
-    resolved
+        .copied()
+        .find(|&t| resolve(&out, t) != out[&t] && !accepts(t, resolve(&out, t)))
+    {
+        out.remove(&t);
+    }
+    out.keys().map(|&t| (t, resolve(&out, t))).collect()
 }
 
 /// Move the sightings of every merged track into its target. A sighting that is not
@@ -210,6 +216,29 @@ mod tests {
         ];
         let m = duplicate_merges(&tracks, 2, 0.85, &|_, _, _| Sighting::Near);
         assert!(m.is_empty(), "{m:?}");
+    }
+
+    #[test]
+    fn a_chain_ends_at_a_target_the_duplicate_is_accepted_by() {
+        // Track 2 is near track 1, which merges into track 0; track 2 is apart from
+        // track 0, so it stays apart instead of following the chain.
+        let tracks = vec![
+            track("Ledger Store", &[0, 1, 2, 3, 4]),
+            track("Ledger Store", &[5, 6]),
+            track("Ledger Store", &[7]),
+        ];
+        let judge = |t: usize, _: usize, e: usize| match (t, e) {
+            (1, 0) | (2, 1) => Sighting::Near,
+            _ => Sighting::Apart,
+        };
+        let m = duplicate_merges(&tracks, 2, 0.85, &judge);
+        assert_eq!(m, BTreeMap::from([(1, 0)]));
+        let judge = |t: usize, _: usize, e: usize| match (t, e) {
+            (1, 0) | (2, 1) | (2, 0) => Sighting::Near,
+            _ => Sighting::Apart,
+        };
+        let m = duplicate_merges(&tracks, 2, 0.85, &judge);
+        assert_eq!(m, BTreeMap::from([(1, 0), (2, 0)]));
     }
 
     #[test]

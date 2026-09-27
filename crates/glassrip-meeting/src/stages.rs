@@ -1203,10 +1203,12 @@ impl Stage for BoardStateStage {
         // ambiguous edge or end-node geometry keeps the incumbent, and a tag panned out
         // of view is not absent.
         // 9: a same-text node track whose boxes are no evidence of a second place
-        // (near the established node, or read on an unreliable reading or where OCR
-        // puts the text at the established node) is merged into it, with its edges and
-        // owner tags; node-majority tracks read as stickies as often, or carrying a
-        // sticky marker, with no connector are stickies.
+        // (near the established node, read on an unreliable reading or a registration
+        // that is off around it, or where OCR puts the text at the established node
+        // and not at its own place) is merged into it, with its edges and owner tags;
+        // node-majority tracks read as stickies as often, or carrying a sticky marker,
+        // with no connector are stickies; one physical owner tag holds at most one
+        // tag per keyframe.
         9
     }
     fn output(&self) -> ArtifactSpec {

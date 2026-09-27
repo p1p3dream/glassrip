@@ -3520,7 +3520,18 @@ fn a_misplaced_same_text_track_merges_into_the_established_node() {
         .folded
         .iter()
         .any(|f| f.text == "Queue" && f.into == "Queue" && f.reason == FoldReason::Duplicate));
-    assert_eq!(s.edges.iter().filter(|e| e.in_final).count(), 3);
+    // The edges read to the misplaced box in keyframes 4 and 5 are Queue's edges:
+    // every Queue edge is seen in all six keyframes.
+    let queue_edges: Vec<_> = s
+        .edges
+        .iter()
+        .filter(|e| e.a_text == "Queue" || e.b_text == "Queue")
+        .collect();
+    assert_eq!(queue_edges.len(), 3, "{:#?}", s.edges);
+    for e in queue_edges {
+        assert!(e.in_final);
+        assert_eq!(e.lifetimes.last().unwrap().keyframes, 6, "{e:#?}");
+    }
 }
 
 #[test]
@@ -3535,7 +3546,13 @@ fn a_same_text_box_on_a_collapsed_reading_merges() {
         }
     }
     let s = run(fr, &params());
-    assert_eq!(queue_nodes(&s).len(), 1, "{:#?}", s.nodes);
+    let q = queue_nodes(&s);
+    assert_eq!(q.len(), 1, "{:#?}", s.nodes);
+    assert_eq!(q[0].lifetimes.last().unwrap().keyframes, 6);
+    assert!(s
+        .folded
+        .iter()
+        .any(|f| f.text == "Queue" && f.reason == FoldReason::Duplicate));
 }
 
 #[test]
@@ -3612,4 +3629,44 @@ fn a_node_read_as_a_sticky_as_often_or_marked_as_one_is_a_sticky() {
         Some(StickyKind::Milestone)
     );
     assert!(sticky("Cache warmup plan").is_some(), "{:#?}", s.stickies);
+}
+
+#[test]
+fn a_same_text_box_where_the_registration_is_off_merges() {
+    // No OCR. In keyframes 4 and 5 the reader throws Queue far from every other
+    // element, and Ledger Store to another far place (a different one in each
+    // keyframe): nothing read near the Queue box confirms the registration there, and
+    // the keyframe misplaces another known element. The Queue box is no second Queue.
+    let specs: Vec<Spec> = (0..6).map(|_| base()).collect();
+    let mut fr = frames(&specs);
+    let id = Similarity::IDENTITY;
+    for (k, ledger_at) in [(4, (-1200.0, 300.0)), (5, (-1200.0, 1400.0))] {
+        for n in &mut fr[k].board.nodes {
+            match n.local_id.as_str() {
+                "n2" => n.bbox = bbox_at(&id, (-700.0, -600.0), 90.0, 40.0),
+                "n3" => n.bbox = bbox_at(&id, ledger_at, 90.0, 40.0),
+                _ => {}
+            }
+        }
+    }
+    let s = run(fr, &params());
+    let q = queue_nodes(&s);
+    assert_eq!(q.len(), 1, "{:#?}", s.nodes);
+    assert_eq!(q[0].lifetimes.last().unwrap().keyframes, 6);
+    assert!(s
+        .folded
+        .iter()
+        .any(|f| f.text == "Queue" && f.reason == FoldReason::Duplicate));
+    // With the Ledger Store boxes where they belong, nothing in those keyframes says
+    // the registration is off: the far Queue box stays unexplained.
+    let mut fr = frames(&specs);
+    for f in &mut fr[4..] {
+        for n in &mut f.board.nodes {
+            if n.local_id == "n2" {
+                n.bbox = bbox_at(&id, (-700.0, -600.0), 90.0, 40.0);
+            }
+        }
+    }
+    let s = run(fr, &params());
+    assert!(s.folded.iter().all(|f| f.reason != FoldReason::Duplicate));
 }
