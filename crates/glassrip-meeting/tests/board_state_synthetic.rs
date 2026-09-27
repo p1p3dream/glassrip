@@ -3572,6 +3572,20 @@ fn a_distant_second_box_that_ocr_confirms_stays_a_second_node() {
 }
 
 #[test]
+fn an_adjacent_second_box_that_ocr_confirms_stays_a_second_node() {
+    // A second Queue box 150 px right of the first (the two boxes nearly touch):
+    // OCR reads Queue inside each box. The margin around the first box does not claim
+    // the second box's text: two Queues.
+    let mut specs: Vec<Spec> = (0..6).map(|_| base()).collect();
+    for s in specs.iter_mut().skip(2) {
+        s.nodes.push(("n9", "Queue".into(), (850.0, 220.0)));
+    }
+    let s = run(frames_with_ocr(&specs, &|_| vec![]), &params());
+    assert_eq!(queue_nodes(&s).len(), 2, "{:#?}", s.nodes);
+    assert!(s.folded.iter().all(|f| f.reason != FoldReason::Duplicate));
+}
+
+#[test]
 fn an_owner_tag_on_a_merged_duplicate_targets_the_established_node() {
     // Avery sits above Ledger Store, then moves above Queue in the two keyframes that
     // misplace Queue's box: the move targets the one Queue node.

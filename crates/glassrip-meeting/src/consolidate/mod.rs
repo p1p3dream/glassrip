@@ -1265,11 +1265,16 @@ pub fn consolidate_with_probe(
         if same_place(&b, &eb) {
             return Sighting::Near;
         }
+        // A span inside the sighting's own box is its own unless it also lies inside
+        // the established box itself (a neighbor's margin does not claim it); the
+        // established place, grown by half its size, explains a sighting only when
+        // OCR reads nothing at the sighting's own place.
         let text = normalize(&o.text);
-        let at_established = ocr_hits(o.frame, &text, &eb, 0.5);
+        let inside_established = ocr_hits(o.frame, &text, &eb, 0.0);
         let own = ocr_hits(o.frame, &text, &b, 0.0)
             .into_iter()
-            .any(|x| !at_established.contains(&x));
+            .any(|x| !inside_established.contains(&x));
+        let at_established = ocr_hits(o.frame, &text, &eb, 0.5);
         let off = registration_off(o.frame, &b, [ti, ei]);
         if own {
             if trusted_registration(o.frame) && !bad && !off {
